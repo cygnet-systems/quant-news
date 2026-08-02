@@ -6,13 +6,16 @@ This module provides functions to fetch news from multiple sources:
 """
 
 import hashlib
+import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
 
 from config import API
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,6 +33,10 @@ class NewsArticle:
     sentiment_score: Optional[float] = None
     impact: Optional[str] = None  # How the stock is affected (e.g., "price target raised")
     price_change_percent: Optional[float] = None  # Current stock price change %
+    ticker_relevance_score: Optional[float] = None  # AV ticker relevance (0-1)
+    topics: Optional[list[dict]] = None  # AV topic list [{topic, relevance_score}, ...]
+    overall_sentiment_score: Optional[float] = None  # AV overall sentiment (-1 to 1)
+    overall_sentiment_label: Optional[str] = None  # AV overall sentiment label
 
 
 def _extract_stock_impact(title: str, summary: str = "") -> Optional[str]:
@@ -170,46 +177,125 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
         return []
 
 
+def _parse_av_feed_item(item: dict, symbol: str) -> Optional[dict]:
+    """Parse a single AV NEWS_SENTIMENT feed item into a standardized dict.
+
+    Shared parser for all AV news consumers. Extracts every field needed
+    by any downstream consumer (UI, DeBERTa, feature_builder, LLM service).
+
+    Args:
+        item: Raw feed item from AV API response.
+        symbol: Ticker symbol (or "" for global/macro news).
+
+    Returns:
+        Standardized article dict, or None if timestamp is unparseable.
+    """
+    time_str = item.get("time_published", "")
+    try:
+        pub_time = datetime.strptime(time_str, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None
+
+    title = item.get("title", "")
+    summary = item.get("summary", "")
+    source = item.get("source", "Unknown")
+    url = item.get("url", "")
+    topics = item.get("topics", [])
+    overall_sentiment_score = float(item.get("overall_sentiment_score", 0))
+    overall_sentiment_label = item.get("overall_sentiment_label", "")
+
+    # Extract ticker-specific sentiment and relevance
+    ticker_sentiment = None
+    sentiment_score = None
+    ticker_sentiment_score = None
+    ticker_relevance_score = None
+
+    if symbol:
+        for ts in item.get("ticker_sentiment", []):
+            if ts.get("ticker", "").upper() == symbol.upper():
+                ticker_sentiment_score = float(ts.get("ticker_sentiment_score", 0))
+                ticker_relevance_score = float(ts.get("relevance_score", 0))
+                sentiment_score = ticker_sentiment_score
+                label = ts.get("ticker_sentiment_label", "")
+                if "bullish" in label.lower():
+                    ticker_sentiment = "bullish"
+                elif "bearish" in label.lower():
+                    ticker_sentiment = "bearish"
+                else:
+                    ticker_sentiment = "neutral"
+                break
+
+    # Fallback to overall sentiment if no ticker-specific data
+    if ticker_sentiment is None:
+        if overall_sentiment_score > 0.15:
+            ticker_sentiment = "bullish"
+        elif overall_sentiment_score < -0.15:
+            ticker_sentiment = "bearish"
+        else:
+            ticker_sentiment = "neutral"
+        sentiment_score = overall_sentiment_score
+
+    return {
+        "id": _generate_article_id(title, source, pub_time),
+        "symbol": symbol.upper() if symbol else "_GLOBAL",
+        "title": title,
+        "summary": summary,
+        "source": source,
+        "url": url,
+        "published_at": pub_time,
+        "published_date": pub_time.strftime("%Y-%m-%d"),
+        "sentiment": ticker_sentiment,
+        "sentiment_score": sentiment_score,
+        "ticker_sentiment_score": ticker_sentiment_score,
+        "ticker_relevance_score": ticker_relevance_score,
+        "topics": topics,
+        "overall_sentiment_score": overall_sentiment_score,
+        "overall_sentiment_label": overall_sentiment_label,
+        "impact": _extract_stock_impact(title, summary),
+    }
+
+
 def fetch_alpha_vantage_news(
     symbol: str,
-    max_articles: int = 10,
+    max_articles: int = 50,
     topics: Optional[str] = None,
     time_from: Optional[str] = None,
     time_to: Optional[str] = None,
     sort: str = "LATEST",
+    relevance_threshold: float = 0.5,
 ) -> list[NewsArticle]:
     """Fetch news from Alpha Vantage News API.
 
-    Includes AI-powered sentiment scores.
+    Fetches up to 50 articles from the last 7 days and pre-filters by
+    ticker relevance score >= relevance_threshold to remove noise.
 
     Args:
         symbol: Stock ticker symbol.
-        max_articles: Maximum number of articles to return.
-        topics: Comma-separated topics to filter by (e.g., "earnings,technology").
-                Available topics: earnings, ipo, mergers_and_acquisitions,
-                financial_markets, economy_fiscal, economy_monetary, economy_macro,
-                energy_transportation, finance, life_sciences, manufacturing,
-                real_estate, retail_wholesale, technology
-        time_from: Start time in YYYYMMDDTHHMM format (e.g., "20260101T0000")
-        time_to: End time in YYYYMMDDTHHMM format (e.g., "20260115T2359")
-        sort: Sort order - "LATEST", "EARLIEST", or "RELEVANCE" (default: LATEST)
+        max_articles: Maximum number of articles to return (AV max is 50).
+        topics: Comma-separated topics to filter by.
+        time_from: Start time in YYYYMMDDTHHMM format. Defaults to 7 days ago.
+        time_to: End time in YYYYMMDDTHHMM format.
+        sort: Sort order - "LATEST", "EARLIEST", or "RELEVANCE".
+        relevance_threshold: Minimum ticker_relevance_score (0-1). Default 0.5.
 
     Returns:
-        List of NewsArticle objects with sentiment data.
+        List of NewsArticle objects with sentiment data, pre-filtered by relevance.
     """
     if not API.ALPHA_VANTAGE_API_KEY:
         return []
 
     try:
+        if not time_from:
+            seven_days_ago = datetime.now() - timedelta(days=7)
+            time_from = seven_days_ago.strftime("%Y%m%dT0000")
+
         params = {
             "function": "NEWS_SENTIMENT",
             "tickers": symbol.upper(),
-            "limit": max_articles,
+            "limit": min(max_articles, 50),
             "apikey": API.ALPHA_VANTAGE_API_KEY,
             "sort": sort,
         }
-
-        # Add optional filters
         if topics:
             params["topics"] = topics
         if time_from:
@@ -223,66 +309,41 @@ def fetch_alpha_vantage_news(
             timeout=API.DEFAULT_TIMEOUT,
         )
         response.raise_for_status()
-
         data = response.json()
 
         if "feed" not in data:
             return []
 
         articles = []
-        for item in data["feed"][:max_articles]:
-            # Parse timestamp (format: 20240115T120000)
-            time_str = item.get("time_published", "")
-            try:
-                pub_time = datetime.strptime(time_str, "%Y%m%dT%H%M%S")
-            except ValueError:
-                pub_time = datetime.now()
+        for item in data["feed"]:
+            parsed = _parse_av_feed_item(item, symbol)
+            if parsed is None:
+                continue
 
-            # Get ticker-specific sentiment
-            ticker_sentiment = None
-            sentiment_score = None
-            for ts in item.get("ticker_sentiment", []):
-                if ts.get("ticker", "").upper() == symbol.upper():
-                    sentiment_score = float(ts.get("ticker_sentiment_score", 0))
-                    label = ts.get("ticker_sentiment_label", "")
-                    if "bullish" in label.lower():
-                        ticker_sentiment = "bullish"
-                    elif "bearish" in label.lower():
-                        ticker_sentiment = "bearish"
-                    else:
-                        ticker_sentiment = "neutral"
-                    break
+            # Pre-filter by relevance. A None score means the ticker isn't
+            # in this article's ticker_sentiment list (i.e. it's market-wide
+            # noise that merely surfaced under a LATEST query) — drop it too.
+            # When relevance_threshold is 0, filtering is disabled entirely.
+            rel = parsed["ticker_relevance_score"]
+            if relevance_threshold > 0 and (rel is None or rel < relevance_threshold):
+                continue
 
-            # If no ticker-specific sentiment, use overall
-            if ticker_sentiment is None:
-                overall_score = float(item.get("overall_sentiment_score", 0))
-                if overall_score > 0.15:
-                    ticker_sentiment = "bullish"
-                elif overall_score < -0.15:
-                    ticker_sentiment = "bearish"
-                else:
-                    ticker_sentiment = "neutral"
-                sentiment_score = overall_score
-
-            title = item.get("title", "")
-            summary = item.get("summary", "")
-            article = NewsArticle(
-                id=_generate_article_id(
-                    title,
-                    item.get("source", ""),
-                    pub_time,
-                ),
+            articles.append(NewsArticle(
+                id=parsed["id"],
                 symbol=symbol.upper(),
-                title=title,
-                source=item.get("source", "Unknown"),
-                url=item.get("url", ""),
-                published_at=pub_time,
-                summary=summary,
-                sentiment=ticker_sentiment,
-                sentiment_score=sentiment_score,
-                impact=_extract_stock_impact(title, summary),
-            )
-            articles.append(article)
+                title=parsed["title"],
+                source=parsed["source"],
+                url=parsed["url"],
+                published_at=parsed["published_at"],
+                summary=parsed["summary"],
+                sentiment=parsed["sentiment"],
+                sentiment_score=parsed["sentiment_score"],
+                impact=parsed["impact"],
+                ticker_relevance_score=parsed["ticker_relevance_score"],
+                topics=parsed["topics"],
+                overall_sentiment_score=parsed["overall_sentiment_score"],
+                overall_sentiment_label=parsed["overall_sentiment_label"],
+            ))
 
         return articles
 
@@ -310,13 +371,14 @@ def _get_stock_price_change(symbol: str) -> Optional[float]:
 
 def fetch_news(
     symbol: str,
-    max_articles: int = 10,
+    max_articles: int = 50,
     prefer_alpha_vantage: bool = True,
     include_price_change: bool = True,
     topics: Optional[str] = None,
     time_from: Optional[str] = None,
     time_to: Optional[str] = None,
     sort: str = "LATEST",
+    relevance_threshold: float = 0.5,
 ) -> list[NewsArticle]:
     """Fetch news from available sources.
 
@@ -331,6 +393,7 @@ def fetch_news(
         time_from: Start time in YYYYMMDDTHHMM format (Alpha Vantage only).
         time_to: End time in YYYYMMDDTHHMM format (Alpha Vantage only).
         sort: Sort order - "LATEST", "EARLIEST", or "RELEVANCE" (Alpha Vantage only).
+        relevance_threshold: Minimum ticker relevance score (Alpha Vantage only).
 
     Returns:
         List of NewsArticle objects, sorted by date (newest first).
@@ -346,6 +409,7 @@ def fetch_news(
             time_from=time_from,
             time_to=time_to,
             sort=sort,
+            relevance_threshold=relevance_threshold,
         )
 
     # Fallback to yfinance if no results
@@ -367,7 +431,7 @@ def fetch_news(
 
 def fetch_news_cached(
     symbol: str,
-    max_articles: int = 10,
+    max_articles: int = 50,
     cache_minutes: int = 15,
 ) -> list[NewsArticle]:
     """Fetch news with DuckDB caching support.
@@ -402,6 +466,10 @@ def fetch_news_cached(
                 sentiment=a.get("sentiment"),
                 sentiment_score=a.get("sentiment_score"),
                 impact=a.get("impact"),
+                ticker_relevance_score=a.get("ticker_relevance_score"),
+                topics=a.get("topics"),
+                overall_sentiment_score=a.get("overall_sentiment_score"),
+                overall_sentiment_label=a.get("overall_sentiment_label"),
             )
             for a in cached[:max_articles]
         ]
@@ -488,6 +556,136 @@ def get_sentiment_summary(articles: list[NewsArticle]) -> dict:
         "overall": overall,
         "score": round(avg_score, 3),
     }
+
+
+def fetch_historical_av_news(
+    symbol: str,
+    months: int = 3,
+) -> dict[str, list[dict]]:
+    """Fetch AV news for past N months, grouped by date.
+
+    Results are cached in the DuckDB historical_news table. Subsequent calls
+    for the same symbol+date range hit the cache.
+
+    Args:
+        symbol: Stock ticker symbol (or "" for global news).
+        months: Number of months of history to fetch.
+
+    Returns:
+        Dict mapping date string (YYYY-MM-DD) to list of article dicts.
+
+    Raises:
+        ValueError: If ALPHA_VANTAGE_API_KEY is not configured.
+    """
+    if not API.ALPHA_VANTAGE_API_KEY:
+        raise ValueError(
+            "ALPHA_VANTAGE_API_KEY required for model training features. "
+            "Set it in .env or environment variables."
+        )
+
+    from services.cache_service import get_cache
+
+    cache = get_cache()
+    cache_symbol = symbol.upper() if symbol else "_GLOBAL"
+
+    # Check cache first
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=30 * months)
+    cached = cache.get_historical_news(
+        cache_symbol,
+        start_date=start_date.strftime("%Y-%m-%d"),
+        end_date=end_date.strftime("%Y-%m-%d"),
+    )
+
+    if cached:
+        result: dict[str, list[dict]] = {}
+        for article in cached:
+            date_key = str(article.get("published_date", ""))[:10]
+            if date_key:
+                result.setdefault(date_key, []).append(article)
+        if result:
+            logger.info(f"AV news cache hit: {cache_symbol}, {len(cached)} articles")
+            return result
+
+    # Fetch from AV API in monthly windows
+    all_articles: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for m in range(months):
+        month_end = end_date - timedelta(days=30 * m)
+        month_start = end_date - timedelta(days=30 * (m + 1))
+        time_from = month_start.strftime("%Y%m%dT0000")
+        time_to = month_end.strftime("%Y%m%dT2359")
+
+        try:
+            params: dict = {
+                "function": "NEWS_SENTIMENT",
+                "limit": 200,
+                "apikey": API.ALPHA_VANTAGE_API_KEY,
+                "sort": "LATEST",
+                "time_from": time_from,
+                "time_to": time_to,
+            }
+            if symbol:
+                params["tickers"] = symbol.upper()
+            else:
+                params["topics"] = (
+                    "economy_macro,economy_fiscal,economy_monetary,financial_markets"
+                )
+
+            response = requests.get(
+                API.ALPHA_VANTAGE_BASE_URL,
+                params=params,
+                timeout=API.DEFAULT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for item in data.get("feed", []):
+                url = item.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                parsed = _parse_av_feed_item(item, symbol)
+                if parsed is None:
+                    continue
+
+                all_articles.append(parsed)
+
+        except Exception as e:
+            logger.warning(f"AV news fetch error (month {m}): {e}")
+            continue
+
+    # Store in cache
+    if all_articles:
+        cache.store_historical_news(all_articles)
+        logger.info(
+            f"Stored {len(all_articles)} AV articles for {cache_symbol}"
+        )
+
+    # Group by date
+    result = {}
+    for article in all_articles:
+        date_key = article["published_date"]
+        result.setdefault(date_key, []).append(article)
+
+    return result
+
+
+def fetch_global_market_news(months: int = 1) -> dict[str, list[dict]]:
+    """Fetch global market/macro news from Alpha Vantage.
+
+    Uses topics: economy_macro, economy_fiscal, economy_monetary,
+    financial_markets. Cached with symbol="_GLOBAL".
+
+    Args:
+        months: Number of months of history.
+
+    Returns:
+        Dict mapping date string to list of article dicts.
+    """
+    return fetch_historical_av_news(symbol="", months=months)
 
 
 def format_time_ago(dt: datetime) -> str:

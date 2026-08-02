@@ -1,8 +1,12 @@
 # Quant News Tracker - Production Dependencies
 
 # Web Framework
-dash>=2.15.0
-dash-bootstrap-components>=1.5.0
+# dash 4.4.1+: FastAPI backend support (4.2) + background-callback HMAC fix (4.4.1)
+dash[fastapi]==4.4.1
+dash-bootstrap-components>=2.0.4
+uvicorn>=0.30.0
+# Background-callback subprocess spawner (imported at app.py top; was undeclared)
+multiprocess>=0.70.16
 plotly>=5.18.0
 
 # Data Sources
@@ -13,15 +17,58 @@ requests>=2.31.0
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Data Caching
-duckdb>=0.10.0
+# Parquet export
 pyarrow>=15.0.0
+# XLSX export (pandas ExcelWriter engine)
+openpyxl>=3.1.0
 
 # Technical Analysis
 ta>=0.11.0
 
 # LLM Integration
 openai>=1.12.0
+# Anthropic fallback provider (lazy-imported in llm_service; was undeclared)
+anthropic>=0.34.0
 
 # Configuration
 python-dotenv>=1.0.0
+
+# Cygnet SSO (shared signing scheme with CygnetResearchTerminal)
+itsdangerous>=2.0.0
+# FastAPI form parsing for /auth/login
+python-multipart>=0.0.9
+
+# Model Prediction Infrastructure
+# Install torch separately for your platform BEFORE pip install -r requirements.txt:
+#   macOS (MPS):       pip install torch
+#   Linux (CPU only):  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   Docker:            Handled in Dockerfile (torch+cpu)
+torch>=2.0.0
+einops>=0.7.0
+huggingface_hub>=0.20.0
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+diskcache>=5.6.0
+pandas_market_calendars>=4.0.0
+
+# Additional Models
+transformers>=4.35.0
+lightgbm>=4.0.0
+
+# Strategy Evaluation
+vectorbt>=0.26.0
+APScheduler>=3.10.0
+
+# PDF Report Generation
+xhtml2pdf>=0.2.17
+# Markdown -> HTML for PDF reports (report_service)
+markdown>=3.5
+# Progress bars in vendored Kronos (models/kronos) — declared explicitly
+# rather than relying on huggingface_hub's transitive install
+tqdm>=4.66
+
+# Persistence Layer (Postgres + S3)
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+psycopg2-binary>=2.9.0
+boto3>=1.34.0

@@ -1,406 +1,291 @@
-"""DuckDB caching service for stock data.
+"""PostgreSQL caching service for stock data and model predictions.
 
-This module provides a caching layer using DuckDB to minimize API calls
+Provides a caching layer using PostgreSQL via SQLAlchemy to minimize API calls
 and enable fast local data access with SQL query capabilities.
+
+Migrated from DuckDB — same public API, Postgres backend.
 """
 
 import hashlib
-from datetime import datetime
+import json
+import logging
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-import duckdb
 import pandas as pd
+from sqlalchemy import delete, func, select, text, update
 
 from config import APP
+from db.session import get_session, get_engine
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN/Inf floats with None for JSONB columns.
+
+    json.dumps(float('nan')) emits the literal `NaN`, which Postgres JSONB
+    rejects. The Dash UI path survives only because dcc.Store's encoder
+    converts NaN to null in transit; any server-side caller (scripts,
+    benchmarks) would fail on insert. Features may now legitimately be NaN
+    ("missing"), so sanitize at the persistence boundary.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
+        return None
+    return obj
+
+
+def _current_uid():
+    """Cygnet SSO uid for this request, or None (anonymous / subprocess)."""
+    try:
+        from services.auth_service import current_uid
+        return current_uid()
+    except Exception:
+        return None
+
+
+def _visible(model_cls):
+    """Row-visibility clause: public rows (or legacy NULL-owner rows) plus
+    the signed-in user's own. With everything public today this filters
+    nothing; it becomes load-bearing the moment private rows exist."""
+    cond = model_cls.is_public.is_(True) | model_cls.owner_uid.is_(None)
+    uid = _current_uid()
+    if uid:
+        cond = cond | (model_cls.owner_uid == uid)
+    return cond
 
 
 class CacheService:
-    """DuckDB-based caching service for stock data.
+    """Postgres-backed caching service for stock data.
 
     Provides methods to cache and retrieve stock prices, company info,
     and news articles with manual refresh capability.
-
-    Attributes:
-        db_path: Path to the DuckDB database file.
-        conn: DuckDB connection object.
     """
 
-    def __init__(self, db_path: str = "cache/quant_news.duckdb") -> None:
-        """Initialize the cache service.
+    def __init__(self) -> None:
+        Path("cache/exports").mkdir(parents=True, exist_ok=True)
 
-        Args:
-            db_path: Path to the DuckDB database file. Created if not exists.
-        """
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def _period_to_days(self, period: str) -> int:
+        if period == "ytd":
+            jan1 = datetime(datetime.now().year, 1, 1)
+            # Floor of a week so early-January YTD still loads a usable window.
+            return max((datetime.now() - jan1).days, 7)
+        period_map = {
+            "1mo": 30, "3mo": 90, "6mo": 180,
+            "1y": 365, "2y": 730, "5y": 1825,
+        }
+        return period_map.get(period, 365)
 
-        # Create exports directory
-        (self.db_path.parent / "exports").mkdir(exist_ok=True)
-
-        self.conn = duckdb.connect(str(self.db_path))
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        """Initialize database schema if tables don't exist."""
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS stock_prices (
-                symbol VARCHAR NOT NULL,
-                date DATE NOT NULL,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume BIGINT,
-                dividends DOUBLE,
-                stock_splits DOUBLE,
-                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (symbol, date)
+    def is_cached(self, symbol: str, data_type: str = "prices", period: Optional[str] = None) -> bool:
+        from db.models import CacheMetadata
+        with get_session() as session:
+            stmt = select(func.count()).select_from(CacheMetadata).where(
+                CacheMetadata.symbol == symbol.upper(),
+                CacheMetadata.data_type == data_type,
             )
-        """)
-
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS stock_info (
-                symbol VARCHAR PRIMARY KEY,
-                name VARCHAR,
-                sector VARCHAR,
-                industry VARCHAR,
-                market_cap BIGINT,
-                current_price DOUBLE,
-                previous_close DOUBLE,
-                pe_ratio DOUBLE,
-                dividend_yield DOUBLE,
-                fifty_two_week_high DOUBLE,
-                fifty_two_week_low DOUBLE,
-                volume BIGINT,
-                avg_volume BIGINT,
-                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS cache_metadata (
-                symbol VARCHAR NOT NULL,
-                data_type VARCHAR NOT NULL,
-                period VARCHAR,
-                last_updated TIMESTAMP,
-                record_count INTEGER,
-                PRIMARY KEY (symbol, data_type)
-            )
-        """)
-
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS news_cache (
-                id VARCHAR PRIMARY KEY,
-                symbol VARCHAR NOT NULL,
-                title VARCHAR,
-                source VARCHAR,
-                url VARCHAR,
-                published_at TIMESTAMP,
-                summary VARCHAR,
-                sentiment VARCHAR,
-                sentiment_score DOUBLE,
-                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Migration: Add sentiment_score column if it doesn't exist (for existing DBs)
-        try:
-            self.conn.execute("ALTER TABLE news_cache ADD COLUMN sentiment_score DOUBLE")
-        except Exception:
-            pass  # Column already exists
-
-    def _checkpoint(self) -> None:
-        """Force WAL checkpoint to prevent corruption on unexpected shutdown.
-
-        This flushes the Write-Ahead Log to the main database file,
-        preventing corruption if the process is killed mid-write
-        (common during Dash debug mode hot reloads).
-        """
-        try:
-            self.conn.execute("CHECKPOINT")
-        except Exception:
-            pass
-
-    def is_cached(
-        self,
-        symbol: str,
-        data_type: str = "prices",
-        period: Optional[str] = None,
-    ) -> bool:
-        """Check if data is cached for a symbol.
-
-        Args:
-            symbol: Stock ticker symbol.
-            data_type: Type of data ('prices', 'info', 'news').
-            period: Time period for prices (e.g., '1y').
-
-        Returns:
-            True if cached data exists, False otherwise.
-        """
-        result = self.conn.execute("""
-            SELECT COUNT(*) FROM cache_metadata
-            WHERE symbol = ? AND data_type = ?
-        """, [symbol.upper(), data_type]).fetchone()
-
-        return result[0] > 0 if result else False
+            return session.execute(stmt).scalar() > 0
 
     def get_cache_info(self, symbol: str, data_type: str = "prices") -> Optional[dict]:
-        """Get cache metadata for a symbol.
-
-        Args:
-            symbol: Stock ticker symbol.
-            data_type: Type of data.
-
-        Returns:
-            Dictionary with cache info or None if not cached.
-        """
-        result = self.conn.execute("""
-            SELECT period, last_updated, record_count
-            FROM cache_metadata
-            WHERE symbol = ? AND data_type = ?
-        """, [symbol.upper(), data_type]).fetchone()
-
-        if result:
-            return {
-                "period": result[0],
-                "last_updated": result[1],
-                "record_count": result[2],
-            }
+        from db.models import CacheMetadata
+        with get_session() as session:
+            row = session.execute(
+                select(CacheMetadata).where(
+                    CacheMetadata.symbol == symbol.upper(),
+                    CacheMetadata.data_type == data_type,
+                )
+            ).scalar_one_or_none()
+            if row:
+                return {
+                    "period": row.period,
+                    "last_updated": row.last_updated,
+                    "record_count": row.record_count,
+                }
         return None
 
-    def get_cached_news(
-        self,
-        symbol: str,
-        max_age_minutes: int = 15,
-    ) -> Optional[list[dict]]:
-        """Get cached news articles for a symbol.
+    # =========================================================================
+    # News cache
+    # =========================================================================
 
-        Args:
-            symbol: Stock ticker symbol.
-            max_age_minutes: Maximum cache age in minutes (default 15).
-
-        Returns:
-            List of article dictionaries or None if cache is stale/empty.
-        """
+    def get_cached_news(self, symbol: str, max_age_minutes: int = 15) -> Optional[list[dict]]:
+        from db.models import NewsArticle
         symbol = symbol.upper().strip()
         cutoff_time = datetime.now() - pd.Timedelta(minutes=max_age_minutes)
 
-        result = self.conn.execute("""
-            SELECT id, symbol, title, source, url, published_at,
-                   summary, sentiment, sentiment_score, fetched_at
-            FROM news_cache
-            WHERE symbol = ? AND fetched_at >= ?
-            ORDER BY published_at DESC
-        """, [symbol, cutoff_time]).fetchall()
+        with get_session() as session:
+            rows = session.execute(
+                select(NewsArticle)
+                .where(NewsArticle.symbol == symbol, NewsArticle.fetched_at >= cutoff_time)
+                .order_by(NewsArticle.published_at.desc())
+            ).scalars().all()
 
-        if not result:
-            return None
+            if not rows:
+                return None
 
-        return [
-            {
-                "id": row[0],
-                "symbol": row[1],
-                "title": row[2],
-                "source": row[3],
-                "url": row[4],
-                "published_at": row[5],
-                "summary": row[6],
-                "sentiment": row[7],
-                "sentiment_score": row[8],
-                "fetched_at": row[9],
-            }
-            for row in result
-        ]
+            return [
+                {
+                    "id": r.id,
+                    "symbol": r.symbol,
+                    "title": r.title,
+                    "source": r.source,
+                    "url": r.url,
+                    "published_at": r.published_at,
+                    "summary": r.summary,
+                    "sentiment": r.sentiment,
+                    "sentiment_score": r.sentiment_score,
+                    "fetched_at": r.fetched_at,
+                    "topics": json.loads(r.topics_json) if r.topics_json else None,
+                    "overall_sentiment_score": r.overall_sentiment_score,
+                    "overall_sentiment_label": r.overall_sentiment_label,
+                    "ticker_relevance_score": r.ticker_relevance_score,
+                    "impact": r.impact,
+                }
+                for r in rows
+            ]
 
     def cache_news(self, symbol: str, articles: list) -> None:
-        """Store news articles in cache.
-
-        Args:
-            symbol: Stock ticker symbol.
-            articles: List of NewsArticle objects or dicts.
-        """
+        from db.models import NewsArticle, CacheMetadata
         symbol = symbol.upper().strip()
         now = datetime.now()
 
-        # Clear old news for this symbol
-        self.conn.execute("DELETE FROM news_cache WHERE symbol = ?", [symbol])
+        with get_session() as session:
+            session.execute(delete(NewsArticle).where(NewsArticle.symbol == symbol))
 
-        for article in articles:
-            # Handle both NewsArticle objects and dicts
-            if hasattr(article, "id"):
-                article_id = article.id
-                title = article.title
-                source = article.source
-                url = article.url
-                published_at = article.published_at
-                summary = article.summary
-                sentiment = article.sentiment
-                sentiment_score = article.sentiment_score
+            for article in articles:
+                if hasattr(article, "id"):
+                    a = article
+                    row = NewsArticle(
+                        id=a.id, symbol=symbol, title=a.title, source=a.source,
+                        url=a.url, published_at=a.published_at, summary=a.summary,
+                        sentiment=a.sentiment, sentiment_score=a.sentiment_score,
+                        fetched_at=now,
+                        topics_json=json.dumps(a.topics) if a.topics else None,
+                        overall_sentiment_score=a.overall_sentiment_score,
+                        overall_sentiment_label=a.overall_sentiment_label,
+                        ticker_relevance_score=a.ticker_relevance_score,
+                        impact=a.impact,
+                    )
+                else:
+                    row = NewsArticle(
+                        id=article.get("id"), symbol=symbol,
+                        title=article.get("title"), source=article.get("source"),
+                        url=article.get("url"), published_at=article.get("published_at"),
+                        summary=article.get("summary"), sentiment=article.get("sentiment"),
+                        sentiment_score=article.get("sentiment_score"), fetched_at=now,
+                        topics_json=json.dumps(article.get("topics")) if article.get("topics") else None,
+                        overall_sentiment_score=article.get("overall_sentiment_score"),
+                        overall_sentiment_label=article.get("overall_sentiment_label"),
+                        ticker_relevance_score=article.get("ticker_relevance_score"),
+                        impact=article.get("impact"),
+                    )
+                session.merge(row)
+
+            existing_meta = session.execute(
+                select(CacheMetadata).where(
+                    CacheMetadata.symbol == symbol,
+                    CacheMetadata.data_type == "news",
+                )
+            ).scalar_one_or_none()
+            if existing_meta:
+                existing_meta.last_updated = now
+                existing_meta.record_count = len(articles)
             else:
-                article_id = article.get("id")
-                title = article.get("title")
-                source = article.get("source")
-                url = article.get("url")
-                published_at = article.get("published_at")
-                summary = article.get("summary")
-                sentiment = article.get("sentiment")
-                sentiment_score = article.get("sentiment_score")
+                session.add(CacheMetadata(
+                    symbol=symbol, data_type="news", period=None,
+                    last_updated=now, record_count=len(articles),
+                ))
 
-            self.conn.execute("""
-                INSERT OR REPLACE INTO news_cache
-                (id, symbol, title, source, url, published_at, summary, sentiment, sentiment_score, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [article_id, symbol, title, source, url, published_at, summary, sentiment, sentiment_score, now])
-
-        # Update metadata
-        self.conn.execute("""
-            INSERT OR REPLACE INTO cache_metadata (symbol, data_type, period, last_updated, record_count)
-            VALUES (?, 'news', NULL, ?, ?)
-        """, [symbol, now, len(articles)])
-
-        self._checkpoint()
-
-    def _period_to_days(self, period: str) -> int:
-        """Convert period string to approximate number of days.
-
-        Args:
-            period: Time period string (e.g., '1mo', '3mo', '1y').
-
-        Returns:
-            Approximate number of days for the period.
-        """
-        period_map = {
-            "1mo": 30,
-            "3mo": 90,
-            "6mo": 180,
-            "1y": 365,
-            "2y": 730,
-            "5y": 1825,
-        }
-        return period_map.get(period, 365)  # Default to 1 year
+    # =========================================================================
+    # Stock prices
+    # =========================================================================
 
     def get_stock_prices(
-        self,
-        symbol: str,
-        period: str = APP.DEFAULT_PERIOD,
-        force_refresh: bool = False,
+        self, symbol: str, period: str = APP.DEFAULT_PERIOD, force_refresh: bool = False,
     ) -> tuple[pd.DataFrame, dict]:
-        """Get stock prices from cache or fetch from API.
-
-        Args:
-            symbol: Stock ticker symbol.
-            period: Time period (e.g., '1y', '6mo', '3mo').
-            force_refresh: If True, bypass cache and fetch fresh data.
-
-        Returns:
-            Tuple of (DataFrame with OHLCV data indexed by date, metadata dict).
-            Metadata contains: from_cache (bool), api_error (str or None), cache_time (datetime or None).
-
-        Raises:
-            ValueError: If symbol is invalid or data unavailable.
-        """
+        from db.models import StockPrice
         symbol = symbol.upper().strip()
         metadata = {"from_cache": False, "api_error": None, "cache_time": None}
 
-        # Calculate the start date based on period
         days = self._period_to_days(period)
         start_date = datetime.now() - pd.Timedelta(days=days)
 
-        # Check cache first (unless force refresh)
         if not force_refresh and self.is_cached(symbol, "prices"):
-            # Check if cache has data going back far enough for the requested period
-            oldest_date_result = self.conn.execute("""
-                SELECT MIN(date) FROM stock_prices WHERE symbol = ?
-            """, [symbol]).fetchone()
+            with get_session() as session:
+                oldest = session.execute(
+                    select(func.min(StockPrice.date)).where(StockPrice.symbol == symbol)
+                ).scalar()
 
-            oldest_cached = oldest_date_result[0] if oldest_date_result else None
-            cache_has_enough_data = False
+            if oldest:
+                oldest_dt = pd.to_datetime(oldest)
+                if oldest_dt <= (start_date + pd.Timedelta(days=7)):
+                    df = pd.read_sql(
+                        select(
+                            StockPrice.date, StockPrice.open, StockPrice.high,
+                            StockPrice.low, StockPrice.close, StockPrice.volume,
+                            StockPrice.dividends, StockPrice.stock_splits,
+                        ).where(
+                            StockPrice.symbol == symbol,
+                            StockPrice.date >= start_date.strftime("%Y-%m-%d"),
+                        ).order_by(StockPrice.date),
+                        get_engine(),
+                    )
+                    if not df.empty:
+                        df.set_index("date", inplace=True)
+                        df.index = pd.to_datetime(df.index)
+                        df = df.rename(columns={
+                            "open": "Open", "high": "High", "low": "Low",
+                            "close": "Close", "volume": "Volume",
+                            "dividends": "Dividends", "stock_splits": "Stock Splits",
+                        })
+                        cache_info = self.get_cache_info(symbol, "prices")
+                        metadata["from_cache"] = True
+                        metadata["cache_time"] = cache_info.get("last_updated") if cache_info else None
+                        return df, metadata
 
-            if oldest_cached:
-                oldest_cached_dt = pd.to_datetime(oldest_cached)
-                # Allow 7 days tolerance for weekends/holidays
-                cache_has_enough_data = oldest_cached_dt <= (start_date + pd.Timedelta(days=7))
-
-            if cache_has_enough_data:
-                df = self.conn.execute("""
-                    SELECT date, open, high, low, close, volume, dividends, stock_splits
-                    FROM stock_prices
-                    WHERE symbol = ? AND date >= ?
-                    ORDER BY date
-                """, [symbol, start_date.strftime("%Y-%m-%d")]).fetchdf()
-
-                if not df.empty:
-                    df.set_index("date", inplace=True)
-                    df.index = pd.to_datetime(df.index)
-                    # Rename columns to match yfinance format
-                    df = df.rename(columns={
-                        "open": "Open", "high": "High", "low": "Low",
-                        "close": "Close", "volume": "Volume",
-                        "dividends": "Dividends", "stock_splits": "Stock Splits"
-                    })
-                    # Get cache metadata
-                    cache_info = self.get_cache_info(symbol, "prices")
-                    metadata["from_cache"] = True
-                    metadata["cache_time"] = cache_info.get("last_updated") if cache_info else None
-                    return df, metadata
-
-        # Fetch from API
         from services.stock_data import fetch_stock_data
-
         try:
             df = fetch_stock_data(symbol, period)
-            # Store in cache
             self._cache_prices(symbol, df, period)
             metadata["from_cache"] = False
             return df, metadata
         except Exception as e:
-            # API failed - try to return cached data if available
             if self.is_cached(symbol, "prices"):
-                days = self._period_to_days(period)
-                start_date = datetime.now() - pd.Timedelta(days=days)
-
-                df = self.conn.execute("""
-                    SELECT date, open, high, low, close, volume, dividends, stock_splits
-                    FROM stock_prices
-                    WHERE symbol = ? AND date >= ?
-                    ORDER BY date
-                """, [symbol, start_date.strftime("%Y-%m-%d")]).fetchdf()
-
-                if not df.empty:
-                    df.set_index("date", inplace=True)
-                    df.index = pd.to_datetime(df.index)
-                    df = df.rename(columns={
+                fallback_df = pd.read_sql(
+                    select(
+                        StockPrice.date, StockPrice.open, StockPrice.high,
+                        StockPrice.low, StockPrice.close, StockPrice.volume,
+                        StockPrice.dividends, StockPrice.stock_splits,
+                    ).where(
+                        StockPrice.symbol == symbol,
+                        StockPrice.date >= start_date.strftime("%Y-%m-%d"),
+                    ).order_by(StockPrice.date),
+                    get_engine(),
+                )
+                if not fallback_df.empty:
+                    fallback_df.set_index("date", inplace=True)
+                    fallback_df.index = pd.to_datetime(fallback_df.index)
+                    fallback_df = fallback_df.rename(columns={
                         "open": "Open", "high": "High", "low": "Low",
                         "close": "Close", "volume": "Volume",
-                        "dividends": "Dividends", "stock_splits": "Stock Splits"
+                        "dividends": "Dividends", "stock_splits": "Stock Splits",
                     })
                     cache_info = self.get_cache_info(symbol, "prices")
                     metadata["from_cache"] = True
                     metadata["api_error"] = str(e)
                     metadata["cache_time"] = cache_info.get("last_updated") if cache_info else None
-                    return df, metadata
-
-            # No cache available, re-raise the error
+                    return fallback_df, metadata
             raise
 
     def _cache_prices(self, symbol: str, df: pd.DataFrame, period: str) -> None:
-        """Store price data in cache.
-
-        Args:
-            symbol: Stock ticker symbol.
-            df: DataFrame with OHLCV data.
-            period: Time period string.
-        """
+        from db.models import StockPrice, CacheMetadata
         if df.empty:
             return
 
-        # Prepare data for insertion - select only the columns we need
-        # yfinance may return varying columns, so be explicit
         cache_df = df.reset_index()
-
-        # The index becomes the first column (date)
-        # Map the columns we need, handling variations in yfinance output
         column_mapping = {}
         for col in cache_df.columns:
             col_lower = str(col).lower()
@@ -422,175 +307,143 @@ class CacheService:
                 column_mapping[col] = "stock_splits"
 
         cache_df = cache_df.rename(columns=column_mapping)
-
-        # Ensure required columns exist, add with default values if missing
         required_cols = ["date", "open", "high", "low", "close", "volume", "dividends", "stock_splits"]
         for col in required_cols:
             if col not in cache_df.columns:
                 cache_df[col] = 0.0 if col != "date" else None
-
-        # Select only the columns we need in the right order
         cache_df = cache_df[required_cols]
-        cache_df["symbol"] = symbol
-        cache_df["fetched_at"] = datetime.now()
 
-        # Delete existing data for this symbol
-        self.conn.execute("DELETE FROM stock_prices WHERE symbol = ?", [symbol])
+        now = datetime.now()
 
-        # Insert new data
-        self.conn.execute("""
-            INSERT INTO stock_prices
-            (symbol, date, open, high, low, close, volume, dividends, stock_splits, fetched_at)
-            SELECT symbol, date, open, high, low, close, volume, dividends, stock_splits, fetched_at
-            FROM cache_df
-        """)
+        with get_session() as session:
+            session.execute(delete(StockPrice).where(StockPrice.symbol == symbol))
 
-        # Update metadata
-        self.conn.execute("""
-            INSERT OR REPLACE INTO cache_metadata (symbol, data_type, period, last_updated, record_count)
-            VALUES (?, 'prices', ?, ?, ?)
-        """, [symbol, period, datetime.now(), len(df)])
+            for _, row in cache_df.iterrows():
+                session.add(StockPrice(
+                    symbol=symbol,
+                    date=row["date"],
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    volume=int(row["volume"]) if pd.notna(row["volume"]) else 0,
+                    dividends=row["dividends"],
+                    stock_splits=row["stock_splits"],
+                    fetched_at=now,
+                ))
 
-        self._checkpoint()
+            existing_meta = session.execute(
+                select(CacheMetadata).where(
+                    CacheMetadata.symbol == symbol,
+                    CacheMetadata.data_type == "prices",
+                )
+            ).scalar_one_or_none()
+            if existing_meta:
+                existing_meta.period = period
+                existing_meta.last_updated = now
+                existing_meta.record_count = len(df)
+            else:
+                session.add(CacheMetadata(
+                    symbol=symbol, data_type="prices", period=period,
+                    last_updated=now, record_count=len(df),
+                ))
+
+    # =========================================================================
+    # Stock info
+    # =========================================================================
 
     def get_stock_info(self, symbol: str, force_refresh: bool = False) -> Optional[dict]:
-        """Get company info from cache or fetch from API.
-
-        Args:
-            symbol: Stock ticker symbol.
-            force_refresh: If True, bypass cache and fetch fresh data.
-
-        Returns:
-            Dictionary with company info or None if unavailable.
-        """
+        from db.models import StockInfo
         symbol = symbol.upper().strip()
 
-        # Check cache first
         if not force_refresh and self.is_cached(symbol, "info"):
-            result = self.conn.execute("""
-                SELECT name, sector, industry, market_cap, current_price,
-                       previous_close, pe_ratio, dividend_yield,
-                       fifty_two_week_high, fifty_two_week_low, volume, avg_volume
-                FROM stock_info
-                WHERE symbol = ?
-            """, [symbol]).fetchone()
+            with get_session() as session:
+                row = session.execute(
+                    select(StockInfo).where(StockInfo.symbol == symbol)
+                ).scalar_one_or_none()
+                if row:
+                    return {
+                        "symbol": symbol,
+                        "name": row.name,
+                        "sector": row.sector,
+                        "industry": row.industry,
+                        "market_cap": row.market_cap,
+                        "current_price": row.current_price,
+                        "previous_close": row.previous_close,
+                        "pe_ratio": row.pe_ratio,
+                        "dividend_yield": row.dividend_yield,
+                        "fifty_two_week_high": row.fifty_two_week_high,
+                        "fifty_two_week_low": row.fifty_two_week_low,
+                        "volume": row.volume,
+                        "avg_volume": row.avg_volume,
+                    }
 
-            if result:
-                return {
-                    "symbol": symbol,
-                    "name": result[0],
-                    "sector": result[1],
-                    "industry": result[2],
-                    "market_cap": result[3],
-                    "current_price": result[4],
-                    "previous_close": result[5],
-                    "pe_ratio": result[6],
-                    "dividend_yield": result[7],
-                    "fifty_two_week_high": result[8],
-                    "fifty_two_week_low": result[9],
-                    "volume": result[10],
-                    "avg_volume": result[11],
-                }
-
-        # Fetch from API
         from services.stock_data import get_stock_info
-
         info = get_stock_info(symbol)
-
-        # Store in cache
         self._cache_info(info)
-
         return {
             "symbol": info.symbol,
-            "name": info.name,
-            "sector": info.sector,
-            "industry": info.industry,
-            "market_cap": info.market_cap,
-            "current_price": info.current_price,
-            "previous_close": info.previous_close,
-            "pe_ratio": info.pe_ratio,
+            "name": info.name, "sector": info.sector, "industry": info.industry,
+            "market_cap": info.market_cap, "current_price": info.current_price,
+            "previous_close": info.previous_close, "pe_ratio": info.pe_ratio,
             "dividend_yield": info.dividend_yield,
             "fifty_two_week_high": info.fifty_two_week_high,
             "fifty_two_week_low": info.fifty_two_week_low,
-            "volume": info.volume,
-            "avg_volume": info.avg_volume,
+            "volume": info.volume, "avg_volume": info.avg_volume,
         }
 
-    def _cache_info(self, info: "StockInfo") -> None:
-        """Store company info in cache.
+    def _cache_info(self, info) -> None:
+        from db.models import StockInfo, CacheMetadata
+        with get_session() as session:
+            session.merge(StockInfo(
+                symbol=info.symbol, name=info.name, sector=info.sector,
+                industry=info.industry, market_cap=info.market_cap,
+                current_price=info.current_price, previous_close=info.previous_close,
+                pe_ratio=info.pe_ratio, dividend_yield=info.dividend_yield,
+                fifty_two_week_high=info.fifty_two_week_high,
+                fifty_two_week_low=info.fifty_two_week_low,
+                volume=info.volume, avg_volume=info.avg_volume,
+                fetched_at=datetime.now(),
+            ))
+            existing_meta = session.execute(
+                select(CacheMetadata).where(
+                    CacheMetadata.symbol == info.symbol,
+                    CacheMetadata.data_type == "info",
+                )
+            ).scalar_one_or_none()
+            if existing_meta:
+                existing_meta.last_updated = datetime.now()
+                existing_meta.record_count = 1
+            else:
+                session.add(CacheMetadata(
+                    symbol=info.symbol, data_type="info", period=None,
+                    last_updated=datetime.now(), record_count=1,
+                ))
 
-        Args:
-            info: StockInfo dataclass from stock_data service.
-        """
-        self.conn.execute("""
-            INSERT OR REPLACE INTO stock_info
-            (symbol, name, sector, industry, market_cap, current_price,
-             previous_close, pe_ratio, dividend_yield, fifty_two_week_high,
-             fifty_two_week_low, volume, avg_volume, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            info.symbol, info.name, info.sector, info.industry,
-            info.market_cap, info.current_price, info.previous_close,
-            info.pe_ratio, info.dividend_yield, info.fifty_two_week_high,
-            info.fifty_two_week_low, info.volume, info.avg_volume,
-            datetime.now()
-        ])
-
-        # Update metadata
-        self.conn.execute("""
-            INSERT OR REPLACE INTO cache_metadata (symbol, data_type, period, last_updated, record_count)
-            VALUES (?, 'info', NULL, ?, 1)
-        """, [info.symbol, datetime.now()])
-
-        self._checkpoint()
+    # =========================================================================
+    # Multiple stocks
+    # =========================================================================
 
     def get_multiple_stocks(
-        self,
-        symbols: list[str],
-        period: str = APP.DEFAULT_PERIOD,
+        self, symbols: list[str], period: str = APP.DEFAULT_PERIOD,
         force_refresh: bool = False,
     ) -> dict[str, pd.DataFrame]:
-        """Get data for multiple stocks.
-
-        Args:
-            symbols: List of stock ticker symbols.
-            period: Time period for historical data.
-            force_refresh: If True, bypass cache for all symbols.
-
-        Returns:
-            Dictionary mapping symbol to DataFrame.
-        """
-        result: dict[str, pd.DataFrame] = {}
-
+        result = {}
         for symbol in symbols:
             try:
                 df = self.get_stock_prices(symbol, period, force_refresh)
                 result[symbol.upper()] = df
             except ValueError:
-                # Skip invalid symbols
                 continue
-
         return result
 
-    def export_to_parquet(
-        self,
-        symbol: str,
-        output_path: Optional[str] = None,
-    ) -> str:
-        """Export cached data to Parquet file.
+    # =========================================================================
+    # Parquet export (uses pandas, not DuckDB)
+    # =========================================================================
 
-        Args:
-            symbol: Stock ticker symbol.
-            output_path: Optional custom output path.
-
-        Returns:
-            Path to the exported file.
-
-        Raises:
-            ValueError: If no cached data exists for symbol.
-        """
+    def export_to_parquet(self, symbol: str, output_path: Optional[str] = None) -> str:
+        from db.models import StockPrice
         symbol = symbol.upper()
-
         if not self.is_cached(symbol, "prices"):
             raise ValueError(f"No cached data for {symbol}")
 
@@ -598,111 +451,765 @@ class CacheService:
             timestamp = datetime.now().strftime("%Y%m%d")
             output_path = f"cache/exports/{symbol}_{timestamp}.parquet"
 
-        self.conn.execute(f"""
-            COPY (
-                SELECT * FROM stock_prices WHERE symbol = '{symbol}'
-            ) TO '{output_path}' (FORMAT PARQUET)
-        """)
-
+        df = pd.read_sql(
+            select(StockPrice).where(StockPrice.symbol == symbol),
+            get_engine(),
+        )
+        df.to_parquet(output_path, index=False)
         return output_path
 
+    # =========================================================================
+    # Cache status / management
+    # =========================================================================
+
     def get_cache_status(self) -> list[dict]:
-        """Get status of all cached data.
-
-        Returns:
-            List of dictionaries with cache info for each symbol.
-        """
-        result = self.conn.execute("""
-            SELECT symbol, data_type, period, last_updated, record_count
-            FROM cache_metadata
-            ORDER BY symbol, data_type
-        """).fetchall()
-
-        return [
-            {
-                "symbol": row[0],
-                "data_type": row[1],
-                "period": row[2],
-                "last_updated": row[3],
-                "record_count": row[4],
-            }
-            for row in result
-        ]
+        from db.models import CacheMetadata
+        with get_session() as session:
+            rows = session.execute(
+                select(CacheMetadata).order_by(CacheMetadata.symbol, CacheMetadata.data_type)
+            ).scalars().all()
+            return [
+                {
+                    "symbol": r.symbol,
+                    "data_type": r.data_type,
+                    "period": r.period,
+                    "last_updated": r.last_updated,
+                    "record_count": r.record_count,
+                }
+                for r in rows
+            ]
 
     def get_all_cached_symbols(self) -> list[str]:
-        """Get list of all cached symbols.
-
-        Returns:
-            List of unique stock symbols in cache.
-        """
-        result = self.conn.execute("""
-            SELECT DISTINCT symbol FROM cache_metadata
-            WHERE data_type = 'prices'
-            ORDER BY symbol
-        """).fetchall()
-
-        return [row[0] for row in result]
+        from db.models import CacheMetadata
+        with get_session() as session:
+            rows = session.execute(
+                select(CacheMetadata.symbol)
+                .where(CacheMetadata.data_type == "prices")
+                .distinct()
+                .order_by(CacheMetadata.symbol)
+            ).scalars().all()
+            return list(rows)
 
     def clear_symbol(self, symbol: str) -> None:
-        """Clear all cached data for a symbol.
-
-        Args:
-            symbol: Stock ticker symbol to clear.
-        """
+        from db.models import StockPrice, StockInfo, NewsArticle, CacheMetadata
         symbol = symbol.upper()
-        self.conn.execute("DELETE FROM stock_prices WHERE symbol = ?", [symbol])
-        self.conn.execute("DELETE FROM stock_info WHERE symbol = ?", [symbol])
-        self.conn.execute("DELETE FROM news_cache WHERE symbol = ?", [symbol])
-        self.conn.execute("DELETE FROM cache_metadata WHERE symbol = ?", [symbol])
-        self._checkpoint()
+        with get_session() as session:
+            for model in [StockPrice, NewsArticle]:
+                session.execute(delete(model).where(model.symbol == symbol))
+            session.execute(delete(StockInfo).where(StockInfo.symbol == symbol))
+            session.execute(delete(CacheMetadata).where(CacheMetadata.symbol == symbol))
 
     def clear_all(self) -> None:
-        """Clear all cached data."""
-        self.conn.execute("DELETE FROM stock_prices")
-        self.conn.execute("DELETE FROM stock_info")
-        self.conn.execute("DELETE FROM news_cache")
-        self.conn.execute("DELETE FROM cache_metadata")
-        self._checkpoint()
+        from db.models import StockPrice, StockInfo, NewsArticle, CacheMetadata
+        with get_session() as session:
+            for model in [StockPrice, StockInfo, NewsArticle, CacheMetadata]:
+                session.execute(delete(model))
 
     def get_raw_data(self, symbol: str) -> pd.DataFrame:
-        """Get raw cached data as DataFrame for display.
+        from db.models import StockPrice
+        return pd.read_sql(
+            select(
+                StockPrice.date, StockPrice.open, StockPrice.high,
+                StockPrice.low, StockPrice.close, StockPrice.volume,
+                StockPrice.fetched_at,
+            ).where(StockPrice.symbol == symbol.upper())
+            .order_by(StockPrice.date.desc()),
+            get_engine(),
+        )
 
-        Args:
-            symbol: Stock ticker symbol.
+    # =========================================================================
+    # Model Predictions
+    # =========================================================================
 
-        Returns:
-            DataFrame with all cached price data.
-        """
-        return self.conn.execute("""
-            SELECT date, open, high, low, close, volume, fetched_at
-            FROM stock_prices
-            WHERE symbol = ?
-            ORDER BY date DESC
-        """, [symbol.upper()]).fetchdf()
+    def store_prediction(
+        self, symbol: str, model_name: str, result: dict,
+        prediction_date_str: str | None = None,
+    ) -> None:
+        from db.models import ModelPrediction, StockPrice
+        from utils.trading_calendar import get_next_trading_day
+
+        symbol = symbol.upper()
+        pred_date = date.fromisoformat(prediction_date_str) if prediction_date_str else date.today()
+        target = get_next_trading_day(pred_date)
+        pred_id = f"{symbol}_{model_name}_{pred_date:%Y%m%d}"
+
+        details = result.get("details", {})
+        feature_values = _sanitize_json(details.get("feature_values"))
+        training_samples = details.get("training_samples")
+
+        data_hash = hashlib.sha256(
+            json.dumps({
+                "symbol": symbol, "model": model_name,
+                "date": str(pred_date),
+                "features": feature_values,
+            }, sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+        with get_session() as session:
+            prev_close_row = session.execute(
+                select(StockPrice.close)
+                .where(StockPrice.symbol == symbol, StockPrice.date <= str(pred_date))
+                .order_by(StockPrice.date.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            session.merge(ModelPrediction(
+                id=pred_id,
+                symbol=symbol,
+                model_name=model_name,
+                prediction_date=pred_date,
+                target_date=target,
+                decision=result.get("decision", "HOLD"),
+                confidence=result.get("confidence"),
+                up_probability=result.get("up_probability"),
+                predicted_close=result.get("predicted_close"),
+                previous_close=prev_close_row,
+                model_version=result.get("model_version") or details.get("model_version"),
+                training_samples=training_samples,
+                feature_values_json=json.dumps(feature_values) if feature_values else None,
+                details_json=_sanitize_json(details) if details else None,
+                input_data_hash=data_hash,
+                created_at=datetime.now(),
+                # Re-storing a prediction id invalidates any prior evaluation:
+                # merge() used to keep old actual_close/was_correct/pnl from a
+                # DIFFERENT decision (12% of rows had scores contradicting
+                # their own decision), and the evaluator never revisits rows
+                # with actual_close set. Explicit Nones force a re-score.
+                actual_close=None,
+                was_correct=None,
+                pnl_dollars=None,
+                evaluated_at=None,
+                # Ownership: stamped from the signed-in user; everything is
+                # public by default until a privacy toggle exists.
+                owner_uid=_current_uid(),
+                is_public=True,
+            ))
+
+    def has_predictions_for_today(self, symbol: str) -> bool:
+        from db.models import ModelPrediction
+        today = date.today()
+        with get_session() as session:
+            count = session.execute(
+                select(func.count()).select_from(ModelPrediction).where(
+                    ModelPrediction.symbol == symbol.upper(),
+                    ModelPrediction.prediction_date == today,
+                )
+            ).scalar()
+            return count > 0
+
+    def get_predictions_for_today(self, symbol: str) -> dict:
+        from db.models import ModelPrediction
+        today = date.today()
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction).where(
+                    ModelPrediction.symbol == symbol.upper(),
+                    ModelPrediction.prediction_date == today,
+                )
+            ).scalars().all()
+
+            results = {}
+            for r in rows:
+                results[r.model_name] = {
+                    "model_name": r.model_name,
+                    "decision": r.decision,
+                    "confidence": r.confidence,
+                    "up_probability": r.up_probability,
+                    "predicted_close": r.predicted_close,
+                    "details": r.details_json or {},
+                    "model_version": r.model_version,
+                    "error": None,
+                }
+            return results
+
+    def evaluate_predictions(self) -> int:
+        from db.models import ModelPrediction, StockPrice
+        from models.base import compute_pnl
+        from utils.trading_calendar import get_previous_trading_day, is_market_open_today
+
+        today = date.today()
+        cutoff = get_previous_trading_day(today) if is_market_open_today() else today
+
+        # Backfill: predictions can't score without the target date's close.
+        # The price cache may be stale (TTL served old rows), so force-refresh
+        # any symbol whose stored prices don't reach its pending target dates.
+        with get_session() as session:
+            pending_pairs = session.execute(
+                select(ModelPrediction.symbol, func.max(ModelPrediction.target_date))
+                .where(
+                    ModelPrediction.actual_close.is_(None),
+                    ModelPrediction.target_date <= cutoff,
+                )
+                .group_by(ModelPrediction.symbol)
+            ).all()
+
+        for symbol, max_target in pending_pairs:
+            with get_session() as session:
+                latest = session.execute(
+                    select(func.max(StockPrice.date)).where(StockPrice.symbol == symbol)
+                ).scalar()
+            if latest is None or str(latest) < str(max_target):
+                try:
+                    self.get_stock_prices(symbol, period="3mo", force_refresh=True)
+                    logger.info(f"Backfilled prices for {symbol} through {max_target}")
+                except Exception as e:
+                    logger.warning(f"Price backfill failed for {symbol}: {e}")
+
+        with get_session() as session:
+            pending = session.execute(
+                select(ModelPrediction).where(
+                    ModelPrediction.actual_close.is_(None),
+                    ModelPrediction.target_date <= cutoff,
+                )
+            ).scalars().all()
+
+            evaluated = 0
+            for pred in pending:
+                actual_row = session.execute(
+                    select(StockPrice.close).where(
+                        StockPrice.symbol == pred.symbol,
+                        StockPrice.date == str(pred.target_date),
+                    )
+                ).scalar_one_or_none()
+
+                if actual_row is None:
+                    continue
+                if pred.previous_close is None or pred.previous_close <= 0:
+                    continue
+
+                actual_close = actual_row
+                price_went_up = actual_close > pred.previous_close
+
+                if pred.decision == "BUY":
+                    was_correct = price_went_up
+                elif pred.decision == "SELL":
+                    was_correct = not price_went_up
+                else:
+                    was_correct = None
+
+                pnl = compute_pnl(pred.decision, pred.previous_close, actual_close)
+
+                pred.actual_close = actual_close
+                pred.was_correct = was_correct
+                pred.pnl_dollars = pnl
+                pred.evaluated_at = datetime.now()
+                evaluated += 1
+
+            if evaluated > 0:
+                logger.info(f"Evaluated {evaluated} predictions")
+
+        return evaluated
+
+    def get_prediction_history(
+        self, symbol: str, model_name: Optional[str] = None, limit: int = 50,
+    ) -> list[dict]:
+        from db.models import ModelPrediction
+        with get_session() as session:
+            stmt = select(ModelPrediction).where(ModelPrediction.symbol == symbol.upper())
+            if model_name:
+                stmt = stmt.where(ModelPrediction.model_name == model_name)
+            stmt = stmt.order_by(ModelPrediction.prediction_date.desc()).limit(limit)
+
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol, "model_name": r.model_name,
+                    "prediction_date": r.prediction_date, "target_date": r.target_date,
+                    "decision": r.decision, "confidence": r.confidence,
+                    "up_probability": r.up_probability, "predicted_close": r.predicted_close,
+                    "previous_close": r.previous_close, "actual_close": r.actual_close,
+                    "was_correct": r.was_correct, "pnl_dollars": r.pnl_dollars,
+                    "model_version": r.model_version,
+                    "evaluated_at": r.evaluated_at, "created_at": r.created_at,
+                }
+                for r in rows
+            ]
+
+    # =========================================================================
+    # TradingAgents report persistence
+    # =========================================================================
+
+    def save_trading_agent_report(
+        self, symbol: str, trade_date: str, decision: str, confidence: float,
+        report_text: str, model_name: str = "", input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        import uuid
+        from db.models import TradingAgentReport
+
+        with get_session() as session:
+            session.add(TradingAgentReport(
+                id=str(uuid.uuid4()),
+                symbol=symbol.upper(),
+                trade_date=trade_date,
+                decision=decision,
+                confidence=confidence,
+                report_text=report_text,
+                model_name=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                owner_uid=_current_uid(),
+                is_public=True,
+            ))
+
+    def get_trading_agent_reports(self, symbol: str, limit: int = 20) -> list[dict]:
+        from db.models import TradingAgentReport
+        with get_session() as session:
+            rows = session.execute(
+                select(TradingAgentReport)
+                .where(TradingAgentReport.symbol == symbol.upper())
+                .order_by(TradingAgentReport.created_at.desc())
+                .limit(limit)
+            ).scalars().all()
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol,
+                    "trade_date": str(r.trade_date),
+                    "decision": r.decision, "confidence": r.confidence,
+                    "report_text": r.report_text, "model_name": r.model_name,
+                    "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                    "created_at": str(r.created_at),
+                }
+                for r in rows
+            ]
+
+    def get_all_trading_agent_reports(self, limit: int = 50) -> list[dict]:
+        from db.models import TradingAgentReport
+        with get_session() as session:
+            rows = session.execute(
+                select(TradingAgentReport)
+                .where(_visible(TradingAgentReport))
+                .order_by(TradingAgentReport.created_at.desc())
+                .limit(limit)
+            ).scalars().all()
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol,
+                    "trade_date": str(r.trade_date),
+                    "decision": r.decision, "confidence": r.confidence,
+                    "report_text": r.report_text, "model_name": r.model_name,
+                    "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                    "created_at": str(r.created_at),
+                }
+                for r in rows
+            ]
+
+    def get_model_accuracy(self, model_name: str, symbol: Optional[str] = None) -> dict:
+        from db.models import ModelPrediction
+        with get_session() as session:
+            base_filter = [
+                ModelPrediction.model_name == model_name,
+                ModelPrediction.was_correct.isnot(None),
+            ]
+            if symbol:
+                base_filter.append(ModelPrediction.symbol == symbol.upper())
+
+            total = session.execute(
+                select(func.count()).select_from(ModelPrediction).where(*base_filter)
+            ).scalar() or 0
+
+            correct = session.execute(
+                select(func.count()).select_from(ModelPrediction).where(
+                    *base_filter, ModelPrediction.was_correct.is_(True)
+                )
+            ).scalar() or 0
+
+            pnl_total = session.execute(
+                select(func.sum(ModelPrediction.pnl_dollars)).where(*base_filter)
+            ).scalar() or 0.0
+
+            distinct_symbols = session.execute(
+                select(func.count(ModelPrediction.symbol.distinct())).where(*base_filter)
+            ).scalar() or 0
+
+            return {
+                "total": total,
+                "correct": correct,
+                "accuracy": correct / total if total > 0 else 0.0,
+                "pnl_total": float(pnl_total),
+                "distinct_symbols": distinct_symbols,
+            }
+
+    # =========================================================================
+    # Strategy Evaluations
+    # =========================================================================
+
+    def store_strategy_evaluations(self, evaluations: list[dict]) -> int:
+        from db.models import StrategyEvaluation
+        inserted = 0
+        with get_session() as session:
+            for ev in evaluations:
+                try:
+                    existing = session.execute(
+                        select(StrategyEvaluation).where(StrategyEvaluation.id == ev["id"])
+                    ).scalar_one_or_none()
+                    if existing:
+                        continue
+                    session.add(StrategyEvaluation(
+                        id=ev["id"],
+                        prediction_id=ev["prediction_id"],
+                        strategy_name=ev["strategy_name"],
+                        strategy_version=ev.get("strategy_version"),
+                        action=ev["action"],
+                        position_size=ev.get("position_size", 1000.0),
+                        entry_price=ev.get("entry_price"),
+                        exit_price=ev.get("exit_price"),
+                        pnl_dollars=ev.get("pnl_dollars"),
+                        was_correct=ev.get("was_correct"),
+                        signal_metadata_json=json.dumps(ev.get("metadata", {})) if ev.get("metadata") else None,
+                        evaluated_at=datetime.now(),
+                    ))
+                    inserted += 1
+                except Exception:
+                    pass
+        return inserted
+
+    def get_unevaluated_predictions_for_strategy(self, strategy_name: str) -> list[dict]:
+        from db.models import ModelPrediction, StrategyEvaluation
+        with get_session() as session:
+            subq = select(StrategyEvaluation.prediction_id).where(
+                StrategyEvaluation.strategy_name == strategy_name
+            ).scalar_subquery()
+
+            rows = session.execute(
+                select(ModelPrediction)
+                .where(
+                    ModelPrediction.actual_close.isnot(None),
+                    ModelPrediction.id.notin_(subq),
+                )
+            ).scalars().all()
+
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol, "model_name": r.model_name,
+                    "prediction_date": r.prediction_date, "target_date": r.target_date,
+                    "decision": r.decision, "confidence": r.confidence,
+                    "up_probability": r.up_probability, "predicted_close": r.predicted_close,
+                    "previous_close": r.previous_close, "actual_close": r.actual_close,
+                    "was_correct": r.was_correct, "pnl_dollars": r.pnl_dollars,
+                    "feature_values_json": r.feature_values_json,
+                    "details_json": json.dumps(r.details_json) if r.details_json else None,
+                    "model_version": r.model_version,
+                }
+                for r in rows
+            ]
+
+    def get_strategy_evaluations(
+        self, strategy_name: str, symbol: Optional[str] = None, limit: int = 200,
+    ) -> list[dict]:
+        from db.models import ModelPrediction, StrategyEvaluation
+        with get_session() as session:
+            stmt = (
+                select(StrategyEvaluation, ModelPrediction)
+                .join(ModelPrediction, ModelPrediction.id == StrategyEvaluation.prediction_id)
+                .where(StrategyEvaluation.strategy_name == strategy_name)
+            )
+            if symbol:
+                stmt = stmt.where(ModelPrediction.symbol == symbol.upper())
+            stmt = stmt.order_by(ModelPrediction.target_date.desc()).limit(limit)
+
+            rows = session.execute(stmt).all()
+            return [
+                {
+                    "id": se.id, "prediction_id": se.prediction_id,
+                    "strategy_name": se.strategy_name, "strategy_version": se.strategy_version,
+                    "action": se.action, "position_size": se.position_size,
+                    "entry_price": se.entry_price, "exit_price": se.exit_price,
+                    "pnl_dollars": se.pnl_dollars, "was_correct": se.was_correct,
+                    "signal_metadata_json": se.signal_metadata_json,
+                    "evaluated_at": se.evaluated_at,
+                    "symbol": mp.symbol, "model_name": mp.model_name,
+                    "target_date": mp.target_date, "model_decision": mp.decision,
+                }
+                for se, mp in rows
+            ]
+
+    def get_evaluated_signal_series(self, strategy_name: str, symbol: str) -> list[dict]:
+        from db.models import ModelPrediction, StrategyEvaluation
+        with get_session() as session:
+            rows = session.execute(
+                select(
+                    ModelPrediction.target_date,
+                    StrategyEvaluation.action,
+                    StrategyEvaluation.entry_price,
+                    StrategyEvaluation.exit_price,
+                    StrategyEvaluation.pnl_dollars,
+                )
+                .join(ModelPrediction, ModelPrediction.id == StrategyEvaluation.prediction_id)
+                .where(
+                    StrategyEvaluation.strategy_name == strategy_name,
+                    ModelPrediction.symbol == symbol.upper(),
+                    StrategyEvaluation.action != "SKIP",
+                )
+                .order_by(ModelPrediction.target_date.asc())
+            ).all()
+            return [
+                {
+                    "target_date": r[0], "action": r[1],
+                    "entry_price": r[2], "exit_price": r[3],
+                    "pnl_dollars": r[4],
+                }
+                for r in rows
+            ]
+
+    def get_strategy_symbols(self, strategy_name: str) -> list[str]:
+        from db.models import ModelPrediction, StrategyEvaluation
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction.symbol.distinct())
+                .select_from(StrategyEvaluation)
+                .join(ModelPrediction, ModelPrediction.id == StrategyEvaluation.prediction_id)
+                .where(
+                    StrategyEvaluation.strategy_name == strategy_name,
+                    StrategyEvaluation.action != "SKIP",
+                )
+            ).scalars().all()
+            return list(rows)
+
+    def store_strategy_metrics(
+        self, strategy_name: str, symbol: Optional[str], period: str, metrics: dict,
+    ) -> None:
+        from db.models import StrategyMetrics
+        metrics_id = f"{strategy_name}_{symbol or 'all'}_{period}"
+        # Non-finite floats (inf Sharpe on a zero-variance series) serialize
+        # to the invalid JSON token "Infinity" and fail the whole insert —
+        # sanitize at the persistence boundary regardless of caller hygiene.
+        metrics = _sanitize_json(metrics)
+        with get_session() as session:
+            session.merge(StrategyMetrics(
+                id=metrics_id,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                period=period,
+                sharpe_ratio=metrics.get("sharpe_ratio"),
+                sortino_ratio=metrics.get("sortino_ratio"),
+                max_drawdown=metrics.get("max_drawdown"),
+                win_rate=metrics.get("win_rate"),
+                total_pnl=metrics.get("total_pnl"),
+                total_trades=metrics.get("total_trades"),
+                metrics_json=metrics,
+                computed_at=datetime.now(),
+            ))
+
+    def get_strategy_metrics(
+        self, strategy_name: Optional[str] = None, symbol: Optional[str] = None,
+    ) -> list[dict]:
+        from db.models import StrategyMetrics
+        with get_session() as session:
+            stmt = select(StrategyMetrics)
+            if strategy_name:
+                stmt = stmt.where(StrategyMetrics.strategy_name == strategy_name)
+            if symbol:
+                stmt = stmt.where(StrategyMetrics.symbol == symbol.upper())
+            stmt = stmt.order_by(StrategyMetrics.computed_at.desc())
+
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": r.id, "strategy_name": r.strategy_name,
+                    "symbol": r.symbol, "period": r.period,
+                    "sharpe_ratio": r.sharpe_ratio, "sortino_ratio": r.sortino_ratio,
+                    "max_drawdown": r.max_drawdown, "win_rate": r.win_rate,
+                    "total_pnl": r.total_pnl, "total_trades": r.total_trades,
+                    "metrics_json": json.dumps(r.metrics_json) if r.metrics_json else None,
+                    "computed_at": r.computed_at,
+                }
+                for r in rows
+            ]
+
+    def delete_strategy_evaluations(self, strategy_name: Optional[str] = None) -> int:
+        from db.models import StrategyEvaluation
+        with get_session() as session:
+            stmt = select(func.count()).select_from(StrategyEvaluation)
+            del_stmt = delete(StrategyEvaluation)
+            if strategy_name:
+                stmt = stmt.where(StrategyEvaluation.strategy_name == strategy_name)
+                del_stmt = del_stmt.where(StrategyEvaluation.strategy_name == strategy_name)
+            count = session.execute(stmt).scalar() or 0
+            if count > 0:
+                session.execute(del_stmt)
+        return count
+
+    # =========================================================================
+    # Historical News (AV)
+    # =========================================================================
+
+    def store_historical_news(self, articles: list[dict]) -> int:
+        from db.models import HistoricalNews
+        inserted = 0
+        with get_session() as session:
+            for article in articles:
+                article_id = article.get("id") or hashlib.md5(
+                    (article.get("url", "") + article.get("published_date", "")).encode()
+                ).hexdigest()
+
+                existing = session.execute(
+                    select(HistoricalNews).where(HistoricalNews.id == article_id)
+                ).scalar_one_or_none()
+                if existing:
+                    continue
+
+                try:
+                    session.add(HistoricalNews(
+                        id=article_id,
+                        symbol=article.get("symbol", ""),
+                        published_date=article.get("published_date"),
+                        title=article.get("title"),
+                        summary=article.get("summary"),
+                        url=article.get("url"),
+                        source=article.get("source"),
+                        topics_json=json.dumps(article.get("topics", [])) if article.get("topics") else None,
+                        overall_sentiment_score=article.get("overall_sentiment_score"),
+                        overall_sentiment_label=article.get("overall_sentiment_label"),
+                        ticker_sentiment_score=article.get("ticker_sentiment_score"),
+                        ticker_relevance_score=article.get("ticker_relevance_score"),
+                        fetched_at=datetime.now(),
+                    ))
+                    inserted += 1
+                except Exception:
+                    pass
+        return inserted
+
+    def get_historical_news(
+        self, symbol: str, start_date: Optional[str] = None, end_date: Optional[str] = None,
+    ) -> list[dict]:
+        from db.models import HistoricalNews
+        with get_session() as session:
+            stmt = select(HistoricalNews).where(HistoricalNews.symbol == symbol.upper())
+            if start_date:
+                stmt = stmt.where(HistoricalNews.published_date >= start_date)
+            if end_date:
+                stmt = stmt.where(HistoricalNews.published_date <= end_date)
+            stmt = stmt.order_by(HistoricalNews.published_date.desc())
+
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol,
+                    "published_date": r.published_date,
+                    "title": r.title, "summary": r.summary,
+                    "url": r.url, "source": r.source,
+                    "topics_json": r.topics_json,
+                    "overall_sentiment_score": r.overall_sentiment_score,
+                    "overall_sentiment_label": r.overall_sentiment_label,
+                    "ticker_sentiment_score": r.ticker_sentiment_score,
+                    "ticker_relevance_score": r.ticker_relevance_score,
+                    "fetched_at": r.fetched_at,
+                }
+                for r in rows
+            ]
+
+    # =========================================================================
+    # Historical Data Queries
+    # =========================================================================
+
+    def list_report_catalog(self, limit: int = 50) -> list[dict]:
+        from db.models import ReportCatalog
+        with get_session() as session:
+            rows = session.execute(
+                select(ReportCatalog)
+                .where(_visible(ReportCatalog))
+                .order_by(ReportCatalog.created_at.desc())
+                .limit(limit)
+            ).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "symbol": r.symbol,
+                    "trade_date": r.trade_date,
+                    "report_type": r.report_type,
+                    "storage_key": r.storage_key,
+                    "file_format": r.file_format,
+                    "size_bytes": r.size_bytes,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+
+    def list_recommendation_runs(self, limit: int = 50) -> list[dict]:
+        from db.models import RecommendationRun
+        with get_session() as session:
+            rows = session.execute(
+                select(RecommendationRun)
+                .where(_visible(RecommendationRun))
+                .order_by(RecommendationRun.created_at.desc())
+                .limit(limit)
+            ).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "trade_date": r.trade_date,
+                    "symbols_csv": r.symbols_csv,
+                    "model_used": r.model_used,
+                    "provider_used": r.provider_used,
+                    "result_json": r.result_json,
+                    "duration_ms": r.duration_ms,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+
+    def list_all_predictions(
+        self, symbol: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        from db.models import ModelPrediction
+        with get_session() as session:
+            q = select(ModelPrediction).where(_visible(ModelPrediction)).order_by(
+                ModelPrediction.prediction_date.desc(),
+                ModelPrediction.symbol,
+                ModelPrediction.model_name,
+            )
+            if symbol:
+                q = q.where(ModelPrediction.symbol == symbol.upper())
+            rows = session.execute(q.limit(limit)).scalars().all()
+            return [
+                {
+                    "id": r.id,
+                    "symbol": r.symbol,
+                    "model_name": r.model_name,
+                    "prediction_date": str(r.prediction_date),
+                    "target_date": str(r.target_date),
+                    "decision": r.decision,
+                    "confidence": r.confidence,
+                    "up_probability": r.up_probability,
+                    "previous_close": r.previous_close,
+                    "actual_close": r.actual_close,
+                    "was_correct": r.was_correct,
+                    "pnl_dollars": r.pnl_dollars,
+                    "model_version": r.model_version,
+                    "duration_ms": r.duration_ms,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+
+    def get_report_content(self, storage_key: str) -> str | None:
+        try:
+            from services.storage_service import download_report
+            return download_report(storage_key)
+        except Exception as e:
+            logger.warning("Failed to download report %s: %s", storage_key, e)
+            return None
+
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
 
     def close(self) -> None:
-        """Close the database connection."""
-        self.conn.close()
+        pass
 
     def __enter__(self) -> "CacheService":
-        """Context manager entry."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit."""
         self.close()
 
 
-# Singleton instance for app-wide use
+# Singleton instance
 _cache_instance: Optional[CacheService] = None
 
 
 def get_cache() -> CacheService:
-    """Get the singleton cache service instance.
-
-    Returns:
-        CacheService instance.
-    """
     global _cache_instance
     if _cache_instance is None:
         _cache_instance = CacheService()

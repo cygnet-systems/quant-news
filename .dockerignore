@@ -1,0 +1,12 @@
+cache/
+.env
+__pycache__/
+*.pyc
+.git/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+*.md
+tests/
+.vscode/
+alpha_vantage_data/

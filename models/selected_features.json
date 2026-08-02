@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "derived_from": "TradingAgents V6 SHAP analysis (n=28, AMBA)",
+  "n_original": 20,
+  "n_selected": 18,
+  "removed": ["sent_neg_pct", "sent_neutral_pct"],
+  "removal_reason": "DeBERTa-derived; DeBERTa excluded from V6.1 pipeline",
+  "features": [
+    "spy_gap",
+    "vs_spy_excess_5d",
+    "av_topic_mergers_and_acquisitions_avg",
+    "av_topic_retail_wholesale_avg",
+    "sector_gap",
+    "spy_return_5d",
+    "spy_ind_atr_delta5",
+    "gap",
+    "av_topic_real_estate_avg",
+    "sector_range_5d",
+    "global_topic_real_estate_avg",
+    "ind_close_50_sma_delta5",
+    "global_topic_retail_wholesale_avg",
+    "spy_ind_rsi",
+    "av_n_tech_articles",
+    "av_topic_ipo_avg",
+    "spy_ind_close_50_sma_delta5",
+    "global_topic_energy_transportation_avg"
+  ]
+}

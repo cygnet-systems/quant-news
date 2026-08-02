@@ -1,0 +1,15 @@
+# Keep the railway up upload lean — build needs source + requirements only.
+.git/
+cache/
+results/
+alpha_vantage_data/
+DataFiles/
+*.png
+*.sql
+.env
+.playwright-mcp/
+__pycache__/
+*.pyc
+tests/
+*.md
+!README.md

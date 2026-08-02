@@ -54,8 +54,8 @@
     --space-8: 48px;
 
     /* Layout */
-    --sidebar-width: 260px;
-    --context-panel-width: 340px;
+    --sidebar-width: 280px;
+    --context-panel-width: 520px;
     --card-radius: 12px;
 
     /* Transitions */
@@ -106,18 +106,18 @@ body {
 .sidebar {
     background-color: var(--bg-secondary);
     border-right: 1px solid var(--border-subtle);
-    padding: var(--space-5);
+    padding: var(--space-5) var(--space-5) var(--space-4);
     display: flex;
     flex-direction: column;
     overflow-y: auto;
     max-height: 100vh;
     position: sticky;
     top: 0;
-    gap: var(--space-3);
+    gap: var(--space-1);
 }
 
 .sidebar-header {
-    margin-bottom: var(--space-2);
+    margin-bottom: var(--space-1);
 }
 
 .app-title {
@@ -137,7 +137,7 @@ body {
 .sidebar-divider {
     border: none;
     border-top: 1px solid var(--border-subtle);
-    margin: var(--space-2) 0;
+    margin: var(--space-1) 0;
 }
 
 .sidebar-spacer {
@@ -189,7 +189,7 @@ body {
 .period-section,
 .indicator-section,
 .data-section {
-    padding: var(--space-2) 0;
+    padding: var(--space-1) 0;
 }
 
 /* =============================================================================
@@ -197,7 +197,7 @@ body {
    ============================================================================= */
 
 .stock-input-container {
-    margin-bottom: var(--space-2);
+    margin-bottom: 0;
 }
 
 .input-label {
@@ -399,14 +399,20 @@ body {
    ============================================================================= */
 
 .data-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
 }
 
 .data-actions .btn {
     font-size: 12px;
-    padding: 4px 10px;
+    padding: 6px 0;
+    width: 100%;
+    justify-content: center;
+}
+
+.data-actions .btn-full {
+    grid-column: 1 / -1;
 }
 
 /* =============================================================================
@@ -622,11 +628,30 @@ body {
 .context-panel {
     background-color: var(--bg-secondary);
     border-left: 1px solid var(--border-subtle);
-    padding: var(--space-4);
+    padding: var(--space-5) var(--space-4);
     overflow-y: auto;
     max-height: 100vh;
     position: sticky;
     top: 0;
+    /* relative for resize handle positioning */
+    position: sticky;
+}
+
+.panel-resize-handle {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 4px;
+    height: 100%;
+    cursor: col-resize;
+    background: transparent;
+    z-index: 10;
+    transition: background 0.15s;
+}
+
+.panel-resize-handle:hover,
+.panel-resize-handle:active {
+    background: var(--accent, #00D4AA);
 }
 
 .panel-title {
@@ -666,7 +691,7 @@ body {
 .ai-section,
 .sentiment-section,
 .signals-section {
-    padding: var(--space-2) 0;
+    padding: var(--space-3) 0;
 }
 
 /* News Cards */
@@ -1042,11 +1067,11 @@ body {
 
 .news-tabs .nav-link {
     color: var(--text-muted);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    padding: var(--space-2) var(--space-3);
+    letter-spacing: 0.4px;
+    padding: var(--space-2) var(--space-4);
     border: none;
     border-radius: 0;
     background: transparent;
@@ -1160,7 +1185,8 @@ body {
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin-bottom: var(--space-2);
+    margin-bottom: var(--space-3);
+    margin-top: var(--space-3);
 }
 
 .key-developments-content {
@@ -1334,6 +1360,8 @@ body {
     color: var(--text-primary);
     margin: 0;
 }
+
+/* .download-report-btn removed — button is now hidden */
 
 /* =============================================================================
    OVERVIEW TAB EMPTY STATE
@@ -1567,4 +1595,1697 @@ body {
 .loading-inline-text {
     font-size: 13px;
     color: var(--text-secondary);
+}
+
+/* =============================================================================
+   MODEL SIGNAL CARDS
+   ============================================================================= */
+
+.signal-cards-section {
+    margin-top: 16px;
+    margin-bottom: 16px;
+}
+
+.signal-cards-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+@media (max-width: 400px) {
+    .signal-cards-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.signal-card {
+    background: #1A1A1A;
+    border-radius: 8px;
+    padding: 12px;
+    border: 1px solid #2A2A2A;
+}
+
+.signal-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.signal-card-model-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+}
+
+.signal-card-decision {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+}
+
+.signal-card-error {
+    padding: 4px 0;
+    word-break: break-word;
+}
+
+.signal-card-confidence {
+    margin-bottom: 6px;
+}
+
+.signal-card-conf-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.signal-card-conf-label {
+    font-size: 11px;
+    color: #A0A0A0;
+}
+
+.signal-card-conf-value {
+    font-size: 11px;
+    font-weight: 600;
+    color: #FFFFFF;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.signal-card-conf-bar-bg {
+    height: 4px;
+    background: #2A2A2A;
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.signal-card-detail-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 0;
+}
+
+.signal-card-detail-label {
+    font-size: 11px;
+    color: #666666;
+}
+
+.signal-card-detail-value {
+    font-size: 11px;
+    color: #A0A0A0;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.signal-card-reasoning {
+    font-size: 11px;
+    color: #888;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #2A2A2A;
+    line-height: 1.4;
+}
+
+/* Prediction History Table */
+.prediction-history-section {
+    margin-top: 16px;
+}
+
+.prediction-history-table {
+    width: 100%;
+    font-size: 11px;
+    border-collapse: collapse;
+}
+
+.prediction-history-table th {
+    color: #666;
+    font-weight: 500;
+    padding: 4px 6px;
+    border-bottom: 1px solid #2A2A2A;
+    text-align: left;
+}
+
+.prediction-history-table td {
+    padding: 4px 6px;
+    border-bottom: 1px solid #1A1A1A;
+    color: #A0A0A0;
+}
+
+/* Model Signals Loading */
+.model-signals-loading {
+    text-align: center;
+    padding: 16px;
+    color: #666;
+    font-size: 12px;
+}
+
+.model-signals-progress {
+    font-size: 12px;
+    color: #00D4AA;
+    padding: 8px 0;
+}
+
+/* Background prediction running indicator */
+.prediction-running-badge {
+    font-size: 11px;
+    color: #00D4AA;
+    margin-left: 8px;
+    animation: fadeInOut 2s ease-in-out infinite;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+.spinning-icon {
+    display: inline-block;
+    animation: spin 1.5s linear infinite;
+}
+
+@keyframes fadeInOut {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+}
+
+/* ============================================================
+   STRATEGY PERFORMANCE
+   ============================================================ */
+
+.strategy-section {
+    margin-top: 16px;
+}
+
+.strategy-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.strategy-card {
+    background: #1A1A1A;
+    border-radius: 8px;
+    padding: 10px 12px;
+    border: 1px solid #2A2A2A;
+}
+
+.strategy-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.strategy-card-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: #FFFFFF;
+}
+
+.strategy-card-symbol {
+    font-size: 10px;
+    font-weight: 500;
+    color: #6B7280;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.strategy-card-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.strategy-stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.strategy-stat-label {
+    font-size: 11px;
+    color: #9CA3AF;
+}
+
+.strategy-stat-value {
+    font-size: 11px;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* =============================================================================
+   ENSEMBLE CARD & CONFIG DRAWER
+   ============================================================================= */
+
+.ensemble-card {
+    grid-column: 1 / -1;
+    border: 1px solid #3D3D3D;
+    background: #1E1E1E;
+}
+
+.ensemble-card-header {
+    justify-content: space-between !important;
+}
+
+.ensemble-gear-btn {
+    background: none;
+    border: 1px solid #3D3D3D;
+    color: #A0A0A0;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    transition: all 0.2s ease;
+}
+
+.ensemble-gear-btn:hover {
+    color: #00D4AA;
+    border-color: #00D4AA;
+}
+
+/* Weight composition bar */
+.ensemble-weight-bar {
+    display: flex;
+    height: 20px;
+    border-radius: 4px;
+    overflow: hidden;
+    gap: 1px;
+}
+
+.ensemble-weight-segment {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 700;
+    color: #0D0D0D;
+    min-width: 24px;
+    transition: flex-grow 0.3s ease;
+}
+
+/* Vote summary */
+.ensemble-vote-summary {
+    font-size: 11px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #2A2A2A;
+    line-height: 1.6;
+}
+
+/* Ensemble config drawer (Offcanvas) */
+.ensemble-config-description {
+    font-size: 12px;
+    color: #A0A0A0;
+    margin-bottom: 16px;
+    line-height: 1.5;
+}
+
+.ensemble-config-models {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.ensemble-model-config-row {
+    padding: 12px;
+    background: #242424;
+    border-radius: 8px;
+    border: 1px solid #2A2A2A;
+}
+
+.ensemble-model-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.ensemble-model-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+    flex: 1;
+}
+
+.ensemble-model-decision {
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.ensemble-weight-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ensemble-weight-label {
+    font-size: 11px;
+    color: #666;
+    white-space: nowrap;
+}
+
+.ensemble-weight-slider {
+    flex: 1;
+}
+
+/* Override Dash slider styles for dark theme */
+.ensemble-weight-slider .rc-slider-track {
+    background-color: #00D4AA;
+}
+
+.ensemble-weight-slider .rc-slider-handle {
+    border-color: #00D4AA;
+    background-color: #1A1A1A;
+}
+
+.ensemble-weight-slider .rc-slider-rail {
+    background-color: #2A2A2A;
+}
+
+.ensemble-weight-slider .rc-slider-mark-text {
+    color: #666;
+    font-size: 10px;
+}
+
+.ensemble-weight-slider .rc-slider-disabled .rc-slider-track {
+    background-color: #3D3D3D;
+}
+
+.ensemble-weight-slider .rc-slider-disabled .rc-slider-handle {
+    border-color: #3D3D3D;
+}
+
+.ensemble-weight-input {
+    width: 56px !important;
+    background: #1A1A1A !important;
+    border: 1px solid #2A2A2A !important;
+    color: #FFFFFF !important;
+    font-size: 11px !important;
+    padding: 4px 6px !important;
+    border-radius: 4px !important;
+    text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.ensemble-weight-input:disabled {
+    opacity: 0.4;
+}
+
+.ensemble-reset-btn {
+    width: 100%;
+    margin-top: 8px;
+}
+
+.ensemble-model-switch .form-check-input:checked {
+    background-color: #00D4AA;
+    border-color: #00D4AA;
+}
+
+/* Offcanvas dark theme overrides */
+#ensemble-config-drawer .offcanvas-header {
+    border-bottom: 1px solid #2A2A2A;
+}
+
+#ensemble-config-drawer .offcanvas-title {
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+#ensemble-config-drawer .btn-close {
+    filter: invert(1);
+}
+
+/* TradingAgents report preview on signal card */
+.ta-report-preview {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #2A2A2A;
+    max-height: 80px;
+    overflow: hidden;
+    color: #888;
+}
+
+.ta-report-preview p {
+    margin: 0;
+}
+
+.view-full-report-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-top: 6px;
+    padding: 3px 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--accent, #00D4AA);
+    background: transparent;
+    border: 1px solid var(--accent, #00D4AA);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.view-full-report-btn:hover {
+    background: var(--accent, #00D4AA);
+    color: #000;
+}
+
+/* =============================================================================
+   RECOMMENDATIONS SECTION (Full Analysis)
+   ============================================================================= */
+
+.recommendations-section {
+    margin-bottom: var(--space-4);
+    padding: var(--space-3);
+    background: rgba(123, 97, 255, 0.04);
+    border: 1px solid rgba(123, 97, 255, 0.15);
+    border-radius: var(--card-radius);
+}
+
+.recommendations-section .section-title {
+    margin-top: 0;
+}
+
+.conflict-card {
+    display: flex;
+    align-items: flex-start;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    background: rgba(255, 176, 32, 0.06);
+    border-left: 2px solid #FFB020;
+    border-radius: 3px;
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
+
+/* History tab — TradingAgents research reports */
+.history-tab .accordion-item {
+    background-color: var(--bg-secondary, #1A1A1A);
+    border-color: #2A2A2A;
+}
+
+.history-tab .accordion-button {
+    background-color: var(--bg-secondary, #1A1A1A);
+    color: var(--text-primary, #E0E0E0);
+    font-size: 0.85rem;
+    padding: 8px 12px;
+}
+
+.history-tab .accordion-button:not(.collapsed) {
+    background-color: var(--bg-tertiary, #242424);
+    color: var(--text-primary, #E0E0E0);
+}
+
+.history-tab .accordion-button::after {
+    filter: invert(0.7);
+}
+
+.history-tab .accordion-body {
+    background-color: var(--bg-primary, #121212);
+    color: var(--text-primary, #E0E0E0);
+    font-size: 0.85rem;
+    padding: 12px;
+}
+
+/* History tab — section titles & tables */
+.history-empty-msg {
+    color: var(--text-secondary);
+    padding: 24px 16px;
+    text-align: center;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.history-section-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 20px 0 10px 0;
+    padding: 0 2px 6px;
+    border-bottom: 1px solid var(--border-subtle, #2A2A2A);
+}
+
+.history-section-title:first-child {
+    margin-top: 8px;
+}
+
+.history-table-wrap {
+    overflow-x: auto;
+    margin-bottom: 16px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle, #2A2A2A);
+}
+
+.history-data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.history-data-table th {
+    background-color: var(--bg-tertiary, #242424);
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.65rem;
+    letter-spacing: 0.05em;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-subtle, #2A2A2A);
+    white-space: nowrap;
+}
+
+.history-data-table td {
+    padding: 7px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: var(--text-secondary, #A0A0A0);
+    white-space: nowrap;
+}
+
+.history-data-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.history-data-table tr:hover td {
+    background-color: rgba(255, 255, 255, 0.03);
+    color: var(--text-primary, #E0E0E0);
+}
+
+.history-decision {
+    display: inline-block;
+    font-weight: 600;
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.02em;
+}
+
+.history-decision.positive {
+    color: var(--positive, #00C805);
+    background-color: var(--positive-muted, #0A3D0A);
+}
+
+.history-decision.negative {
+    color: var(--negative, #FF5000);
+    background-color: var(--negative-muted, #3D1A0A);
+}
+
+.history-decision.neutral {
+    color: var(--text-secondary);
+    background-color: var(--bg-tertiary, #242424);
+}
+
+.positive { color: var(--positive, #00C805); }
+.negative { color: var(--negative, #FF5000); }
+
+.history-dl-btn {
+    background: none;
+    border: 1px solid var(--border-focus, #3D3D3D);
+    color: var(--accent-primary, #00D4AA);
+    font-size: 0.7rem;
+    padding: 3px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+}
+
+.history-dl-btn:hover {
+    background-color: var(--accent-primary, #00D4AA);
+    border-color: var(--accent-primary, #00D4AA);
+    color: var(--bg-primary, #0D0D0D);
+}
+
+.history-fmt-badge {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    padding: 2px 6px;
+    background-color: var(--bg-tertiary, #242424);
+    border-radius: 3px;
+}
+
+.history-rec-action {
+    white-space: normal !important;
+    line-height: 1.4;
+    color: var(--text-primary, #E0E0E0);
+    min-width: 160px;
+}
+
+/* History — hero title with icon */
+.history-hero-title {
+    font-size: 0.8rem;
+    margin-top: 4px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+/* TradingAgents report cards */
+.ta-cards-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.ta-report-card {
+    background-color: var(--bg-tertiary, #242424);
+    border: 1px solid var(--border-subtle, #2A2A2A);
+    border-radius: 8px;
+    padding: 12px 14px;
+    transition: border-color 0.15s ease;
+}
+
+.ta-report-card:hover {
+    border-color: var(--border-focus, #3D3D3D);
+}
+
+.ta-card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.ta-card-symbol {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    letter-spacing: 0.02em;
+}
+
+.ta-card-conf {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.ta-card-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.ta-card-date {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.ta-card-meta {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.ta-card-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.ta-view-btn,
+.ta-pdf-btn {
+    background: none;
+    border: 1px solid var(--border-focus, #3D3D3D);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    padding: 4px 12px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+}
+
+.ta-view-btn:hover {
+    background-color: var(--accent-primary, #00D4AA);
+    border-color: var(--accent-primary, #00D4AA);
+    color: var(--bg-primary, #0D0D0D);
+}
+
+.ta-pdf-btn:hover {
+    background-color: #FF6B6B;
+    border-color: #FF6B6B;
+    color: #fff;
+}
+
+.ta-accordion-meta {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+/* Predict date picker — dark theme */
+.predict-date-picker .DateInput_input {
+    background-color: var(--bg-secondary, #1E1E1E);
+    color: var(--text-primary, #E0E0E0);
+    border: 1px solid var(--border-color, #333);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.9rem;
+    width: 160px;
+}
+
+.predict-date-picker .DateInput_input__focused {
+    border-color: var(--accent, #00D4AA);
+}
+
+.predict-date-picker .SingleDatePickerInput {
+    background-color: transparent;
+    border: none;
+}
+
+.predict-date-picker .CalendarDay__selected {
+    background: var(--accent, #00D4AA);
+    border-color: var(--accent, #00D4AA);
+    color: #000;
+}
+
+/* ==========================================================================
+   HISTORY TAB — FILTER BAR + COLLAPSIBLE SECTIONS
+   ========================================================================== */
+
+.history-filter-bar {
+    padding: 12px 0 8px;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.08));
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.history-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+}
+
+.history-dropdown-row {
+    width: 100%;
+}
+
+/* Symbol dropdown — dark-theme overrides */
+.history-symbol-dropdown {
+    width: 100%;
+    min-width: 0;
+}
+
+.history-symbol-dropdown .Select {
+    width: 100%;
+}
+
+.history-symbol-dropdown .Select-control {
+    background-color: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
+    border-radius: 6px !important;
+    color: var(--text-primary, #e0e0e0) !important;
+    min-height: 36px !important;
+}
+
+.history-symbol-dropdown .Select-control:hover {
+    border-color: var(--accent, #00D4AA) !important;
+}
+
+.history-symbol-dropdown .Select-menu-outer {
+    background-color: var(--bg-card, #1a1d23) !important;
+    border: 1px solid rgba(255,255,255,0.12) !important;
+    border-radius: 6px !important;
+    margin-top: 2px !important;
+}
+
+.history-symbol-dropdown .Select-option {
+    background-color: transparent !important;
+    color: var(--text-primary, #e0e0e0) !important;
+    padding: 6px 10px !important;
+    font-size: 0.85rem !important;
+}
+
+.history-symbol-dropdown .Select-option.is-focused {
+    background-color: rgba(0,212,170,0.12) !important;
+}
+
+.history-symbol-dropdown .Select-value {
+    background-color: rgba(0,212,170,0.15) !important;
+    border: 1px solid rgba(0,212,170,0.3) !important;
+    border-radius: 4px !important;
+    color: var(--accent, #00D4AA) !important;
+    font-size: 0.8rem !important;
+}
+
+.history-symbol-dropdown .Select-value-icon {
+    border-right: 1px solid rgba(0,212,170,0.3) !important;
+    color: var(--accent, #00D4AA) !important;
+}
+
+.history-symbol-dropdown .Select-value-icon:hover {
+    background-color: rgba(0,212,170,0.25) !important;
+    color: #fff !important;
+}
+
+.history-symbol-dropdown .Select-input > input {
+    color: var(--text-primary, #e0e0e0) !important;
+}
+
+.history-symbol-dropdown .Select-placeholder {
+    color: var(--text-secondary, #888) !important;
+    font-size: 0.85rem !important;
+}
+
+.history-symbol-dropdown .Select-clear-zone {
+    color: var(--text-secondary, #888) !important;
+}
+
+.history-symbol-dropdown .Select-arrow-zone {
+    color: var(--text-secondary, #888) !important;
+}
+
+/* Recent chips */
+.history-recent-label,
+.history-date-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    min-width: 50px;
+}
+
+.history-recent-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.history-recent-chip {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 4px;
+    color: var(--text-primary, #e0e0e0);
+    font-size: 0.78rem;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.history-recent-chip:hover {
+    border-color: var(--accent, #00D4AA);
+    background: rgba(0,212,170,0.08);
+    color: var(--accent, #00D4AA);
+}
+
+/* Date row layout */
+.history-date-row {
+    flex-wrap: wrap;
+    gap: 6px 12px;
+}
+
+.history-date-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.history-range-btns {
+    display: flex;
+    align-items: center;
+}
+
+/* Date picker — dark-theme overrides */
+.history-date-picker {
+    flex-shrink: 0;
+}
+
+.history-date-picker .DateInput {
+    width: 120px;
+    background: transparent;
+}
+
+.history-date-picker .DateInput_input {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+    color: var(--text-primary, #e0e0e0);
+    font-size: 0.82rem;
+    padding: 4px 8px;
+    line-height: 1.4;
+}
+
+.history-date-picker .DateInput_input:focus,
+.history-date-picker .DateInput_input__focused {
+    border-color: var(--accent, #00D4AA);
+    outline: none;
+}
+
+.history-date-picker .SingleDatePickerInput {
+    background: transparent;
+    border: none;
+}
+
+.history-date-picker .SingleDatePickerInput_calendarIcon {
+    padding: 4px;
+    margin: 0 0 0 -4px;
+    color: var(--text-secondary, #888);
+}
+
+.history-date-picker .CalendarDay__selected {
+    background: var(--accent, #00D4AA);
+    border-color: var(--accent, #00D4AA);
+    color: #000;
+}
+
+.history-date-picker .DayPickerNavigation_button {
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.04);
+}
+
+.history-date-picker .CalendarMonth_caption {
+    color: var(--text-primary, #e0e0e0);
+    font-size: 0.85rem;
+}
+
+/* Date button group */
+.history-date-group {
+    gap: 0;
+}
+
+.history-date-btn {
+    font-size: 0.78rem !important;
+    padding: 2px 10px !important;
+    border-radius: 4px !important;
+}
+
+/* Applied filter chips */
+.history-applied-filters {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-height: 0;
+}
+
+.history-applied-filters:empty {
+    display: none;
+}
+
+.history-filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(0,212,170,0.1);
+    border: 1px solid rgba(0,212,170,0.25);
+    border-radius: 4px;
+    color: var(--accent, #00D4AA);
+    font-size: 0.78rem;
+    padding: 2px 6px 2px 8px;
+}
+
+.history-filter-chip-remove {
+    background: none;
+    border: none;
+    color: var(--accent, #00D4AA);
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+
+.history-filter-chip-remove:hover {
+    opacity: 1;
+    color: #ff6b6b;
+}
+
+.history-clear-all-link {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #888);
+    font-size: 0.75rem;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0 4px;
+}
+
+.history-clear-all-link:hover {
+    color: var(--accent, #00D4AA);
+}
+
+/* Collapsible sections */
+.history-collapsible-section {
+    margin-bottom: 4px;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.history-section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.02);
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text-primary, #e0e0e0);
+    transition: background 0.15s;
+    user-select: none;
+}
+
+.history-section-header:hover {
+    background: rgba(255,255,255,0.05);
+}
+
+.history-section-header i:first-child {
+    color: var(--accent, #00D4AA);
+    font-size: 0.9rem;
+}
+
+.history-chevron {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    transition: transform 0.2s ease;
+}
+
+.history-count-badge {
+    font-size: 0.7rem !important;
+    padding: 1px 6px !important;
+    background: rgba(255,255,255,0.08) !important;
+    color: var(--text-secondary, #888) !important;
+}
+
+.history-section-body {
+    padding: 8px 12px 12px;
+}
+
+/* Prediction evaluation bar + scoreboard */
+.history-eval-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 5px;
+}
+
+.history-eval-hint {
+    font-size: 0.78rem;
+    color: var(--text-secondary, #888);
+}
+
+.history-evaluate-btn {
+    font-size: 0.75rem !important;
+    padding: 2px 10px !important;
+    white-space: nowrap;
+}
+
+.history-scoreboard-hint {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    margin-bottom: 8px;
+    font-style: italic;
+}
+
+/* "35 · 4 held" -- the trade count leads, holds are context. */
+.scoreboard-muted {
+    color: var(--text-secondary, #888);
+    font-size: 0.85em;
+}
+
+/* Headers carry their column definition as a native title tooltip; the
+   dotted underline and help cursor are what tell you it is there. */
+.scoreboard-th {
+    text-decoration: underline dotted rgba(255, 255, 255, 0.28);
+    text-underline-offset: 3px;
+    cursor: help;
+}
+
+.scoreboard-th:hover {
+    text-decoration-color: var(--text-secondary, #A0A0A0);
+    color: var(--text-primary, #FFFFFF);
+}
+
+/* Bootstrap's outline-secondary resolved to #444 text on a near-black
+   background (~1.7:1) -- below the 4.5:1 AA floor and, worse, identical to
+   how a disabled control reads. Enabled state now sits at --text-secondary
+   (#A0A0A0, ~7:1) and disabled keeps the dim treatment, so the two states
+   are actually distinguishable. */
+.btn-outline-secondary:not(:disabled):not(.disabled) {
+    color: var(--text-secondary, #A0A0A0);
+    border-color: var(--border-focus, #3D3D3D);
+    background-color: transparent;
+}
+
+.btn-outline-secondary:not(:disabled):not(.disabled):hover,
+.btn-outline-secondary:not(:disabled):not(.disabled):focus-visible {
+    color: var(--text-primary, #FFFFFF);
+    border-color: var(--text-secondary, #A0A0A0);
+    background-color: var(--bg-tertiary, #242424);
+}
+
+/* Sidebar buttons are colour-coded by ROLE, not all tinted with the accent.
+   Tinting every DATA button teal put them in the same visual class as the
+   solid "Add" CTA and the green Full Analysis, so most of the sidebar read
+   as one colour. Now:
+     neutral  -- passive utilities (Refresh, Export, View Data)
+     violet   -- Scoreboard, which opens a separate view rather than acting
+     amber / blue / green -- the three run actions (unchanged)
+   Scoped to .data-actions: the quick-add chips and period selector share the
+   Bootstrap class and stay neutral. */
+.data-actions .btn-outline-secondary:not(:disabled):not(.disabled) {
+    color: #C3C8D0;
+    border-color: var(--border-focus, #3D3D3D);
+}
+
+.data-actions .btn-outline-secondary:not(:disabled):not(.disabled):hover,
+.data-actions .btn-outline-secondary:not(:disabled):not(.disabled):focus-visible {
+    color: var(--text-primary, #FFFFFF);
+    border-color: #6B727D;
+    background-color: var(--bg-tertiary, #242424);
+}
+
+/* Scoreboard opens a view; give it its own identity so it is not mistaken
+   for another data utility. Violet is otherwise unused in the sidebar. */
+#scoreboard-btn:not(:disabled):not(.disabled) {
+    color: #9B8BFF;
+    border-color: rgba(123, 97, 255, 0.4);
+}
+
+#scoreboard-btn:not(:disabled):not(.disabled):hover,
+#scoreboard-btn:not(:disabled):not(.disabled):focus-visible {
+    color: #B5A9FF;
+    border-color: var(--chart-2, #7B61FF);
+    background-color: rgba(123, 97, 255, 0.14);
+}
+
+.btn-outline-secondary:disabled,
+.btn-outline-secondary.disabled {
+    color: var(--text-muted, #666666);
+    border-color: var(--border-subtle, #2A2A2A);
+    opacity: 0.55;
+}
+
+/* --- Activity panel: expand / minimise / close ------------------------- */
+
+/* Expanded fills the working area rather than a fixed 460px box, so a long
+   run is readable without scrolling a 12-line window.
+   Doubled selector on purpose: these rules sit earlier in the file than
+   .progress-panel, so at equal specificity its width would win on order. */
+.progress-panel.progress-panel-expanded {
+    width: min(1100px, calc(100vw - 48px));
+    max-height: min(82vh, 900px);
+}
+
+/* Minimised keeps the header (and its controls) reachable, hiding only the
+   feed -- distinct from Close, which removes the panel entirely. */
+.progress-panel.progress-panel-minimised .progress-feed {
+    display: none;
+}
+
+.progress-panel.progress-panel-minimised {
+    max-height: none;
+}
+
+.progress-controls {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+}
+
+.progress-ctl {
+    background: transparent;
+    border: none;
+    color: var(--text-muted, #666666);
+    padding: 2px 6px;
+    border-radius: 4px;
+    line-height: 1;
+    font-size: 0.72rem;
+    cursor: pointer;
+}
+
+.progress-ctl:hover,
+.progress-ctl:focus-visible {
+    color: var(--text-primary, #FFFFFF);
+    background: var(--bg-tertiary, #242424);
+}
+
+/* Reopen affordance -- without it, Close would be a one-way door. */
+.progress-reopen {
+    position: fixed;
+    bottom: 56px;
+    right: 16px;
+    z-index: 1030;
+    background: var(--bg-card, #16181d);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-secondary, #A0A0A0);
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-size: 0.75rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+}
+
+.progress-reopen:hover {
+    color: var(--text-primary, #FFFFFF);
+    border-color: var(--text-secondary, #A0A0A0);
+}
+
+/* Activity Log: an expanded run scrolls within itself so a long run can't
+   push the rest of the history list off-screen. */
+.activity-run-feed {
+    max-height: 320px;
+    overflow-y: auto;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.72rem;
+    padding: 4px 0;
+}
+
+.activity-run-meta {
+    font-size: 0.68rem;
+    color: var(--text-muted, #666666);
+    margin: -4px 0 8px 26px;
+}
+
+/* Research report body (verdict-first markdown). Section headings get a
+   rule + spacing so the eight sections scan; the Read lines are emphasized
+   by their bold marker already. */
+.ta-report-body h2 {
+    font-size: 1rem;
+    margin: 4px 0 8px;
+    color: var(--accent-primary, #00D4AA);
+}
+
+.ta-report-body h3 {
+    font-size: 0.9rem;
+    margin: 16px 0 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-subtle, #2A2A2A);
+}
+
+.ta-report-body ul {
+    margin: 4px 0 8px;
+    padding-left: 20px;
+}
+
+.ta-report-body p {
+    margin: 4px 0;
+}
+
+/* AI Report "so what" interpretation lines + watch items */
+.analysis-read-line {
+    margin-top: 6px;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    font-style: italic;
+    color: var(--text-secondary, #A0A0A0);
+    background: var(--bg-tertiary, #242424);
+    border-left: 3px solid var(--accent-primary, #00D4AA);
+    border-radius: 0 4px 4px 0;
+}
+
+.watch-items-list {
+    margin: 4px 0 0;
+    padding-left: 20px;
+    font-size: 0.82rem;
+}
+
+.watch-items-list li {
+    margin-bottom: 4px;
+}
+
+/* The AI Report modal's date picker must read as a sibling of the
+   dbc.Select controls beside it — same height, same dark chrome, full
+   column width — instead of react-dates' default white inline input. */
+.ai-report-datepicker,
+.ai-report-datepicker .SingleDatePicker,
+.ai-report-datepicker .SingleDatePickerInput,
+.ai-report-datepicker .DateInput {
+    display: block;
+    width: 100%;
+}
+
+.ai-report-datepicker .SingleDatePickerInput {
+    background: var(--bg-tertiary, #242424);
+    border: 1px solid var(--border-focus, #3D3D3D);
+    border-radius: 6px;
+}
+
+.ai-report-datepicker .DateInput {
+    background: transparent;
+}
+
+.ai-report-datepicker .DateInput_input {
+    background: transparent;
+    color: var(--text-primary, #FFFFFF);
+    font-size: 0.8rem;
+    font-weight: 400;
+    padding: 6px 10px;
+    border-bottom: none;
+}
+
+.ai-report-datepicker .DateInput_input__focused {
+    border-bottom: 2px solid var(--accent-primary, #00D4AA);
+}
+
+/* Calendar popover: dark theme + clearly struck-out non-trading days */
+.ai-report-datepicker .DayPicker,
+.ai-report-datepicker .CalendarMonth,
+.ai-report-datepicker .CalendarMonthGrid {
+    background: var(--bg-secondary, #1A1A1A);
+}
+
+.ai-report-datepicker .CalendarDay__default {
+    background: var(--bg-secondary, #1A1A1A);
+    border-color: var(--border-subtle, #2A2A2A);
+    color: var(--text-primary, #FFFFFF);
+}
+
+.ai-report-datepicker .CalendarDay__default:hover {
+    background: var(--bg-tertiary, #242424);
+}
+
+.ai-report-datepicker .CalendarDay__selected {
+    background: var(--accent-primary, #00D4AA);
+    border-color: var(--accent-primary, #00D4AA);
+    color: #0D0D0D;
+}
+
+.ai-report-datepicker .CalendarDay__blocked_calendar,
+.ai-report-datepicker .CalendarDay__blocked_out_of_range {
+    background: var(--bg-primary, #0D0D0D);
+    color: var(--text-muted, #666666);
+    text-decoration: line-through;
+}
+
+.ai-report-datepicker .CalendarMonth_caption,
+.ai-report-datepicker .DayPicker_weekHeader {
+    color: var(--text-secondary, #A0A0A0);
+}
+
+.ai-report-article-preview {
+    font-size: 0.8rem;
+}
+
+/* Research report inside a symbol tab */
+.research-report-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.research-verdict-badge {
+    margin-left: auto;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    background: var(--bg-tertiary, #242424);
+}
+
+.research-verdict-badge.positive { color: var(--positive, #00C805); }
+.research-verdict-badge.negative { color: var(--negative, #FF5000); }
+.research-verdict-badge.neutral  { color: var(--neutral, #FFD700); }
+
+.research-report-footnote {
+    margin-top: 6px;
+    font-size: 0.72rem;
+    color: var(--text-muted, #666666);
+    font-style: italic;
+}
+
+/* Raw AI-report payload: view button + modal body */
+.ai-json-btn {
+    background: transparent;
+    border: 1px solid var(--border-focus, #3D3D3D);
+    color: var(--text-secondary, #A0A0A0);
+    border-radius: 4px;
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.ai-json-btn:hover {
+    color: var(--text-primary, #FFFFFF);
+    border-color: var(--text-secondary, #A0A0A0);
+}
+
+.ai-json-body {
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--text-secondary, #A0A0A0);
+    background: var(--bg-primary, #0D0D0D);
+    padding: 12px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Luna actionability lines: the level that matters and the flip condition */
+.rec-key-level,
+.rec-change-trigger {
+    font-size: 0.76rem;
+    margin-top: 3px;
+    color: var(--text-secondary, #A0A0A0);
+}
+
+.rec-key-level::before {
+    content: "◆ ";
+    color: var(--accent-primary, #00D4AA);
+}
+
+.rec-change-trigger::before {
+    content: "↺ ";
+    color: var(--neutral, #FFD700);
+}
+
+/* Scoreboard modal */
+.scoreboard-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+}
+
+.scoreboard-filter-symbols {
+    flex: 1;
+    min-width: 220px;
+}
+
+.scoreboard-filter-dates {
+    flex-shrink: 0;
+}
+
+.scoreboard-summary {
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.scoreboard-subtitle {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted, #888);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 14px 0 6px;
+}
+
+.predict-date-picker .DateRangePickerInput {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 6px;
+}
+
+.predict-date-picker .DateRangePickerInput_arrow {
+    color: var(--text-secondary, #888);
+}
+
+/* Pipeline activity feed */
+.progress-panel-container {
+    position: fixed;
+    /* Clears Dash's dev toolbar, which sits bottom-right and was covering
+       the last few lines of the feed -- the ones that matter most.
+       z-index sits BELOW Bootstrap modals (backdrop 1040 / dialog 1055):
+       at 9998 the panel floated over every modal's lower-right corner and
+       swallowed clicks on their footer buttons. */
+    bottom: 56px;
+    right: 16px;
+    z-index: 1030;
+    max-width: calc(100vw - 32px);
+}
+
+.progress-panel {
+    width: 460px;
+    max-width: 100%;
+    max-height: min(46vh, 460px);
+    transition: width 0.15s ease, max-height 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-card, #16181d);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    overflow: hidden;
+}
+
+.progress-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.02);
+}
+
+.progress-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+.progress-count {
+    margin-left: auto;
+    font-size: 0.72rem;
+    color: var(--text-secondary, #888);
+}
+
+.progress-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(0,212,170,0.25);
+    border-top-color: var(--accent, #00D4AA);
+    border-radius: 50%;
+    animation: progress-spin 0.9s linear infinite;
+}
+
+@keyframes progress-spin {
+    to { transform: rotate(360deg); }
+}
+
+.progress-header-done {
+    color: var(--positive, #22c55e);
+    font-size: 0.85rem;
+}
+
+.progress-feed {
+    overflow-y: auto;
+    padding: 6px 10px;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 2px;
+}
+
+.progress-line {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    font-family: 'SF Mono', 'JetBrains Mono', monospace;
+}
+
+.progress-ts {
+    color: var(--text-muted, #666);
+    flex-shrink: 0;
+}
+
+.progress-icon {
+    font-size: 0.7rem;
+    color: var(--text-secondary, #888);
+    flex-shrink: 0;
+}
+
+.progress-icon-ta { color: #7B61FF; }
+.progress-icon-luna { color: #f0b429; }
+.progress-icon-ai { color: #38bdf8; }
+.progress-icon-models { color: var(--accent, #00D4AA); }
+.progress-icon-done { color: var(--positive, #22c55e); }
+.progress-icon-error { color: var(--negative, #ef4444); }
+
+.progress-msg {
+    color: var(--text-primary, #ddd);
+    word-break: break-word;
+}
+
+.progress-line-error .progress-msg { color: var(--negative, #ef4444); }
+.progress-line-done .progress-msg {
+    color: var(--positive, #22c55e);
+    font-weight: 600;
+}
+
+/* Predictions grouped by symbol → date */
+.history-pred-symbol-group {
+    margin-bottom: 4px;
+}
+
+.history-pred-header {
+    padding: 8px 10px;
+    gap: 10px;
+}
+
+.history-pred-symbol {
+    font-weight: 700;
+    font-family: 'SF Mono', 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+}
+
+.history-pred-hits,
+.history-pred-days {
+    font-size: 0.72rem;
+    color: var(--text-secondary, #888);
+}
+
+.history-pred-pnl {
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+.history-pred-date-block {
+    margin-bottom: 10px;
+}
+
+.history-pred-date-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 6px 0 4px;
+}
+
+.history-pred-date {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--accent, #00D4AA);
+}
+
+.history-pred-target {
+    font-size: 0.72rem;
+    color: var(--text-secondary, #888);
+}
+
+.history-pred-table {
+    margin-bottom: 0;
+}
+
+/* Period selector: 12 windows in three clusters (days | weeks | months+).
+   The cluster-start margin draws the visual group boundary. */
+.period-selector {
+    flex-wrap: wrap;
+    gap: 2px 0;
+}
+.period-selector .period-cluster-start {
+    margin-left: 10px !important;
+    border-top-left-radius: var(--bs-border-radius-sm) !important;
+    border-bottom-left-radius: var(--bs-border-radius-sm) !important;
 }

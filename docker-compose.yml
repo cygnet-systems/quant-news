@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:18
+    # init:true gives the container a real PID 1 (docker-init). Without it the
+    # postmaster is PID 1, and a healthcheck killed on timeout leaves an
+    # orphaned pg_isready that reparents to the postmaster and exits nonzero --
+    # which PG18 treats as a crashed backend and panics into crash recovery.
+    init: true
+    environment:
+      POSTGRES_USER: quantnews
+      POSTGRES_PASSWORD: quantnews
+      POSTGRES_DB: quantnews
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantnews"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - s3data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    command: >
+      sh -c "pip install alembic psycopg2-binary sqlalchemy boto3 &&
+             alembic upgrade head"
+    environment:
+      DATABASE_URL: postgresql://quantnews:quantnews@postgres:5432/quantnews
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    ports:
+      - "8050:8050"
+    environment:
+      DATABASE_URL: postgresql://quantnews:quantnews@postgres:5432/quantnews
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET_NAME: quantnews-reports
+    env_file:
+      - .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./cache:/app/cache
+
+volumes:
+  pgdata:
+  s3data:

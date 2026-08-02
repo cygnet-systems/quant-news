@@ -67,6 +67,9 @@ class APIConfig:
     # LM Studio (local LLM)
     LM_STUDIO_URL: str = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
 
+    # Anthropic (Claude)
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
     # OpenAI (fallback)
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
@@ -78,6 +81,10 @@ class APIConfig:
     # Request settings
     DEFAULT_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
+
+    # LLM client timeout (seconds). Without it a hung socket pins a worker
+    # thread for the SDK default of 600s. Synthesis calls run ~1 min.
+    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "180"))
 
 
 API: Final = APIConfig()
@@ -94,6 +101,12 @@ class AppConfig:
 
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
     PORT: int = int(os.getenv("PORT", "8050"))
+
+    # Concurrent per-symbol fetches in async callbacks. Stock fetches tolerate
+    # a few parallel yfinance calls; Alpha Vantage free tier (~5 req/min)
+    # punishes parallel news fetches, so that cap stays low.
+    STOCK_FETCH_CONCURRENCY: int = int(os.getenv("STOCK_FETCH_CONCURRENCY", "4"))
+    NEWS_FETCH_CONCURRENCY: int = int(os.getenv("NEWS_FETCH_CONCURRENCY", "2"))
     HOST: str = os.getenv("HOST", "127.0.0.1")
 
     # Default data period
@@ -255,6 +268,175 @@ CHART_THEME: Final[dict] = {
     },
     "margin": {"l": 10, "r": 60, "t": 40, "b": 40},
 }
+
+
+# =============================================================================
+# INDICATOR COLOR MAP
+# =============================================================================
+
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """Model hyperparameters and training settings."""
+
+    # Kronos
+    KRONOS_MODEL_SIZE: str = "mini"
+    KRONOS_PRED_DAYS: int = 3
+    KRONOS_SAMPLE_COUNT: int = 20
+    KRONOS_TEMPERATURE: float = 0.8
+    KRONOS_CONTEXT_BARS: int = 90
+
+    # XGBoost
+    XGBOOST_N_ESTIMATORS: int = 150
+    XGBOOST_MAX_DEPTH: int = 3
+    XGBOOST_LEARNING_RATE: float = 0.05
+
+    # Training
+    MIN_TRAINING_SAMPLES: int = 30
+    TRAINING_HISTORY_PERIOD: str = "1y"
+    LABEL_AMBIGUITY_THRESHOLD: float = 0.0015  # 0.15%, set to 0.0 to disable
+    NEWS_LOOKBACK_MONTHS: int = 3
+
+    # Decision thresholds (shared across Kronos and XGBoost)
+    BUY_THRESHOLD: float = 0.55
+    SELL_THRESHOLD: float = 0.45
+
+    # Research-driven "trading_agents" model.
+    # sonnet-5: ~2x faster and ~45% cheaper than sonnet-4-6 on report prompts
+    # (measured 27s vs 51s); llm_service handles its no-sampling-params and
+    # thinking-budget semantics.
+    # 2026-07-26 A/B: Luna matched Sonnet on grounding (0 fabrications),
+    # flagged data conflicts explicitly, 2x faster, ~2.8x cheaper at
+    # $1/$6 per M vs $3/$15 — and research is the N-calls-per-run role.
+    TRADING_AGENTS_MODEL: str = "gpt-5.6-luna"
+    # Swappable research backend: "single_agent" (in-tree default) or
+    # "tradingagents" (adapter over a pinned external release; see
+    # models/research_backend.py). Lets us ingest a future TradingAgents version
+    # without touching callers.
+    RESEARCH_BACKEND: str = os.getenv("RESEARCH_BACKEND", "single_agent")
+
+    # LightGBM
+    LIGHTGBM_NUM_LEAVES: int = 31
+    LIGHTGBM_LEARNING_RATE: float = 0.05
+    LIGHTGBM_N_ESTIMATORS: int = 200
+
+    # DeBERTa Sentiment
+    DEBERTA_MODEL_NAME: str = "mrm8488/deberta-v3-ft-financial-news-sentiment-analysis"
+    DEBERTA_RELEVANCE_THRESHOLD: float = 0.7
+    DEBERTA_BUY_THRESHOLD: float = 0.6
+    DEBERTA_SELL_THRESHOLD: float = 0.4
+
+    # Ensemble thresholds
+    ENSEMBLE_BUY_THRESHOLD: float = 0.15
+    ENSEMBLE_SELL_THRESHOLD: float = -0.15
+
+    # Ensemble defaults (initial UI values — user adjusts from dashboard)
+    ENSEMBLE_DEFAULT_ENABLED: tuple[str, ...] = ("kronos_mini", "xgboost_shap")
+    ENSEMBLE_DEFAULT_WEIGHTS: tuple[tuple[str, float], ...] = (
+        ("kronos_mini", 1.0),
+        ("xgboost_shap", 1.0),
+        ("lightgbm", 1.0),
+        ("deberta_sentiment", 1.0),
+        ("trading_agents", 1.0),
+    )
+
+    # Legacy strategy weights (used by ensemble_vote strategy)
+    ENSEMBLE_KRONOS_WEIGHT: float = 1.1
+    ENSEMBLE_XGBOOST_WEIGHT: float = 1.3
+    ENSEMBLE_TRADING_AGENTS_WEIGHT: float = 0.8
+
+    # Recommendations engine (second-pass synthesis model)
+    # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic (says which
+    # side to trust and why, two-sided levels); this is ONE call per run
+    # so the Luna price advantage is ~3 cents — quality wins here.
+    RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "claude-sonnet-5")
+    RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "anthropic")
+    # 5000: key_level/change_trigger/watch_items grew the JSON; a truncated
+    # payload fails the parser and blanks the whole Luna panel.
+    RECOMMENDATIONS_MAX_TOKENS: int = 5000
+    RECOMMENDATIONS_TEMPERATURE: float = 0.3
+    RECOMMENDATIONS_REASONING_EFFORT: str = os.getenv(
+        "RECOMMENDATIONS_REASONING_EFFORT", "high"
+    )
+
+
+MODEL: Final = ModelConfig()
+
+
+# =============================================================================
+# DATABASE CONFIG (Postgres via SQLAlchemy)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    """PostgreSQL connection settings."""
+
+    URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql://quantnews:quantnews@localhost:5432/quantnews",
+    )
+    POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "5"))
+    MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    ECHO_SQL: bool = os.getenv("DB_ECHO_SQL", "").lower() == "true"
+
+
+DB: Final = DatabaseConfig()
+
+
+# =============================================================================
+# OBJECT STORAGE CONFIG (S3-compatible — Railway / MinIO / R2)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    """S3-compatible object storage settings."""
+
+    ENDPOINT_URL: str = os.getenv(
+        "S3_ENDPOINT_URL", "http://localhost:9000"
+    )
+    ACCESS_KEY: str = os.getenv("S3_ACCESS_KEY", "minioadmin")
+    SECRET_KEY: str = os.getenv("S3_SECRET_KEY", "minioadmin")
+    BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "quantnews-reports")
+    REGION: str = os.getenv("S3_REGION", "us-east-1")
+
+
+STORAGE: Final = StorageConfig()
+
+
+# =============================================================================
+# STRATEGY EVALUATION CONFIG
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Strategy evaluation and scheduling settings."""
+
+    # Scheduler (ET timezone, weekdays only)
+    EVAL_SCHEDULE_HOUR: int = 16
+    EVAL_SCHEDULE_MINUTE: int = 35
+
+    # Position sizing
+    DEFAULT_POSITION_SIZE: float = 1000.0
+
+    # Confidence threshold strategy
+    CONFIDENCE_THRESHOLD: float = 0.65
+
+    # vectorbt portfolio
+    VECTORBT_INIT_CASH: float = 10000.0
+
+    # Minimum trades before showing metrics
+    MIN_TRADES_FOR_METRICS: int = 5
+
+
+STRATEGY: Final = StrategyConfig()
 
 
 # =============================================================================

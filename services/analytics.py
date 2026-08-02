@@ -208,7 +208,11 @@ def calculate_rolling_std(
     Returns:
         Rolling standard deviation series.
     """
-    return close.rolling(window=period).std()
+    # ddof=0 to agree with the ta BollingerBands columns this lands next to
+    # in the same DataFrame — with the pandas default (ddof=1),
+    # (BB_Upper - BB_Mid) / 2 != Rolling_Std and the chart hover's
+    # "= SMA(20) + 2 x Std Dev" claim was false.
+    return close.rolling(window=period).std(ddof=0)
 
 
 def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:

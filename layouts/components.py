@@ -10,7 +10,7 @@ from typing import Any, Optional
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from config import COLORS, SPACING
+from config import COLORS, MODEL, SPACING
 
 
 def calculate_period_label(start_date: str, end_date: str) -> str:
@@ -129,23 +129,22 @@ def create_stock_input() -> html.Div:
                 className="mb-2",
             ),
             html.Div(id="symbol-tags", className="symbol-tags"),
+            dbc.Button(
+                [html.I(className="bi bi-x-circle me-1"), "Clear all"],
+                id="clear-symbols-btn",
+                size="sm",
+                outline=True,
+                color="secondary",
+                className="clear-symbols-btn mt-1",
+                style={"display": "none"},  # shown only when symbols selected
+            ),
+            # Recent searches: whole symbol GROUPS, so a past multi-symbol
+            # session is one click to restore (replaced the static quick-add
+            # tickers, which never matched what anyone was actually watching).
             html.Div(
                 [
-                    html.Span("Quick add: ", className="quick-add-label"),
-                    html.Div(
-                        [
-                            dbc.Button(
-                                sym,
-                                id={"type": "quick-add", "symbol": sym},
-                                size="sm",
-                                outline=True,
-                                color="secondary",
-                                className="quick-add-btn me-1 mb-1",
-                            )
-                            for sym in ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META"]
-                        ],
-                        className="quick-add-buttons",
-                    ),
+                    html.Span("Recent: ", className="quick-add-label"),
+                    html.Div(id="recent-groups", className="quick-add-buttons"),
                 ],
                 className="quick-add-section mt-2",
             ),
@@ -292,14 +291,17 @@ def create_period_selector(selected: str = "1y") -> dbc.ButtonGroup:
     Returns:
         Button group for period selection.
     """
+    # Organized short -> long in three clusters: days, trading weeks, then
+    # calendar months/years. Sub-6mo values are DISPLAY windows — the data
+    # layer keeps a 6-month daily floor underneath (see app._PERIOD_CONFIG),
+    # and 1D/3D/1W render intraday bars on the price chart.
     periods = [
-        ("1M", "1mo"),
-        ("3M", "3mo"),
-        ("6M", "6mo"),
-        ("1Y", "1y"),
-        ("2Y", "2y"),
-        ("5Y", "5y"),
+        ("1D", "1d"), ("3D", "3d"),
+        ("1W", "1wk"), ("2W", "2wk"), ("3W", "3wk"),
+        ("1M", "1mo"), ("3M", "3mo"), ("6M", "6mo"),
+        ("YTD", "ytd"), ("1Y", "1y"), ("2Y", "2y"), ("5Y", "5y"),
     ]
+    cluster_starts = {"1wk", "1mo", "ytd"}
 
     return dbc.ButtonGroup(
         [
@@ -309,7 +311,8 @@ def create_period_selector(selected: str = "1y") -> dbc.ButtonGroup:
                 color="primary" if value == selected else "secondary",
                 outline=value != selected,
                 size="sm",
-                className="period-btn",
+                className=("period-btn period-cluster-start"
+                           if value in cluster_starts else "period-btn"),
             )
             for label, value in periods
         ],
@@ -437,7 +440,6 @@ def create_data_actions() -> html.Div:
                 color="secondary",
                 size="sm",
                 outline=True,
-                className="me-2",
             ),
             dbc.Button(
                 [html.I(className="bi bi-download me-1"), "Export"],
@@ -445,7 +447,6 @@ def create_data_actions() -> html.Div:
                 color="secondary",
                 size="sm",
                 outline=True,
-                className="me-2",
             ),
             dbc.Button(
                 [html.I(className="bi bi-table me-1"), "View Data"],
@@ -453,6 +454,37 @@ def create_data_actions() -> html.Div:
                 color="secondary",
                 size="sm",
                 outline=True,
+            ),
+            dbc.Button(
+                [html.I(className="bi bi-cpu me-1"), "Predict"],
+                id="run-predictions-btn",
+                color="warning",
+                size="sm",
+                outline=True,
+            ),
+            dbc.Button(
+                [html.I(className="bi bi-file-text me-1"), "AI Report"],
+                id="generate-report-btn",
+                color="info",
+                size="sm",
+                outline=True,
+                className="btn-full",
+            ),
+            dbc.Button(
+                [html.I(className="bi bi-lightning-fill me-1"), "Full Analysis"],
+                id="full-analysis-btn",
+                color="success",
+                size="sm",
+                outline=True,
+                className="btn-full",
+            ),
+            dbc.Button(
+                [html.I(className="bi bi-trophy me-1"), "Scoreboard"],
+                id="scoreboard-btn",
+                color="secondary",
+                size="sm",
+                outline=True,
+                className="btn-full",
             ),
         ],
         className="data-actions",
@@ -512,12 +544,12 @@ def create_recommendation_banner(
     Returns:
         Styled recommendation banner component.
     """
-    # Handle loading state
+    # Handle loading state — prompt user to click AI Report
     if recommendation == "LOADING":
         return html.Div(
             [
-                html.Div("Analyzing...", className="recommendation-label"),
-                html.Div("Processing news articles", className="recommendation-meta"),
+                html.Div("Awaiting Analysis", className="recommendation-label"),
+                html.Div('Click "AI Report" to analyze', className="recommendation-meta"),
             ],
             className="recommendation-banner loading",
         )
@@ -773,4 +805,114 @@ def create_overview_empty_state() -> html.Div:
             ),
         ],
         className="overview-empty-state",
+    )
+
+
+def create_ensemble_config_drawer() -> dbc.Offcanvas:
+    """Create the ensemble configuration offcanvas drawer.
+
+    Contains per-model enable/disable switches and weight sliders.
+    Triggered by the gear icon on the ensemble card.
+    """
+    models = [
+        ("kronos_mini", "Kronos"),
+        ("xgboost_shap", "XGBoost"),
+        ("lightgbm", "LightGBM"),
+        ("deberta_sentiment", "DeBERTa"),
+        ("trading_agents", "TradingAgents"),
+    ]
+
+    default_enabled = set(MODEL.ENSEMBLE_DEFAULT_ENABLED)
+    default_weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+
+    model_rows = []
+    for model_id, display_name in models:
+        is_enabled = model_id in default_enabled
+        weight = default_weights.get(model_id, 1.0)
+
+        model_rows.append(
+            html.Div(
+                [
+                    # Top row: switch + model name + current decision placeholder
+                    html.Div(
+                        [
+                            dbc.Switch(
+                                id={"type": "ensemble-model-switch", "model": model_id},
+                                value=is_enabled,
+                                className="ensemble-model-switch",
+                            ),
+                            html.Span(
+                                display_name,
+                                className="ensemble-model-label",
+                            ),
+                            html.Span(
+                                id={"type": "ensemble-model-decision", "model": model_id},
+                                className="ensemble-model-decision",
+                            ),
+                        ],
+                        className="ensemble-model-header",
+                    ),
+                    # Weight slider + number input
+                    html.Div(
+                        [
+                            html.Span(
+                                "Weight:",
+                                className="ensemble-weight-label",
+                            ),
+                            dcc.Slider(
+                                id={"type": "ensemble-weight-slider", "model": model_id},
+                                min=0.1,
+                                max=2.0,
+                                step=0.1,
+                                value=weight,
+                                marks={0.5: "0.5", 1.0: "1.0", 1.5: "1.5", 2.0: "2.0"},
+                                className="ensemble-weight-slider",
+                                disabled=not is_enabled,
+                            ),
+                            dcc.Input(
+                                id={"type": "ensemble-weight-input", "model": model_id},
+                                type="number",
+                                min=0.1,
+                                max=2.0,
+                                step=0.1,
+                                value=weight,
+                                className="ensemble-weight-input",
+                                disabled=not is_enabled,
+                            ),
+                        ],
+                        className="ensemble-weight-row",
+                    ),
+                ],
+                className="ensemble-model-config-row",
+            )
+        )
+
+    return dbc.Offcanvas(
+        [
+            html.Div(
+                [
+                    html.P(
+                        "Choose which models contribute to the ensemble "
+                        "prediction and adjust their relative weights.",
+                        className="ensemble-config-description",
+                    ),
+                    html.Div(model_rows, className="ensemble-config-models"),
+                    html.Hr(style={"borderColor": COLORS.BORDER_SUBTLE}),
+                    dbc.Button(
+                        "Reset to Defaults",
+                        id="ensemble-reset-btn",
+                        outline=True,
+                        color="secondary",
+                        size="sm",
+                        className="ensemble-reset-btn",
+                    ),
+                ],
+                className="ensemble-config-content",
+            ),
+        ],
+        id="ensemble-config-drawer",
+        title="Ensemble Configuration",
+        placement="end",
+        is_open=False,
+        style={"width": "380px", "backgroundColor": COLORS.BG_SECONDARY},
     )

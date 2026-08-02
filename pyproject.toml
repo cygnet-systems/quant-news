@@ -4,14 +4,18 @@ version = "0.1.0"
 description = "Quantitative stock tracking app with news analysis"
 requires-python = ">=3.10"
 dependencies = [
-    "dash>=2.15.0",
-    "dash-bootstrap-components>=1.5.0",
+    "dash[fastapi]==4.4.1",
+    "dash-bootstrap-components>=2.0.4",
+    "uvicorn>=0.30.0",
+    "multiprocess>=0.70.16",
+    "anthropic>=0.34.0",
+    "itsdangerous>=2.0.0",
+    "python-multipart>=0.0.9",
     "plotly>=5.18.0",
     "yfinance>=0.2.36",
     "requests>=2.31.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
-    "duckdb>=0.10.0",
     "pyarrow>=15.0.0",
     "ta>=0.11.0",
     "openai>=1.12.0",

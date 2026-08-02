@@ -117,6 +117,66 @@ def fetch_stock_data(
         raise ValueError(f"Failed to fetch data for {symbol}: {str(e)}") from e
 
 
+# Intraday bars are chart-only: never written to the daily StockPrice cache
+# and never placed in the shared data store, so models/metrics always consume
+# daily data. Short in-process TTL absorbs chart re-renders.
+_INTRADAY_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_INTRADAY_TTL_SECONDS = 60
+
+
+def fetch_intraday(
+    symbol: str,
+    yf_period: str = "1d",
+    interval: str = "5m",
+    sessions: Optional[int] = None,
+) -> pd.DataFrame:
+    """Fetch intraday OHLCV for the price chart.
+
+    Args:
+        symbol: Ticker.
+        yf_period: yfinance period ("1d" / "5d").
+        interval: bar interval ("5m" / "30m").
+        sessions: keep only the last N trading sessions (e.g. 3D slices a
+                  5d fetch down to 3 sessions).
+    """
+    import time as _time
+
+    key = (symbol.upper(), yf_period, interval)
+    hit = _INTRADAY_CACHE.get(key)
+    if hit and _time.time() - hit[0] < _INTRADAY_TTL_SECONDS:
+        df = hit[1]
+    else:
+        df = get_ticker(symbol).history(period=yf_period, interval=interval)
+        if not df.empty and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        _INTRADAY_CACHE[key] = (_time.time(), df)
+
+    if sessions and not df.empty:
+        keep = set(sorted({ts.date() for ts in df.index})[-sessions:])
+        df = df[[ts.date() in keep for ts in df.index]]
+    return df
+
+
+def get_company_profile(symbol: str, max_chars: int = 900) -> str:
+    """Return a short company background block: name, sector, industry,
+    and the business summary (truncated). Empty string on failure.
+    """
+    try:
+        info = get_ticker(symbol).info or {}
+        summary = (info.get("longBusinessSummary") or "").strip()
+        if len(summary) > max_chars:
+            cut = summary[:max_chars].rfind(". ")
+            summary = summary[:cut + 1] if cut > max_chars * 0.5 else summary[:max_chars]
+        parts = [
+            f"{info.get('shortName', symbol)} — {info.get('sector', 'N/A')} / {info.get('industry', 'N/A')}",
+        ]
+        if summary:
+            parts.append(summary)
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
 def get_stock_info(symbol: str) -> StockInfo:
     """Get company information and current metrics.
 
@@ -205,50 +265,3 @@ def get_multiple_stocks(
             continue
 
     return result
-
-
-def calculate_performance_metrics(df: pd.DataFrame) -> dict:
-    """Calculate basic performance metrics from price data.
-
-    Args:
-        df: DataFrame with OHLCV data
-
-    Returns:
-        Dictionary with performance metrics:
-            - total_return: Percentage return over period
-            - max_drawdown: Maximum peak-to-trough decline
-            - volatility: Annualized standard deviation of returns
-            - start_price: First price in period
-            - end_price: Last price in period
-    """
-    if df.empty:
-        return {}
-
-    close = df["Close"]
-
-    # Total return
-    start_price = close.iloc[0]
-    end_price = close.iloc[-1]
-    total_return = ((end_price - start_price) / start_price) * 100
-
-    # Daily returns
-    daily_returns = close.pct_change().dropna()
-
-    # Volatility (annualized)
-    volatility = daily_returns.std() * (252**0.5) * 100  # 252 trading days
-
-    # Max drawdown
-    cumulative = (1 + daily_returns).cumprod()
-    rolling_max = cumulative.expanding().max()
-    drawdown = (cumulative - rolling_max) / rolling_max
-    max_drawdown = drawdown.min() * 100
-
-    return {
-        "total_return": round(total_return, 2),
-        "max_drawdown": round(max_drawdown, 2),
-        "volatility": round(volatility, 2),
-        "start_price": round(start_price, 2),
-        "end_price": round(end_price, 2),
-        "start_date": df.index[0].strftime("%Y-%m-%d"),
-        "end_date": df.index[-1].strftime("%Y-%m-%d"),
-    }
