@@ -89,12 +89,40 @@ def _send(subject: str, html: str) -> bool:
             },
             timeout=20,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            logger.error(
+                f"Notification send failed ({resp.status_code}): "
+                f"{_diagnose(resp.status_code, cfg['NOTIFY_FROM_EMAIL'])}"
+            )
+            return False
         logger.info(f"Notification sent: {subject}")
         return True
     except Exception:
         logger.exception("Failed to send notification email — continuing")
         return False
+
+
+def _diagnose(status: int, sender: str) -> str:
+    """Turn a Graph status into the thing to actually go and fix.
+
+    These three are indistinguishable in a raw traceback and have completely
+    different fixes, so name them rather than making the reader guess.
+    """
+    if status == 401:
+        return ("the token was rejected — check AZURE_TENANT_ID, "
+                "AZURE_CLIENT_ID and AZURE_CLIENT_SECRET")
+    if status == 403:
+        return ("authenticated but not allowed — the app registration needs "
+                "Mail.Send as an APPLICATION permission with admin consent, "
+                "and any application access policy must include this mailbox")
+    if status == 404:
+        return (f"the tenant has no mailbox at {sender} — Graph resolves "
+                f"/users/{{id}} by primary UPN or object id, so an alias or "
+                f"proxy address will 404. Create it (a shared mailbox needs "
+                f"no licence) or set NOTIFY_FROM_EMAIL to the primary UPN")
+    if status == 429:
+        return "throttled by Graph — the next scheduled run will try again"
+    return "see the Graph response above"
 
 
 # ---------------------------------------------------------------------------

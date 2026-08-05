@@ -24,6 +24,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Imported for its load_dotenv() side effect: the analyze/evaluate paths pull
+# config in deep inside the pipeline, but `cost` and `notify-test` read
+# os.environ directly and would otherwise see an empty local environment and
+# report every variable as missing.
+import config  # noqa: E402,F401
+
 # Weights are cached; a scheduled run must not stall on a HF network call.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
@@ -110,11 +116,10 @@ def main() -> int:
             return 1
 
         ok = notify_service.send_test()
-        print("\nSent." if ok else
-              "\nSend FAILED — see the traceback above. The usual causes are "
-              "the app registration lacking the Mail.Send APPLICATION "
-              "permission (with admin consent), or an application access "
-              "policy that excludes this mailbox.")
+        # The failure reason is logged by the sender, which knows the status
+        # code and can name the specific fix; repeating a guess here would
+        # only compete with it.
+        print("\nSent." if ok else "\nSend FAILED — see the logged reason above.")
         return 0 if ok else 1
 
     if args.command == "cost":
