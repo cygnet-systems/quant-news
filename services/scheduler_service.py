@@ -177,15 +177,61 @@ def update_job(job_id: str, **fields) -> bool:
 # ---------------------------------------------------------------------------
 
 def _running_jobs() -> set[str]:
+    """Jobs genuinely in flight right now.
+
+    Bounded by the job timeout, because a "running" row is only evidence that
+    a process STARTED one — a container killed mid-run (every deploy does
+    this) never gets to write its ending. Treating those as running forever
+    would pin the job: the UI disables its Run-now button, and the overdue
+    check skips anything running, so /healthz would report healthy while
+    nothing had run for days.
+    """
+    from datetime import timedelta
+
     from db.models import JobRun
     from db.session import get_session
     from sqlalchemy import select
 
+    cutoff = datetime.now().astimezone() - timedelta(seconds=JOB_TIMEOUT_SECONDS)
     with get_session() as session:
         rows = session.execute(
-            select(JobRun.job_id).where(JobRun.status == "running")
+            select(JobRun.job_id).where(
+                JobRun.status == "running",
+                JobRun.started_at >= cutoff,
+            )
         ).scalars().all()
     return set(rows)
+
+
+def reap_abandoned_runs() -> int:
+    """Close out runs whose process died, so history says so.
+
+    Without this the row stays "running" and the failure is invisible in both
+    the panel and the run table — indistinguishable from a job still working.
+    """
+    from datetime import timedelta
+
+    from db.models import JobRun
+    from db.session import get_session
+    from sqlalchemy import select
+
+    cutoff = datetime.now().astimezone() - timedelta(seconds=JOB_TIMEOUT_SECONDS)
+    reaped = 0
+    with get_session() as session:
+        stale = session.execute(
+            select(JobRun).where(JobRun.status == "running",
+                                 JobRun.started_at < cutoff)
+        ).scalars().all()
+        for run in stale:
+            run.status = "interrupted"
+            run.finished_at = datetime.now()
+            run.detail = ((run.detail or "") +
+                          "\nProcess ended before the run finished "
+                          "(deploy, restart or crash).").strip()
+            reaped += 1
+    if reaped:
+        logger.warning(f"Reaped {reaped} abandoned job run(s)")
+    return reaped
 
 
 def _build_command(job: dict) -> list[str]:
@@ -599,6 +645,9 @@ def start() -> None:
             from apscheduler.triggers.interval import IntervalTrigger
 
             seed_default_jobs()
+            # A restart is the usual reason a run never finished, so this is
+            # exactly the moment to close those rows out.
+            reap_abandoned_runs()
             _scheduler = BackgroundScheduler()
             _scheduler.start()
             for job in list_jobs():
