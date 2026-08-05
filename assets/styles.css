@@ -4061,3 +4061,75 @@ body {
 #run-modal .SingleDatePickerInput {
     border: none;
 }
+
+/* Date picker popup ---------------------------------------------------------
+   react-dates ships a light calendar, and the app's --text-primary is #FFFFFF,
+   so the month caption and weekday letters rendered white on white — the
+   calendar opened looking blank apart from the day numbers. Theme the popup
+   dark rather than patching one caption colour, so it matches everything
+   around it. */
+
+.history-date-picker .SingleDatePicker_picker,
+.history-date-picker .DayPicker,
+.history-date-picker .DayPicker_focusRegion,
+.history-date-picker .CalendarMonthGrid,
+.history-date-picker .CalendarMonth,
+.history-date-picker .DayPicker_transitionContainer {
+    background: var(--bg-secondary, #1A1A1A) !important;
+}
+
+.history-date-picker .DayPicker {
+    border: 1px solid var(--border-subtle, #2A2A2A);
+    border-radius: 8px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.history-date-picker .CalendarMonth_caption,
+.history-date-picker .CalendarMonth_caption strong {
+    color: var(--text-primary, #FFFFFF) !important;
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.history-date-picker .DayPicker_weekHeader,
+.history-date-picker .DayPicker_weekHeader_li small {
+    color: var(--text-muted, #666) !important;
+    font-size: 0.72rem;
+}
+
+.history-date-picker .CalendarDay__default {
+    background: var(--bg-secondary, #1A1A1A);
+    border: 1px solid var(--border-subtle, #2A2A2A);
+    color: var(--text-secondary, #A0A0A0);
+}
+
+.history-date-picker .CalendarDay__default:hover {
+    background: var(--bg-tertiary, #242424);
+    color: var(--text-primary, #FFFFFF);
+}
+
+/* Days with no data are still selectable; grey them so the eye goes to the
+   sessions that have something behind them. */
+.history-date-picker .CalendarDay__blocked_out_of_range,
+.history-date-picker .CalendarDay__blocked_out_of_range:hover {
+    background: var(--bg-primary, #0D0D0D);
+    color: var(--text-muted, #444);
+}
+
+.history-date-picker .CalendarDay__today {
+    font-weight: 700;
+    color: var(--accent-primary, #00D4AA);
+}
+
+.history-date-picker .DayPickerNavigation_button__default {
+    background: var(--bg-tertiary, #242424);
+    border: 1px solid var(--border-subtle, #2A2A2A);
+}
+
+.history-date-picker .DayPickerNavigation_svg__horizontal {
+    fill: var(--text-secondary, #A0A0A0);
+}
+
+.history-date-picker .DayPickerKeyboardShortcuts_show__bottomRight {
+    display: none;
+}

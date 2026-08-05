@@ -21,12 +21,27 @@ def filter_items(items, filter_symbols, filter_date_range, specific_date=None, s
         items = [i for i in items if i.get(sym_key, "") in filter_symbols]
     if specific_date:
         items = [i for i in items if (i.get(date_key, "") or "")[:10] == specific_date[:10]]
+    elif filter_date_range == "today":
+        # The current SESSION, not the calendar day: on a weekend or holiday
+        # "today" holds nothing, and showing an empty table would read as data
+        # loss rather than as the market being shut.
+        session = current_session().isoformat()
+        items = [i for i in items if (i.get(date_key, "") or "")[:10] == session]
     elif filter_date_range and filter_date_range != "all":
         days = {"7d": 7, "30d": 30, "90d": 90}.get(filter_date_range, 0)
         if days:
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
             items = [i for i in items if (i.get(date_key, "") or "") >= cutoff]
     return items
+
+
+def current_session():
+    """Today if the market trades today, else the last session that ran."""
+    from datetime import date as _date
+
+    from utils.trading_calendar import get_previous_trading_day, is_trading_day
+    today = _date.today()
+    return today if is_trading_day(today) else get_previous_trading_day(today)
 
 
 def collapsible_section(title, section_id, children, icon_class, default_open=False, count=0):
@@ -146,10 +161,7 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
             )
         )
 
-    from utils.trading_calendar import is_trading_day, get_previous_trading_day
-    from datetime import date as _date
-    today = _date.today()
-    active_day = today if is_trading_day(today) else get_previous_trading_day(today)
+    active_day = current_session()
 
     rows.append(
         html.Div(
@@ -172,6 +184,11 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
                     [
                         dbc.ButtonGroup(
                             [
+                                # The common case — "what did we just do?" —
+                                # needed a calendar click before this.
+                                dbc.Button("Today", id={"type": "history-date-btn", "range": "today"},
+                                           size="sm", outline=True, color="secondary",
+                                           className="history-date-btn"),
                                 dbc.Button("7d", id={"type": "history-date-btn", "range": "7d"},
                                            size="sm", outline=True, color="secondary",
                                            className="history-date-btn"),
