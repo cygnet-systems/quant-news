@@ -285,6 +285,26 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
     )
 
 
+def send_test() -> bool:
+    """Send a probe so the mail path can be proven before a run depends on it.
+
+    Exercises the same token + sendMail call the scheduled notifications use,
+    so a success here means the app registration, the sender mailbox and the
+    recipients are all genuinely working — not merely configured.
+    """
+    cfg = _config()
+    if cfg is None:
+        return False
+    body = (
+        "<p>If you are reading this, quant-news can send mail.</p>"
+        f"<p style='color:#666;font-size:13px'>Sent as "
+        f"<code>{cfg['NOTIFY_FROM_EMAIL']}</code> via Microsoft Graph, using "
+        f"the same path as the pre-open and results notifications.</p>"
+    )
+    return _send("quant-news: notification test",
+                 _wrap("Notification test", "Manual probe", body))
+
+
 def notify_job_failure(job_id: str, detail: str) -> bool:
     body = (f'<p>The scheduled job <code>{job_id}</code> did not complete.</p>'
             f'<pre style="background:#f6f6f6;padding:10px;border-radius:4px;'

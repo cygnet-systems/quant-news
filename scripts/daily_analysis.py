@@ -46,7 +46,8 @@ def _configure_logging(verbose: bool) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["analyze", "evaluate", "cost"])
+    parser.add_argument("command",
+                        choices=["analyze", "evaluate", "cost", "notify-test"])
     parser.add_argument("--symbols", help="Comma-separated (default: watchlist)")
     parser.add_argument("--target", help="Target session YYYY-MM-DD "
                                          "(default: next unresolved session)")
@@ -86,6 +87,35 @@ def main() -> int:
         print(json.dumps(summary) if args.json
               else f"Evaluated {count} prediction(s)")
         return 0
+
+    if args.command == "notify-test":
+        from services import notify_service
+
+        # Names only — never echo the values. This is meant to be run in a
+        # deployment console, where the output is not necessarily private.
+        present = [k for k in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID",
+                               "AZURE_CLIENT_SECRET", "NOTIFY_FROM_EMAIL",
+                               "NOTIFY_TO_EMAIL") if os.environ.get(k)]
+        missing = [k for k in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID",
+                               "AZURE_CLIENT_SECRET", "NOTIFY_FROM_EMAIL",
+                               "NOTIFY_TO_EMAIL") if not os.environ.get(k)]
+        print(f"Set:     {', '.join(present) or 'none'}")
+        print(f"Missing: {', '.join(missing) or 'none'}")
+        # The sender and recipients are not secrets and are the two values
+        # most likely to be wrong, so show them.
+        print(f"From:    {os.environ.get('NOTIFY_FROM_EMAIL', '—')}")
+        print(f"To:      {os.environ.get('NOTIFY_TO_EMAIL', '—')}")
+        if missing:
+            print("\nNotifications are OFF until every variable is set.")
+            return 1
+
+        ok = notify_service.send_test()
+        print("\nSent." if ok else
+              "\nSend FAILED — see the traceback above. The usual causes are "
+              "the app registration lacking the Mail.Send APPLICATION "
+              "permission (with admin consent), or an application access "
+              "policy that excludes this mailbox.")
+        return 0 if ok else 1
 
     if args.command == "cost":
         from config import LLM_PRICING_VERIFIED_ON
