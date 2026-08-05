@@ -1007,8 +1007,11 @@ body {
 }
 
 .ai-summary-content h1 { font-size: 16px; }
+
 .ai-summary-content h2 { font-size: 15px; }
+
 .ai-summary-content h3 { font-size: 14px; }
+
 .ai-summary-content h4 { font-size: 13px; }
 
 .ai-summary-content code {
@@ -1233,6 +1236,7 @@ body {
     .panel-resize-handle {
         display: none;
     }
+
 }
 
 /* Icon-only rail: labels are the first thing worth trading for chart width. */
@@ -1264,6 +1268,7 @@ body {
         justify-content: center;
         padding: 8px 0 !important;
     }
+
 }
 
 @media (max-width: 768px) {
@@ -1318,6 +1323,7 @@ body {
     .summary-cards-row {
         grid-template-columns: repeat(2, 1fr);
     }
+
 }
 
 /* =============================================================================
@@ -1372,7 +1378,9 @@ body {
 
 @keyframes fadeInTab {
     from { opacity: 0; transform: translateY(4px); }
+
     to { opacity: 1; transform: translateY(0); }
+
 }
 
 /* =============================================================================
@@ -1823,6 +1831,7 @@ body {
     to {
         transform: rotate(360deg);
     }
+
 }
 
 .loading-status-text {
@@ -1886,6 +1895,7 @@ body {
     .signal-cards-grid {
         grid-template-columns: 1fr;
     }
+
 }
 
 .signal-card {
@@ -2027,7 +2037,9 @@ body {
 
 @keyframes spin {
     0% { transform: rotate(0deg); }
+
     100% { transform: rotate(360deg); }
+
 }
 
 .spinning-icon {
@@ -2037,7 +2049,9 @@ body {
 
 @keyframes fadeInOut {
     0%, 100% { opacity: 0.5; }
+
     50% { opacity: 1; }
+
 }
 
 /* ============================================================
@@ -2220,33 +2234,6 @@ body {
     flex: 1;
 }
 
-/* Override Dash slider styles for dark theme */
-.ensemble-weight-slider .rc-slider-track {
-    background-color: #00D4AA;
-}
-
-.ensemble-weight-slider .rc-slider-handle {
-    border-color: #00D4AA;
-    background-color: #1A1A1A;
-}
-
-.ensemble-weight-slider .rc-slider-rail {
-    background-color: #2A2A2A;
-}
-
-.ensemble-weight-slider .rc-slider-mark-text {
-    color: #666;
-    font-size: 10px;
-}
-
-.ensemble-weight-slider .rc-slider-disabled .rc-slider-track {
-    background-color: #3D3D3D;
-}
-
-.ensemble-weight-slider .rc-slider-disabled .rc-slider-handle {
-    border-color: #3D3D3D;
-}
-
 .ensemble-weight-input {
     width: 56px !important;
     background: #1A1A1A !important;
@@ -2416,13 +2403,15 @@ body {
     font-variant-numeric: tabular-nums;
 }
 
+/* Was uppercase 0.65rem in --text-muted, which came to 2.7:1 against the
+   header fill and made every table shout its column names in text too small
+   to read. Sentence case at a legible size, in the secondary tone. */
 .history-data-table th {
     background-color: var(--bg-tertiary, #242424);
-    color: var(--text-muted);
+    color: var(--text-secondary);
     font-weight: 600;
-    text-transform: uppercase;
-    font-size: 0.65rem;
-    letter-spacing: 0.05em;
+    font-size: var(--text-xs);
+    letter-spacing: 0;
     padding: 8px 10px;
     border-bottom: 1px solid var(--border-subtle, #2A2A2A);
     white-space: nowrap;
@@ -2469,6 +2458,7 @@ body {
 }
 
 .positive { color: var(--positive, #00C805); }
+
 .negative { color: var(--negative, #FF5000); }
 
 .history-dl-btn {
@@ -2612,31 +2602,6 @@ body {
 }
 
 /* Predict date picker — dark theme */
-.predict-date-picker .DateInput_input {
-    background-color: var(--bg-secondary, #1E1E1E);
-    color: var(--text-primary, #E0E0E0);
-    border: 1px solid var(--border-color, #333);
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 0.9rem;
-    width: 160px;
-}
-
-.predict-date-picker .DateInput_input__focused {
-    border-color: var(--accent, #00D4AA);
-}
-
-.predict-date-picker .SingleDatePickerInput {
-    background-color: transparent;
-    border: none;
-}
-
-.predict-date-picker .CalendarDay__selected {
-    background: var(--accent, #00D4AA);
-    border-color: var(--accent, #00D4AA);
-    color: #000;
-}
-
 /* ==========================================================================
    HISTORY TAB — FILTER BAR + COLLAPSIBLE SECTIONS
    ========================================================================== */
@@ -2665,75 +2630,6 @@ body {
 .history-symbol-dropdown {
     width: 100%;
     min-width: 0;
-}
-
-.history-symbol-dropdown .Select {
-    width: 100%;
-}
-
-.history-symbol-dropdown .Select-control {
-    background-color: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    border-radius: 6px !important;
-    color: var(--text-primary, #e0e0e0) !important;
-    min-height: 36px !important;
-}
-
-.history-symbol-dropdown .Select-control:hover {
-    border-color: var(--accent, #00D4AA) !important;
-}
-
-.history-symbol-dropdown .Select-menu-outer {
-    background-color: var(--bg-card, #1a1d23) !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    border-radius: 6px !important;
-    margin-top: 2px !important;
-}
-
-.history-symbol-dropdown .Select-option {
-    background-color: transparent !important;
-    color: var(--text-primary, #e0e0e0) !important;
-    padding: 6px 10px !important;
-    font-size: 0.85rem !important;
-}
-
-.history-symbol-dropdown .Select-option.is-focused {
-    background-color: rgba(0,212,170,0.12) !important;
-}
-
-.history-symbol-dropdown .Select-value {
-    background-color: rgba(0,212,170,0.15) !important;
-    border: 1px solid rgba(0,212,170,0.3) !important;
-    border-radius: 4px !important;
-    color: var(--accent, #00D4AA) !important;
-    font-size: 0.8rem !important;
-}
-
-.history-symbol-dropdown .Select-value-icon {
-    border-right: 1px solid rgba(0,212,170,0.3) !important;
-    color: var(--accent, #00D4AA) !important;
-}
-
-.history-symbol-dropdown .Select-value-icon:hover {
-    background-color: rgba(0,212,170,0.25) !important;
-    color: #fff !important;
-}
-
-.history-symbol-dropdown .Select-input > input {
-    color: var(--text-primary, #e0e0e0) !important;
-}
-
-.history-symbol-dropdown .Select-placeholder {
-    color: var(--text-secondary, #888) !important;
-    font-size: 0.85rem !important;
-}
-
-.history-symbol-dropdown .Select-clear-zone {
-    color: var(--text-secondary, #888) !important;
-}
-
-.history-symbol-dropdown .Select-arrow-zone {
-    color: var(--text-secondary, #888) !important;
 }
 
 /* Recent chips */
@@ -2791,54 +2687,6 @@ body {
 /* Date picker — dark-theme overrides */
 .history-date-picker {
     flex-shrink: 0;
-}
-
-.history-date-picker .DateInput {
-    width: 120px;
-    background: transparent;
-}
-
-.history-date-picker .DateInput_input {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 6px;
-    color: var(--text-primary, #e0e0e0);
-    font-size: 0.82rem;
-    padding: 4px 8px;
-    line-height: 1.4;
-}
-
-.history-date-picker .DateInput_input:focus,
-.history-date-picker .DateInput_input__focused {
-    border-color: var(--accent, #00D4AA);
-    outline: none;
-}
-
-.history-date-picker .SingleDatePickerInput {
-    background: transparent;
-    border: none;
-}
-
-.history-date-picker .SingleDatePickerInput_calendarIcon {
-    padding: 4px;
-    margin: 0 0 0 -4px;
-    color: var(--text-secondary, #888);
-}
-
-.history-date-picker .CalendarDay__selected {
-    background: var(--accent, #00D4AA);
-    border-color: var(--accent, #00D4AA);
-    color: #000;
-}
-
-.history-date-picker .DayPickerNavigation_button {
-    border: 1px solid rgba(255,255,255,0.15);
-    background: rgba(255,255,255,0.04);
-}
-
-.history-date-picker .CalendarMonth_caption {
-    color: var(--text-primary, #e0e0e0);
-    font-size: 0.85rem;
 }
 
 /* Date button group */
@@ -3194,75 +3042,6 @@ body {
     margin-bottom: 4px;
 }
 
-/* The AI Report modal's date picker must read as a sibling of the
-   dbc.Select controls beside it — same height, same dark chrome, full
-   column width — instead of react-dates' default white inline input. */
-.ai-report-datepicker,
-.ai-report-datepicker .SingleDatePicker,
-.ai-report-datepicker .SingleDatePickerInput,
-.ai-report-datepicker .DateInput {
-    display: block;
-    width: 100%;
-}
-
-.ai-report-datepicker .SingleDatePickerInput {
-    background: var(--bg-tertiary, #242424);
-    border: 1px solid var(--border-focus, #3D3D3D);
-    border-radius: 6px;
-}
-
-.ai-report-datepicker .DateInput {
-    background: transparent;
-}
-
-.ai-report-datepicker .DateInput_input {
-    background: transparent;
-    color: var(--text-primary, #FFFFFF);
-    font-size: 0.8rem;
-    font-weight: 400;
-    padding: 6px 10px;
-    border-bottom: none;
-}
-
-.ai-report-datepicker .DateInput_input__focused {
-    border-bottom: 2px solid var(--accent-primary, #00D4AA);
-}
-
-/* Calendar popover: dark theme + clearly struck-out non-trading days */
-.ai-report-datepicker .DayPicker,
-.ai-report-datepicker .CalendarMonth,
-.ai-report-datepicker .CalendarMonthGrid {
-    background: var(--bg-secondary, #1A1A1A);
-}
-
-.ai-report-datepicker .CalendarDay__default {
-    background: var(--bg-secondary, #1A1A1A);
-    border-color: var(--border-subtle, #2A2A2A);
-    color: var(--text-primary, #FFFFFF);
-}
-
-.ai-report-datepicker .CalendarDay__default:hover {
-    background: var(--bg-tertiary, #242424);
-}
-
-.ai-report-datepicker .CalendarDay__selected {
-    background: var(--accent-primary, #00D4AA);
-    border-color: var(--accent-primary, #00D4AA);
-    color: #0D0D0D;
-}
-
-.ai-report-datepicker .CalendarDay__blocked_calendar,
-.ai-report-datepicker .CalendarDay__blocked_out_of_range {
-    background: var(--bg-primary, #0D0D0D);
-    color: var(--text-muted, #666666);
-    text-decoration: line-through;
-}
-
-.ai-report-datepicker .CalendarMonth_caption,
-.ai-report-datepicker .DayPicker_weekHeader {
-    color: var(--text-secondary, #A0A0A0);
-}
-
 .ai-report-article-preview {
     font-size: 0.8rem;
 }
@@ -3285,7 +3064,9 @@ body {
 }
 
 .research-verdict-badge.positive { color: var(--positive, #00C805); }
+
 .research-verdict-badge.negative { color: var(--negative, #FF5000); }
+
 .research-verdict-badge.neutral  { color: var(--neutral, #FFD700); }
 
 .research-report-footnote {
@@ -3373,16 +3154,6 @@ body {
     margin: 14px 0 6px;
 }
 
-.predict-date-picker .DateRangePickerInput {
-    background: transparent;
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 6px;
-}
-
-.predict-date-picker .DateRangePickerInput_arrow {
-    color: var(--text-secondary, #888);
-}
-
 /* Pipeline activity feed */
 .progress-panel-container {
     position: fixed;
@@ -3442,6 +3213,7 @@ body {
 
 @keyframes progress-spin {
     to { transform: rotate(360deg); }
+
 }
 
 .progress-header-done {
@@ -3478,10 +3250,15 @@ body {
 }
 
 .progress-icon-ta { color: #7B61FF; }
+
 .progress-icon-luna { color: #f0b429; }
+
 .progress-icon-ai { color: #38bdf8; }
+
 .progress-icon-models { color: var(--accent, #00D4AA); }
+
 .progress-icon-done { color: var(--positive, #22c55e); }
+
 .progress-icon-error { color: var(--negative, #ef4444); }
 
 .progress-msg {
@@ -3490,6 +3267,7 @@ body {
 }
 
 .progress-line-error .progress-msg { color: var(--negative, #ef4444); }
+
 .progress-line-done .progress-msg {
     color: var(--positive, #22c55e);
     font-weight: 600;
@@ -3554,6 +3332,7 @@ body {
     flex-wrap: wrap;
     gap: 2px 0;
 }
+
 .period-selector .period-cluster-start {
     margin-left: 10px !important;
     border-top-left-radius: var(--bs-border-radius-sm) !important;
@@ -3621,9 +3400,13 @@ body {
 }
 
 .scheduler-status-ok { color: var(--positive); }
+
 .scheduler-status-error { color: var(--negative); }
+
 .scheduler-status-muted { color: var(--text-muted); }
+
 .scheduler-status-running { color: var(--accent-primary); }
+
 .scheduler-meta { color: var(--text-secondary); }
 
 .scheduler-row {
@@ -3688,7 +3471,9 @@ body {
 }
 
 .scheduler-feedback { font-size: 0.76rem; }
+
 .scheduler-feedback-ok { color: var(--positive); }
+
 .scheduler-feedback-error { color: var(--negative); }
 
 .scheduler-details { margin-top: 10px; }
@@ -3877,10 +3662,15 @@ body {
 }
 
 .home-chip-decision { font-weight: 600; }
+
 .home-chip-conf { color: var(--text-muted); font-size: var(--text-2xs); }
+
 .home-chip-positive { color: var(--positive); background: rgba(0, 200, 5, 0.08); }
+
 .home-chip-negative { color: var(--negative); background: rgba(255, 80, 0, 0.08); }
+
 .home-chip-neutral  { color: var(--text-secondary); background: var(--bg-tertiary); }
+
 .home-chip-none     { color: var(--text-muted); }
 
 .home-symbol { font-weight: 600; }
@@ -3924,9 +3714,13 @@ body {
 }
 
 .home-open-block { padding: var(--space-2) 0; }
+
 .home-open-block + .home-open-block { border-top: 1px solid var(--border-subtle); }
+
 .home-open-head { display: flex; gap: var(--space-3); align-items: baseline; }
+
 .home-open-date { font-weight: 600; }
+
 .home-open-symbols { font-size: var(--text-xs); color: var(--text-secondary); }
 
 .home-job-row {
@@ -3939,6 +3733,7 @@ body {
 }
 
 .home-job-row + .home-job-row { border-top: 1px solid var(--border-subtle); }
+
 .home-job-name { font-weight: 600; }
 
 .home-empty-note {
@@ -4002,6 +3797,7 @@ body {
 }
 
 .activity-filter-field { min-width: 150px; }
+
 .activity-filter-wide { min-width: 260px; flex: 1 1 260px; }
 
 .search-restore-btn {
@@ -4033,103 +3829,256 @@ body {
     margin: var(--space-4) 0 var(--space-2);
 }
 
-/* The date picker in the run dialog inherited only the input-level rules, so
-   its wrapper stayed light-themed and stretched to the modal width. */
-#run-modal .SingleDatePicker,
-#run-modal .SingleDatePickerInput,
-#run-modal .DateInput {
-    background-color: transparent;
-    width: auto;
+/* =============================================================================
+   DASH 4 COMPONENT THEME
+
+   Dash 4.4.1 replaced its react-dates / react-select internals with its own
+   components, driven by a --Dash-* token set that ships light by default.
+   Every .DateInput_input / .CalendarDay / .Select-control rule this file used
+   to carry had quietly stopped matching anything, which is why the date input
+   rendered as a white box with invisible text.
+
+   Retheming the tokens fixes every Dash component at once and keeps working
+   when new ones appear, instead of chasing each vendor class by specificity
+   (Dash's own selectors are more specific than a single class, so that fight
+   ends in !important).
+   ============================================================================= */
+
+:root {
+    --Dash-Text-Strong: var(--text-primary);
+    --Dash-Text-Primary: var(--text-primary);
+    --Dash-Text-Weak: var(--text-secondary);
+    --Dash-Text-Disabled: var(--text-muted);
+
+    /* Was #7f4bc4. One accent for the whole app, and it is teal. */
+    --Dash-Fill-Interactive-Strong: var(--accent-primary);
+    --Dash-Fill-Interactive-Weak: rgb(255 255 255 / 0.06);
+    --Dash-Fill-Primary-Hover: rgb(255 255 255 / 0.06);
+    --Dash-Fill-Primary-Active: rgb(255 255 255 / 0.10);
+    --Dash-Fill-Disabled: rgb(255 255 255 / 0.04);
+    /* The popup surface. Light by default, hence the white calendar. */
+    --Dash-Fill-Inverse-Strong: var(--bg-secondary);
+
+    --Dash-Stroke-Strong: var(--border-focus);
+    --Dash-Stroke-Weak: var(--border-subtle);
+
+    --Dash-Shading-Strong: rgb(0 0 0 / 0.55);
+    --Dash-Shading-Weak: rgb(0 0 0 / 0.35);
 }
 
-#run-modal .DateInput {
+/* Selected day: the token gives it a teal fill, so its label needs to flip to
+   dark rather than inherit the light-on-light default. */
+.dash-datepicker-calendar td[aria-selected="true"],
+.dash-datepicker-calendar td[data-selected],
+.dash-datepicker-calendar td.dash-datepicker-calendar-date-selected {
+    color: #000;
+    font-weight: 600;
+}
+
+/* Dates are figures: same treatment as every other number in the app. */
+.dash-datepicker-input,
+.dash-datepicker-calendar td,
+.dash-datepicker-calendar th {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+.dash-datepicker-input-wrapper {
     border-radius: var(--radius-sm);
-    overflow: hidden;
 }
 
-#run-modal .DateInput_input {
+.dash-datepicker-content {
+    border-radius: var(--card-radius);
+    z-index: 2000;
+}
+
+/* =============================================================================
+   BOOTSTRAP CONTROLS — global dark theme
+
+   These were previously styled per instance (.symbol-input, and a rule bound
+   to .stock-input-container .input-group .form-control), so every control
+   added afterwards fell back to Bootstrap's light default: the run dialog's
+   selects and the Activity symbol filter rendered as white boxes. Theming the
+   families once fixes those and anything added later.
+   ============================================================================= */
+
+.form-control,
+.form-select {
     background-color: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm);
-    padding: 6px 10px;
-    font-family: var(--font-mono);
-    font-size: var(--text-base);
-    width: 150px;
 }
 
-#run-modal .SingleDatePickerInput {
-    border: none;
+.form-control:focus,
+.form-select:focus {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary);
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px rgb(0 212 170 / 0.15);
 }
 
-/* Date picker popup ---------------------------------------------------------
-   react-dates ships a light calendar, and the app's --text-primary is #FFFFFF,
-   so the month caption and weekday letters rendered white on white — the
-   calendar opened looking blank apart from the day numbers. Theme the popup
-   dark rather than patching one caption colour, so it matches everything
-   around it. */
-
-.history-date-picker .SingleDatePicker_picker,
-.history-date-picker .DayPicker,
-.history-date-picker .DayPicker_focusRegion,
-.history-date-picker .CalendarMonthGrid,
-.history-date-picker .CalendarMonth,
-.history-date-picker .DayPicker_transitionContainer {
-    background: var(--bg-secondary, #1A1A1A) !important;
+.form-control::placeholder {
+    color: var(--text-muted);
+    opacity: 1;
 }
 
-.history-date-picker .DayPicker {
-    border: 1px solid var(--border-subtle, #2A2A2A);
-    border-radius: 8px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+.form-control:disabled,
+.form-select:disabled {
+    background-color: var(--bg-secondary);
+    color: var(--text-muted);
 }
 
-.history-date-picker .CalendarMonth_caption,
-.history-date-picker .CalendarMonth_caption strong {
-    color: var(--text-primary, #FFFFFF) !important;
-    font-size: 0.9rem;
+/* Bootstrap inlines a near-black chevron as a background SVG, which is
+   invisible on a dark control. */
+.form-select {
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23A0A0A0' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='m2 5 6 6 6-6'/%3e%3c/svg%3e");
+}
+
+.form-select option {
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+/* One accent for every toggle and checkbox, rather than Bootstrap's blue. */
+.form-check-input {
+    background-color: var(--bg-tertiary);
+    border-color: var(--border-focus);
+}
+
+.form-check-input:checked {
+    background-color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+.form-check-input:focus {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px rgb(0 212 170 / 0.15);
+}
+
+/* The accent is a light teal, so its label has to be dark. White on teal is
+   about 1.9:1, which is unreadable; black is about 11:1. */
+.btn-primary,
+.btn-success {
+    --bs-btn-color: #000;
+    --bs-btn-bg: var(--accent-primary);
+    --bs-btn-border-color: var(--accent-primary);
+    --bs-btn-hover-color: #000;
+    --bs-btn-hover-bg: var(--accent-hover);
+    --bs-btn-hover-border-color: var(--accent-hover);
+    --bs-btn-active-color: #000;
+    --bs-btn-active-bg: var(--accent-hover);
+    --bs-btn-active-border-color: var(--accent-hover);
+    --bs-btn-disabled-color: var(--text-muted);
+    --bs-btn-disabled-bg: var(--bg-tertiary);
+    --bs-btn-disabled-border-color: var(--border-subtle);
     font-weight: 600;
 }
 
-.history-date-picker .DayPicker_weekHeader,
-.history-date-picker .DayPicker_weekHeader_li small {
-    color: var(--text-muted, #666) !important;
-    font-size: 0.72rem;
+
+/* =============================================================================
+   SLIDER (Dash 4 `dash-slider`)
+
+   Ports the ensemble weight slider off rc-slider, which Dash 4 no longer
+   renders. Global rather than scoped to .ensemble-weight-slider, for the same
+   reason as the controls above: the next slider should arrive themed.
+   ============================================================================= */
+
+.dash-slider-track {
+    background-color: var(--border-subtle);
 }
 
-.history-date-picker .CalendarDay__default {
-    background: var(--bg-secondary, #1A1A1A);
-    border: 1px solid var(--border-subtle, #2A2A2A);
+.dash-slider-range {
+    background-color: var(--accent-primary);
+}
+
+.dash-slider-thumb {
+    background-color: var(--bg-secondary);
+    border: 2px solid var(--accent-primary);
+}
+
+.dash-slider-thumb:hover,
+.dash-slider-thumb:focus {
+    border-color: var(--accent-hover);
+    box-shadow: 0 0 0 4px rgb(0 212 170 / 0.18);
+    outline: none;
+}
+
+.dash-slider-mark {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+}
+
+.dash-slider-dot {
+    background-color: var(--bg-tertiary);
+    border-color: var(--border-subtle);
+}
+
+.dash-slider-tooltip {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+}
+
+/* Disabled weights read as inert rather than merely dimmer. */
+.dash-slider-root[data-disabled] .dash-slider-range,
+.dash-slider-wrapper[data-disabled] .dash-slider-range {
+    background-color: var(--border-focus);
+}
+
+.dash-slider-root[data-disabled] .dash-slider-thumb,
+.dash-slider-wrapper[data-disabled] .dash-slider-thumb {
+    border-color: var(--border-focus);
+}
+
+/* Scheduler: type badge, delete, create form ------------------------------- */
+
+.scheduler-title-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.scheduler-type-badge {
+    font-size: 0.65rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: rgba(255, 255, 255, 0.08) !important;
+    color: var(--text-secondary, #A0A0A0) !important;
+}
+
+.scheduler-delete-btn {
+    padding: 2px 8px !important;
+    line-height: 1.4;
+}
+
+.scheduler-field-grow {
+    flex: 1 1 200px;
+}
+
+.scheduler-new {
+    border: 1px dashed var(--border-subtle, #2A2A2A);
+    border-radius: 6px;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.015);
+}
+
+.scheduler-new-summary {
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
     color: var(--text-secondary, #A0A0A0);
+    user-select: none;
 }
 
-.history-date-picker .CalendarDay__default:hover {
-    background: var(--bg-tertiary, #242424);
+.scheduler-new-summary:hover {
     color: var(--text-primary, #FFFFFF);
 }
 
-/* Days with no data are still selectable; grey them so the eye goes to the
-   sessions that have something behind them. */
-.history-date-picker .CalendarDay__blocked_out_of_range,
-.history-date-picker .CalendarDay__blocked_out_of_range:hover {
-    background: var(--bg-primary, #0D0D0D);
-    color: var(--text-muted, #444);
-}
-
-.history-date-picker .CalendarDay__today {
-    font-weight: 700;
-    color: var(--accent-primary, #00D4AA);
-}
-
-.history-date-picker .DayPickerNavigation_button__default {
-    background: var(--bg-tertiary, #242424);
-    border: 1px solid var(--border-subtle, #2A2A2A);
-}
-
-.history-date-picker .DayPickerNavigation_svg__horizontal {
-    fill: var(--text-secondary, #A0A0A0);
-}
-
-.history-date-picker .DayPickerKeyboardShortcuts_show__bottomRight {
-    display: none;
+.scheduler-new-body {
+    margin-top: 12px;
 }

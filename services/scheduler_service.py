@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -60,6 +62,62 @@ _applied: dict[str, tuple] = {}
 # Last overdue alert sent, so the half-hourly watchdog does not mail the
 # same miss all day.
 _last_overdue_alert: dict[str, object] = {}
+
+
+# ---------------------------------------------------------------------------
+# Operation types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class JobType:
+    """One kind of scheduled operation.
+
+    Declarative so a new operation — options flow, a rebalance, a different
+    research pass — is an entry in this table plus a CLI verb, rather than
+    another branch in the command builder and another special case in the UI.
+    ``needs_symbols`` drives whether the form shows a symbol list at all.
+    """
+
+    kind: str
+    label: str
+    description: str
+    verb: str                      # the daily_analysis.py subcommand
+    needs_symbols: bool = False
+    default_hour: int = 8
+    default_minute: int = 30
+
+
+JOB_TYPES: dict[str, JobType] = {
+    "analysis": JobType(
+        kind="analysis",
+        label="Predict",
+        description="Run every model over a watchlist and synthesize the calls",
+        verb="analyze",
+        needs_symbols=True,
+        default_hour=8,
+        default_minute=30,
+    ),
+    "evaluation": JobType(
+        kind="evaluation",
+        label="Evaluate",
+        description="Score predictions whose target session has closed",
+        verb="evaluate",
+        needs_symbols=False,
+        default_hour=18,
+        default_minute=0,
+    ),
+}
+
+
+def list_job_types() -> list[dict]:
+    """Operation types the UI can offer, for a create form."""
+    return [
+        {"kind": t.kind, "label": t.label, "description": t.description,
+         "needs_symbols": t.needs_symbols,
+         "default_hour": t.default_hour, "default_minute": t.default_minute}
+        for t in JOB_TYPES.values()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +155,17 @@ def seed_default_jobs() -> None:
     """Create the two standard jobs if they don't exist. Never overwrites."""
     from db.models import ScheduledJob
     from db.session import get_session
+    from sqlalchemy import func, select
 
     with get_session() as session:
+        # Only into an EMPTY table. Seeding per-id would resurrect a job the
+        # user deliberately deleted on the next restart, which is a confusing
+        # thing for a schedule to do.
+        if session.execute(select(func.count()).select_from(ScheduledJob)).scalar():
+            return
         for spec in DEFAULT_JOBS:
-            if session.get(ScheduledJob, spec["id"]) is None:
-                session.add(ScheduledJob(**spec))
-                logger.info(f"Seeded scheduled job: {spec['id']}")
+            session.add(ScheduledJob(**spec))
+            logger.info(f"Seeded scheduled job: {spec['id']}")
 
 
 def list_jobs() -> list[dict]:
@@ -136,7 +199,88 @@ def list_jobs() -> list[dict]:
     for job in jobs:
         job["next_run_at"] = _next_run_at(job["id"])
         job["running"] = job["id"] in _running_jobs()
+        # The type drives what the form shows, so the UI never has to know
+        # which kinds take a symbol list.
+        job_type = JOB_TYPES.get(job["kind"])
+        job["type_label"] = job_type.label if job_type else job["kind"]
+        job["needs_symbols"] = bool(job_type and job_type.needs_symbols)
     return jobs
+
+
+def create_job(kind: str, description: str, hour: int, minute: int,
+               days_of_week: str = "mon-fri", timezone: str = "US/Eastern",
+               symbols_csv: str | None = None,
+               params: dict | None = None) -> Optional[str]:
+    """Add a scheduled job. Returns its id, or None if the type is unknown.
+
+    The id is derived from the description so the run history and the
+    advisory lock read as something a person chose, with a numeric suffix
+    only when a name is reused.
+    """
+    from db.models import ScheduledJob
+    from db.session import get_session
+
+    job_type = JOB_TYPES.get(kind)
+    if job_type is None:
+        logger.warning(f"create_job: unknown operation type {kind!r}")
+        return None
+
+    base = re.sub(r"[^a-z0-9]+", "_", (description or job_type.label).lower()).strip("_")
+    base = (base or job_type.kind)[:48]
+
+    with get_session() as session:
+        job_id, n = base, 2
+        while session.get(ScheduledJob, job_id) is not None:
+            job_id = f"{base}_{n}"
+            n += 1
+        session.add(ScheduledJob(
+            id=job_id,
+            kind=kind,
+            description=description or job_type.label,
+            enabled=True,
+            hour=max(0, min(23, int(hour))),
+            minute=max(0, min(59, int(minute))),
+            days_of_week=days_of_week or "mon-fri",
+            timezone=timezone or "US/Eastern",
+            symbols_csv=symbols_csv if job_type.needs_symbols else None,
+            params_json=params or {},
+            owner_uid=_owner_uid(),
+        ))
+
+    _reschedule(job_id)
+    logger.info(f"Created scheduled job {job_id} ({kind})")
+    return job_id
+
+
+def delete_job(job_id: str) -> bool:
+    """Remove a job from the schedule, keeping its run history.
+
+    The runs stay: they are the record of what the platform did, and losing
+    them because someone retired a job would make the scoreboard's provenance
+    unexplainable.
+    """
+    from db.models import ScheduledJob
+    from db.session import get_session
+
+    with get_session() as session:
+        row = session.get(ScheduledJob, job_id)
+        if row is None:
+            return False
+        session.delete(row)
+
+    if _scheduler is not None and _scheduler.get_job(job_id):
+        _scheduler.remove_job(job_id)
+    _applied.pop(job_id, None)
+    logger.info(f"Deleted scheduled job {job_id}")
+    return True
+
+
+def _owner_uid():
+    try:
+        from services.auth_service import current_uid
+        return current_uid()
+    except Exception:
+        return None
 
 
 def update_job(job_id: str, **fields) -> bool:
@@ -236,10 +380,14 @@ def reap_abandoned_runs() -> int:
 
 def _build_command(job: dict) -> list[str]:
     params = job.get("params") or {}
-    if job["kind"] == "evaluation":
-        return [sys.executable, CLI, "evaluate", "--json"]
+    job_type = JOB_TYPES.get(job["kind"])
+    if job_type is None:
+        raise ValueError(f"unknown operation type: {job['kind']}")
 
-    cmd = [sys.executable, CLI, "analyze", "--json"]
+    cmd = [sys.executable, CLI, job_type.verb, "--json"]
+    if not job_type.needs_symbols:
+        return cmd
+
     if job.get("symbols_csv"):
         cmd += ["--symbols", job["symbols_csv"]]
     if params.get("only_trading_days", True):

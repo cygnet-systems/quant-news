@@ -205,10 +205,21 @@ def create_layout() -> html.Div:
                         [
                             create_topbar(),
                             create_watchlist_panel(),
+                            # target_components pins this to route changes.
+                            # By default a Loading reacts to every callback
+                            # writing anywhere inside it, so a filter change
+                            # unmounted the whole section for as long as the
+                            # request took. overlay_style keeps the children
+                            # on screen and dims them instead of blanking,
+                            # and delay_show stops fast updates flashing.
                             dcc.Loading(
                                 html.Div(id="page-content", className="page-content"),
                                 type="circle",
                                 color="#00D4AA",
+                                target_components={"page-content": "children"},
+                                overlay_style={"visibility": "visible",
+                                               "opacity": 0.45},
+                                delay_show=350,
                             ),
                         ],
                         className="shell-main",

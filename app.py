@@ -1960,6 +1960,9 @@ def update_symbol_tabs(symbols, news_data, stored_tab):
                 html.Div(id="tab-content", className="tab-content-host"),
                 type="circle",
                 color="#00D4AA",
+                target_components={"tab-content": "children"},
+                overlay_style={"visibility": "visible", "opacity": 0.45},
+                delay_show=350,
             ),
         ],
     )
@@ -2858,8 +2861,9 @@ _PROGRESS_POLL_IDLE_MS = 10_000
     Output("progress-header-icon", "children"),
     Output("progress-interval", "interval"),
     Input("progress-interval", "n_intervals"),
+    State("progress-interval", "interval"),
 )
-def render_progress_panel(_n):
+def render_progress_panel(_n, _current_interval):
     """Live activity feed for pipeline runs.
 
     Streams events emitted by every stage (including the background model
@@ -2872,8 +2876,11 @@ def render_progress_panel(_n):
     events = feed.get("events") or []
     poll = (_PROGRESS_POLL_ACTIVE_MS if feed.get("active")
             else _PROGRESS_POLL_IDLE_MS)
+    # Writing interval on every tick restarts the timer and costs a DOM update
+    # for no change; only send it when the rate actually changes.
+    poll_out = poll if poll != _current_interval else dash.no_update
     if not events:
-        return dash.no_update, dash.no_update, dash.no_update, poll
+        return dash.no_update, dash.no_update, dash.no_update, poll_out
 
     # No auto-hide: the panel is an audit log now, so it stays up until the
     # user closes it. (It previously vanished 5 minutes after a run finished.)
@@ -2896,7 +2903,7 @@ def render_progress_panel(_n):
                    if feed.get("active")
                    else html.I(className="bi bi-check-circle-fill progress-header-done"))
 
-    return rows, f"{len(events)} events", header_icon, poll
+    return rows, f"{len(events)} events", header_icon, poll_out
 
 
 @callback(
@@ -2930,10 +2937,18 @@ def update_progress_panel_state(_e, _m, _c, _r, state):
     Output("progress-reopen-btn", "style"),
     Output("progress-expand-icon", "className"),
     Output("progress-min-icon", "className"),
+    Output("progress-interval", "disabled"),
     Input("progress-panel-state", "data"),
 )
 def apply_progress_panel_state(state):
-    """Translate panel state into layout. Sizing lives in CSS classes."""
+    """Translate panel state into layout. Sizing lives in CSS classes.
+
+    Closing the panel also stops the poll. The feed is written by a background
+    subprocess (and possibly by another instance running the scheduler), so
+    the browser has no way to be notified and has to ask; but there is nothing
+    to ask for while the panel is shut. Reopening rehydrates from the stored
+    feed, so nothing is lost by not having polled meanwhile.
+    """
     state = state or {}
     closed = bool(state.get("closed"))
     mode = state.get("mode", "normal")
@@ -2951,6 +2966,7 @@ def apply_progress_panel_state(state):
         "bi bi-arrows-angle-contract" if mode == "expanded"
         else "bi bi-arrows-angle-expand",
         "bi bi-plus-lg" if mode == "minimised" else "bi bi-dash-lg",
+        closed,
     )
 
 
@@ -3429,6 +3445,7 @@ def render_scheduler_panel(_n, _action):
         return build_scheduler_panel(
             scheduler_service.list_jobs(),
             scheduler_service.recent_runs(limit=8),
+            scheduler_service.list_job_types(),
         )
     except Exception as e:
         logger.warning(f"Scheduler panel render failed: {e}")
@@ -3484,6 +3501,71 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols):
     state = "enabled" if enabled else "disabled"
     return html.Span(f"Saved — {state}, {hour:02d}:{minute:02d} {tz}",
                      className="scheduler-feedback-ok")
+
+
+@callback(
+    Output("scheduler-action-status", "data", allow_duplicate=True),
+    Output("sched-create-feedback", "children"),
+    Input("sched-create", "n_clicks"),
+    State("sched-new-kind", "value"),
+    State("sched-new-name", "value"),
+    State("sched-new-hour", "value"),
+    State("sched-new-minute", "value"),
+    State("sched-new-days", "value"),
+    State("sched-new-tz", "value"),
+    State("sched-new-symbols", "value"),
+    prevent_initial_call=True,
+)
+def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols):
+    """Add a job of any registered operation type."""
+    if not n_clicks:
+        raise PreventUpdate
+
+    from services import scheduler_service
+
+    if not kind:
+        return dash.no_update, html.Span("Pick an operation",
+                                         className="scheduler-feedback-error")
+    try:
+        hour, minute = int(hour), int(minute)
+    except (TypeError, ValueError):
+        return dash.no_update, html.Span("Time must be a number",
+                                         className="scheduler-feedback-error")
+
+    cleaned = ",".join(s.strip().upper()
+                       for s in str(symbols or "").replace("\n", ",").split(",")
+                       if s.strip())
+    needs = {t["kind"]: t["needs_symbols"] for t in scheduler_service.list_job_types()}
+    if needs.get(kind) and not cleaned:
+        return dash.no_update, html.Span("This operation needs at least one symbol",
+                                         className="scheduler-feedback-error")
+
+    job_id = scheduler_service.create_job(
+        kind=kind, description=(name or "").strip(), hour=hour, minute=minute,
+        days_of_week=days, timezone=tz, symbols_csv=cleaned or None,
+        params={"only_trading_days": True},
+    )
+    if not job_id:
+        return dash.no_update, html.Span("Could not create the job",
+                                         className="scheduler-feedback-error")
+    return ({"created": job_id, "at": datetime.now().isoformat()},
+            html.Span(f"Created {job_id}", className="scheduler-feedback-ok"))
+
+
+@callback(
+    Output("scheduler-action-status", "data", allow_duplicate=True),
+    Input({"type": "sched-delete", "job": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def delete_scheduled_job(clicks):
+    """Remove a job. Its run history stays — that is the record of what ran."""
+    if not clicks or not any(c for c in clicks if c):
+        raise PreventUpdate
+
+    from services import scheduler_service
+    job_id = ctx.triggered_id["job"]
+    scheduler_service.delete_job(job_id)
+    return {"deleted": job_id, "at": datetime.now().isoformat()}
 
 
 @callback(
