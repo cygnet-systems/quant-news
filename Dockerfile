@@ -23,13 +23,26 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-bake Kronos weights — zero runtime downloads
+# HF_HOME must be set BEFORE the downloads so they land where the runtime
+# looks. Previously it was set after, and the download passed
+# cache_dir=/app/models_cache — which makes that path the cache ROOT, while
+# HF_HOME expects the hub cache one level down at $HF_HOME/hub. The weights
+# were baked into the image and then never found, so Kronos failed on every
+# symbol in production with "cannot find the requested files in the local
+# cache". One variable now governs both sides.
+ENV HF_HOME=/app/models_cache
+
+# Pre-bake every model weight — zero runtime downloads. DeBERTa was missing
+# here entirely, so it could not load offline either; it returned HOLD
+# without scoring anything and looked like a working model.
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('NeoQuasar/Kronos-mini', cache_dir='/app/models_cache'); \
-snapshot_download('NeoQuasar/Kronos-Tokenizer-base', cache_dir='/app/models_cache')"
+snapshot_download('NeoQuasar/Kronos-mini'); \
+snapshot_download('NeoQuasar/Kronos-Tokenizer-base'); \
+snapshot_download('mrm8488/deberta-v3-ft-financial-news-sentiment-analysis')"
 
-ENV HF_HOME=/app/models_cache
+# Only AFTER the downloads — set earlier, they would block the build's own
+# fetches.
 ENV TRANSFORMERS_OFFLINE=1
 ENV HF_HUB_OFFLINE=1
 
