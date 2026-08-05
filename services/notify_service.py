@@ -333,6 +333,40 @@ def send_test() -> bool:
                  _wrap("Notification test", "Manual probe", body))
 
 
+def notify_partial(job_id: str, reasons: list[str], summary: dict) -> bool:
+    """The run finished and stored data, but not all of what it was asked for.
+
+    Kept distinct from a failure because the two need different responses: a
+    failure means today has no analysis, a partial means today has one you
+    should not fully trust.
+    """
+    coverage = summary.get("model_coverage") or {}
+    rows = "".join(
+        f'<tr><td style="{_TD}">{m}</td>'
+        f'<td style="{_TD};color:{"#D93900" if n == 0 else "#666"}">{n}</td></tr>'
+        for m, n in sorted(coverage.items())
+    )
+    body = (
+        "<p>The run completed and stored predictions, but did not produce "
+        "everything it was asked for:</p><ul>"
+        + "".join(f"<li>{r}</li>" for r in reasons)
+        + "</ul>"
+    )
+    if rows:
+        body += (
+            f'<h3 style="font-size:14px;margin:18px 0 6px">Symbols scored per model</h3>'
+            f'<table style="border-collapse:collapse;min-width:300px">'
+            f'<tr><th style="{_TH}">Model</th><th style="{_TH}">Scored</th></tr>'
+            f'{rows}</table>'
+        )
+    body += ('<p style="color:#666;font-size:13px;margin-top:14px">'
+             'Today is recorded as not-yet-successful, so /healthz reports it '
+             'overdue. It will not retry on its own — re-run it from '
+             'History &rarr; Scheduled Jobs once the cause is fixed.</p>')
+    return _send(f"⚠️ quant-news: {job_id} partial — {reasons[0] if reasons else 'incomplete'}",
+                 _wrap("Partial run", summary.get("target_date", job_id), body))
+
+
 def notify_job_failure(job_id: str, detail: str) -> bool:
     body = (f'<p>The scheduled job <code>{job_id}</code> did not complete.</p>'
             f'<pre style="background:#f6f6f6;padding:10px;border-radius:4px;'

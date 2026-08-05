@@ -755,7 +755,15 @@ def run_full_analysis(
     except Exception as e:
         logger.info(f"AI report not archived to object storage: {e}")
 
-    prog.finish_run("Full Analysis complete (scheduled)")
+    coverage, degraded = _assess_completeness(
+        signals, priced, models, recommendations)
+
+    if degraded:
+        prog.emit("error", "Full Analysis incomplete — " + "; ".join(degraded))
+        prog.finish_run("Full Analysis PARTIAL — " + "; ".join(degraded))
+    else:
+        prog.finish_run("Full Analysis complete (scheduled)")
+
     return {
         "symbols": priced,
         "skipped": [s for s in symbols if s not in priced],
@@ -766,8 +774,50 @@ def run_full_analysis(
         "evaluated": evaluated,
         "actions": {s: v.get("action")
                     for s, v in ((recommendations or {}).get("by_symbol") or {}).items()},
+        "model_coverage": coverage,
+        "degraded": degraded,
         "duration_s": round((datetime.now() - started).total_seconds(), 1),
     }
+
+
+def _assess_completeness(
+    signals: dict,
+    symbols: list[str],
+    models: Optional[set[str]],
+    recommendations: Optional[dict],
+) -> tuple[dict, list[str]]:
+    """How much of the run actually landed, and what is missing.
+
+    A run that ships four of six models and no synthesis is not a success —
+    it is a partial result that happens to have exited zero. Every model
+    failure here is caught per model by design (one broken model must not
+    lose the other five), so without an explicit completeness check the only
+    signal left is the exit code, which says nothing about coverage. That is
+    how two dead models and a truncated synthesis ran unnoticed for a full
+    cycle in production.
+
+    Returns ``(coverage, degraded)`` — symbols scored per model, and a list
+    of human-readable reasons, empty when the run is whole.
+    """
+    expected = set(models or ALL_MODELS) | {"ensemble"}
+    coverage = {name: 0 for name in expected}
+    for symbol in symbols:
+        for name, result in (signals.get(symbol) or {}).items():
+            if name in coverage and isinstance(result, dict) and not result.get("error"):
+                coverage[name] += 1
+
+    n = len(symbols)
+    degraded: list[str] = []
+    dead = sorted(m for m, scored in coverage.items() if scored == 0)
+    partial = sorted(m for m, scored in coverage.items() if 0 < scored < n)
+    if dead:
+        degraded.append(f"scored nothing: {', '.join(dead)}")
+    if partial:
+        degraded.append("incomplete: " + ", ".join(
+            f"{m} {coverage[m]}/{n}" for m in partial))
+    if not (recommendations or {}).get("by_symbol"):
+        degraded.append("no recommendations produced")
+    return coverage, degraded
 
 
 def evaluate_pending() -> int:

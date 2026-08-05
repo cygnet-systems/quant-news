@@ -179,8 +179,16 @@ def main() -> int:
                 print(f"Skipped (no price data): {', '.join(summary['skipped'])}")
             for sym, action in (summary.get("actions") or {}).items():
                 print(f"  {sym}: {action}")
+            for reason in summary.get("degraded") or []:
+                print(f"  PARTIAL: {reason}")
 
-    return 1 if summary.get("error") or not summary.get("predictions_stored") else 0
+    # Three outcomes, not two. A run that stored predictions but lost whole
+    # models, or produced no synthesis, is neither a success nor a failure —
+    # collapsing it into either one is what hid a two-model outage for a full
+    # cycle. 2 is the caller's cue to record it as partial.
+    if summary.get("error") or not summary.get("predictions_stored"):
+        return 1
+    return 2 if summary.get("degraded") else 0
 
 
 if __name__ == "__main__":

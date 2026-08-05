@@ -294,7 +294,10 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
         )
         tail = (proc.stdout or "").strip().splitlines()
         detail = "\n".join(tail[-25:]) if tail else ""
-        if proc.returncode != 0:
+        if proc.returncode == 2:
+            # Ran and stored something, but not everything it was asked for.
+            status = "partial"
+        elif proc.returncode != 0:
             status = "error"
             err = (proc.stderr or "").strip().splitlines()
             detail = (detail + "\n" + "\n".join(err[-15:])).strip()
@@ -339,7 +342,11 @@ def _notify(job: dict, status: str, detail: str, started: datetime,
     try:
         if not notify_service.enabled():
             return
-        if status != "success":
+        if status == "partial":
+            summary = _parse_summary(detail)
+            notify_service.notify_partial(
+                job["id"], summary.get("degraded") or [], summary)
+        elif status != "success":
             notify_service.notify_job_failure(job["id"], detail)
         elif job["kind"] == "analysis":
             notify_service.notify_analysis(
@@ -519,6 +526,16 @@ def _catch_up() -> None:
         if not window_passed:
             continue
         if job["last_success_date"] == today.isoformat():
+            continue
+        # Already attempted today — do not retry automatically. A partial run
+        # deliberately withholds last_success_date so it shows as overdue, and
+        # without this a restart loop would re-run an expensive analysis on
+        # every boot chasing a completeness it cannot reach on its own.
+        # Re-running a partial is a decision, so it stays manual.
+        last_run = job.get("last_run_at")
+        if last_run and last_run.astimezone(now.tzinfo).date() == today:
+            logger.info(f"Catch-up: {job['id']} already attempted today "
+                        f"({job.get('last_status')}) — not retrying automatically")
             continue
         logger.info(f"Catch-up: {job['id']} missed its {job['hour']:02d}:"
                     f"{job['minute']:02d} window today — running now")
