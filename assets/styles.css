@@ -3289,3 +3289,188 @@ body {
     border-top-left-radius: var(--bs-border-radius-sm) !important;
     border-bottom-left-radius: var(--bs-border-radius-sm) !important;
 }
+
+/* =========================================================================
+   Scheduler panel (History tab)
+   ========================================================================= */
+
+.scheduler-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.scheduler-card {
+    background: var(--bg-secondary) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 6px;
+}
+
+.scheduler-card .card-body {
+    padding: 12px 14px;
+}
+
+.scheduler-job-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.scheduler-job-heading {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.25;
+    min-width: 0;
+}
+
+.scheduler-job-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.scheduler-job-id {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    background: none;
+    padding: 0;
+}
+
+.scheduler-switch {
+    margin: 0;
+    padding-left: 2.4em;
+}
+
+.scheduler-status-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin: 8px 0 10px;
+    font-size: 0.78rem;
+}
+
+.scheduler-status-ok { color: var(--positive); }
+.scheduler-status-error { color: var(--negative); }
+.scheduler-status-muted { color: var(--text-muted); }
+.scheduler-status-running { color: var(--accent-primary); }
+.scheduler-meta { color: var(--text-secondary); }
+
+.scheduler-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: flex-end;
+}
+
+.scheduler-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 130px;
+}
+
+.scheduler-field-wide {
+    width: 100%;
+    margin-top: 10px;
+}
+
+.scheduler-label {
+    font-size: 0.72rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted) !important;
+    margin: 0 !important;
+}
+
+.scheduler-time-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.scheduler-time-input {
+    width: 62px !important;
+    text-align: center;
+}
+
+.scheduler-time-sep {
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.scheduler-symbols {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem !important;
+}
+
+.scheduler-hint {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    margin-top: 3px;
+}
+
+.scheduler-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.scheduler-feedback { font-size: 0.76rem; }
+.scheduler-feedback-ok { color: var(--positive); }
+.scheduler-feedback-error { color: var(--negative); }
+
+.scheduler-details { margin-top: 10px; }
+
+.scheduler-detail-summary {
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.scheduler-detail {
+    margin-top: 6px;
+    padding: 8px;
+    max-height: 220px;
+    overflow: auto;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+
+.scheduler-history { margin-top: 4px; }
+
+.scheduler-subhead {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.scheduler-run-table {
+    font-size: 0.76rem;
+    margin-bottom: 0;
+}
+
+.scheduler-run-table th {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.scheduler-run-job {
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.scheduler-empty {
+    padding: 14px;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}

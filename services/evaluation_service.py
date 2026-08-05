@@ -150,7 +150,21 @@ class EvaluationService:
         }
 
     def _refresh_metrics(self, strategy_name: str, cache) -> None:
-        """Recompute vectorbt metrics for a strategy."""
+        """Recompute per-symbol metrics for a strategy.
+
+        These are independent one-session directional calls, not a held
+        position, so they are scored as a series of per-trade returns rather
+        than fed to vectorbt as an equity curve. The previous version built a
+        `close` series out of each trade's exit_price, took BUY as an entry
+        and SELL as an exit of a long, and reported whatever came back. On
+        disjoint one-day calls that is not an equity curve, and it produced
+        results like Sharpe -11.18 on 2 trades and a symbol showing 20% win
+        rate with Sharpe +1.72 and a positive return at the same time.
+
+        Ratio metrics are withheld below MIN_TRADES_FOR_RATIOS: a Sharpe from
+        a handful of trades is noise, and the UI omits a metric that is None
+        rather than printing a number nobody should act on.
+        """
         from config import STRATEGY
 
         symbols = cache.get_strategy_symbols(strategy_name)
@@ -158,51 +172,86 @@ class EvaluationService:
             return
 
         try:
+            import numpy as np
             import pandas as pd
-            import vectorbt as vbt
         except ImportError:
-            logger.warning("vectorbt not available, skipping metrics refresh")
+            logger.warning("numpy/pandas unavailable, skipping metrics refresh")
             return
+
+        min_ratio_n = getattr(STRATEGY, "MIN_TRADES_FOR_RATIOS", 30)
 
         for symbol in symbols:
             series = cache.get_evaluated_signal_series(strategy_name, symbol)
             if len(series) < STRATEGY.MIN_TRADES_FOR_METRICS:
                 continue
 
-            df = pd.DataFrame(series)
-            close = pd.Series(
-                df["exit_price"].astype(float).values,
-                index=pd.to_datetime(df["target_date"]),
-            )
-            entries = (df["action"] == "BUY").values
-            exits = (df["action"] == "SELL").values
-
             try:
-                pf = vbt.Portfolio.from_signals(
-                    close=close,
-                    entries=entries,
-                    exits=exits,
-                    init_cash=STRATEGY.VECTORBT_INIT_CASH,
-                    freq="1D",
-                )
-                stats = pf.stats()
+                df = pd.DataFrame(series)
+                entry = df["entry_price"].astype(float)
+                exit_ = df["exit_price"].astype(float)
+                side = np.where(df["action"].str.upper() == "SELL", -1.0, 1.0)
+                ret = side * (exit_ - entry) / entry.replace(0, np.nan)
+                # .to_numpy() matters: handing pandas a Series plus a new index
+                # REINDEXES against it rather than relabelling, and the old
+                # positional index matches no timestamp, so every value becomes
+                # NaN and the whole series silently drops to empty.
+                ret = pd.Series(ret.to_numpy(),
+                                index=pd.to_datetime(df["target_date"])).dropna()
+                if ret.empty:
+                    continue
+
+                # One equity curve from the day's mean return, so several calls
+                # on the same date count once rather than compounding serially.
+                daily = ret.groupby(ret.index).mean().sort_index()
+                equity = (1.0 + daily).cumprod()
+                drawdown = equity / equity.cummax() - 1.0
+
+                n = int(len(ret))
+                win_rate = float((ret > 0).mean() * 100.0)
+                total_return = float((equity.iloc[-1] - 1.0) * 100.0)
+                max_dd = float(drawdown.min() * 100.0)
+
+                sharpe = sortino = None
+                if n >= min_ratio_n and daily.std(ddof=1) > 0:
+                    sharpe = float(daily.mean() / daily.std(ddof=1) * np.sqrt(252))
+                    downside = daily[daily < 0]
+                    if len(downside) > 1 and downside.std(ddof=1) > 0:
+                        sortino = float(
+                            daily.mean() / downside.std(ddof=1) * np.sqrt(252)
+                        )
+
+                # Tail and significance stats. Mean per-trade return this small
+                # is dominated by its tail, so a hit rate on its own overstates
+                # how much the series actually says.
+                se = float(ret.std(ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+                t_stat = float(ret.mean() / se) if se > 0 else None
+                var95 = float(ret.quantile(0.05) * 100.0)
+                tail = ret[ret <= ret.quantile(0.05)]
+                cvar95 = float(tail.mean() * 100.0) if len(tail) else None
 
                 cache.store_strategy_metrics(
                     strategy_name,
                     symbol,
                     "all",
                     {
-                        "sharpe_ratio": _safe_float(stats.get("Sharpe Ratio")),
-                        "sortino_ratio": _safe_float(stats.get("Sortino Ratio")),
-                        "max_drawdown": _safe_float(stats.get("Max Drawdown [%]")),
-                        "win_rate": _safe_float(stats.get("Win Rate [%]")),
-                        "total_pnl": _safe_float(stats.get("Total Return [%]")),
-                        "total_trades": int(stats.get("Total Trades", 0)),
+                        "sharpe_ratio": _safe_float(sharpe),
+                        "sortino_ratio": _safe_float(sortino),
+                        "max_drawdown": _safe_float(max_dd),
+                        "win_rate": _safe_float(win_rate),
+                        "total_pnl": _safe_float(total_return),
+                        "total_trades": n,
+                        "mean_return_bp": _safe_float(ret.mean() * 1e4),
+                        "t_stat": _safe_float(t_stat),
+                        "var95_pct": _safe_float(var95),
+                        "cvar95_pct": _safe_float(cvar95),
+                        "skew": _safe_float(ret.skew()) if n > 2 else None,
+                        "excess_kurtosis": _safe_float(ret.kurt()) if n > 3 else None,
+                        "ratios_withheld_below_n": None if n >= min_ratio_n else min_ratio_n,
                     },
                 )
             except Exception as e:
                 logger.warning(
-                    f"vectorbt metrics failed for {strategy_name}/{symbol}: {e}"
+                    f"metrics computation failed for {strategy_name}/{symbol}: {e}"
                 )
 
     def refresh_all_metrics(self) -> None:

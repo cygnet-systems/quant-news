@@ -597,14 +597,14 @@ def create_predict_confirm_modal() -> dbc.Modal:
 
     today = date.today()
 
-    # Default the as-of date to the last COMPLETED session: pre-market/intraday
-    # this is yesterday, so the prediction targets today's close. After the
-    # close it is today, targeting the next session.
+    # The picker holds the TARGET session — the close being predicted — and
+    # defaults to the next one whose close has not happened yet. Data is cut
+    # off at the previous trading day, so a Monday target sees through Friday.
     try:
-        from utils.trading_calendar import get_last_completed_trading_day
-        default_asof = get_last_completed_trading_day()
+        from utils.trading_calendar import get_default_target_day
+        default_target = get_default_target_day()
     except Exception:
-        default_asof = today
+        default_target = today
 
     return dbc.Modal(
         [
@@ -619,13 +619,13 @@ def create_predict_confirm_modal() -> dbc.Modal:
                 # Dynamic data summary (populated by callback)
                 html.Div(id="predict-data-summary"),
                 html.Hr(),
-                # Prediction date picker
-                html.H6("Prediction Date", className="mb-2"),
+                # Target date picker — the session whose close is predicted
+                html.H6("Target Date", className="mb-2"),
                 html.Div([
                     dcc.DatePickerSingle(
                         id="predict-date-picker",
-                        date=default_asof.isoformat(),
-                        max_date_allowed=today.isoformat(),
+                        date=default_target.isoformat(),
+                        max_date_allowed=default_target.isoformat(),
                         min_date_allowed="2020-01-01",
                         display_format="YYYY-MM-DD",
                         className="predict-date-picker",
@@ -686,8 +686,8 @@ def create_full_analysis_modal() -> dbc.Modal:
 
     _today = _date.today()
     try:
-        from utils.trading_calendar import get_last_completed_trading_day
-        _fa_default = get_last_completed_trading_day()
+        from utils.trading_calendar import get_default_target_day
+        _fa_default = get_default_target_day()
     except Exception:
         _fa_default = _today
 
@@ -704,21 +704,22 @@ def create_full_analysis_modal() -> dbc.Modal:
                 html.Div(id="full-analysis-body"),
                 html.Hr(),
                 html.Div([
-                    html.H6("As-of Date", className="mb-1"),
+                    html.H6("Target Date", className="mb-1"),
                     html.Div([
                         dcc.DatePickerSingle(
                             id="fa-date-picker",
                             date=_fa_default.isoformat(),
-                            max_date_allowed=_today.isoformat(),
+                            max_date_allowed=_fa_default.isoformat(),
                             min_date_allowed="2020-01-01",
                             display_format="YYYY-MM-DD",
                             className="predict-date-picker",
                         ),
                         html.Span(
-                            "All three stages only see data through this date "
-                            "(prices, news, metrics) — the prediction targets the "
-                            "next trading day's close. Pick a past date to backtest "
-                            "without lookahead bias.",
+                            "The session whose close is being predicted. All three "
+                            "stages only see data through the PREVIOUS trading day "
+                            "(prices, news, metrics) — a Monday target sees nothing "
+                            "after the preceding Friday's close. Pick a past date to "
+                            "backtest without lookahead bias.",
                             className="ms-2 text-muted small",
                             style={"maxWidth": "380px", "display": "inline-block",
                                    "verticalAlign": "middle"},

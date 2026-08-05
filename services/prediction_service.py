@@ -15,6 +15,8 @@ Parallelism strategy (3-phase):
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
+from functools import partial
 from typing import Optional
 
 import pandas as pd
@@ -157,6 +159,7 @@ class PredictionService:
         historical_av_news: Optional[dict] = None,
         historical_global_news: Optional[dict] = None,
         as_of: Optional[str] = None,
+        **model_kwargs,
     ) -> dict[str, dict]:
         """Run selected models on a symbol with 3-phase parallelism.
 
@@ -176,8 +179,13 @@ class PredictionService:
             historical_global_news: Dict[date_str → list[dict]] for global news features.
             as_of: Backtest cut-off date (ISO). Models must not use any data
                 after this date — enforced for internally-fetched frames too.
+            model_kwargs: Extra per-model options forwarded verbatim (e.g.
+                the Full Analysis flow's ``research_model``/``include_thesis``,
+                which only trading_agents reads). Models ignore what they
+                don't recognize.
         """
         kwargs = dict(
+            **model_kwargs,
             spy_df=spy_df,
             sector_df=sector_df,
             av_news=news or [],
@@ -221,11 +229,18 @@ class PredictionService:
 
         # Phase 2: Remaining individual models (parallel — CPU + I/O don't contend)
         if parallel:
+            # Worker threads start with an EMPTY context, unlike
+            # asyncio.to_thread which copies the caller's. Anything the caller
+            # set in a ContextVar — the signed-in identity, the usage/cost
+            # stage label — would be invisible to the model running here, so
+            # the research model's spend landed under stage "unknown". Copy
+            # the context in explicitly at submit time.
             with ThreadPoolExecutor(max_workers=len(parallel)) as executor:
                 futures = {
                     executor.submit(
-                        self._run_single_model,
-                        model_name, symbol, ohlcv_df, **kwargs,
+                        copy_context().run,
+                        partial(self._run_single_model,
+                                model_name, symbol, ohlcv_df, **kwargs),
                     ): model_name
                     for model_name in parallel
                 }

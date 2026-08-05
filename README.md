@@ -64,6 +64,106 @@ across all Cygnet apps), `AUTH_DATABASE_URL` (the shared auth Postgres),
 `DATABASE_URL`, and the S3 vars. `alembic upgrade head` runs from the
 entrypoint; the auth tables are created automatically if absent.
 
+## Scheduled runs
+
+**The app schedules itself.** An APScheduler instance starts with the server
+(ASGI lifespan → `services/scheduler_service.py`) and runs two jobs:
+
+| Job | Default | What it does |
+|---|---|---|
+| `daily_analysis` | 08:00 ET, weekdays | Full Analysis on the watchlist, targeting that morning's session |
+| `daily_evaluation` | 18:00 ET, weekdays | Scores predictions whose target session has closed, then runs the strategies |
+
+Schedules live in the `scheduled_jobs` table and are edited from **History →
+Scheduled Jobs**: time, days, timezone, symbol list, enable/disable, plus
+*Run now* and the last run's output. No cron, no launchd, nothing tied to a
+particular machine — deploying the app deploys the schedule.
+
+Four properties make it safe on an always-on deploy:
+
+- **Advisory lock** — every run takes a Postgres advisory lock on its job id,
+  so a rollout with two live instances cannot double-fire an expensive job.
+- **Catch-up by date** — on startup, a job whose window passed today with no
+  success recorded *for today* runs once. A restart across 08:00 still
+  produces the day's analysis; a crash loop does not re-run it repeatedly.
+- **Database sync** — the live triggers are reconciled with the stored
+  schedule every 60s, so an edit made in another instance (or straight in the
+  database) takes effect without a restart.
+- **Subprocess execution** — jobs shell out to the CLI below, keeping model
+  memory and a ~10-minute CPU burn out of the process serving the UI.
+
+The same pipeline is available directly, which is what the jobs invoke:
+
+```bash
+python scripts/daily_analysis.py analyze                       # next session, watchlist
+python scripts/daily_analysis.py analyze --symbols PANW --target 2026-08-03
+python scripts/daily_analysis.py evaluate                      # score what has closed
+```
+
+It writes anonymously, so everything it produces is public and appears in
+History, the Scoreboard and the Activity Log. `SCHEDULER_ENABLED=0` turns the
+scheduler off for a process that should not run jobs.
+
+### Knowing it actually ran
+
+`GET /healthz` reports the schedule, not just the process:
+
+```json
+{"scheduler_running": true, "overdue": [], "healthy": true,
+ "jobs": [{"id": "daily_analysis", "next_run_at": "…", "last_success_date": "…"}]}
+```
+
+It returns **503** when the scheduler thread is dead or a job's window has
+passed (plus a timeout's grace) with no success recorded that day — so an
+uptime monitor pointed here reports "today's analysis didn't happen", which a
+plain page check would miss entirely. A watchdog logs the same condition to
+the Activity Log every 30 minutes.
+
+### Email notifications
+
+Set the five `AZURE_*` / `NOTIFY_*` variables (see `.env.example`) and each
+scheduled run mails its outcome. The transport is inherited from
+CygnetResearchTerminal's `cron_jobs/notify.py` — Microsoft Graph `sendMail`
+with the same variable names, so one Azure app registration serves both apps.
+With any of them missing, notifications stay off and runs are unaffected.
+
+| Mail | When | Contains |
+|---|---|---|
+| Pre-open calls | after the morning analysis | the call per symbol, buy/sell/hold counts, predictions stored, duration, LLM cost |
+| Results | after the evening evaluation | hit rate and P&L per model, the synthesis call per symbol with right/wrong |
+| Job failed | any non-zero exit | the captured output tail |
+| Job overdue | watchdog | which job missed its window (once per day, not every 30 min) |
+
+**On Railway:** services are always-on by default; the scale-to-zero
+"Serverless" mode is opt-in per service and should stay **off** here. Sleep is
+judged on *outbound* traffic, and this app's connection pool plus the
+scheduler's 60s sync mean it never idles — so enabling it would save nothing
+and add cold-start risk. The real interruptions are deploys, crashes and plan
+limits: catch-up covers the first, `/healthz` surfaces the rest.
+
+Re-running an analysis nothing has changed under costs nothing: a symbol whose
+models already ran for this cutoff — against the same closing bar — is reused,
+and the report and synthesis are served from their input-hash caches. A repeat
+run finishes in seconds with zero API calls. `--force` re-runs anyway.
+
+## Cost telemetry
+
+Every LLM call is recorded in `llm_usage`: exact token counts from the provider
+response, the $/Mtok rates applied, the derived cost, and which stage spent it
+(`research` / `ai_report` / `recommendations`). Nothing in that table is ever
+fed back into a prompt.
+
+```bash
+python scripts/daily_analysis.py cost --days 7
+```
+
+Rates live in `LLM_PRICING` in [config.py](config.py) and are copied onto each
+row as it is written, so repricing a model never rewrites the cost of calls
+already made. A model with no entry records its tokens with a NULL cost and is
+counted separately in the report — an unpriced call is visibly unpriced rather
+than quietly free. **Verify the seeded rates against current provider pricing
+before treating spend numbers as exact.**
+
 ## Configuration
 
 | Variable | Description |

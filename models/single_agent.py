@@ -476,12 +476,26 @@ def extract_decision(text: str) -> str:
 
 
 def extract_confidence(text: str) -> float:
+    """The report's stated CONFIDENCE, or 0.5 when it cannot be read.
+
+    The fallback is indistinguishable from a report that genuinely said 0.50,
+    so it is logged — silently defaulting made a parse failure look like a
+    real neutral call.
+    """
     m = _CONF_RE.search(text or "")
     if m:
         try:
             return max(0.0, min(1.0, float(m.group(1))))
         except ValueError:
-            pass
+            logger.warning(
+                "extract_confidence: CONFIDENCE anchor found but unparseable "
+                f"({m.group(1)!r}) — defaulting to 0.5"
+            )
+            return 0.5
+    logger.warning(
+        "extract_confidence: no CONFIDENCE anchor in report — defaulting to "
+        "0.5; this is NOT a stated neutral call"
+    )
     return 0.5
 
 
@@ -681,16 +695,31 @@ class SingleAgentResearch:
         if self.provider == "openai" and self.model.startswith("gpt-"):
             gen_kwargs["reasoning_effort"] = "medium"
 
+        # Token cost ACCUMULATES across attempts: a retried report really did
+        # cost both calls, and billing the caller only for the surviving one
+        # understates it by up to half.
+        usage_total = {"input_tokens": 0, "output_tokens": 0,
+                       "model": self.model or "", "provider": self.provider or ""}
         raw_text = None
         for attempt in (1, 2):
+            attempt_usage: dict = {}
             raw_text = llm.generate(
                 prompt,
                 max_tokens=self.max_tokens,
                 temperature=0.3,
                 model=self.model,
                 provider=self.provider,
+                usage_out=attempt_usage,
                 **gen_kwargs,
             )
+            if attempt_usage:
+                usage_total["input_tokens"] += attempt_usage.get("input_tokens", 0)
+                usage_total["output_tokens"] += attempt_usage.get("output_tokens", 0)
+                # Record what actually served the call — a failover may have
+                # moved it off the requested model.
+                usage_total["model"] = attempt_usage.get("model") or usage_total["model"]
+                usage_total["provider"] = (attempt_usage.get("provider")
+                                           or usage_total["provider"])
             if not raw_text:
                 raise ValueError("LLM returned empty response")
             if (_DECISION_RE.search(raw_text) and _CONF_RE.search(raw_text)
@@ -787,4 +816,7 @@ class SingleAgentResearch:
             "provenance": provenance,
             "news_count": len(news_articles),
             "sector_etf": sector_etf,
+            "input_tokens": usage_total["input_tokens"],
+            "output_tokens": usage_total["output_tokens"],
+            "served_by_model": usage_total["model"],
         }

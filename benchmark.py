@@ -535,8 +535,16 @@ def main():
               f"{str(ticker_full.index[test_end-1])[:10]}")
         print(f"  Actual test days: {actual_test_days}", flush=True)
 
+        # --all-models already walks Kronos and XGBoost through the registry,
+        # so the dedicated arms below would run them a SECOND time and append
+        # both passes under the same model label — doubling their reported
+        # sample counts (20 "days tested" for a 10-day window) and making the
+        # results look better powered than they are. The LLM arm was already
+        # de-duplicated this way; these two were not.
+        dedicated_arms = not args.all_models
+
         # Kronos FIRST — must load torch before XGBoost pickle (MPS deadlock)
-        if not args.skip_kronos:
+        if dedicated_arms and not args.skip_kronos:
             print(f"\n  Running Kronos walk-forward ({actual_test_days} days, "
                   f"{args.mc_samples} MC samples each)...", flush=True)
             t0 = time.time()
@@ -547,7 +555,7 @@ def main():
             print(f"  Kronos done in {time.time()-t0:.1f}s", flush=True)
 
         # XGBoost
-        if not args.skip_xgboost:
+        if dedicated_arms and not args.skip_xgboost:
             print(f"\n  Running XGBoost walk-forward ({actual_test_days} retrains)...",
                   flush=True)
             t0 = time.time()

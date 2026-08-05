@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Scheduled Full Analysis / evaluation for the quant-news dashboard.
+
+Runs the same pipeline as the dashboard's Full Analysis button with no
+browser attached, writing as the public user (anonymous — owner_uid NULL,
+is_public true), so everything shows up in History, the Scoreboard and the
+Activity Log exactly like a UI run.
+
+Usage:
+    python scripts/daily_analysis.py analyze                # next session, default watchlist
+    python scripts/daily_analysis.py analyze --symbols PANW --target 2026-08-03
+    python scripts/daily_analysis.py evaluate               # score everything that has closed
+
+Exit codes: 0 on success, 1 when a stage produced nothing usable.
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Weights are cached; a scheduled run must not stall on a HF network call.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+# The 20-symbol watchlist this routine was set up for.
+DEFAULT_SYMBOLS = [
+    "PANW", "BAC", "VZ", "HWM", "DOC", "HPQ", "LUV", "TPL", "MPWR", "MCD",
+    "ROP", "ETR", "CMS", "XYZ", "HIG", "IP", "FLEX", "MET", "FIS", "TYL",
+]
+
+
+def _configure_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+    logging.getLogger("services").setLevel(logging.INFO)
+    logging.getLogger("models").setLevel(logging.INFO)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", choices=["analyze", "evaluate", "cost"])
+    parser.add_argument("--symbols", help="Comma-separated (default: watchlist)")
+    parser.add_argument("--target", help="Target session YYYY-MM-DD "
+                                         "(default: next unresolved session)")
+    parser.add_argument("--lookback", type=int, default=7,
+                        help="News window in days (default: 7)")
+    parser.add_argument("--report-model", default="gpt-5.6-luna",
+                        help="Research/report model (default: gpt-5.6-luna)")
+    parser.add_argument("--recs-model", default=None,
+                        help="Synthesis model (default: config RECOMMENDATIONS_MODEL)")
+    parser.add_argument("--models", default=None,
+                        help="Comma-separated model ids to run (default: all)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run symbols even when an identical analysis "
+                             "for this cutoff is already stored")
+    parser.add_argument("--days", type=int, default=7,
+                        help="cost: lookback window in days (default: 7)")
+    parser.add_argument("--only-trading-days", action="store_true",
+                        help="No-op when today is not an NYSE session. The "
+                             "scheduled job uses this so a market holiday "
+                             "doesn't predict tomorrow's close twice.")
+    parser.add_argument("--json", action="store_true", help="Print the summary as JSON")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Warnings only")
+    args = parser.parse_args()
+
+    _configure_logging(not args.quiet)
+
+    from services.analysis_runner import evaluate_pending, run_full_analysis
+    from utils.trading_calendar import is_trading_day
+
+    if args.only_trading_days and not is_trading_day(datetime.now().date()):
+        print(f"{datetime.now().date()} is not an NYSE session — nothing to do.")
+        return 0
+
+    if args.command == "evaluate":
+        count = evaluate_pending()
+        summary = {"evaluated": count, "at": datetime.now().isoformat()}
+        print(json.dumps(summary) if args.json
+              else f"Evaluated {count} prediction(s)")
+        return 0
+
+    if args.command == "cost":
+        from config import LLM_PRICING_VERIFIED_ON
+        from services.usage_service import summarize
+
+        rows = summarize(days=args.days)
+        if args.json:
+            print(json.dumps(rows, indent=2, default=str))
+            return 0
+        if not rows:
+            print(f"No LLM calls recorded in the last {args.days} days.")
+            return 0
+        print(f"{'DAY':11}{'STAGE':16}{'MODEL':18}{'CALLS':>6}"
+              f"{'IN':>10}{'OUT':>9}{'COST':>10}")
+        total = 0.0
+        unpriced = 0
+        for r in rows:
+            cost = r["cost"] or 0.0
+            total += cost
+            unpriced += r["unpriced"] or 0
+            print(f"{str(r['day']):11}{r['stage'][:15]:16}{(r['model'] or '?')[:17]:18}"
+                  f"{r['calls']:>6}{r['in_tok'] or 0:>10,}{r['out_tok'] or 0:>9,}"
+                  f"{cost:>10.4f}")
+        print(f"\nTotal: ${total:.4f} over {args.days} days "
+              f"(rates last verified {LLM_PRICING_VERIFIED_ON})")
+        if unpriced:
+            print(f"WARNING: {unpriced} call(s) had no price for their model — "
+                  f"tokens counted, cost excluded. Add them to LLM_PRICING.")
+        return 0
+
+    symbols = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+               if args.symbols else DEFAULT_SYMBOLS)
+    models = ({m.strip() for m in args.models.split(",") if m.strip()}
+              if args.models else None)
+
+    summary = run_full_analysis(
+        symbols,
+        target=args.target,
+        lookback_days=args.lookback,
+        report_model=args.report_model,
+        recs_model=args.recs_model,
+        models=models,
+        force=args.force,
+    )
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        if summary.get("error"):
+            print(f"Failed: {summary['error']}")
+        else:
+            print(f"Target {summary['target_date']} (data through {summary['as_of']}) — "
+                  f"{summary['predictions_stored']} predictions stored in "
+                  f"{summary['duration_s']}s")
+            if summary.get("skipped"):
+                print(f"Skipped (no price data): {', '.join(summary['skipped'])}")
+            for sym, action in (summary.get("actions") or {}).items():
+                print(f"  {sym}: {action}")
+
+    return 1 if summary.get("error") or not summary.get("predictions_stored") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

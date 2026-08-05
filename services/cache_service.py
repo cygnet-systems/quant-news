@@ -597,14 +597,21 @@ class CacheService:
             ).scalar()
             return count > 0
 
-    def get_predictions_for_today(self, symbol: str) -> dict:
+    def get_predictions_for_today(self, symbol: str,
+                                  prediction_date: date | None = None) -> dict:
+        """Stored predictions for a symbol, keyed by model name.
+
+        ``prediction_date`` defaults to today; pass the run's data cutoff to
+        ask "has this exact analysis already been done?" — which is what lets
+        a repeated run reuse work instead of re-paying for it.
+        """
         from db.models import ModelPrediction
-        today = date.today()
+        target_day = prediction_date or date.today()
         with get_session() as session:
             rows = session.execute(
                 select(ModelPrediction).where(
                     ModelPrediction.symbol == symbol.upper(),
-                    ModelPrediction.prediction_date == today,
+                    ModelPrediction.prediction_date == target_day,
                 )
             ).scalars().all()
 
@@ -618,6 +625,9 @@ class CacheService:
                     "predicted_close": r.predicted_close,
                     "details": r.details_json or {},
                     "model_version": r.model_version,
+                    # The bar this call was made against — a reuse check needs
+                    # it to tell "already done" from "done on stale data".
+                    "previous_close": r.previous_close,
                     "error": None,
                 }
             return results
@@ -664,6 +674,7 @@ class CacheService:
             ).scalars().all()
 
             evaluated = 0
+            hold_bands: dict = {}
             for pred in pending:
                 actual_row = session.execute(
                     select(StockPrice.close).where(
@@ -685,7 +696,13 @@ class CacheService:
                 elif pred.decision == "SELL":
                     was_correct = not price_went_up
                 else:
-                    was_correct = None
+                    # A HOLD is right when standing aside was right: the move
+                    # stayed inside the symbol's own no-trade band. Leaving
+                    # this as None made HOLD unfalsifiable, so a model that
+                    # holds most of the time never showed a wrong call.
+                    move = abs(actual_close - pred.previous_close) / pred.previous_close
+                    was_correct = move <= self._hold_band(
+                        session, pred.symbol, hold_bands)
 
                 pnl = compute_pnl(pred.decision, pred.previous_close, actual_close)
 
@@ -699,6 +716,117 @@ class CacheService:
                 logger.info(f"Evaluated {evaluated} predictions")
 
         return evaluated
+
+    def _hold_band(self, session, symbol: str, _cache: dict) -> float:
+        """No-trade band for a symbol: its own typical absolute daily move.
+
+        Judging every name against one fixed percentage compares a utility
+        against a biotech. This uses the symbol's median absolute daily return
+        so "the session was quiet for this stock" means the same thing
+        everywhere. Falls back to the fixed band when history is too short.
+        """
+        from db.models import StockPrice
+        from config import MODEL
+
+        if symbol in _cache:
+            return _cache[symbol]
+
+        band = MODEL.HOLD_BAND_PCT
+        try:
+            closes = session.execute(
+                select(StockPrice.close)
+                .where(StockPrice.symbol == symbol)
+                .order_by(StockPrice.date.asc())
+            ).scalars().all()
+            if len(closes) > MODEL.HOLD_BAND_MIN_HISTORY:
+                moves = [
+                    abs(closes[i] - closes[i - 1]) / closes[i - 1]
+                    for i in range(1, len(closes))
+                    if closes[i - 1]
+                ]
+                if moves:
+                    moves.sort()
+                    mid = len(moves) // 2
+                    median = (moves[mid] if len(moves) % 2
+                              else (moves[mid - 1] + moves[mid]) / 2)
+                    if median > 0:
+                        band = median * MODEL.HOLD_BAND_VOL_MULTIPLE
+        except Exception as e:
+            logger.debug("hold band fallback for %s: %s", symbol, e)
+
+        _cache[symbol] = band
+        return band
+
+    def backfill_hold_scores(self) -> int:
+        """Score HOLD rows that were resolved before HOLDs were scorable.
+
+        `evaluate_predictions` only considers rows with `actual_close IS NULL`,
+        so rows already resolved under the old rule — where a HOLD got
+        `was_correct = None` — are permanently invisible to it. Any future
+        change to how a decision is scored needs a pass like this one, or the
+        history keeps whatever verdict the rule at the time produced.
+
+        Idempotent: only touches HOLDs that have a resolved price and no
+        verdict yet. Never rewrites a BUY/SELL.
+        """
+        from db.models import ModelPrediction
+
+        updated = 0
+        bands: dict = {}
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction).where(
+                    ModelPrediction.decision == "HOLD",
+                    ModelPrediction.was_correct.is_(None),
+                    ModelPrediction.actual_close.isnot(None),
+                )
+            ).scalars().all()
+
+            for pred in rows:
+                if not pred.previous_close or pred.previous_close <= 0:
+                    continue
+                move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
+                pred.was_correct = move <= self._hold_band(session, pred.symbol, bands)
+                if pred.pnl_dollars is None:
+                    pred.pnl_dollars = 0.0
+                pred.evaluated_at = datetime.now()
+                updated += 1
+
+        if updated:
+            logger.info(f"Backfilled {updated} HOLD scores across "
+                        f"{len(bands)} symbol bands")
+        return updated
+
+    def rescore_hold_predictions(self) -> int:
+        """Clear and recompute every HOLD verdict under the current band.
+
+        Separate from `backfill_hold_scores`, which only fills gaps. Use this
+        after changing HOLD_BAND_* so history reflects one consistent rule
+        rather than a mix of whatever was configured when each row resolved.
+        """
+        from db.models import ModelPrediction
+
+        updated = 0
+        bands: dict = {}
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction).where(
+                    ModelPrediction.decision == "HOLD",
+                    ModelPrediction.actual_close.isnot(None),
+                )
+            ).scalars().all()
+            for pred in rows:
+                if not pred.previous_close or pred.previous_close <= 0:
+                    continue
+                move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
+                pred.was_correct = move <= self._hold_band(session, pred.symbol, bands)
+                pred.evaluated_at = datetime.now()
+                updated += 1
+
+        if updated:
+            logger.info(f"Rescored {updated} HOLD predictions across "
+                        f"{len(bands)} symbol bands")
+        return updated
 
     def get_prediction_history(
         self, symbol: str, model_name: Optional[str] = None, limit: int = 50,
@@ -795,6 +923,14 @@ class CacheService:
             ]
 
     def get_model_accuracy(self, model_name: str, symbol: Optional[str] = None) -> dict:
+        """Accuracy for a model.
+
+        `total`/`correct`/`accuracy` cover ACTIVE (BUY/SELL) calls only, so the
+        headline number keeps meaning "directional hit rate" now that HOLDs are
+        also scored. HOLD accountability is reported alongside as hold_*, and
+        `all_*` covers both — mixing them into one rate would compare a
+        directional call against a no-trade-band call.
+        """
         from db.models import ModelPrediction
         with get_session() as session:
             base_filter = [
@@ -804,15 +940,18 @@ class CacheService:
             if symbol:
                 base_filter.append(ModelPrediction.symbol == symbol.upper())
 
-            total = session.execute(
-                select(func.count()).select_from(ModelPrediction).where(*base_filter)
-            ).scalar() or 0
+            active = [*base_filter, ModelPrediction.decision != "HOLD"]
+            held = [*base_filter, ModelPrediction.decision == "HOLD"]
 
-            correct = session.execute(
-                select(func.count()).select_from(ModelPrediction).where(
-                    *base_filter, ModelPrediction.was_correct.is_(True)
-                )
-            ).scalar() or 0
+            def _count(*where) -> int:
+                return session.execute(
+                    select(func.count()).select_from(ModelPrediction).where(*where)
+                ).scalar() or 0
+
+            total = _count(*active)
+            correct = _count(*active, ModelPrediction.was_correct.is_(True))
+            hold_total = _count(*held)
+            hold_correct = _count(*held, ModelPrediction.was_correct.is_(True))
 
             pnl_total = session.execute(
                 select(func.sum(ModelPrediction.pnl_dollars)).where(*base_filter)
@@ -822,10 +961,18 @@ class CacheService:
                 select(func.count(ModelPrediction.symbol.distinct())).where(*base_filter)
             ).scalar() or 0
 
+            all_total = total + hold_total
+            all_correct = correct + hold_correct
             return {
                 "total": total,
                 "correct": correct,
                 "accuracy": correct / total if total > 0 else 0.0,
+                "hold_total": hold_total,
+                "hold_correct": hold_correct,
+                "hold_accuracy": hold_correct / hold_total if hold_total > 0 else 0.0,
+                "all_total": all_total,
+                "all_correct": all_correct,
+                "all_accuracy": all_correct / all_total if all_total > 0 else 0.0,
                 "pnl_total": float(pnl_total),
                 "distinct_symbols": distinct_symbols,
             }

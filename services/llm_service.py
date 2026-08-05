@@ -39,6 +39,54 @@ def _first_text(response) -> Optional[str]:
     return None
 
 
+def _record_usage(usage_out: Optional[dict], response, provider: str,
+                  model: str, duration_ms: Optional[int] = None) -> None:
+    """Normalise a response's token counts, then fan them out two ways.
+
+    1. ``usage_out``, when a caller passed one — an out-parameter rather than a
+       changed return type, because ``generate()`` returns a plain string to a
+       couple of dozen call sites and only the report path wants the counts.
+    2. The durable ``llm_usage`` table, ALWAYS. Cost telemetry that depended on
+       callers opting in would only ever measure the paths someone remembered
+       to instrument; this is the one funnel every provider path returns
+       through, so recording here means no call goes uncounted.
+
+    Anthropic reports input_tokens/output_tokens; the OpenAI-compatible path
+    reports prompt_tokens/completion_tokens. Both are normalised here so
+    callers never branch on provider. Never raises — telemetry must not be
+    able to fail a generation that already succeeded.
+    """
+    in_tok = out_tok = 0
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            if provider == "anthropic":
+                raw_in = getattr(usage, "input_tokens", None)
+                raw_out = getattr(usage, "output_tokens", None)
+            else:
+                raw_in = getattr(usage, "prompt_tokens", None)
+                raw_out = getattr(usage, "completion_tokens", None)
+            in_tok = int(raw_in) if raw_in is not None else 0
+            out_tok = int(raw_out) if raw_out is not None else 0
+
+        if usage_out is not None:
+            usage_out.update({
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "model": model,
+                "provider": provider,
+            })
+    except Exception as e:  # pragma: no cover - telemetry is best-effort
+        logger.debug("usage capture failed: %s", e)
+
+    from services import usage_service
+    usage_service.record(
+        model=model, provider=provider,
+        input_tokens=in_tok, output_tokens=out_tok,
+        duration_ms=duration_ms,
+    )
+
+
 # Default model per provider — single source of truth for the three copies of
 # this mapping that used to live in _get_model / generate / failover.
 _DEFAULT_MODELS = {
@@ -206,6 +254,7 @@ class LLMService:
         temperature: float = 0.7,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        usage_out: Optional[dict] = None,
         **kwargs,
     ) -> Optional[str]:
         """Generate text using the LLM.
@@ -218,6 +267,10 @@ class LLMService:
             model: Override model name (uses default for provider if None).
             provider: Override provider ('openai', 'anthropic', 'lm_studio').
                       Creates a temporary client; does not mutate self.
+            usage_out: Optional dict, populated in place with input_tokens,
+                      output_tokens, model and provider for the call that
+                      actually produced the text — including after a failover,
+                      so recorded cost matches the model that was really used.
             **kwargs: Provider-specific params (e.g. reasoning_effort for OpenAI).
 
         Returns:
@@ -241,6 +294,11 @@ class LLMService:
             use_model = _DEFAULT_MODELS.get(use_provider, "")
 
         import time as _time
+        _call_t0 = _time.time()
+
+        def _elapsed_ms() -> int:
+            return int((_time.time() - _call_t0) * 1000)
+
         try:
             if use_provider == "anthropic":
                 api_kwargs = {
@@ -279,6 +337,8 @@ class LLMService:
                         f"LLM response truncated at max_tokens={max_tokens} "
                         f"(model={use_model}) — output is incomplete"
                     )
+                _record_usage(usage_out, response, "anthropic", use_model,
+                              duration_ms=_elapsed_ms())
                 return _first_text(response)
 
             # OpenAI-compatible path (LM Studio, OpenAI)
@@ -336,6 +396,8 @@ class LLMService:
                 response = use_client.chat.completions.create(**api_kwargs)
                 content = response.choices[0].message.content
 
+            _record_usage(usage_out, response, use_provider, use_model,
+                          duration_ms=_elapsed_ms())
             return content
 
         except Exception as e:
@@ -352,6 +414,7 @@ class LLMService:
                         fo_client, _ = self._get_client_for_provider("anthropic")
                         result = self._generate_anthropic(
                             fo_client, prompt, system_prompt, max_tokens, temperature,
+                            usage_out=usage_out,
                         )
                         self._active = (fo_client, "anthropic")
                         logger.info("Failover to Anthropic succeeded, keeping provider")
@@ -374,10 +437,22 @@ class LLMService:
                         )
                         self._active = (fo_client, "openai")
                         logger.info("Failover to OpenAI succeeded, keeping provider")
+                        _record_usage(usage_out, response, "openai",
+                                      _DEFAULT_MODELS["openai"])
                         return response.choices[0].message.content
                     except Exception as e3:
                         logger.warning(f"OpenAI failover failed: {e3}")
 
+            # A failed call still consumed wall-clock and, on a mid-stream
+            # error, possibly tokens the provider will bill. Record it as a
+            # zero-token failure so the stage's call count matches reality
+            # instead of quietly dropping the attempt.
+            from services import usage_service
+            usage_service.record(
+                model=use_model, provider=use_provider,
+                input_tokens=0, output_tokens=0,
+                duration_ms=_elapsed_ms(), ok=False, error=str(e),
+            )
             return None
 
     def _generate_anthropic(
@@ -387,6 +462,7 @@ class LLMService:
         system_prompt: Optional[str],
         max_tokens: int,
         temperature: float,
+        usage_out: Optional[dict] = None,
     ) -> Optional[str]:
         """Generate text using Anthropic Claude API (explicit client — used
         by failover before the active pair is swapped)."""
@@ -400,6 +476,7 @@ class LLMService:
             kwargs["system"] = system_prompt
 
         response = client.messages.create(**kwargs)
+        _record_usage(usage_out, response, "anthropic", _DEFAULT_MODELS["anthropic"])
         return response.content[0].text
 
     def summarize_news(
@@ -533,14 +610,28 @@ Respond using this EXACT markdown format:
                 lines = [f"\n--- {sym} Financial Data ---"]
 
                 if info:
+                    # Every line below is emitted ONLY when its data is really
+                    # present. The as-of-safe flows (Full Analysis, any
+                    # backtest) deliberately strip live quote fields so the
+                    # model cannot see the session being predicted; printing
+                    # them unconditionally rendered the absence as
+                    # "Current Price: $0.00 | Volume: 0 | P/E: N/A" for every
+                    # symbol, and the analyst model — correctly — refused to
+                    # analyze and reported a broken data feed instead.
                     lines.append(f"Company: {info.get('name', sym)} | Sector: {info.get('sector', 'N/A')} | Industry: {info.get('industry', 'N/A')}")
-                    lines.append(f"Market Cap: ${info.get('market_cap', 0):,.0f} | P/E Ratio: {info.get('pe_ratio', 'N/A')} | Dividend Yield: {info.get('dividend_yield', 'N/A')}")
-                    lines.append(f"Current Price: ${info.get('current_price', 0):.2f} | Previous Close: ${info.get('previous_close', 0):.2f} | Day Change: {info.get('day_change_percent', 0):.2f}%")
+                    if info.get("market_cap") or info.get("pe_ratio") or info.get("dividend_yield"):
+                        mcap = (f"${info['market_cap']:,.0f}" if info.get("market_cap")
+                                else "N/A")
+                        lines.append(f"Market Cap: {mcap} | P/E Ratio: {info.get('pe_ratio', 'N/A')} | Dividend Yield: {info.get('dividend_yield', 'N/A')}")
+                    if info.get("current_price"):
+                        lines.append(f"Current Price: ${info['current_price']:.2f} | Previous Close: ${info.get('previous_close', 0):.2f} | Day Change: {info.get('day_change_percent', 0):.2f}%")
                     # yfinance's 52w figures are raw exchange prices; every
                     # indicator here runs on dividend-adjusted history, so
                     # label the basis or the LLM flags a phantom discrepancy.
-                    lines.append(f"52-Week High: ${info.get('fifty_two_week_high', 0):.2f} | 52-Week Low: ${info.get('fifty_two_week_low', 0):.2f} (exchange figures, unadjusted)")
-                    lines.append(f"Volume: {info.get('volume', 0):,} | Avg Volume: {info.get('avg_volume', 0):,}")
+                    if info.get("fifty_two_week_high"):
+                        lines.append(f"52-Week High: ${info['fifty_two_week_high']:.2f} | 52-Week Low: ${info.get('fifty_two_week_low', 0):.2f} (exchange figures, unadjusted)")
+                    if info.get("volume") or info.get("avg_volume"):
+                        lines.append(f"Volume: {info.get('volume', 0):,} | Avg Volume: {info.get('avg_volume', 0):,}")
 
                 if metrics:
                     lines.append(f"Period Return: {metrics.get('total_return', 'N/A')}% | Volatility: {metrics.get('volatility', 'N/A')}%")
@@ -971,10 +1062,19 @@ Respond with ONLY valid JSON matching this schema:
                     if not isinstance(result, dict) or model_name.startswith("_"):
                         continue
                     decision = result.get("decision", "N/A")
-                    confidence = result.get("confidence", 0)
-                    up_prob = result.get("up_probability", 0.5)
                     display = self._MODEL_DESCRIPTIONS.get(model_name, model_name).split(":")[0]
-                    lines.append(f"  {display}: {decision} (conf: {confidence:.0%}, up: {up_prob:.0%})")
+                    # A model may legitimately decline to state either number
+                    # (the research arm publishes no up-probability until it
+                    # has a track record, and a signal read back from storage
+                    # carries NULL rather than a default). `.get(k, default)`
+                    # does not cover that — the key is present and None — and
+                    # formatting None raised, taking the whole synthesis down.
+                    # Say "n/a" instead of inventing a 50%.
+                    confidence = result.get("confidence")
+                    up_prob = result.get("up_probability")
+                    conf_str = f"{confidence:.0%}" if confidence is not None else "n/a"
+                    up_str = f"{up_prob:.0%}" if up_prob is not None else "n/a"
+                    lines.append(f"  {display}: {decision} (conf: {conf_str}, up: {up_str})")
                     triggers = (result.get("details") or {}).get("triggers") or {}
                     if triggers.get("reassess_to_buy"):
                         lines.append(f"    TA reassess-to-BUY trigger: {triggers['reassess_to_buy'][:150]}")

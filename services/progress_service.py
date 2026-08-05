@@ -95,6 +95,11 @@ def _run_identity() -> tuple[str, str | None]:
     return _local_run["id"] or "adhoc", _local_run["title"]
 
 
+def current_run_id() -> str:
+    """The run id events and spend are grouped under ("adhoc" outside a run)."""
+    return _run_identity()[0]
+
+
 def _write_audit(stage: str, message: str) -> None:
     """Append to the durable audit trail. Best-effort: the DB being down must
     never break a pipeline, and the diskcache feed still drives the panel."""

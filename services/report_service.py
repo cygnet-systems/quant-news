@@ -52,15 +52,22 @@ def generate_report_pdf(
     model_signals: dict | None = None,
     recommendations: dict | None = None,
     news_data: dict | None = None,
+    target_date: str | None = None,
+    data_through: str | None = None,
 ) -> Optional[bytes]:
     """Generate the unified PDF report from current analysis data.
 
     One template for every flow: compilation provenance up front, executive
     summary, model predictions, then per-symbol chapters that carry the full
     research report when one exists (falling back to the news-summary tier).
+
+    target_date/data_through are the run's own dates. Passing them is
+    preferred: without them the report can only infer dates from the
+    predictions payload, which is not necessarily the run's.
     Returns PDF bytes or None on failure.
     """
-    html = _build_report_html(symbols, ai_analysis, model_signals, recommendations, news_data)
+    html = _build_report_html(symbols, ai_analysis, model_signals, recommendations,
+                              news_data, target_date, data_through)
     return _html_to_pdf(html)
 
 
@@ -96,18 +103,22 @@ def _html_to_pdf(html: str) -> Optional[bytes]:
 
 
 def _build_ta_predictions_section(predictions: list[dict]) -> str:
-    """Render model prediction signals for the symbol as a table."""
-    from html import escape
+    """Render model prediction signals for the symbol as a table.
 
+    Dates go through _esc, not html.escape: these fields arrive as `date`
+    objects from some cache accessors, and html.escape() on a date raises
+    (it calls date.replace("&", "&amp;")), which took the whole PDF down
+    and silently degraded the download to Markdown.
+    """
     rows = ["<h2>Model Predictions</h2>"]
     first = predictions[0] if predictions else {}
     pred_date = first.get("prediction_date", "")
     target_date = first.get("target_date", "")
-    if pred_date:
-        meta = f"<strong>As-of (data through):</strong> {escape(pred_date)}"
-        if target_date:
-            meta += f" &nbsp;&nbsp;<strong>Predicting close of:</strong> {escape(target_date)}"
-        rows.append(f"<p class='meta'>{meta}</p>")
+    # Always rendered — a missing date shows as "—" rather than the whole
+    # line vanishing, so a broken date is visible instead of silent.
+    meta = f"<strong>Target date (close being predicted):</strong> {_esc(target_date) or '—'}"
+    meta += f" &nbsp;&nbsp;<strong>Data through:</strong> {_esc(pred_date) or '—'}"
+    rows.append(f"<p class='meta'>{meta}</p>")
 
     rows.append("<table><tr><th>Model</th><th>Signal</th><th>Confidence</th>"
                 "<th>Up Prob</th><th>Target</th><th>Result</th></tr>")
@@ -125,10 +136,10 @@ def _build_ta_predictions_section(predictions: list[dict]) -> str:
         else:
             result = "Pending"
         rows.append(
-            f"<tr><td>{escape(p.get('model_name', ''))}</td>"
-            f"<td>{escape(p.get('decision', ''))}</td>"
+            f"<tr><td>{_esc(p.get('model_name', ''))}</td>"
+            f"<td>{_esc(p.get('decision', ''))}</td>"
             f"<td>{conf_str}</td><td>{up_str}</td>"
-            f"<td>{escape(p.get('target_date', '') or '—')}</td><td>{result}</td></tr>"
+            f"<td>{_esc(p.get('target_date', '')) or '—'}</td><td>{result}</td></tr>"
         )
     rows.append("</table><hr/>")
     return "\n".join(rows)
@@ -136,8 +147,6 @@ def _build_ta_predictions_section(predictions: list[dict]) -> str:
 
 def _build_ta_recommendation_section(recommendation: dict) -> str:
     """Render the recommendation-model (Luna) reasoning for the symbol."""
-    from html import escape
-
     model_used = recommendation.get("model_used", "")
     created_at = str(recommendation.get("created_at", ""))[:19]
     sym_rec = recommendation.get("symbol_rec", {}) or {}
@@ -146,9 +155,9 @@ def _build_ta_recommendation_section(recommendation: dict) -> str:
     rows = ["<h2>Recommendation Synthesis</h2>"]
     meta_bits = []
     if model_used:
-        meta_bits.append(f"<strong>Model:</strong> {escape(model_used)}")
+        meta_bits.append(f"<strong>Model:</strong> {_esc(model_used)}")
     if created_at:
-        meta_bits.append(f"<strong>Generated:</strong> {escape(created_at)}")
+        meta_bits.append(f"<strong>Generated:</strong> {_esc(created_at)}")
     if meta_bits:
         rows.append(f"<p class='meta'>{' &nbsp;&nbsp; '.join(meta_bits)}</p>")
 
@@ -160,27 +169,27 @@ def _build_ta_recommendation_section(recommendation: dict) -> str:
             try:
                 conviction_str = f" &nbsp;&nbsp;<strong>Conviction:</strong> {int(float(conviction) * 100)}%"
             except (TypeError, ValueError):
-                conviction_str = f" &nbsp;&nbsp;<strong>Conviction:</strong> {escape(str(conviction))}"
-        rows.append(f"<div class='action-box'><strong>Action:</strong> {escape(action)}{conviction_str}</div>")
+                conviction_str = f" &nbsp;&nbsp;<strong>Conviction:</strong> {_esc(conviction)}"
+        rows.append(f"<div class='action-box'><strong>Action:</strong> {_esc(action)}{conviction_str}</div>")
 
     reasoning = sym_rec.get("reasoning", "")
     if reasoning:
-        rows.append(f"<h3>Reasoning</h3><p>{escape(reasoning)}</p>")
+        rows.append(f"<h3>Reasoning</h3><p>{_esc(reasoning)}</p>")
 
     conflicts = sym_rec.get("conflicts", [])
     if conflicts:
         rows.append("<h3>Identified Conflicts</h3><ol>")
         for c in conflicts:
-            rows.append(f"<li>{escape(str(c))}</li>")
+            rows.append(f"<li>{_esc(c)}</li>")
         rows.append("</ol>")
 
     model_notes = sym_rec.get("model_notes", "")
     if model_notes:
-        rows.append(f"<h3>Model Notes</h3><p>{escape(str(model_notes))}</p>")
+        rows.append(f"<h3>Model Notes</h3><p>{_esc(model_notes)}</p>")
 
     risk = overall.get("risk_assessment", "")
     if risk:
-        rows.append(f"<h3>Risk Assessment</h3><p>{escape(risk)}</p>")
+        rows.append(f"<h3>Risk Assessment</h3><p>{_esc(risk)}</p>")
 
     rows.append("<hr/>")
     return "\n".join(rows)
@@ -284,6 +293,8 @@ def _build_report_html(
     model_signals: dict | None,
     recommendations: dict | None,
     news_data: dict | None,
+    target_date: str | None = None,
+    data_through: str | None = None,
 ) -> str:
     now = datetime.now()
     date_str = now.strftime("%B %d, %Y")
@@ -318,7 +329,8 @@ def _build_report_html(
     sections.append(_build_executive_summary(recommendations, ai_analysis, symbols))
 
     # --- II. Model Predictions ---
-    sections.append(_build_model_predictions_section(model_signals, symbols))
+    sections.append(_build_model_predictions_section(model_signals, symbols,
+                                                     target_date, data_through))
 
     # --- III. Per-Symbol Analysis (research chapters or news-summary tier) ---
     sections.append(_build_ai_analysis_section(ai_analysis, symbols))
@@ -543,6 +555,8 @@ def _build_executive_summary(
 def _build_model_predictions_section(
     model_signals: dict | None,
     symbols: list[str],
+    target_date: str | None = None,
+    data_through: str | None = None,
 ) -> str:
     rows = ["<h2>II. Model Predictions</h2>"]
 
@@ -599,11 +613,18 @@ def _build_model_predictions_section(
 
         rows.append("</tbody></table>")
 
-    # Prediction metadata
-    if meta:
-        predict_date = meta.get("predict_date", "N/A")
-        rows.append(f"<p class='meta'><strong>Prediction date:</strong> {predict_date}"
-                    f" &nbsp; <strong>Generated at:</strong> {datetime.now().strftime('%H:%M:%S')}</p>")
+    # Date provenance. The run's own dates win; the payload's are only a
+    # fallback, and are labelled when they are merely "latest in the DB"
+    # rather than this run's. Always rendered, so a missing date shows as
+    # "N/A" instead of the line silently disappearing.
+    tgt = target_date or meta.get("target_date") or "N/A"
+    through = data_through or meta.get("predict_date") or "N/A"
+    stale = not (target_date or data_through) and meta.get("dates_are_latest_available")
+    note = " (latest available, not this run)" if stale else ""
+    rows.append(f"<p class='meta'><strong>Target date (close being predicted):</strong> "
+                f"{_esc(tgt)}{note} &nbsp; <strong>Data through:</strong> {_esc(through)}"
+                f" &nbsp; <strong>Generated at:</strong> "
+                f"{datetime.now().strftime('%H:%M:%S')}</p>")
 
     rows.append("<hr/>")
     return "\n".join(rows)

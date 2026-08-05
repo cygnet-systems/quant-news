@@ -424,3 +424,122 @@ class ActivityLog(Base):
         Index("ix_activity_user_time", "user_id", "created_at"),
         Index("ix_activity_run", "run_id"),
     )
+
+
+class ScheduledJob(Base):
+    """A recurring job the app runs itself, editable from the dashboard.
+
+    The schedule lives in the database rather than in config so it survives a
+    redeploy and can be changed without one. The app owns the clock: there is
+    no external cron, and nothing here depends on the machine the container
+    happens to be running on beyond it being up.
+
+    ``last_success_date`` is what makes catch-up safe. On startup a job whose
+    window has passed today and that has no success recorded for today runs
+    once; a redeploy loop cannot turn that into repeated runs.
+    """
+
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False,
+                                          server_default=text("true"))
+
+    # Local-time schedule. Stored as parts rather than a cron string so the UI
+    # can present a time picker and a weekday choice without parsing.
+    hour: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    minute: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    days_of_week: Mapped[str] = mapped_column(String(32), nullable=False,
+                                              server_default="mon-fri")
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False,
+                                          server_default="US/Eastern")
+
+    symbols_csv: Mapped[str | None] = mapped_column(Text)
+    params_json: Mapped[dict | None] = mapped_column(JSONB)
+
+    # Denormalised outcome of the most recent run — the UI reads these on
+    # every render, and catch-up needs last_success_date without scanning
+    # the history table.
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str | None] = mapped_column(String(16))
+    last_detail: Mapped[str | None] = mapped_column(Text)
+    last_duration_ms: Mapped[int | None] = mapped_column(Integer)
+    last_success_date: Mapped[str | None] = mapped_column(String(10))
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+
+
+class JobRun(Base):
+    """One execution of a scheduled job — the audit trail behind the status."""
+
+    __tablename__ = "job_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # schedule | manual | catchup
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False, default="schedule")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[str | None] = mapped_column(Text)
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+
+    __table_args__ = (
+        Index("ix_job_runs_job_time", "job_id", "started_at"),
+    )
+
+
+class LLMUsage(Base):
+    """One row per LLM API call: tokens, cost, and what the call was for.
+
+    Internal telemetry — nothing here is ever fed back into a prompt. Token
+    counts come from the provider response and are exact. Cost is derived,
+    so the RATES USED are stored on the row: a later price change cannot
+    silently rewrite the cost of calls already made.
+
+    ``stage`` is what the call was for (research / ai_report /
+    recommendations / …) so spend can be attributed to the thing that
+    produced it rather than to a model name alone.
+    """
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    run_id: Mapped[str | None] = mapped_column(String(36))
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    symbol: Mapped[str | None] = mapped_column(String(16))
+    trade_date: Mapped[str | None] = mapped_column(String(10))
+
+    provider: Mapped[str | None] = mapped_column(String(32))
+    model: Mapped[str | None] = mapped_column(String(64))
+
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Dollars per MILLION tokens, as applied to this row.
+    input_rate_per_mtok: Mapped[float | None] = mapped_column(Double)
+    output_rate_per_mtok: Mapped[float | None] = mapped_column(Double)
+    cost_usd: Mapped[float | None] = mapped_column(Double)
+
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    error: Mapped[str | None] = mapped_column(Text)
+
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+
+    __table_args__ = (
+        Index("ix_llm_usage_time", "created_at"),
+        Index("ix_llm_usage_stage", "stage", "created_at"),
+        Index("ix_llm_usage_run", "run_id"),
+    )

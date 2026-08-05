@@ -291,6 +291,12 @@ def build_model_inputs_xlsx(
     from services.stock_data import fetch_stock_data, get_company_profile
 
     as_of = str(as_of)[:10]
+    # as_of is the data cutoff; the target is the next session's close.
+    try:
+        from utils.trading_calendar import get_next_trading_day
+        _target_str = str(get_next_trading_day(as_of))
+    except Exception:
+        _target_str = "N/A"
     buf = io.BytesIO()
 
     spy_full = fetch_stock_data("SPY", period="2y")
@@ -393,7 +399,8 @@ def build_model_inputs_xlsx(
         {"Field": "What is this?",
          "Value": "The point-in-time inputs behind this report/prediction, so you "
                   "can audit them and draw your own conclusions."},
-        {"Field": "As-of date", "Value": as_of},
+        {"Field": "Data through (as-of)", "Value": as_of},
+        {"Field": "Target date (close being predicted)", "Value": _target_str},
         {"Field": "Symbols", "Value": ", ".join(symbols)},
         {"Field": "Generated", "Value": _dt.now().strftime("%Y-%m-%d %H:%M:%S")},
         {"Field": "Kronos OHLCV",

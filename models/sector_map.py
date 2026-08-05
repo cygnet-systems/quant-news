@@ -13,6 +13,7 @@ say which proxy it is using.
 """
 
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ PEER_MAP: dict[str, list[str]] = {
 
 # Runtime cache: symbol -> resolved info dict
 _sector_cache: dict[str, dict] = {}
+_sector_lock = threading.Lock()
 
 
 def get_peers(symbol: str, limit: int = 4) -> list[str]:
@@ -110,33 +112,58 @@ def get_sector_info(symbol: str) -> dict:
         treat as "no distinct sector context", not as a sector).
     """
     symbol = symbol.upper()
-    if symbol in _sector_cache:
-        return _sector_cache[symbol]
+    cached = _sector_cache.get(symbol)
+    if cached is not None:
+        return cached
 
-    sector = industry = ""
-    try:
-        from services.stock_data import get_ticker
-        info = get_ticker(symbol).info or {}
-        sector = (info.get("sector") or "").strip()
-        industry = (info.get("industry") or "").strip()
-    except Exception as e:
-        logger.warning(f"Sector lookup failed for {symbol}: {e}")
+    # One fetch per symbol, serialized. The prediction pipeline resolves the
+    # sector from several models at once (Phase 2 runs XGBoost, LightGBM and
+    # the research agent concurrently); without this lock they all missed the
+    # cache together and yfinance returned an EMPTY info dict to some of them.
+    # Those callers silently got etf="SPY", so the sector features were a
+    # duplicate of the SPY features — measured at 11 of 40 GBM predictions in
+    # one 20-symbol run, and nondeterministic between models on one symbol.
+    with _sector_lock:
+        cached = _sector_cache.get(symbol)
+        if cached is not None:
+            return cached
 
-    if industry and industry in INDUSTRY_TO_ETF:
-        etf, level = INDUSTRY_TO_ETF[industry], "industry"
-    elif sector in SECTOR_TO_ETF:
-        etf, level = SECTOR_TO_ETF[sector], "sector"
-    else:
-        etf, level = "SPY", "unknown"
-        if sector:
-            logger.warning(f"Unmapped sector name for {symbol}: {sector!r}")
+        sector = industry = ""
+        try:
+            from services.stock_data import get_ticker
+            info = get_ticker(symbol).info or {}
+            sector = (info.get("sector") or "").strip()
+            industry = (info.get("industry") or "").strip()
+        except Exception as e:
+            logger.warning(f"Sector lookup failed for {symbol}: {e}")
 
-    result = {"etf": etf, "sector": sector or "unknown",
-              "industry": industry or "unknown", "level": level}
-    _sector_cache[symbol] = result
-    logger.info(f"Sector lookup: {symbol} -> {sector or 'unknown'} / "
-                f"{industry or 'unknown'} -> {etf} ({level})")
-    return result
+        if industry and industry in INDUSTRY_TO_ETF:
+            etf, level = INDUSTRY_TO_ETF[industry], "industry"
+        elif sector in SECTOR_TO_ETF:
+            etf, level = SECTOR_TO_ETF[sector], "sector"
+        else:
+            etf, level = "SPY", "unknown"
+            if sector:
+                logger.warning(f"Unmapped sector name for {symbol}: {sector!r}")
+
+        result = {"etf": etf, "sector": sector or "unknown",
+                  "industry": industry or "unknown", "level": level}
+
+        if level == "unknown" and not sector:
+            # An empty info dict is a transient vendor failure, not a fact about
+            # the company. Caching it would pin every later consumer in this
+            # process to the SPY fallback; leaving it uncached costs one retry.
+            logger.warning(
+                f"Sector metadata unavailable for {symbol} — falling back to "
+                f"SPY for this call only (not cached; sector features will be "
+                f"a duplicate of SPY wherever this result is used)"
+            )
+            return result
+
+        _sector_cache[symbol] = result
+        logger.info(f"Sector lookup: {symbol} -> {sector or 'unknown'} / "
+                    f"{industry or 'unknown'} -> {etf} ({level})")
+        return result
 
 
 def get_sector_etf(symbol: str) -> str:

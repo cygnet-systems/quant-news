@@ -97,12 +97,13 @@ class EnsembleModel(BaseModel):
                 },
             )
 
-        # Compute confidence-weighted vote: each model's vote counts as
-        # (config weight x its own confidence). A unanimous BUY from three
-        # low-confidence models no longer produces 100% ensemble confidence,
-        # and HOLD votes dilute the lean instead of being ignored.
+        # Confidence-weighted vote: each model's vote counts as
+        # (config weight x its own confidence). This decides the DIRECTION.
+        # It deliberately does not decide the confidence — see below.
         weighted_score = 0.0
         total_weight = 0.0
+        prob_sum = 0.0
+        prob_weight = 0.0
         votes = {}
         weights_used = {}
 
@@ -118,6 +119,15 @@ class EnsembleModel(BaseModel):
             total_weight += effective
             votes[model_name] = f"{decision} ({model_conf:.0%})"
             weights_used[model_name] = round(effective, 3)
+
+            # Members' own probabilities, weighted by config weight only.
+            member_p = result.get("up_probability")
+            if member_p is None:
+                # No probability published: fall back to the member's stated
+                # confidence pushed to the side it actually voted.
+                member_p = 0.5 + direction * (model_conf / 2.0)
+            prob_sum += weight * float(member_p)
+            prob_weight += weight
 
         if total_weight == 0:
             return PredictionResult(
@@ -137,12 +147,22 @@ class EnsembleModel(BaseModel):
         else:
             action = "HOLD"
 
-        # Confidence: how strongly the ensemble leans one way
-        confidence = min(abs(normalized), 1.0)
+        # Confidence and up_probability come from the MEAN MEMBER PROBABILITY,
+        # not from `normalized`. When every member agrees on direction the
+        # per-model confidences cancel in weighted_score/total_weight, so
+        # `normalized` is exactly +/-1 no matter how unsure the members were,
+        # pinning confidence at 1.0. That fired on ~45% of predictions, whose
+        # realised up-rate was 0.499 — the ensemble claimed certainty on a coin
+        # flip. Measured over a 2024-2026 walk-forward plus a 2026-04..07
+        # holdout, this change improves Brier from 0.408 to 0.263 (design) and
+        # 0.381 to 0.255 (holdout); a constant 0.5 forecast scores 0.25, so the
+        # old formula was worse than declining to answer. It adds no edge — it
+        # stops the ensemble overstating what it knows.
+        up_probability = prob_sum / prob_weight if prob_weight else 0.5
+        confidence = min(abs(up_probability - 0.5) * 2, 1.0)
 
-        # Up probability: map normalized score [-1, 1] → [0, 1]
-        up_probability = (normalized + 1) / 2
-
+        # `normalized` is retained as a directional-agreement diagnostic. It is
+        # a measure of consensus, not of confidence, and is named accordingly.
         return PredictionResult(
             model_name=self.name,
             decision=action,
@@ -153,6 +173,7 @@ class EnsembleModel(BaseModel):
                 "weights_used": weights_used,
                 "weighted_score": round(weighted_score, 3),
                 "normalized_score": round(normalized, 3),
+                "direction_agreement": round(abs(normalized), 3),
                 "models_enabled": sorted(enabled_models),
                 "models_excluded": sorted(excluded),
                 "models_used": len(valid),

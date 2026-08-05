@@ -1,0 +1,304 @@
+"""Email notifications for scheduled runs — morning calls, evening results.
+
+The transport is inherited from CygnetResearchTerminal's ``cron_jobs/notify.py``:
+Microsoft Graph ``sendMail`` with client-credentials auth, reading the SAME
+environment variables (``AZURE_TENANT_ID``, ``AZURE_CLIENT_ID``,
+``AZURE_CLIENT_SECRET``, ``NOTIFY_FROM_EMAIL``, ``NOTIFY_TO_EMAIL``). One Azure
+app registration and one set of Railway variables serve both apps.
+
+What is NOT inherited is the message shape. CRT reports whether a data-loading
+job moved bytes; the interesting content here is what the platform decided and
+whether it was right, so the two mails are:
+
+* **Prediction** (after the morning analysis) — the call per symbol, what the
+  models disagreed about, and what the run cost.
+* **Result** (after the evening evaluation) — how those calls actually landed:
+  hit rate, P&L, and which names were wrong.
+
+Every function is best-effort. A mail server problem must never fail a run
+that already produced its analysis.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import date
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+_SEND_URL = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+
+_REQUIRED = (
+    "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET",
+    "NOTIFY_FROM_EMAIL", "NOTIFY_TO_EMAIL",
+)
+
+_ACTION_COLOR = {"BUY": "#00C805", "SELL": "#FF5000", "HOLD": "#A0A0A0"}
+
+
+def _config() -> Optional[dict]:
+    cfg = {k: os.environ.get(k) for k in _REQUIRED}
+    missing = [k for k, v in cfg.items() if not v]
+    if missing:
+        logger.debug(f"Email notifications disabled — missing: {', '.join(missing)}")
+        return None
+    return cfg
+
+
+def enabled() -> bool:
+    return _config() is not None
+
+
+def _send(subject: str, html: str) -> bool:
+    cfg = _config()
+    if cfg is None:
+        return False
+    try:
+        token = requests.post(
+            _TOKEN_URL.format(tenant=cfg["AZURE_TENANT_ID"]),
+            data={
+                "client_id": cfg["AZURE_CLIENT_ID"],
+                "client_secret": cfg["AZURE_CLIENT_SECRET"],
+                "scope": "https://graph.microsoft.com/.default",
+                "grant_type": "client_credentials",
+            },
+            timeout=15,
+        )
+        token.raise_for_status()
+        access = token.json()["access_token"]
+
+        resp = requests.post(
+            _SEND_URL.format(sender=cfg["NOTIFY_FROM_EMAIL"]),
+            headers={"Authorization": f"Bearer {access}",
+                     "Content-Type": "application/json"},
+            json={
+                "message": {
+                    "subject": subject,
+                    "body": {"contentType": "HTML", "content": html},
+                    "toRecipients": [
+                        {"emailAddress": {"address": addr.strip()}}
+                        for addr in cfg["NOTIFY_TO_EMAIL"].split(",") if addr.strip()
+                    ],
+                },
+                "saveToSentItems": "false",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        logger.info(f"Notification sent: {subject}")
+        return True
+    except Exception:
+        logger.exception("Failed to send notification email — continuing")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+_STYLE = (
+    "font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+    "font-size:14px;color:#1a1a1a;line-height:1.5"
+)
+_TH = ("text-align:left;padding:6px 10px;border-bottom:2px solid #ddd;"
+       "font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666")
+_TD = "padding:6px 10px;border-bottom:1px solid #eee"
+
+
+def _wrap(title: str, subtitle: str, body: str) -> str:
+    return (
+        f'<div style="{_STYLE}">'
+        f'<h2 style="margin:0 0 2px">{title}</h2>'
+        f'<div style="color:#666;font-size:13px;margin-bottom:16px">{subtitle}</div>'
+        f'{body}'
+        '<p style="color:#999;font-size:12px;margin-top:22px">'
+        'Sent by quant-news. Predictions are model output, not advice — the '
+        'platform has shown no demonstrable alpha at scale.</p></div>'
+    )
+
+
+def run_cost(since, until=None) -> Optional[float]:
+    """LLM spend inside a time window.
+
+    Attributed by time rather than by ``run_id``: the job executes the
+    pipeline in a subprocess, which opens its own progress run, so the
+    parent's id never appears on the usage rows the work actually wrote.
+    """
+    from datetime import datetime as _dt
+
+    try:
+        from db.session import get_session
+        from sqlalchemy import text
+        with get_session() as session:
+            return session.execute(
+                text("select sum(cost_usd) from llm_usage "
+                     "where created_at >= :a and created_at <= :b"),
+                {"a": since, "b": until or _dt.now()},
+            ).scalar()
+    except Exception as e:
+        logger.debug(f"cost lookup failed: {e}")
+        return None
+
+
+def notify_analysis(summary: dict, cost: float | None = None,
+                    duration_ms: int | None = None) -> bool:
+    """The morning mail: what the platform is calling for today's session."""
+    actions = summary.get("actions") or {}
+    if not actions:
+        return notify_job_failure(
+            "daily_analysis",
+            "Run finished but produced no recommendations — check the History tab.")
+
+    order = {"BUY": 0, "SELL": 1, "HOLD": 2}
+    rows = ""
+    for sym, action in sorted(actions.items(),
+                              key=lambda kv: (order.get(kv[1], 3), kv[0])):
+        color = _ACTION_COLOR.get(action, "#666")
+        rows += (f'<tr><td style="{_TD};font-weight:600">{sym}</td>'
+                 f'<td style="{_TD};color:{color};font-weight:600">{action}</td></tr>')
+
+    counts = {a: sum(1 for v in actions.values() if v == a)
+              for a in ("BUY", "SELL", "HOLD")}
+    meta = [f"{summary.get('predictions_stored', 0)} predictions stored"]
+    if duration_ms:
+        meta.append(f"{duration_ms // 1000}s")
+    if cost:
+        meta.append(f"${cost:.2f} in LLM calls")
+    if summary.get("skipped"):
+        meta.append(f"skipped: {', '.join(summary['skipped'])}")
+
+    body = (
+        f'<table style="border-collapse:collapse;min-width:280px">'
+        f'<tr><th style="{_TH}">Symbol</th><th style="{_TH}">Call</th></tr>'
+        f'{rows}</table>'
+        f'<p style="color:#666;font-size:13px;margin-top:14px">'
+        f'{counts["BUY"]} buy · {counts["SELL"]} sell · {counts["HOLD"]} hold<br>'
+        f'{" · ".join(meta)}</p>'
+    )
+    subject = (f"Pre-open calls {summary.get('target_date', '')} — "
+               f"{counts['BUY']}B/{counts['SELL']}S/{counts['HOLD']}H")
+    return _send(subject, _wrap(
+        "Pre-open calls",
+        f"Target session {summary.get('target_date', '?')} · "
+        f"data through {summary.get('as_of', '?')}",
+        body,
+    ))
+
+
+def notify_evaluation(trade_date: str | None = None) -> bool:
+    """The evening mail: how the calls actually landed."""
+    from db.session import get_session
+    from sqlalchemy import text
+
+    target = trade_date or date.today().isoformat()
+    try:
+        with get_session() as session:
+            per_model = session.execute(text("""
+                select model_name,
+                       count(*) filter (where decision <> 'HOLD') as active,
+                       count(*) filter (where decision <> 'HOLD' and was_correct) as hits,
+                       round(sum(pnl_dollars)::numeric, 2) as pnl
+                from model_predictions
+                where target_date = :d and was_correct is not null
+                group by 1 order by 1
+            """), {"d": target}).mappings().all()
+
+            synthesis = session.execute(text("""
+                select symbol, decision, was_correct,
+                       round(pnl_dollars::numeric, 2) as pnl
+                from model_predictions
+                where target_date = :d and model_name = 'recommendation_synthesis'
+                  and was_correct is not null
+                order by symbol
+            """), {"d": target}).mappings().all()
+    except Exception as e:
+        logger.warning(f"evaluation notification query failed: {e}")
+        return False
+
+    if not per_model:
+        # Nothing scored is a legitimate outcome (holiday, or the session's
+        # close has not published yet). Say so rather than sending an empty
+        # table that reads like a failure.
+        return _send(
+            f"No results to score for {target}",
+            _wrap("Nothing scored", f"Target session {target}",
+                  "<p>No predictions were ready to evaluate. This is normal on a "
+                  "non-trading day, or when the vendor has not published the "
+                  "session's close yet.</p>"))
+
+    model_rows = ""
+    for r in per_model:
+        acc = (r["hits"] / r["active"] * 100) if r["active"] else None
+        pnl = float(r["pnl"] or 0)
+        pnl_color = "#00A004" if pnl > 0 else "#D93900" if pnl < 0 else "#666"
+        model_rows += (
+            f'<tr><td style="{_TD}">{r["model_name"]}</td>'
+            f'<td style="{_TD}">{r["active"]}</td>'
+            f'<td style="{_TD}">{f"{acc:.0f}%" if acc is not None else "—"}</td>'
+            f'<td style="{_TD};color:{pnl_color}">${pnl:,.2f}</td></tr>'
+        )
+
+    miss_rows = ""
+    for r in synthesis:
+        mark = "✓" if r["was_correct"] else "✗"
+        color = "#00A004" if r["was_correct"] else "#D93900"
+        miss_rows += (
+            f'<tr><td style="{_TD};font-weight:600">{r["symbol"]}</td>'
+            f'<td style="{_TD}">{r["decision"]}</td>'
+            f'<td style="{_TD};color:{color}">{mark}</td>'
+            f'<td style="{_TD}">${float(r["pnl"] or 0):,.2f}</td></tr>'
+        )
+
+    total_active = sum(r["active"] for r in per_model)
+    total_hits = sum(r["hits"] for r in per_model)
+    total_pnl = sum(float(r["pnl"] or 0) for r in per_model)
+    overall = (total_hits / total_active * 100) if total_active else 0
+
+    body = (
+        f'<table style="border-collapse:collapse;min-width:380px">'
+        f'<tr><th style="{_TH}">Model</th><th style="{_TH}">Active</th>'
+        f'<th style="{_TH}">Hit rate</th><th style="{_TH}">P&amp;L</th></tr>'
+        f'{model_rows}</table>'
+    )
+    if miss_rows:
+        body += (
+            f'<h3 style="font-size:14px;margin:20px 0 6px">Synthesis calls</h3>'
+            f'<table style="border-collapse:collapse;min-width:320px">'
+            f'<tr><th style="{_TH}">Symbol</th><th style="{_TH}">Call</th>'
+            f'<th style="{_TH}">Right?</th><th style="{_TH}">P&amp;L</th></tr>'
+            f'{miss_rows}</table>'
+        )
+    body += (
+        f'<p style="color:#666;font-size:13px;margin-top:14px">'
+        f'{total_hits}/{total_active} directional calls correct ({overall:.0f}%) · '
+        f'${total_pnl:,.2f} gross, before costs.<br>'
+        f'A single day is far too small a sample to read as skill.</p>'
+    )
+    return _send(
+        f"Results {target} — {overall:.0f}% on {total_active} calls, ${total_pnl:,.2f}",
+        _wrap("Results", f"Target session {target}", body),
+    )
+
+
+def notify_job_failure(job_id: str, detail: str) -> bool:
+    body = (f'<p>The scheduled job <code>{job_id}</code> did not complete.</p>'
+            f'<pre style="background:#f6f6f6;padding:10px;border-radius:4px;'
+            f'font-size:12px;white-space:pre-wrap">{(detail or "")[:2000]}</pre>'
+            f'<p style="color:#666;font-size:13px">Check <code>/healthz</code> '
+            f'and the Activity Log.</p>')
+    return _send(f"❌ quant-news: {job_id} failed", _wrap("Job failed", job_id, body))
+
+
+def notify_overdue(job_ids: list[str]) -> bool:
+    names = ", ".join(job_ids)
+    body = (f'<p>These jobs have no successful run today and their scheduled '
+            f'window has passed: <strong>{names}</strong>.</p>'
+            f'<p style="color:#666;font-size:13px">The app is reachable — this '
+            f'is a job problem, not an uptime one. Check <code>/healthz</code>.</p>')
+    return _send(f"⚠️ quant-news: {names} overdue",
+                 _wrap("Job overdue", names, body))

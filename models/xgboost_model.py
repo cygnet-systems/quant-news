@@ -91,6 +91,12 @@ class XGBoostModel(BaseModel):
         as_of = kwargs.get("as_of")
 
         sector_df = kwargs.get("sector_df")
+        # Recorded on the trained-model cache: a model trained when the sector
+        # lookup fell back to SPY holds features that duplicate the SPY block,
+        # and nothing else in the cache key changes when the lookup later
+        # resolves correctly. Without this the corrupted model is served all
+        # day from disk.
+        sector_etf = "caller-provided"
         if sector_df is None:
             sector_etf = get_sector_etf(symbol)
             try:
@@ -115,6 +121,7 @@ class XGBoostModel(BaseModel):
             clf = self._get_or_train(
                 symbol, ohlcv_df, spy_df, sector_df,
                 historical_av_news, historical_global_news,
+                sector_etf=sector_etf,
             )
 
             # Build today's features (uses current news for live prediction)
@@ -145,6 +152,7 @@ class XGBoostModel(BaseModel):
         sector_df: pd.DataFrame,
         historical_av_news: dict[str, list[dict]],
         historical_global_news: dict[str, list[dict]],
+        sector_etf: str = "",
     ) -> XGBClassifier:
         """Get cached model or train a new one."""
         MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,6 +163,11 @@ class XGBoostModel(BaseModel):
         # trained on full history must never serve a backtest of an earlier
         # as-of date (and vice versa) — that would leak future data.
         data_end = str(ticker_df.index[-1].date()) if len(ticker_df) else ""
+        # The training NEWS window is an input too. Price data ending on the
+        # same day says nothing about how much news backed each training row,
+        # so a model trained on a frozen/partial news window would be served
+        # unchanged after the window was repaired.
+        news_end = max(historical_av_news) if historical_av_news else ""
 
         # Check disk cache
         if cache_path.exists() and meta_path.exists():
@@ -165,7 +178,9 @@ class XGBoostModel(BaseModel):
                 from models.feature_builder import FEATURE_VERSION
                 if (meta.get("training_date") == str(date.today())
                         and meta.get("data_end") == data_end
-                        and meta.get("feature_version") == FEATURE_VERSION):
+                        and meta.get("feature_version") == FEATURE_VERSION
+                        and meta.get("sector_etf") == sector_etf
+                        and meta.get("news_end") == news_end):
                     clf = pickle.loads(cache_path.read_bytes())
                     self._last_training_samples = meta.get("n_samples", 0)
                     logger.info(f"XGBoost cache hit: {symbol} (data through {data_end})")
@@ -188,6 +203,8 @@ class XGBoostModel(BaseModel):
             "n_samples": n_samples,
             "data_end": data_end,
             "feature_version": FEATURE_VERSION,
+            "sector_etf": sector_etf,
+            "news_end": news_end,
         }))
 
         self._last_training_samples = n_samples

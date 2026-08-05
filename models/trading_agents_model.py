@@ -186,6 +186,11 @@ class TradingAgentsModel(BaseModel):
                 "news_count": result.get("news_count", 0),
                 "sector_etf": result.get("sector_etf", ""),
                 "used_news": use_news,
+                # Token cost of the report, summed over retries. Persisted so
+                # cost per report is measurable instead of being stored as 0.
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+                "served_by_model": result.get("served_by_model", ""),
             },
         )
 

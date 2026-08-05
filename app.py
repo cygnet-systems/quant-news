@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from io import StringIO
@@ -217,6 +218,30 @@ def _sso_login(token: str = "", next: str = "/"):
     resp = RedirectResponse(dest, status_code=303)
     _set_session_cookie(resp, raw, remember=True)
     return resp
+
+
+@server.get("/healthz")
+def _healthz():
+    """Liveness for the process AND for the schedule it is supposed to keep.
+
+    Returns 503 when the scheduler thread is dead or a job has missed its
+    window, so an uptime monitor watching this URL reports the thing that
+    actually matters — "did today's analysis happen" — rather than "is the web
+    server answering", which stays true while nothing runs.
+
+    Unauthenticated on purpose: a monitor cannot log in, and this exposes
+    schedule state only, no market data or user content.
+    """
+    from fastapi.responses import JSONResponse
+
+    from services import scheduler_service
+
+    try:
+        state = scheduler_service.health()
+    except Exception as e:
+        return JSONResponse({"healthy": False, "error": str(e)[:200]},
+                            status_code=503)
+    return JSONResponse(state, status_code=200 if state["healthy"] else 503)
 
 
 @server.get("/auth/whoami")
@@ -1162,24 +1187,22 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
     if not (n_clicks or retry_clicks or full_clicks) or not news_data or not news_data.get("articles_by_symbol"):
         raise PreventUpdate
 
-    # As-of date: the Full Analysis picker when that flow triggered this,
-    # else the AI Report modal's own date (empty = today).
+    # Target date: the session whose close is being predicted, taken from the
+    # Full Analysis picker when that flow triggered this, else the AI Report
+    # modal's own. Data is cut off at the PREVIOUS trading day, so a Monday
+    # target sees nothing after the preceding Friday's close.
     today = date_cls.today()
-    as_of = None
+    picked = None
     is_full = ctx.triggered_id == "full-analysis-confirm-btn"
     if is_full and fa_date:
-        as_of = str(fa_date)[:10]
+        picked = str(fa_date)[:10]
     elif not is_full and ai_date:
-        as_of = str(ai_date)[:10]
-    if as_of:
-        as_of_d = date_cls.fromisoformat(as_of)
-    else:
-        # No date chosen: the session the report is FOR — next trading day
-        # (matches the picker default; plain "today" could be a weekend).
-        from utils.trading_calendar import get_next_trading_day
-        as_of_d = get_next_trading_day(today)
-    is_backtest = as_of_d < today
+        picked = str(ai_date)[:10]
+    from utils.trading_calendar import resolve_target_and_cutoff
+    target_d, as_of_d = resolve_target_and_cutoff(picked)
+    is_backtest = target_d < today
     as_of_str = as_of_d.isoformat()
+    target_str = target_d.isoformat()
 
     # Parameters come from the modal that actually triggered this run — each
     # flow owns its own visible controls (the Full Analysis flow used to
@@ -1204,13 +1227,15 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
 
     from services import progress_service as prog
     if is_full:
-        prog.start_run(f"Full Analysis — {len(symbols or [])} symbols, as-of {as_of_str}"
+        prog.start_run(f"Full Analysis — {len(symbols or [])} symbols, "
+                       f"target {target_str} (data through {as_of_str})"
                        + (" (backtest)" if is_backtest else ""))
     prog.emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
     prog.emit("action", f"Options: model={report_model}, window={lookback_days}d, "
                         f"type={'thesis' if include_thesis_flag else 'standard'}, "
                         f"research={'on' if include_research else 'pipeline' if is_full else 'off'}, "
-                        f"recs={recs_mode} ({recs_model_val}), as-of {as_of_str}")
+                        f"recs={recs_mode} ({recs_model_val}), "
+                        f"target {target_str}, data through {as_of_str}")
 
     articles_by_symbol = news_data.get("articles_by_symbol", {})
 
@@ -1249,7 +1274,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
                 articles_by_symbol.get(sym, []), as_of_str, lookback_days=lookback_days)
     articles_by_symbol = windowed
     total_articles = sum(len(a) for a in articles_by_symbol.values())
-    prog.emit("news", f"News window {lookback_days}d ending {as_of_str}: "
+    prog.emit("news", f"News window {lookback_days}d ending {as_of_str} "
+                      f"(target {target_str} minus 1 trading day): "
                       f"{total_articles} articles fetched (point-in-time)")
 
     # Check persistent cache (Postgres + S3) before running LLM
@@ -1302,33 +1328,21 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
         }
         try:
             from services.stock_data import get_stock_info
-            # Live quote/info only when analyzing as of today — a backtest
-            # must not see current prices. Static identity is kept either way.
+            # Only static identity, live run or not. get_stock_info() returns a
+            # CURRENT quote, so on a run whose target is today's close it would
+            # hand the LLM intraday prices from the very session being
+            # predicted. Keeping live and backtest on one path is what makes
+            # the window leak-proof rather than leak-proof-only-in-backtest.
+            # Prices, technicals and fundamentals all arrive instead through
+            # the validated blocks below, which are computed from OHLCV
+            # truncated to the as-of date.
             info = get_stock_info(symbol)
-            if is_backtest:
-                enriched["info"] = {
-                    "name": info.name, "sector": info.sector, "industry": info.industry,
-                }
-                # Period metrics/signals in the store are computed on current
-                # data — drop them for backtests; validated blocks replace them.
-                enriched["metrics"] = {}
-                enriched["signals"] = {}
-            else:
-                enriched["info"] = {
-                    "name": info.name,
-                    "sector": info.sector,
-                    "industry": info.industry,
-                    "market_cap": info.market_cap,
-                    "current_price": info.current_price,
-                    "previous_close": info.previous_close,
-                    "day_change_percent": info.day_change_percent,
-                    "volume": info.volume,
-                    "avg_volume": info.avg_volume,
-                    "fifty_two_week_high": info.fifty_two_week_high,
-                    "fifty_two_week_low": info.fifty_two_week_low,
-                    "pe_ratio": info.pe_ratio,
-                    "dividend_yield": info.dividend_yield,
-                }
+            enriched["info"] = {
+                "name": info.name, "sector": info.sector, "industry": info.industry,
+            }
+            # Store metrics/signals are computed on current data — always drop.
+            enriched["metrics"] = {}
+            enriched["signals"] = {}
         except Exception as e:
             logger.warning(f"Could not fetch stock info for {symbol}: {e}")
         enriched_stock_data[symbol] = enriched
@@ -1364,8 +1378,10 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
 
             peers = get_peers(symbol)
             if peers:
+                # Cutoff applies live too — peer relative strength must be
+                # measured through the previous trading day, not "latest".
                 block = compute_peer_relative_strength(
-                    symbol, peers, as_of=as_of_str if is_backtest else None)
+                    symbol, peers, as_of=as_of_str)
                 if block:
                     blocks["peers"] = block
 
@@ -1454,6 +1470,10 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
                     symbol=symbol, trade_date=as_of_str,
                     decision=r.decision, confidence=r.confidence,
                     report_text=raw, model_name=report_model,
+                    # This flow was omitting token counts entirely, so every
+                    # report it wrote recorded 0 and cost was unmeasurable.
+                    input_tokens=details.get("input_tokens", 0),
+                    output_tokens=details.get("output_tokens", 0),
                 )
             except Exception as e:
                 logger.warning(f"research report persist failed for {symbol}: {e}")
@@ -1506,10 +1526,19 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
     run_overall = overall_articles and not (
         include_research and recs_mode != "off")
     if run_overall:
+        # The per-symbol metric blocks are already computed above from OHLCV
+        # truncated to the cutoff. The overall call used to get none of them,
+        # and since this flow also withholds live quotes, its financial block
+        # was empty — the model reported a broken data feed instead of an
+        # analysis. Hand it the same validated numbers the symbol calls get.
+        overall_metrics = "\n\n".join(
+            b["metrics"] for b in extra_blocks_by_symbol.values() if b.get("metrics")
+        )
         aio_tasks.append(_run_task(
             "overall", None, llm.summarize_news_structured, overall_articles, symbols or [],
             stock_data=enriched_stock_data,
             as_of_date=as_of_str,
+            extra_blocks={"metrics": overall_metrics} if overall_metrics else None,
             model=report_model,
             provider=report_provider,
         ))
@@ -2173,6 +2202,16 @@ def _build_history_tab_layout(history_data: dict) -> html.Div:
 
     return html.Div(
         [
+            # Above the filter bar and outside the filtered content: the
+            # schedule is not history, and it must stay reachable when the
+            # filters match nothing (that view early-returns an empty state).
+            _collapsible_section(
+                "Scheduled Jobs", "scheduler",
+                html.Div(id="scheduler-panel-container"),
+                icon_class="bi-alarm", default_open=False,
+            ),
+            dcc.Interval(id="scheduler-refresh", interval=15_000),
+            dcc.Store(id="scheduler-action-status"),
             _build_history_filter_bar(history_data),
             html.Div(id="history-tab-content"),
         ],
@@ -2423,7 +2462,12 @@ def _build_filtered_history_sections(history_data, filter_symbols, filter_date_r
         symbol_groups = []
         for sym in sorted(by_symbol):
             sym_preds = by_symbol[sym]
-            scored = [p for p in sym_preds if p.get("was_correct") is not None]
+            # Directional hit rate only. HOLDs are now scored too (against the
+            # no-trade band), but folding them in here would silently change
+            # what this percentage has always meant.
+            scored = [p for p in sym_preds
+                      if p.get("was_correct") is not None
+                      and p.get("decision") != "HOLD"]
             hits = sum(1 for p in scored if p["was_correct"])
             pnl_total = sum(p.get("pnl_dollars") or 0 for p in sym_preds)
             pnl_cls = "positive" if pnl_total > 0 else "negative" if pnl_total < 0 else ""
@@ -3674,8 +3718,15 @@ def download_report_pdf(n_clicks, symbols, ai_analysis, model_signals, recommend
                         "confidence": p.get("confidence"),
                         "up_probability": p.get("up_probability"),
                     }
+                # These are whatever is newest in the DB across ALL symbols,
+                # not the dates of any particular run, so they are labelled
+                # as such instead of being passed off as this report's target.
                 meta = preds[0] if preds else {}
-                model_signals["_meta"] = {"predict_date": meta.get("prediction_date", "")}
+                model_signals["_meta"] = {
+                    "predict_date": meta.get("prediction_date", ""),
+                    "target_date": meta.get("target_date", ""),
+                    "dates_are_latest_available": True,
+                }
         except Exception as e:
             logger.debug(f"Could not load predictions for report: {e}")
 
@@ -3695,12 +3746,22 @@ def download_report_pdf(n_clicks, symbols, ai_analysis, model_signals, recommend
     # the PDF's per-symbol chapters carry the full report, whichever flow ran.
     ai_analysis, _ = _merge_research_into_analysis(ai_analysis, model_signals, symbols)
 
+    # The run's own dates, so the report states them rather than inferring
+    # them from whichever predictions happen to be in the payload. The DB
+    # fallback above is NOT the run's, so it is left for the report to label
+    # as "latest available" rather than being passed off as authoritative.
+    _sig_meta = (model_signals or {}).get("_meta", {}) if isinstance(model_signals, dict) else {}
+    if _sig_meta.get("dates_are_latest_available"):
+        _sig_meta = {}
+
     pdf_bytes = generate_report_pdf(
         symbols=symbols,
         ai_analysis=ai_analysis,
         model_signals=model_signals,
         recommendations=recommendations,
         news_data=news_data,
+        target_date=_sig_meta.get("target_date") or None,
+        data_through=_sig_meta.get("predict_date") or None,
     )
 
     if not pdf_bytes:
@@ -3824,15 +3885,15 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
 
     from datetime import date as date_cls
 
-    # Parse the selected prediction date (default: today)
-    if predict_date_str:
-        predict_date = date_cls.fromisoformat(
-            predict_date_str[:10]
-        )
-    else:
-        predict_date = date_cls.today()
+    # The picker holds the TARGET session — the close being predicted. Models
+    # are truncated to `predict_date`, the previous trading day, so a Monday
+    # target trains and scores on nothing after the preceding Friday.
+    from utils.trading_calendar import resolve_target_and_cutoff
+    target_date, predict_date = resolve_target_and_cutoff(
+        predict_date_str[:10] if predict_date_str else None
+    )
 
-    is_backtest = predict_date < date_cls.today()
+    is_backtest = target_date < date_cls.today()
 
     _ALL_MODEL_IDS = [
         "kronos_mini", "xgboost_shap", "lightgbm",
@@ -3853,8 +3914,10 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
         spy_df = None
         try:
             spy_df = fetch_ohlcv("SPY", period="2y")
-            if is_backtest:
-                spy_df = spy_df[spy_df.index <= str(predict_date)]
+            # Always truncate to the cutoff, not only when backtesting: a live
+            # run whose target is TODAY's close would otherwise be handed
+            # today's partial intraday bar, which the target has not produced yet.
+            spy_df = spy_df[spy_df.index <= str(predict_date)]
         except Exception as e:
             logger.warning(f"SPY fetch failed: {e}")
 
@@ -3889,26 +3952,28 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
             except Exception:
                 continue
 
-            # Backtest: truncate OHLCV to only data available as of predict_date
-            if is_backtest:
-                if "Date" in df.columns:
-                    df = df[df["Date"] <= str(predict_date)]
-                else:
-                    df = df[df.index <= str(predict_date)]
-                if df.empty:
-                    logger.warning(
-                        f"{symbol}: no data available as of {predict_date}"
-                    )
-                    continue
+            # Truncate OHLCV to the cutoff on EVERY run, not just backtests.
+            # The target session's own bar must never be visible — live, that
+            # bar is today's partial intraday print.
+            if "Date" in df.columns:
+                df = df[df["Date"] <= str(predict_date)]
+            else:
+                df = df[df.index <= str(predict_date)]
+            if df.empty:
+                logger.warning(
+                    f"{symbol}: no data available as of {predict_date}"
+                )
+                continue
 
             sym_news = []
             if news_data and news_data.get("articles_by_symbol"):
                 sym_news = news_data["articles_by_symbol"].get(symbol) or []
 
-            # No lookahead: the news store holds articles fetched today —
-            # a backtest must not see anything published after the as-of date.
+            # No lookahead: the news store holds articles fetched today, so it
+            # is windowed to the cutoff on EVERY run — live included, where it
+            # would otherwise leak articles published during the target session.
             # Robust half-open UTC window (see services.news_window).
-            if is_backtest and sym_news:
+            if sym_news:
                 from services.news_window import filter_articles_as_of
                 sym_news = filter_articles_as_of(sym_news, predict_date, lookback_days=3650)
 
@@ -3948,7 +4013,9 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
                 run_ensemble=bool(run_ensemble),
                 historical_av_news=historical_av_news,
                 historical_global_news=historical_global_news,
-                as_of=str(predict_date) if is_backtest else None,
+                # Always the cutoff, live or backtest — downstream slicing has
+                # to stop at the previous trading day either way.
+                as_of=str(predict_date),
                 **research_kwargs,
             )
 
@@ -3958,9 +4025,11 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
             _prog.emit("models", f"{symbol}: " + ", ".join(
                 f"{m}={d}" for m, d in decisions.items()))
 
-        # Attach metadata so persist_predictions knows the date
+        # Attach metadata so persist_predictions knows the date, and so the
+        # report can state the target session rather than infer one.
         results["_meta"] = {
-            "predict_date": predict_date.isoformat(),
+            "predict_date": predict_date.isoformat(),   # data cutoff
+            "target_date": target_date.isoformat(),     # session being predicted
             "is_backtest": is_backtest,
         }
 
@@ -4959,21 +5028,117 @@ def recompute_ensemble(ensemble_config, signals):
 
 
 # =============================================================================
-# SCHEDULED EVALUATION (APScheduler)
+# SCHEDULER PANEL (History tab)
 # =============================================================================
 
 
-def _scheduled_evaluation():
-    """Daily evaluation job: evaluate predictions, run strategies, refresh metrics."""
-    try:
-        from services.evaluation_service import get_evaluation_service
+@callback(
+    Output("scheduler-panel-container", "children"),
+    Input("scheduler-refresh", "n_intervals"),
+    Input("scheduler-action-status", "data"),
+)
+def render_scheduler_panel(_n, _action):
+    """Redraw the schedule panel from the database.
 
-        service = get_evaluation_service()
-        results = service.run_evaluation()
-        if any(v > 0 for v in results.values()):
-            logger.info(f"Scheduled evaluation: {results}")
+    Reads on a timer rather than caching in a Store: the job state is written
+    by the scheduler thread (and possibly by another instance), so the browser
+    is never the source of truth for it.
+    """
+    from layouts.scheduler_components import build_scheduler_panel
+    from services import scheduler_service
+
+    try:
+        return build_scheduler_panel(
+            scheduler_service.list_jobs(),
+            scheduler_service.recent_runs(limit=8),
+        )
     except Exception as e:
-        logger.error(f"Scheduled evaluation error: {e}")
+        logger.warning(f"Scheduler panel render failed: {e}")
+        return html.Div(f"Scheduler unavailable: {str(e)[:160]}",
+                        className="scheduler-empty")
+
+
+@callback(
+    Output({"type": "sched-feedback", "job": MATCH}, "children"),
+    Input({"type": "sched-save", "job": MATCH}, "n_clicks"),
+    State({"type": "sched-enabled", "job": MATCH}, "value"),
+    State({"type": "sched-hour", "job": MATCH}, "value"),
+    State({"type": "sched-minute", "job": MATCH}, "value"),
+    State({"type": "sched-days", "job": MATCH}, "value"),
+    State({"type": "sched-tz", "job": MATCH}, "value"),
+    # Only the analysis job renders a symbol box.
+    State({"type": "sched-symbols", "job": MATCH}, "value", allow_optional=True),
+    prevent_initial_call=True,
+)
+def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols):
+    """Persist one job's schedule and reschedule it immediately."""
+    if not n_clicks:
+        raise PreventUpdate
+
+    job_id = ctx.triggered_id["job"]
+    try:
+        hour = max(0, min(23, int(hour)))
+        minute = max(0, min(59, int(minute)))
+    except (TypeError, ValueError):
+        return html.Span("Time must be a number", className="scheduler-feedback-error")
+
+    fields = {
+        "enabled": bool(enabled),
+        "hour": hour,
+        "minute": minute,
+        "days_of_week": days,
+        "timezone": tz,
+    }
+    if symbols is not None:
+        cleaned = ",".join(
+            s.strip().upper() for s in str(symbols).replace("\n", ",").split(",")
+            if s.strip()
+        )
+        if not cleaned:
+            return html.Span("Add at least one symbol",
+                             className="scheduler-feedback-error")
+        fields["symbols_csv"] = cleaned
+
+    from services import scheduler_service
+    if not scheduler_service.update_job(job_id, **fields):
+        return html.Span("Save failed", className="scheduler-feedback-error")
+
+    state = "enabled" if enabled else "disabled"
+    return html.Span(f"Saved — {state}, {hour:02d}:{minute:02d} {tz}",
+                     className="scheduler-feedback-ok")
+
+
+@callback(
+    Output("scheduler-action-status", "data"),
+    Input({"type": "sched-run", "job": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def run_job_now(clicks):
+    """Trigger a job by hand, off the callback thread.
+
+    An analysis run is ~10 minutes; waiting on it here would pin a callback
+    worker for the duration and time the browser out. The thread writes its
+    progress to job_runs, which the panel is already polling.
+    """
+    if not clicks or not any(clicks):
+        raise PreventUpdate
+
+    job_id = ctx.triggered_id["job"]
+    from services import scheduler_service
+
+    threading.Thread(
+        target=scheduler_service.run_job,
+        args=(job_id,),
+        kwargs={"trigger": "manual"},
+        daemon=True,
+        name=f"manual-{job_id}",
+    ).start()
+    return {"started": job_id, "at": datetime.now().isoformat()}
+
+
+# =============================================================================
+# SCHEDULED JOBS (see services/scheduler_service.py)
+# =============================================================================
 
 
 # Startup/shutdown run through the ASGI lifespan (see _lifespan near the Dash
@@ -4981,13 +5146,8 @@ def _scheduled_evaluation():
 # guard was Werkzeug-only — under uvicorn it silently skipped the scheduler
 # when DEBUG=true, and the background-callback spawn child started a duplicate
 # scheduler when DEBUG=false.
-_scheduler = None
-
-
 def _startup():
     """One-time server-process startup: progress hydrate, S3, auth, scheduler."""
-    global _scheduler
-
     _progress_service.hydrate_from_db()
     _init_s3()
     # Auth tables (no-op when AUTH_DATABASE_URL points at the shared Cygnet
@@ -4995,41 +5155,18 @@ def _startup():
     from services.auth_service import ensure_auth_tables
     ensure_auth_tables()
 
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-        from apscheduler.triggers.cron import CronTrigger
-        from apscheduler.triggers.date import DateTrigger
-        import pytz
-
-        from config import STRATEGY
-
-        _scheduler = BackgroundScheduler(timezone=pytz.timezone("US/Eastern"))
-        _scheduler.add_job(
-            _scheduled_evaluation,
-            CronTrigger(
-                day_of_week="mon-fri",
-                hour=STRATEGY.EVAL_SCHEDULE_HOUR,
-                minute=STRATEGY.EVAL_SCHEDULE_MINUTE,
-            ),
-            id="daily_evaluation",
-            replace_existing=True,
-        )
-        # Catch-up pass for missed evaluations runs on the scheduler thread —
-        # inline it used to block server startup for the whole evaluation.
-        _scheduler.add_job(_scheduled_evaluation, DateTrigger(), id="startup_evaluation")
-        _scheduler.start()
-        logger.info(
-            f"APScheduler: daily evaluation at "
-            f"{STRATEGY.EVAL_SCHEDULE_HOUR}:{STRATEGY.EVAL_SCHEDULE_MINUTE:02d} ET"
-        )
-    except Exception as e:
-        logger.error(f"APScheduler setup failed: {e}")
+    # Scheduling now lives in scheduler_service: the schedule is DB-backed and
+    # editable from the dashboard, runs are advisory-locked so a deploy overlap
+    # cannot double-fire an expensive job, and both the analysis and the
+    # evaluation are jobs rather than one hardcoded evaluation trigger.
+    from services import scheduler_service
+    scheduler_service.start()
 
 
 def _shutdown():
     """Lifespan shutdown: stop the scheduler without waiting on running jobs."""
-    if _scheduler is not None:
-        _scheduler.shutdown(wait=False)
+    from services import scheduler_service
+    scheduler_service.shutdown()
 
 
 # =============================================================================
@@ -5209,23 +5346,27 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, symbols):
     prevent_initial_call=True,
 )
 def update_predict_date_label(date_str):
-    """Show Live or Backtest mode label based on selected date."""
+    """Show Live or Backtest mode, and the data cutoff the target implies."""
     from datetime import date as date_cls
+
+    from utils.trading_calendar import resolve_target_and_cutoff
 
     if not date_str:
         return "", {"display": "none"}
-    selected = date_cls.fromisoformat(date_str[:10])
+    target, cutoff = resolve_target_and_cutoff(date_str[:10])
+    selected = target
     today = date_cls.today()
     if selected >= today:
         return [
             html.I(className="bi bi-broadcast me-1"),
-            "Live prediction (next trading day)",
+            f"Live — targeting {target} close, data through {cutoff}",
         ], {"fontSize": "0.85rem", "color": "var(--positive)"}
     else:
         days_back = (today - selected).days
         return [
             html.I(className="bi bi-clock-history me-1"),
-            f"Backtest mode ({days_back}d ago — data truncated to {selected})",
+            f"Backtest ({days_back}d ago) — targeting {target} close, "
+            f"data truncated to {cutoff}",
         ], {"fontSize": "0.85rem", "color": "var(--warning, #ffc107)"}
 
 
@@ -5416,59 +5557,11 @@ def set_full_analysis_flag(n_clicks):
     raise PreventUpdate
 
 
-def _merge_research_into_analysis(
-    ai_analysis: dict | None,
-    model_signals: dict | None,
-    symbols: list | None,
-) -> tuple[dict, bool]:
-    """Backfill per-symbol research (and its derived stance fields) from the
-    trading_agents signal into an AI-analysis dict.
-
-    Full Analysis produces its research text through the prediction pipeline
-    only; consumers that read ai_analysis["by_symbol"] (Luna, XLSX export,
-    PDF report) get the same report the user sees on screen. Entries that
-    already carry text analysis are untouched. Returns (dict, changed).
-    """
-    _stance = {"BUY": "BULLISH", "SELL": "BEARISH", "HOLD": "NEUTRAL"}
-    ai_analysis = ai_analysis or {}
-    by_sym = dict(ai_analysis.get("by_symbol") or {})
-    changed = False
-    for sym in (symbols or []):
-        entry = dict(by_sym.get(sym) or {})
-        if entry.get("research"):
-            continue
-        sig = ((model_signals or {}).get(sym) or {}).get("trading_agents") or {}
-        det = (sig.get("details") or {}) if isinstance(sig, dict) else {}
-        if not det.get("raw_response"):
-            continue
-        st = det.get("structured") or {}
-        entry["research"] = {
-            "decision": sig.get("decision"),
-            "confidence": sig.get("confidence"),
-            "raw_response": det["raw_response"],
-            "triggers": det.get("triggers") or {},
-            "structured": st,
-            "provenance": det.get("provenance") or {},
-            "model": det.get("model", ""),
-        }
-        if "recommendation" not in entry:
-            entry["recommendation"] = (st.get("stance")
-                                       or _stance.get(sig.get("decision"), "NEUTRAL"))
-            entry["confidence"] = sig.get("confidence")
-            entry["stance_source"] = "research_verdict"
-            if st.get("sentiment_alignment"):
-                entry["sentiment_explanation"] = st["sentiment_alignment"]
-            if st.get("watch_items"):
-                entry["watch_items"] = st["watch_items"]
-            if st.get("company_thesis"):
-                entry["company_thesis"] = st["company_thesis"]
-            if det.get("provenance"):
-                entry["provenance"] = det["provenance"]
-        by_sym[sym] = entry
-        changed = True
-    if not changed:
-        return ai_analysis, False
-    return {**ai_analysis, "by_symbol": by_sym}, True
+# Shared with the scheduled runner (scripts/daily_analysis.py) so the UI and
+# cron paths merge research identically.
+from services.analysis_runner import (  # noqa: E402
+    merge_research_into_analysis as _merge_research_into_analysis,
+)
 
 
 @callback(

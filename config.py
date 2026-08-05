@@ -306,6 +306,23 @@ class ModelConfig:
     BUY_THRESHOLD: float = 0.55
     SELL_THRESHOLD: float = 0.45
 
+    # No-trade band used to SCORE a HOLD: correct when the target session
+    # moved less than the band, i.e. standing aside was right. Without it a
+    # HOLD is never right or wrong, so a model can dodge accountability by
+    # holding — 221 stored predictions were unscored for exactly this reason.
+    #
+    # The band is RELATIVE to each symbol's own typical daily move (its median
+    # absolute daily return), times the multiplier below. A fixed band cannot
+    # work across this universe: the median absolute move here is 1.78%, so a
+    # fixed 0.15% band marked 96% of HOLDs wrong and was really measuring
+    # volatility rather than the model. At a multiplier of 1.0 a quieter-than-
+    # typical session counts as a good HOLD, which makes a coin-flip holder
+    # score ~50% and lets a real skill difference show up as deviation from it.
+    HOLD_BAND_VOL_MULTIPLE: float = 1.0
+    # Fallback when a symbol has too little price history to derive a band.
+    HOLD_BAND_PCT: float = 0.0015  # 0.15%
+    HOLD_BAND_MIN_HISTORY: int = 20
+
     # Research-driven "trading_agents" model.
     # sonnet-5: ~2x faster and ~45% cheaper than sonnet-4-6 on report prompts
     # (measured 27s vs 51s); llm_service handles its no-sampling-params and
@@ -357,8 +374,14 @@ class ModelConfig:
     RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "claude-sonnet-5")
     RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "anthropic")
     # 5000: key_level/change_trigger/watch_items grew the JSON; a truncated
-    # payload fails the parser and blanks the whole Luna panel.
-    RECOMMENDATIONS_MAX_TOKENS: int = 5000
+    # payload fails the parser and blanks the whole Luna panel. The synthesis
+    # is one call for the WHOLE run, so the ceiling has to cover the widest
+    # watchlist someone runs — ~200 output tokens per symbol, before a
+    # reasoning model spends any of the budget thinking. Env-tunable so a
+    # 20-symbol scheduled run doesn't need a code change.
+    RECOMMENDATIONS_MAX_TOKENS: int = int(
+        os.getenv("RECOMMENDATIONS_MAX_TOKENS", "5000")
+    )
     RECOMMENDATIONS_TEMPERATURE: float = 0.3
     RECOMMENDATIONS_REASONING_EFFORT: str = os.getenv(
         "RECOMMENDATIONS_REASONING_EFFORT", "high"
@@ -366,6 +389,35 @@ class ModelConfig:
 
 
 MODEL: Final = ModelConfig()
+
+
+# Dollars per MILLION tokens, keyed by model id. Used only to price telemetry
+# rows — token counts themselves come from the provider response and are exact,
+# so a wrong rate here misprices a report but never corrupts usage data. The
+# rate applied is copied onto each llm_usage row, so editing this table does
+# not rewrite the cost of calls already made.
+#
+# Seeded from the rates recorded in this repo's own A/B notes (2026-07-26:
+# Luna $1/$6 per M, Sonnet $3/$15 per M — see ModelConfig above). VERIFY
+# against current provider pricing before treating spend reports as exact.
+LLM_PRICING: Final[dict[str, dict[str, float]]] = {
+    "gpt-5.6-luna":     {"input": 1.00, "output": 6.00},
+    "claude-sonnet-5":  {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+}
+LLM_PRICING_VERIFIED_ON: Final[str] = "2026-07-26"
+
+
+def get_llm_rates(model: str | None) -> tuple[float | None, float | None]:
+    """(input, output) $/Mtok for a model, or (None, None) when unpriced.
+
+    An unknown model records tokens with a NULL cost rather than a guessed
+    one — an unpriced call must be visibly unpriced, not quietly free.
+    """
+    entry = LLM_PRICING.get((model or "").strip())
+    if not entry:
+        return None, None
+    return entry.get("input"), entry.get("output")
 
 
 # =============================================================================
@@ -434,6 +486,12 @@ class StrategyConfig:
 
     # Minimum trades before showing metrics
     MIN_TRADES_FOR_METRICS: int = 5
+
+    # Minimum trades before Sharpe/Sortino are reported at all. A ratio built
+    # from a handful of one-day calls is noise dressed as a number — the old
+    # n=5 floor produced Sharpe -11.18 on 2 trades. Below this the counting
+    # metrics (win rate, return, trade count) still show; the ratios do not.
+    MIN_TRADES_FOR_RATIOS: int = 30
 
 
 STRATEGY: Final = StrategyConfig()

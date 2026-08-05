@@ -137,3 +137,33 @@ def non_trading_days(start: Union[str, date, datetime],
             out.append(cur)
         cur += timedelta(days=1)
     return out
+
+
+def get_default_target_day() -> date:
+    """The session a prediction made right now would target.
+
+    That is the first trading day whose close has not happened yet: before
+    today's close it is today, after it (or on a weekend/holiday) the next
+    trading day.
+    """
+    return get_next_trading_day(get_last_completed_trading_day())
+
+
+def resolve_target_and_cutoff(
+    value: Union[str, date, datetime, None] = None,
+) -> tuple[date, date]:
+    """Resolve a user-selected TARGET date to ``(target, data_cutoff)``.
+
+    The target is the session whose close is being predicted, so it must be
+    a trading day — a weekend/holiday selection snaps forward to the next
+    one. Everything the models and the report are allowed to see is cut off
+    at the *previous trading day*: a Monday target sees nothing after the
+    preceding Friday's close, and a target after a holiday skips the holiday.
+
+    Returns:
+        (target, data_cutoff) — both trading days, cutoff strictly before target.
+    """
+    target = _to_date(value) if value else get_default_target_day()
+    if not is_trading_day(target):
+        target = get_next_trading_day(target)
+    return target, get_previous_trading_day(target)

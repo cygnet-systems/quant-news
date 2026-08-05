@@ -8,7 +8,7 @@ This module provides functions to fetch news from multiple sources:
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import requests
@@ -16,6 +16,11 @@ import requests
 from config import API
 
 logger = logging.getLogger(__name__)
+
+# How far behind the window end the cached training news may fall before it is
+# refetched. Two days absorbs a weekend with no coverage without letting a
+# symbol's news window quietly freeze on the day it was first fetched.
+_HISTORICAL_NEWS_MAX_STALENESS_DAYS = 2
 
 
 @dataclass
@@ -604,8 +609,22 @@ def fetch_historical_av_news(
             if date_key:
                 result.setdefault(date_key, []).append(article)
         if result:
-            logger.info(f"AV news cache hit: {cache_symbol}, {len(cached)} articles")
-            return result
+            # Existence is not coverage. The window slides forward every day
+            # but these rows do not: the old check returned any hit inside
+            # [now-90d, now], so the FIRST fetch froze a symbol's training
+            # news forever and every day after it trained on a window with a
+            # growing hole at the recent end — silently, since a partial
+            # window looks exactly like a quiet news period.
+            newest = max(result)
+            staleness = (end_date.date() - date.fromisoformat(newest)).days
+            if staleness <= _HISTORICAL_NEWS_MAX_STALENESS_DAYS:
+                logger.info(f"AV news cache hit: {cache_symbol}, "
+                            f"{len(cached)} articles through {newest}")
+                return result
+            logger.info(
+                f"AV news cache for {cache_symbol} ends {newest} "
+                f"({staleness}d before the window end) — refetching"
+            )
 
     # Fetch from AV API in monthly windows
     all_articles: list[dict] = []
