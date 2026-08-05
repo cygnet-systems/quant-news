@@ -525,6 +525,20 @@ def _catch_up() -> None:
         run_job(job["id"], trigger="catchup")
 
 
+def scheduling_enabled() -> bool:
+    """Whether THIS process is allowed to execute jobs.
+
+    Deliberately per-process, and deliberately not the same lever as a job's
+    ``enabled`` column: that one means "nobody should run this job" and takes
+    every instance with it. This one means "not on this machine" — the case
+    where a laptop is pointed at the production database for UI work and
+    should not win the lock and spend money on an analysis.
+    """
+    return os.environ.get("SCHEDULER_ENABLED", "1").strip().lower() not in (
+        "0", "false", "no", "off"
+    )
+
+
 def health() -> dict:
     """Liveness of the scheduler and whether any job has missed its window.
 
@@ -554,11 +568,16 @@ def health() -> dict:
         jobs.append(entry)
 
     alive = _scheduler is not None and getattr(_scheduler, "running", False)
+    # A process told not to schedule is not a broken one. Without this
+    # distinction an intentional stand-down is indistinguishable from a
+    # crashed scheduler, and a monitor cannot tell which it is looking at.
+    stood_down = not scheduling_enabled()
     return {
         "scheduler_running": alive,
+        "scheduling_disabled": stood_down,
         "jobs": jobs,
         "overdue": overdue,
-        "healthy": alive and not overdue,
+        "healthy": stood_down or (alive and not overdue),
     }
 
 
@@ -636,8 +655,11 @@ def start() -> None:
     with _lock:
         if _scheduler is not None:
             return
-        if os.environ.get("SCHEDULER_ENABLED", "1").lower() in ("0", "false", "no"):
-            logger.info("Scheduler disabled by SCHEDULER_ENABLED")
+        if not scheduling_enabled():
+            logger.info(
+                "SCHEDULER_ENABLED is off — this process will not run jobs. "
+                "Another instance sharing this database still will."
+            )
             return
         try:
             from apscheduler.schedulers.background import BackgroundScheduler

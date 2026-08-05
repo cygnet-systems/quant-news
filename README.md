@@ -101,8 +101,17 @@ python scripts/daily_analysis.py evaluate                      # score what has 
 ```
 
 It writes anonymously, so everything it produces is public and appears in
-History, the Scoreboard and the Activity Log. `SCHEDULER_ENABLED=0` turns the
-scheduler off for a process that should not run jobs.
+History, the Scoreboard and the Activity Log.
+
+**Two instances can run schedulers at once.** They read one schedule from the
+database and re-sync every 60s, the advisory lock means only one executes a
+given run, and the reuse caches make a second run idempotent if it ever
+happens. `SCHEDULER_ENABLED=0` is a per-process stand-down for the case that
+does not cover — a process sharing the production database that should not
+spend money, such as the app running on a laptop pointed at prod. To stop a
+job for everyone, disable the job itself in the UI. A stood-down process
+reports `scheduling_disabled` and stays healthy, so it reads differently from
+a crashed scheduler.
 
 ### Knowing it actually ran
 
