@@ -12,7 +12,7 @@ share the same feed without any wiring.
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import diskcache
 
@@ -146,7 +146,10 @@ def start_run(title: str) -> None:
         logger.debug(f"progress start_run failed: {e}")
 
 
-def get_activity_runs(limit_runs: int = 50, scope: str = "all") -> list[dict]:
+def get_activity_runs(limit_runs: int = 50, scope: str = "all",
+                      stages: list[str] | None = None,
+                      symbol: str | None = None,
+                      since_days: int | None = None) -> list[dict]:
     """Past runs from the audit trail, newest first, each with its events.
 
     Visibility follows the shared Cygnet role: an Administrator sees every
@@ -161,14 +164,36 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all") -> list[dict]:
     Runs are keyed by (user_id, run_id), not run_id alone: ad-hoc events share
     the literal ids "adhoc" and "auth", so grouping on run_id would fuse
     different people's unrelated events into one block in the admin view.
+
+    The optional filters narrow both queries: a run qualifies if it has any
+    matching event, and only its matching events are returned. ``symbol``
+    matches on a word boundary so filtering for SPY does not also surface
+    every SPYG line.
     """
     try:
-        from sqlalchemy import func, select, tuple_
+        from datetime import timedelta
+
+        from sqlalchemy import func, or_, select, tuple_
 
         from db.models import ActivityLog
         from db.session import get_session
 
         show_all = scope == "all" and viewer_is_admin()
+
+        conds = []
+        if not show_all:
+            conds.append(ActivityLog.user_id == _user_id())
+        if stages:
+            conds.append(ActivityLog.stage.in_(list(stages)))
+        if since_days:
+            conds.append(ActivityLog.created_at
+                         >= datetime.now(timezone.utc) - timedelta(days=since_days))
+        if symbol and symbol.strip():
+            sym = symbol.strip().upper()
+            conds.append(or_(
+                ActivityLog.message.op("~*")(rf"\y{sym}\y"),
+                ActivityLog.run_title.op("~*")(rf"\y{sym}\y"),
+            ))
 
         with get_session() as session:
             recent_q = select(
@@ -176,8 +201,8 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all") -> list[dict]:
                 ActivityLog.run_id,
                 func.max(ActivityLog.created_at).label("last_at"),
             )
-            if not show_all:
-                recent_q = recent_q.where(ActivityLog.user_id == _user_id())
+            for c in conds:
+                recent_q = recent_q.where(c)
             recent = session.execute(
                 recent_q
                 .group_by(ActivityLog.user_id, ActivityLog.run_id)
@@ -188,11 +213,15 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all") -> list[dict]:
             if not keys:
                 return []
 
+            events_q = select(ActivityLog).where(
+                tuple_(ActivityLog.user_id, ActivityLog.run_id).in_(keys))
+            # Reapply the event-level filters so an expanded run shows the
+            # lines that matched, not the whole run.
+            for c in conds:
+                events_q = events_q.where(c)
             rows = session.execute(
-                select(ActivityLog)
-                .where(tuple_(ActivityLog.user_id,
-                              ActivityLog.run_id).in_(keys))
-                .order_by(ActivityLog.created_at.asc(), ActivityLog.id.asc())
+                events_q.order_by(ActivityLog.created_at.asc(),
+                                  ActivityLog.id.asc())
             ).scalars().all()
 
         by_run: dict[tuple[str, str], dict] = {}

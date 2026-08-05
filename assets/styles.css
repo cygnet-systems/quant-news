@@ -54,9 +54,11 @@
     --space-8: 48px;
 
     /* Layout */
-    --sidebar-width: 280px;
+    --rail-width: 220px;
+    --topbar-height: 56px;
     --context-panel-width: 520px;
     --card-radius: 12px;
+    --radius-sm: 6px;
 
     /* Transitions */
     --duration-fast: 100ms;
@@ -93,27 +95,223 @@ body {
     background-color: var(--bg-primary);
 }
 
-.dashboard-grid {
-    display: grid;
-    grid-template-columns: var(--sidebar-width) 1fr var(--context-panel-width);
-    min-height: 100vh;
-}
-
 /* =============================================================================
-   SIDEBAR
+   APP SHELL: NAV RAIL + TOOLBAR + ROUTED CONTENT
    ============================================================================= */
 
-.sidebar {
-    background-color: var(--bg-secondary);
-    border-right: 1px solid var(--border-subtle);
-    padding: var(--space-5) var(--space-5) var(--space-4);
+.app-shell {
+    display: grid;
+    grid-template-columns: var(--rail-width) minmax(0, 1fr);
+    height: 100vh;
+}
+
+.shell-main {
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* The only scroll container. Sections inside it lay out at natural height
+   rather than each owning a 100vh scroller, so a page scrolls as one thing. */
+.page-content {
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
-    max-height: 100vh;
-    position: sticky;
-    top: 0;
-    gap: var(--space-1);
+    background-color: var(--bg-primary);
+}
+
+.page {
+    padding: var(--space-5);
+}
+
+/* --- Nav rail --------------------------------------------------------- */
+
+.nav-rail {
+    background-color: var(--bg-secondary);
+    border-right: 1px solid var(--border-subtle);
+    padding: var(--space-5) var(--space-3) var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    height: 100vh;
+    overflow-y: auto;
+}
+
+.rail-brand {
+    display: flex;
+    flex-direction: column;
+    padding: 0 var(--space-2);
+}
+
+.rail-brand-name {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
+}
+
+.rail-brand-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+.rail-nav {
+    gap: 2px;
+}
+
+.rail-link {
+    display: flex !important;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 8px var(--space-3) !important;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary) !important;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background var(--duration-fast) var(--easing-default),
+                color var(--duration-fast) var(--easing-default);
+}
+
+.rail-link:hover {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary) !important;
+}
+
+.rail-link.active {
+    background-color: var(--bg-tertiary) !important;
+    color: var(--accent-primary) !important;
+    box-shadow: inset 2px 0 0 var(--accent-primary);
+}
+
+.rail-icon {
+    font-size: 14px;
+    width: 16px;
+    text-align: center;
+    flex: none;
+}
+
+.rail-spacer {
+    flex: 1 1 auto;
+}
+
+.rail-footer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-2) 0;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 11px;
+}
+
+/* --- Toolbar ---------------------------------------------------------- */
+
+.topbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    min-height: var(--topbar-height);
+    padding: 0 var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.topbar-heading {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.topbar-title {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+    color: var(--text-primary);
+}
+
+.topbar-subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    margin-left: auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.watchlist-panel-inner {
+    padding: var(--space-4) var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+/* The action buttons were built as a 2-column grid for a 280px sidebar, where
+   btn-full meant "span both columns". In a horizontal toolbar that reads as a
+   forced line break, so the grid is flattened to a row here. */
+.topbar-actions .data-actions {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 6px;
+}
+
+.topbar-actions .data-actions .btn,
+.topbar-actions .data-actions .btn-full {
+    grid-column: auto;
+    width: auto;
+    white-space: nowrap;
+    padding: 6px 10px;
+}
+
+.rail-footer .cache-label {
+    margin-right: var(--space-1);
+}
+
+/* --- Analyze layout --------------------------------------------------- */
+
+.analyze-indicator-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.analyze-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--context-panel-width);
+    align-items: start;
+}
+
+/* --- Shared empty state ----------------------------------------------- */
+
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: var(--space-8) var(--space-5);
+    text-align: center;
+}
+
+.empty-state-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.empty-state-note {
+    font-size: 13px;
+    color: var(--text-secondary);
+    max-width: 48ch;
 }
 
 .sidebar-header {
@@ -419,10 +617,11 @@ body {
    MAIN CONTENT
    ============================================================================= */
 
+/* Height and scrolling belong to .page-content now: this used to be a column
+   of the old 100vh grid and owned its own scroller. */
 .main-content {
     padding: var(--space-5);
-    overflow-y: auto;
-    max-height: 100vh;
+    min-width: 0;
     background-color: var(--bg-primary);
 }
 
@@ -629,12 +828,9 @@ body {
     background-color: var(--bg-secondary);
     border-left: 1px solid var(--border-subtle);
     padding: var(--space-5) var(--space-4);
-    overflow-y: auto;
-    max-height: 100vh;
-    position: sticky;
-    top: 0;
-    /* relative for resize handle positioning */
-    position: sticky;
+    /* relative so the drag handle can position against it */
+    position: relative;
+    min-width: 0;
 }
 
 .panel-resize-handle {
@@ -1021,24 +1217,98 @@ body {
    RESPONSIVE
    ============================================================================= */
 
+/* Below ~1280 the analysis panel starves the charts, so it drops under them. */
 @media (max-width: 1280px) {
-    .dashboard-grid {
-        grid-template-columns: var(--sidebar-width) 1fr var(--context-panel-width);
+    .analyze-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .context-panel {
+        border-left: none;
+        border-top: 1px solid var(--border-subtle);
+        width: auto !important;
+        min-width: 0 !important;
+    }
+
+    .panel-resize-handle {
+        display: none;
+    }
+}
+
+/* Icon-only rail: labels are the first thing worth trading for chart width. */
+@media (max-width: 1100px) {
+    .app-shell {
+        grid-template-columns: 56px minmax(0, 1fr);
+    }
+
+    .nav-rail {
+        padding: var(--space-4) var(--space-1);
+        align-items: center;
+    }
+
+    .rail-label,
+    .rail-brand-sub,
+    .rail-footer .cache-label {
+        display: none;
+    }
+
+    .rail-brand-name {
+        font-size: 0;
+    }
+
+    .rail-brand-name::first-letter {
+        font-size: 20px;
+    }
+
+    .rail-link {
+        justify-content: center;
+        padding: 8px 0 !important;
     }
 }
 
 @media (max-width: 768px) {
-    .dashboard-grid {
-        grid-template-columns: 1fr;
+    .app-shell {
+        grid-template-columns: minmax(0, 1fr);
+        height: auto;
     }
 
-    .sidebar {
-        position: relative;
-        max-height: none;
+    /* Rail becomes a horizontal strip above the content. */
+    .nav-rail {
+        flex-direction: row;
+        align-items: center;
+        height: auto;
+        overflow-x: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-subtle);
     }
 
-    .main-content {
-        max-height: none;
+    .rail-nav {
+        flex-direction: row !important;
+        flex-wrap: nowrap;
+    }
+
+    .rail-spacer,
+    .rail-footer {
+        display: none;
+    }
+
+    .shell-main {
+        height: auto;
+        overflow: visible;
+    }
+
+    .page-content {
+        overflow-y: visible;
+    }
+
+    .topbar {
+        flex-wrap: wrap;
+        padding: var(--space-3);
+    }
+
+    .topbar-actions {
+        margin-left: 0;
+        justify-content: flex-start;
     }
 
     .indicators-row {
@@ -3473,4 +3743,321 @@ body {
     padding: 14px;
     color: var(--text-secondary);
     font-size: 0.82rem;
+}
+
+/* =============================================================================
+   TYPE SCALE + NUMERICS
+   Added with the routed shell. The token block at the top of this file was
+   under-used, so sizing was improvised per feature across 3,000 lines.
+   ============================================================================= */
+
+:root {
+    --text-2xs: 10px;
+    --text-xs: 11px;
+    --text-sm: 12px;
+    --text-base: 13px;
+    --text-md: 15px;
+    --text-lg: 18px;
+    --text-xl: 22px;
+    --text-2xl: 28px;
+}
+
+/* Every figure in the app: prices, percentages, P&L, counts, dates, tickers.
+   tabular-nums is what stops columns of numbers from shifting as they update. */
+.num,
+.history-data-table td,
+.scoreboard-th + td {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+.page h1, .page h2, .page h3 {
+    letter-spacing: -0.01em;
+}
+
+/* =============================================================================
+   HOME
+   ============================================================================= */
+
+.page-home {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+}
+
+.home-card {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--card-radius);
+    padding: var(--space-4) var(--space-5) var(--space-5);
+}
+
+.home-card-titlerow {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+}
+
+.home-card-title {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    margin: 0;
+    color: var(--text-primary);
+}
+
+.home-card-subtitle {
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+}
+
+.home-card-titlerow > *:last-child {
+    margin-left: auto;
+}
+
+.home-card-link {
+    font-size: var(--text-sm);
+    color: var(--accent-primary);
+    text-decoration: none;
+}
+
+.home-card-link:hover { color: var(--accent-hover); }
+
+.home-card-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding-bottom: var(--space-3);
+    margin-bottom: var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+/* The gaps here are load-bearing: without them the meta row runs together as
+   "Predicting 2026-08-05Data through 2026-08-0420 symbols". */
+.home-meta-row,
+.home-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-4);
+    font-size: var(--text-sm);
+}
+
+.home-meta-row > span,
+.home-status-row > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.home-meta-label { color: var(--text-muted); }
+
+.home-pending-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+}
+
+.home-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+}
+
+.home-chip-decision { font-weight: 600; }
+.home-chip-conf { color: var(--text-muted); font-size: var(--text-2xs); }
+.home-chip-positive { color: var(--positive); background: rgba(0, 200, 5, 0.08); }
+.home-chip-negative { color: var(--negative); background: rgba(255, 80, 0, 0.08); }
+.home-chip-neutral  { color: var(--text-secondary); background: var(--bg-tertiary); }
+.home-chip-none     { color: var(--text-muted); }
+
+.home-symbol { font-weight: 600; }
+
+.home-resolution {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    white-space: nowrap;
+}
+
+.home-hits { color: var(--text-secondary); font-size: var(--text-xs); }
+
+.home-two-col {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: var(--space-5);
+}
+
+.home-stat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: var(--space-4);
+}
+
+.home-stat-name {
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+}
+
+.home-stat-big {
+    font-size: var(--text-xl);
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.home-stat-sub {
+    display: flex;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+}
+
+.home-open-block { padding: var(--space-2) 0; }
+.home-open-block + .home-open-block { border-top: 1px solid var(--border-subtle); }
+.home-open-head { display: flex; gap: var(--space-3); align-items: baseline; }
+.home-open-date { font-weight: 600; }
+.home-open-symbols { font-size: var(--text-xs); color: var(--text-secondary); }
+
+.home-job-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto;
+    gap: var(--space-4);
+    align-items: center;
+    padding: var(--space-2) 0;
+    font-size: var(--text-sm);
+}
+
+.home-job-row + .home-job-row { border-top: 1px solid var(--border-subtle); }
+.home-job-name { font-weight: 600; }
+
+.home-empty-note {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    padding: var(--space-3) 0;
+}
+
+/* =============================================================================
+   RUN MODAL
+   ============================================================================= */
+
+.run-field { margin-bottom: var(--space-3); }
+
+.run-field-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--space-3);
+}
+
+.run-field-hint {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.run-scope-radio {
+    display: flex;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+}
+
+.run-model-name { font-weight: 600; margin-right: var(--space-2); }
+
+.run-model-req {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+}
+
+.run-article-preview { font-size: var(--text-sm); }
+
+/* =============================================================================
+   ACTIVITY + PERFORMANCE PAGES
+   ============================================================================= */
+
+.page-lede {
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+    max-width: 72ch;
+    margin-bottom: var(--space-4);
+}
+
+.activity-filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    align-items: flex-end;
+    padding-bottom: var(--space-4);
+    margin-bottom: var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.activity-filter-field { min-width: 150px; }
+.activity-filter-wide { min-width: 260px; flex: 1 1 260px; }
+
+.search-restore-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent-primary);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    text-align: left;
+}
+
+.search-restore-btn:hover { color: var(--accent-hover); text-decoration: underline; }
+
+.perf-pending-label {
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+}
+
+/* Section headings were uppercase micro-labels everywhere, which made every
+   header look the same and read slower. */
+.scoreboard-subtitle {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: var(--text-base);
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: var(--space-4) 0 var(--space-2);
+}
+
+/* The date picker in the run dialog inherited only the input-level rules, so
+   its wrapper stayed light-themed and stretched to the modal width. */
+#run-modal .SingleDatePicker,
+#run-modal .SingleDatePickerInput,
+#run-modal .DateInput {
+    background-color: transparent;
+    width: auto;
+}
+
+#run-modal .DateInput {
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+
+#run-modal .DateInput_input {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: var(--text-base);
+    width: 150px;
+}
+
+#run-modal .SingleDatePickerInput {
+    border: none;
 }

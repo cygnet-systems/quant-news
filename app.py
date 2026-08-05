@@ -64,9 +64,18 @@ from layouts.components import (
 from layouts.main_layout import create_layout
 from layouts.formatters import MODEL_DISPLAY, json_report_to_markdown
 from layouts.history_sections import (
-    build_filtered_history_sections,
-    build_history_tab_layout,
+    applied_filter_chips,
+    build_activity_section,
+    build_predictions_section,
+    filter_history_data,
 )
+from layouts.nav import SECTION_TITLES
+from layouts.pages import activity as activity_page
+from layouts.pages import analyze as analyze_page
+from layouts.pages import home as home_page
+from layouts.pages import performance as performance_page
+from layouts.pages import reports as reports_page
+from layouts.pages import schedule as schedule_page
 from layouts.pages.analyze import (
     build_overall_tab_content,
     build_tab_content,
@@ -498,6 +507,240 @@ def _init_s3():
 
 
 # =============================================================================
+# ROUTING
+# =============================================================================
+
+# Section content is built on navigation rather than all at once. The win is
+# not just a smaller DOM: a callback whose Output is unmounted does not fire,
+# so leaving /analyze silently stops its chart, news and AI callbacks. Toggling
+# hidden divs instead would keep every callback live on every page.
+def _build_route(path, history_data, filter_symbols, filter_range,
+                 filter_specific, activity_scope, activity_since):
+    """Build one section. Each page reads only the state it renders."""
+    if path == "/analyze":
+        return analyze_page.layout()
+    if path in ("/performance", "/reports"):
+        # Live read, not the store: see fetch_report_history. Each page asks
+        # only for the buckets it renders.
+        if path == "/performance":
+            return performance_page.layout(
+                history_data or fetch_report_history(only={"predictions"}),
+                filter_symbols, filter_range, filter_specific)
+        return reports_page.layout(
+            history_data or fetch_report_history(
+                only={"reports", "recommendations", "trading_agent_reports"}),
+            filter_symbols, filter_range, filter_specific)
+    if path == "/schedule":
+        return schedule_page.layout()
+    if path == "/activity":
+        from services import watchlist_service
+        return activity_page.layout(
+            activity_scope=activity_scope,
+            searches=watchlist_service.search_history(limit=100),
+            since_days=activity_since,
+        )
+
+    from services import dashboard_service as ds
+    jobs = []
+    try:
+        from services import scheduler_service
+        jobs = scheduler_service.list_jobs()
+    except Exception as e:
+        logger.warning("Could not read scheduled jobs for Home: %s", e)
+    return home_page.layout(
+        cohort=ds.get_latest_cohort(),
+        open_preds=ds.get_open_predictions(),
+        rolling=ds.get_rolling_performance(days=HOME_ROLLING_DAYS),
+        last_run=ds.get_last_run(),
+        jobs=jobs,
+        rolling_days=HOME_ROLLING_DAYS,
+    )
+
+
+HOME_ROLLING_DAYS = 30
+
+_ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule", "/activity"]
+
+
+@callback(
+    Output("page-content", "children"),
+    Output("topbar-title", "children"),
+    Input("url", "pathname"),
+    State("report-history-store", "data"),
+    State("history-filter-symbols", "data"),
+    State("history-filter-date-range", "data"),
+    State("history-filter-date-specific", "data"),
+    State("history-activity-scope", "data"),
+    State("activity-since-days", "data"),
+)
+def render_page(pathname, history_data, filter_symbols, filter_range,
+                filter_specific, activity_scope, activity_since):
+    """Mount the section for this URL.
+
+    The URL is the only Input on purpose. When the archive stores were Inputs
+    too, a store-triggered invocation could carry a stale pathname and land
+    after the navigation that superseded it, leaving one section's content
+    under another section's title. Filter changes now rebuild #archive-body
+    instead (render_archive_body), which cannot outrank a route change.
+
+    Unknown paths fall back to Home rather than erroring, so a stale bookmark
+    from the pre-routing single page still lands somewhere useful.
+    """
+    path = (pathname or "/").rstrip("/") or "/"
+    if path not in _ROUTES:
+        logger.info("Unknown route %s, falling back to Home", path)
+        path = "/"
+    try:
+        page = _build_route(path, history_data, filter_symbols, filter_range,
+                            filter_specific, activity_scope, activity_since)
+        return page, SECTION_TITLES.get(path, "QuantNews")
+    except Exception as e:
+        logger.exception("Failed to render %s", path)
+        return (
+            html.Div(
+                [
+                    html.Div("This section failed to load.",
+                             className="empty-state-title"),
+                    html.Div(str(e), className="empty-state-note"),
+                ],
+                className="empty-state",
+            ),
+            SECTION_TITLES.get(path, "QuantNews"),
+        )
+
+
+@callback(
+    Output("predictions-log-body", "children"),
+    Input({"type": "history-section-toggle", "section": "predictions"}, "n_clicks"),
+    State("history-filter-symbols", "data"),
+    State("history-filter-date-range", "data"),
+    State("history-filter-date-specific", "data"),
+    prevent_initial_call=True,
+)
+def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specific):
+    """Build the prediction log the first time its section is opened."""
+    if not n_clicks:
+        raise PreventUpdate
+    buckets = filter_history_data(fetch_report_history(), filter_symbols,
+                                  filter_range, filter_specific)
+    section = build_predictions_section(buckets["predictions"])
+    if section is None:
+        return html.Div("No predictions match this filter.",
+                        className="history-empty-msg")
+    # Unwrap: the outer collapsible already exists on the page.
+    return section.children[1].children
+
+
+@callback(
+    Output("history-applied-filters", "children"),
+    Input("history-filter-symbols", "data"),
+    Input("history-filter-date-range", "data"),
+    Input("history-filter-date-specific", "data"),
+    prevent_initial_call=True,
+)
+def render_filter_chips(filter_symbols, filter_range, filter_specific):
+    """Refresh the applied-filter chips.
+
+    Separate from the filter bar so the bar is never rebuilt: re-creating the
+    dropdown re-fires its value Input, which writes this store, which would
+    rebuild the bar again. Chips contain only buttons, which are guarded
+    against firing on insertion, so this is safe to re-render.
+    """
+    return applied_filter_chips(filter_symbols, filter_range, filter_specific)
+
+
+@callback(
+    Output("archive-body", "children"),
+    Input("report-history-store", "data"),
+    Input("history-filter-symbols", "data"),
+    Input("history-filter-date-range", "data"),
+    Input("history-filter-date-specific", "data"),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def render_archive_body(history_data, filter_symbols, filter_range,
+                        filter_specific, pathname):
+    """Rebuild the filterable part of Performance or Reports.
+
+    #archive-body exists only on those two routes, and only their own controls
+    write these stores, so this never fires with the Output unmounted.
+    """
+    path = (pathname or "/").rstrip("/") or "/"
+    if path not in ("/performance", "/reports"):
+        raise PreventUpdate
+    data = history_data or fetch_report_history()
+    page = performance_page if path == "/performance" else reports_page
+    return page.body(data, filter_symbols, filter_range, filter_specific)
+
+
+@callback(
+    Output("watchlist-panel", "is_open"),
+    Input("watchlist-toggle-btn", "n_clicks"),
+    State("watchlist-panel", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_watchlist_panel(n_clicks, is_open):
+    """Reveal the symbol editor under the toolbar."""
+    return not is_open if n_clicks else is_open
+
+
+# =============================================================================
+# ACTIVITY PAGE
+# =============================================================================
+
+
+@callback(
+    Output("activity-since-days", "data"),
+    Input({"type": "activity-since-btn", "days": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def set_activity_since(clicks):
+    """Time window for the run log. 0 means no lower bound."""
+    if not any(c for c in (clicks or []) if c):
+        raise PreventUpdate
+    return ctx.triggered_id.get("days", 0)
+
+
+@callback(
+    Output("activity-runs", "children"),
+    Input("activity-symbol-filter", "value", allow_optional=True),
+    Input("activity-stage-filter", "value", allow_optional=True),
+    Input("activity-since-days", "data"),
+    Input("history-activity-scope", "data"),
+)
+def render_activity_runs(symbol, stages, since_days, scope):
+    """Re-query the audit trail whenever a filter moves.
+
+    Filtering happens in SQL rather than over an already-rendered list, so a
+    narrow filter reads a few rows instead of fifty runs' worth of events.
+    """
+    return build_activity_section(
+        activity_scope=scope or "all",
+        stages=stages or None,
+        symbol=(symbol or "").strip() or None,
+        since_days=since_days or None,
+    )
+
+
+@callback(
+    Output("selected-symbols", "data", allow_duplicate=True),
+    Input({"type": "search-restore", "csv": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def restore_past_search(clicks):
+    """Reload a watchlist from the durable search history."""
+    if not any(c for c in (clicks or []) if c):
+        raise PreventUpdate
+    csv = (ctx.triggered_id or {}).get("csv", "")
+    symbols = [s for s in csv.split(",") if s]
+    if not symbols:
+        raise PreventUpdate
+    from services import progress_service as prog
+    prog.emit("action", f"Restored past search: {', '.join(symbols)}")
+    return symbols
+
+
+# =============================================================================
 # SYMBOL MANAGEMENT CALLBACKS
 # =============================================================================
 
@@ -592,27 +835,60 @@ def manage_symbols(add_click, input_submit, clear_click, group_clicks,
     prevent_initial_call=True,
 )
 def record_recent_group(stock_data, symbols, groups):
-    """Keep the last 5 distinct symbol GROUPS for one-click restore.
+    """Record the symbol group in durable history and refresh the chips.
 
     Triggered by the data store (not the raw selection) so only symbols that
-    actually returned data are recorded — a typo'd ticker with zero results
-    never pollutes Recent. Subset-merge so incremental adds grow one entry
-    instead of littering the list with partial prefixes (REX / REX+WGO /
-    REX+WGO+IOVA...). Clearing or trimming a selection never destroys a
-    recorded group.
+    actually returned data are recorded: a typo'd ticker with zero results
+    never pollutes Recent.
+
+    The write goes to watchlist_history, which keeps every distinct group.
+    The store this returns is now a display cache of the top few rather than
+    the record itself, so clearing browser storage no longer destroys history.
+    Collapsing (REX, then REX+WGO, then REX+WGO+IOVA leaving one chip) happens
+    at read time in watchlist_service.recent_groups.
     """
     symbols = [s for s in (symbols or [])
                if s and ((stock_data or {}).get(s) or {}).get("prices")]
     if not symbols:
         raise PreventUpdate
+
+    from services import watchlist_service
     new = sorted(symbols)
+    watchlist_service.record_group(new)
+
+    fresh = watchlist_service.recent_groups(limit=5)
+    if fresh:
+        if fresh == [list(g) for g in (groups or [])]:
+            raise PreventUpdate
+        return fresh
+
+    # History unavailable (DB down): fall back to the previous in-store merge
+    # so the chips keep working for the rest of the session.
     groups = [list(g) for g in (groups or [])]
-    # Already represented by an identical or superset group → nothing to do
     if any(set(new) <= set(g) for g in groups):
         raise PreventUpdate
-    # Drop groups the new one supersedes, prepend, cap at 5
     groups = [g for g in groups if not set(g) < set(new)]
     return [new] + groups[:4]
+
+
+@callback(
+    Output("recent-symbol-groups", "data", allow_duplicate=True),
+    Input("url", "pathname"),
+    prevent_initial_call="initial_duplicate",
+)
+def hydrate_recent_groups(_pathname):
+    """Seed the chips from durable history on every page load.
+
+    The store is browser-local, so without this a fresh browser (or a cleared
+    cache) starts with no recent groups even though the account has years of
+    them. It also has to write the store, not just the chips: the chip click
+    handler restores by index into this same list.
+    """
+    from services import watchlist_service
+    groups = watchlist_service.recent_groups(limit=5)
+    if not groups:
+        raise PreventUpdate
+    return groups
 
 
 @callback(
@@ -828,7 +1104,8 @@ async def fetch_stock_data_callback(symbols, period, refresh_click, cache_enable
     Output("chart-title", "children"),
     Output("chart-subtitle", "children"),
     Input("stock-data-store", "data"),
-    Input("indicator-toggles", "value"),
+    # Analyze page only.
+    Input("indicator-toggles", "value", allow_optional=True),
     State("selected-symbols", "data"),
 )
 def update_price_chart(stock_data, indicators, symbols):
@@ -1151,31 +1428,24 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
 
 @callback(
     Output("ai-analysis-store", "data"),
-    Input("report-confirm-btn", "n_clicks"),
+    Input("run-confirm-btn", "n_clicks"),
     Input("ai-retry-btn", "n_clicks"),
-    Input("full-analysis-confirm-btn", "n_clicks"),
+    State("run-scope", "value"),
     State("news-data-store", "data"),
     State("selected-symbols", "data"),
     State("stock-data-store", "data"),
-    State("fa-date-picker", "date"),
-    State("ai-report-date", "date"),
-    State("ai-report-lookback", "value"),
-    State("ai-report-model", "value"),
-    State("ai-report-type", "value"),
-    State("ai-report-include-research", "value"),
-    State("ai-report-recs", "value"),
-    State("ai-report-recs-model", "value"),
-    State("fa-lookback", "value"),
-    State("fa-model", "value"),
-    State("fa-type", "value"),
-    State("fa-recs", "value"),
-    State("fa-recs-model", "value"),
+    State("run-date-picker", "date"),
+    State("run-lookback", "value"),
+    State("run-model", "value"),
+    State("run-type", "value"),
+    State("run-include-research", "value"),
+    State("run-recs", "value"),
+    State("run-recs-model", "value"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, symbols,
-                               stock_data, fa_date, ai_date, ai_lookback, ai_model, ai_type,
-                               ai_research, ai_recs, ai_recs_model,
-                               fa_lookback, fa_model, fa_type, fa_recs, fa_recs_model):
+async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols,
+                               stock_data, run_date, lookback, model, depth,
+                               research, recs, recs_model):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1189,7 +1459,11 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
     """
     from datetime import date as date_cls
 
-    if not (n_clicks or retry_clicks or full_clicks) or not news_data or not news_data.get("articles_by_symbol"):
+    # A models-only run has no report to build.
+    scope = scope or "full"
+    if ctx.triggered_id == "run-confirm-btn" and scope == "models":
+        raise PreventUpdate
+    if not (n_clicks or retry_clicks) or not news_data or not news_data.get("articles_by_symbol"):
         raise PreventUpdate
 
     # Target date: the session whose close is being predicted, taken from the
@@ -1197,38 +1471,25 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
     # modal's own. Data is cut off at the PREVIOUS trading day, so a Monday
     # target sees nothing after the preceding Friday's close.
     today = date_cls.today()
-    picked = None
-    is_full = ctx.triggered_id == "full-analysis-confirm-btn"
-    if is_full and fa_date:
-        picked = str(fa_date)[:10]
-    elif not is_full and ai_date:
-        picked = str(ai_date)[:10]
+    is_full = scope == "full"
+    picked = str(run_date)[:10] if run_date else None
     from utils.trading_calendar import resolve_target_and_cutoff
     target_d, as_of_d = resolve_target_and_cutoff(picked)
     is_backtest = target_d < today
     as_of_str = as_of_d.isoformat()
     target_str = target_d.isoformat()
 
-    # Parameters come from the modal that actually triggered this run — each
-    # flow owns its own visible controls (the Full Analysis flow used to
-    # silently read the AI Report modal's state).
-    if is_full:
-        lookback_days = int(fa_lookback or 7)
-        report_model = fa_model or "gpt-5.6-luna"
-        include_thesis_flag = (fa_type or "thesis") != "standard"
-        recs_mode = fa_recs or "auto"
-        recs_model_val = fa_recs_model or "claude-sonnet-5"
-    else:
-        lookback_days = int(ai_lookback or 7)
-        report_model = ai_model or "gpt-5.6-luna"
-        include_thesis_flag = (ai_type or "thesis") != "standard"
-        recs_mode = ai_recs or "auto"
-        recs_model_val = ai_recs_model or "claude-sonnet-5"
+    # One set of controls, read once. There is no longer a second, hidden
+    # parameter panel for another flow to read by mistake.
+    lookback_days = int(lookback or 7)
+    report_model = model or "gpt-5.6-luna"
+    include_thesis_flag = (depth or "thesis") != "standard"
+    recs_mode = recs or "auto"
+    recs_model_val = recs_model or "claude-sonnet-5"
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
-    # Research reports only for the AI Report flow proper — Full Analysis
-    # already generates them through the prediction pipeline, and doubling
-    # the run would double the LLM spend for identical output.
-    include_research = bool(ai_research) and not is_full
+    # Full pipeline already produces research through the prediction stage;
+    # running it here too would double the LLM spend for identical output.
+    include_research = bool(research) and not is_full
 
     from services import progress_service as prog
     if is_full:
@@ -1634,7 +1895,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, full_clicks, news_data, s
 
 @callback(
     Output("active-tab-store", "data"),
-    Input("symbol-tabs", "active_tab"),
+    # symbol-tabs is built by a callback and only exists on /analyze.
+    Input("symbol-tabs", "active_tab", allow_optional=True),
     prevent_initial_call=True,
 )
 def track_active_tab(active_tab):
@@ -1644,8 +1906,68 @@ def track_active_tab(active_tab):
     return active_tab
 
 
+def _tab_ids(symbols, news_data):
+    """Which tabs exist right now, and which is the default.
+
+    No History tab: the archive it held is now the Performance, Reports and
+    Activity sections. Analyze is about the symbols in front of you.
+    """
+    if not symbols:
+        return ["tab-overview-empty"], "tab-overview-empty"
+    if not news_data or not news_data.get("articles_by_symbol"):
+        return ["tab-loading"], "tab-loading"
+    return ["tab-overall"] + [f"tab-{s}" for s in symbols], "tab-overall"
+
+
 @callback(
     Output("symbol-tabs-container", "children"),
+    Input("selected-symbols", "data"),
+    Input("news-data-store", "data"),
+    State("active-tab-store", "data"),
+)
+def update_symbol_tabs(symbols, news_data, stored_tab):
+    """Build the tab BAR only: labels, ids, and which one is selected.
+
+    Content is rendered separately by render_active_tab. Previously this one
+    callback built the body of every tab on every store change, so a 20-symbol
+    watchlist serialized 20 full analysis trees to the browser in order to
+    display one. It also took eight Inputs, so any store update rebuilt all of
+    them; the bar itself only depends on the symbol list and whether news has
+    arrived.
+    """
+    tab_ids, default = _tab_ids(symbols, news_data)
+    labels = {
+        "tab-overview-empty": "Overview",
+        "tab-loading": "Loading...",
+        "tab-overall": "Overall",
+    }
+    return html.Div(
+        [
+            dbc.Tabs(
+                [
+                    dbc.Tab(
+                        label=labels.get(tid, tid.removeprefix("tab-")),
+                        tab_id=tid,
+                        className="context-tab",
+                    )
+                    for tid in tab_ids
+                ],
+                id="symbol-tabs",
+                active_tab=restore_tab(stored_tab, tab_ids, default),
+                className="symbol-tabs",
+            ),
+            dcc.Loading(
+                html.Div(id="tab-content", className="tab-content-host"),
+                type="circle",
+                color="#00D4AA",
+            ),
+        ],
+    )
+
+
+@callback(
+    Output("tab-content", "children"),
+    Input("symbol-tabs", "active_tab", allow_optional=True),
     Input("news-data-store", "data"),
     Input("ai-analysis-store", "data"),
     Input("selected-symbols", "data"),
@@ -1654,143 +1976,47 @@ def track_active_tab(active_tab):
     Input("strategy-evaluations-store", "data"),
     Input("report-history-store", "data"),
     Input("recommendations-store", "data"),
-    State("active-tab-store", "data"),
 )
-def update_symbol_tabs(
-    news_data, ai_analysis, symbols, model_signals,
-    strategy_metrics, strategy_evaluations, report_history,
-    recommendations, stored_tab,
+def render_active_tab(
+    active_tab, news_data, ai_analysis, symbols, model_signals,
+    strategy_metrics, strategy_evaluations, report_history, recommendations,
 ):
-    """Build dynamic tabs based on selected symbols.
+    """Render the body of the selected tab, and only that one."""
+    tab_ids, default = _tab_ids(symbols, news_data)
+    active = active_tab if active_tab in tab_ids else default
 
-    Creates an "Overall" tab (always first) plus one tab per symbol. The
-    user's active tab is preserved across re-renders (background store
-    updates used to reset the view to Overall).
-    """
-    # Handle empty state — still show History tab
-    if not symbols:
-        history_content = build_history_tab_layout(report_history or {})
-        return dbc.Tabs(
-            [
-                dbc.Tab(
-                    create_overview_empty_state(),
-                    label="Overview",
-                    tab_id="tab-overview-empty",
-                    className="context-tab",
-                ),
-                dbc.Tab(
-                    history_content,
-                    label="History",
-                    tab_id="tab-history",
-                    className="context-tab",
-                ),
-            ],
-            id="symbol-tabs",
-            active_tab=restore_tab(stored_tab, ["tab-overview-empty", "tab-history"],
-                                    "tab-overview-empty"),
-            className="symbol-tabs",
+    if active == "tab-overview-empty":
+        return create_overview_empty_state()
+    if active == "tab-loading":
+        return create_loading_state(symbols or [])
+
+    articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
+    analysis_by_symbol = (ai_analysis or {}).get("by_symbol", {})
+    ai_failed = bool(ai_analysis and ai_analysis.get("failed"))
+
+    if active == "tab-overall":
+        return build_overall_tab_content(
+            articles_by_symbol=articles_by_symbol,
+            analysis_by_symbol=analysis_by_symbol,
+            overall_analysis=(ai_analysis or {}).get("overall", {}),
+            symbols=symbols,
+            ai_failed=ai_failed,
+            recommendations=recommendations,
         )
 
-    # Show loading state if symbols selected but no news data yet
-    if not news_data or not news_data.get("articles_by_symbol"):
-        history_content = build_history_tab_layout(report_history or {})
-        loading = create_loading_state(symbols)
-        return dbc.Tabs(
-            [
-                dbc.Tab(loading, label="Loading...", tab_id="tab-loading", className="context-tab"),
-                dbc.Tab(history_content, label="History", tab_id="tab-history", className="context-tab"),
-            ],
-            id="symbol-tabs",
-            active_tab=restore_tab(stored_tab, ["tab-loading", "tab-history"], "tab-loading"),
-            className="symbol-tabs",
-        )
-
-    articles_by_symbol = news_data.get("articles_by_symbol", {}) if news_data else {}
-    analysis_by_symbol = ai_analysis.get("by_symbol", {}) if ai_analysis else {}
-    overall_analysis = ai_analysis.get("overall", {}) if ai_analysis else {}
-
-    # Build tabs list
-    tabs = []
-
-    # --- Overall Tab (always first) ---
-    all_articles = []
-    for sym_articles in articles_by_symbol.values():
-        all_articles.extend(sym_articles or [])
-
-    overall_content = build_overall_tab_content(
-        articles_by_symbol=articles_by_symbol,
-        analysis_by_symbol=analysis_by_symbol,
-        overall_analysis=overall_analysis,
-        symbols=symbols,
-        ai_failed=bool(ai_analysis and ai_analysis.get("failed")),
-        recommendations=recommendations,
-    )
-
-    tabs.append(
-        dbc.Tab(
-            overall_content,
-            label="Overall",
-            tab_id="tab-overall",
-            className="context-tab",
-        )
-    )
-
-    # --- Per-Symbol Tabs ---
-    for symbol in symbols:
-        sym_articles = articles_by_symbol.get(symbol, [])
-        sym_analysis = analysis_by_symbol.get(symbol, {})
-        sym_signals = (model_signals or {}).get(symbol, {})
-
-        # Filter strategy data for this symbol
-        sym_metrics = [
-            m for m in (strategy_metrics or [])
-            if m.get("symbol") == symbol
-        ]
-        sym_evals = [
-            e for e in (strategy_evaluations or [])
-            if e.get("symbol") == symbol
-        ]
-
-        sym_recs = (recommendations or {}).get("by_symbol", {}).get(symbol, {})
-
-        tab_content = build_tab_content(
-            articles=sym_articles,
-            analysis=sym_analysis,
-            symbols=[symbol],
-            is_overall=False,
-            model_signals=sym_signals,
-            strategy_metrics=sym_metrics,
-            strategy_evaluations=sym_evals,
-            ai_failed=bool(ai_analysis and ai_analysis.get("failed")),
-            recommendations=sym_recs,
-        )
-
-        tabs.append(
-            dbc.Tab(
-                tab_content,
-                label=symbol,
-                tab_id=f"tab-{symbol}",
-                className="context-tab",
-            )
-        )
-
-    # --- History Tab (TradingAgents research reports) ---
-    history_content = build_history_tab_layout(report_history or {})
-    tabs.append(
-        dbc.Tab(
-            history_content,
-            label="History",
-            tab_id="tab-history",
-            className="context-tab",
-        )
-    )
-
-    available_ids = ["tab-overall"] + [f"tab-{s}" for s in symbols] + ["tab-history"]
-    return dbc.Tabs(
-        tabs,
-        id="symbol-tabs",
-        active_tab=restore_tab(stored_tab, available_ids, "tab-overall"),
-        className="symbol-tabs",
+    symbol = active.removeprefix("tab-")
+    return build_tab_content(
+        articles=articles_by_symbol.get(symbol, []),
+        analysis=analysis_by_symbol.get(symbol, {}),
+        symbols=[symbol],
+        is_overall=False,
+        model_signals=(model_signals or {}).get(symbol, {}),
+        strategy_metrics=[m for m in (strategy_metrics or [])
+                          if m.get("symbol") == symbol],
+        strategy_evaluations=[e for e in (strategy_evaluations or [])
+                              if e.get("symbol") == symbol],
+        ai_failed=ai_failed,
+        recommendations=(recommendations or {}).get("by_symbol", {}).get(symbol, {}),
     )
 
 
@@ -2017,7 +2243,8 @@ def export_data(export_click, modal_export_click, symbols, stock_data,
 
 @callback(
     Output("download-report", "data"),
-    Input("download-report-btn", "n_clicks"),
+    # Hidden button inside the Analyze context panel.
+    Input("download-report-btn", "n_clicks", allow_optional=True),
     State("selected-symbols", "data"),
     State("ai-analysis-store", "data"),
     State("model-signals-store", "data"),
@@ -2186,27 +2413,26 @@ def update_period(clicks, current_period):
 
 @callback(
     Output("model-signals-store", "data"),
-    Input("predict-confirm-btn", "n_clicks"),
-    Input("full-analysis-confirm-btn", "n_clicks"),
+    Input("run-confirm-btn", "n_clicks"),
+    State("run-scope", "value"),
     State("stock-data-store", "data"),
     State("selected-symbols", "data"),
     State("ensemble-config-store", "data"),
     State("news-data-store", "data"),
-    State({"type": "predict-model-check", "model": ALL}, "value"),
-    State("predict-ensemble-check", "value"),
-    State("predict-date-picker", "date"),
-    State("fa-date-picker", "date"),
-    State("fa-model", "value"),
-    State("fa-type", "value"),
+    State({"type": "run-model-check", "model": ALL}, "value"),
+    State("run-ensemble-check", "value"),
+    State("run-date-picker", "date"),
+    State("run-model", "value"),
+    State("run-type", "value"),
     background=True,
     running=[
         (Output("prediction-running-indicator", "style"), {"display": "block"}, {"display": "none"}),
     ],
     prevent_initial_call=True,
 )
-def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_config,
+def generate_model_signals(n_clicks, scope, stock_data, symbols, ensemble_config,
                            news_data, model_checks, run_ensemble,
-                           predict_date_str, fa_date_str, fa_model, fa_type):
+                           predict_date_str, research_model, research_depth):
     """Generate model predictions in a background subprocess.
 
     Supports backtesting: when the selected as-of date is in the past, OHLCV
@@ -2214,26 +2440,27 @@ def generate_model_signals(n_clicks, full_clicks, stock_data, symbols, ensemble_
     as of that day. The selected date is stored in metadata for
     correct persistence.
     """
-    if not (n_clicks or full_clicks) or not stock_data or not symbols:
+    # A report-only run has no models to execute.
+    scope = scope or "full"
+    if scope == "report":
+        raise PreventUpdate
+    if not n_clicks or not stock_data or not symbols:
         raise PreventUpdate
 
-    # Full Analysis: run all models with ensemble enabled (override checkboxes)
-    # and take the as-of date from the Full Analysis modal's own picker. The
-    # research report (trading_agents) honors the modal's model/type choices —
-    # `research_model` is a distinct kwarg so no other model can mistake it.
-    is_full_analysis = ctx.triggered_id == "full-analysis-confirm-btn"
+    # The model checkboxes are now honoured on every scope. Full pipeline used
+    # to overwrite them with [True] * 5, so the boxes you unticked ran anyway.
+    is_full_analysis = scope == "full"
     research_kwargs = {}
     if is_full_analysis:
-        model_checks = [True] * 5
-        run_ensemble = True
-        if fa_date_str:
-            predict_date_str = fa_date_str
+        # The research report (trading_agents) honours the report model/depth
+        # choices; `research_model` is a distinct kwarg so no other model can
+        # mistake it for its own.
         research_kwargs = {
-            "research_model": fa_model or None,
-            "include_thesis": (fa_type or "thesis") != "standard",
+            "research_model": research_model or None,
+            "include_thesis": (research_depth or "thesis") != "standard",
         }
     else:
-        # Predict-only flow owns the feed; Full Analysis started it already
+        # Models-only owns the feed; the full pipeline started it already.
         from services import progress_service as _prog
         _prog.start_run(f"Predictions — {len(symbols or [])} symbols")
 
@@ -2458,6 +2685,9 @@ def persist_predictions(signals, fa_requested):
         from services import progress_service as prog
         prog.emit("store", f"Stored {stored} predictions"
                            + (f", evaluated {evaluated}" if evaluated else ""))
+        # New rows: the launch screen must show this run, not the last one.
+        from services.dashboard_service import invalidate_memo
+        invalidate_memo()
         if not fa_requested:
             prog.finish_run(f"Predictions complete — {stored} stored")
         else:
@@ -2486,27 +2716,30 @@ def persist_predictions(signals, fa_requested):
     Output("history-eval-toast", "is_open"),
     Output("history-eval-toast", "children"),
     Output("history-eval-toast", "icon"),
-    # Both buttons are rendered dynamically (History tab / Scoreboard modal).
     # Dash 4's renderer hard-errors on dispatch when an Input id is missing
     # from the layout (Dash 3 tolerated it); allow_optional restores that.
-    Input("history-evaluate-btn", "n_clicks", allow_optional=True),
-    Input("scoreboard-evaluate-btn", "n_clicks", allow_optional=True),
+    # This button lives on the Performance page, so it is absent elsewhere.
+    Input("perf-evaluate-btn", "n_clicks", allow_optional=True),
     prevent_initial_call=True,
 )
-def evaluate_predictions_now(n_clicks, sb_clicks):
+def evaluate_predictions_now(n_clicks):
     """Score pending predictions against actual closes, on user demand.
 
-    Triggered from the History tab or the Scoreboard modal. The n_clicks
-    guard also covers the re-render insertion trigger (n_clicks resets to
-    None whenever the History tab re-renders its button).
+    Triggered from the Performance page. The n_clicks guard also covers the
+    re-render insertion trigger: n_clicks resets to None whenever the page
+    rebuilds its button.
     """
-    if not n_clicks and not sb_clicks:
+    if not n_clicks:
         raise PreventUpdate
     try:
         cache = get_cache()
         count = cache.evaluate_predictions()
         from services import progress_service as prog
         prog.emit("action", f"Evaluation run: {count} predictions scored")
+        # Scoring rewrites was_correct/pnl on existing rows, so the cached
+        # cohort and rolling stats are now wrong.
+        from services.dashboard_service import invalidate_memo
+        invalidate_memo()
         if count > 0:
             msg = f"Evaluated {count} prediction{'s' if count != 1 else ''} against actual closing prices."
             icon = "success"
@@ -2530,6 +2763,35 @@ def evaluate_predictions_now(n_clicks, sb_clicks):
 )
 def load_report_history(symbols, _prediction_status, _download_done, _eval_status):
     """Load all historical data: reports, predictions, recommendations, TradingAgents."""
+    return fetch_report_history(symbols)
+
+
+_HISTORY_TTL_S = 3.0
+_history_memo: dict = {}
+
+
+def fetch_report_history(symbols=None, only=None) -> dict:
+    """Read the archive straight from the cache layer.
+
+    Called both by the store-populating callback and directly by the router.
+    The router cannot wait for the store: on a deep link the store update can
+    land before #archive-body is mounted, and that update is then dropped,
+    leaving Performance and Reports permanently empty.
+
+    A very short TTL collapses the cold-load burst, where the router and the
+    store callback both ask for the same rows within milliseconds. It is
+    deliberately shorter than any human round trip, so it cannot show stale
+    data after a run.
+    """
+    key = (tuple(sorted(symbols)) if symbols else (),
+           tuple(sorted(only)) if only else ())
+    hit = _history_memo.get(key)
+    if hit and (time.monotonic() - hit[0]) < _HISTORY_TTL_S:
+        return hit[1]
+
+    def wanted(bucket):
+        return only is None or bucket in only
+
     result = {
         "reports": [],
         "predictions": [],
@@ -2541,7 +2803,9 @@ def load_report_history(symbols, _prediction_status, _download_done, _eval_statu
 
         # TradingAgents reports — load for selected symbols or all if none selected
         ta_reports = []
-        if symbols:
+        if not wanted("trading_agent_reports"):
+            pass
+        elif symbols:
             for symbol in symbols:
                 ta_reports.extend(cache.get_trading_agent_reports(symbol, limit=10))
         else:
@@ -2549,15 +2813,14 @@ def load_report_history(symbols, _prediction_status, _download_done, _eval_statu
         ta_reports.sort(key=lambda r: r.get("created_at", ""), reverse=True)
         result["trading_agent_reports"] = ta_reports
 
-        # PDF / AI reports from report_catalog
-        result["reports"] = cache.list_report_catalog(limit=50)
+        if wanted("reports"):
+            result["reports"] = cache.list_report_catalog(limit=50)
+        if wanted("predictions"):
+            result["predictions"] = cache.list_all_predictions(limit=1000)
+        if wanted("recommendations"):
+            result["recommendations"] = cache.list_recommendation_runs(limit=50)
 
-        # Model predictions
-        result["predictions"] = cache.list_all_predictions(limit=1000)
-
-        # Recommendation runs
-        result["recommendations"] = cache.list_recommendation_runs(limit=50)
-
+        _history_memo[key] = (time.monotonic(), result)
         return result
     except Exception as e:
         logger.debug(f"History load error: {e}")
@@ -2582,26 +2845,35 @@ _STAGE_ICONS = {
 }
 
 
+# Poll fast enough to feel live during a run, slowly enough the rest of the
+# time that an idle tab is not making 40 requests a minute forever. A
+# scheduled 08:00 job is still picked up within the idle interval.
+_PROGRESS_POLL_ACTIVE_MS = 1500
+_PROGRESS_POLL_IDLE_MS = 10_000
+
+
 @callback(
     Output("progress-feed-scroll", "children"),
     Output("progress-count", "children"),
     Output("progress-header-icon", "children"),
+    Output("progress-interval", "interval"),
     Input("progress-interval", "n_intervals"),
 )
 def render_progress_panel(_n):
-    """Live activity feed for Full Analysis / Predict runs.
+    """Live activity feed for pipeline runs.
 
     Streams events emitted by every stage (including the background model
-    subprocess). Shows while a run is active and for a grace period after,
-    so late viewers can catch up on what happened.
+    subprocess). Visible on every route: this is the live view, and the
+    Activity section is the filtered archive on top of it.
     """
-    import time as _time
     from services import progress_service as prog
 
     feed = prog.get_feed()
     events = feed.get("events") or []
+    poll = (_PROGRESS_POLL_ACTIVE_MS if feed.get("active")
+            else _PROGRESS_POLL_IDLE_MS)
     if not events:
-        raise PreventUpdate
+        return dash.no_update, dash.no_update, dash.no_update, poll
 
     # No auto-hide: the panel is an audit log now, so it stays up until the
     # user closes it. (It previously vanished 5 minutes after a run finished.)
@@ -2624,7 +2896,7 @@ def render_progress_panel(_n):
                    if feed.get("active")
                    else html.I(className="bi bi-check-circle-fill progress-header-done"))
 
-    return rows, f"{len(events)} events", header_icon
+    return rows, f"{len(events)} events", header_icon, poll
 
 
 @callback(
@@ -2687,208 +2959,6 @@ def apply_progress_panel_state(state):
 # =============================================================================
 
 
-# Column definitions for the scoreboard, surfaced as header tooltips --
-# several of these (Trades vs held, hit rate excluding HOLDs, the $1,000
-# notional behind P&L) are not guessable from the label alone.
-_SCOREBOARD_TIPS = {
-    "Model": "The prediction model that produced these calls.",
-    "Symbol": "The ticker these calls were made on.",
-    "Trades": "BUY/SELL calls that took a position. HOLD days take no "
-              "position and are counted separately as 'held'.",
-    "Hit Rate": "Share of BUY/SELL calls where the next close moved the way "
-                "the model predicted. HOLD days are excluded — they cannot "
-                "be right or wrong.",
-    "Avg Conf": "The model's own average stated confidence. Compare it with "
-                "Hit Rate: a model claiming 70% should be right ~70% of the "
-                "time, and a large gap means it is miscalibrated.",
-    "P&L": "Total dollars across all trades. Each takes a fixed $1,000 "
-           "notional position, entered at the close and exited at the next "
-           "close. Gross — before commission, spread and slippage.",
-    "$/Trade": "P&L divided by Trades: the average edge per position. This "
-               "is the number to judge, since a large P&L over many trades "
-               "can still be a per-trade edge of roughly zero.",
-}
-
-
-def _sb_th(label: str) -> html.Th:
-    """Scoreboard header cell carrying its column definition as a tooltip."""
-    return html.Th(label, title=_SCOREBOARD_TIPS.get(label, ""),
-                   className="scoreboard-th")
-
-
-def _aggregate_scoreboard(preds: list[dict], group_key: str) -> list[html.Tr]:
-    """Aggregate evaluated predictions by model or symbol into table rows."""
-    groups = {}
-    for p in preds:
-        g = groups.setdefault(p.get(group_key, "?"),
-                              {"scored": 0, "hits": 0, "trades": 0, "trade_hits": 0,
-                               "holds": 0, "pnl": 0.0, "conf": []})
-        is_trade = (p.get("decision") or "HOLD").upper() != "HOLD"
-        if p.get("was_correct") is not None:
-            g["scored"] += 1
-            g["hits"] += 1 if p["was_correct"] else 0
-            # Only BUY/SELL take a position, so only they can be right or wrong
-            # in a way that moves money -- HOLD scores "correct" by default and
-            # would otherwise inflate the hit rate.
-            if is_trade:
-                g["trades"] += 1
-                g["trade_hits"] += 1 if p["was_correct"] else 0
-        elif not is_trade and p.get("pnl_dollars") is not None:
-            # Evaluated HOLDs: the evaluator leaves was_correct as None (a
-            # HOLD can't be right or wrong) but sets pnl_dollars to 0.0 --
-            # keying "held" on was_correct kept this counter at zero forever.
-            g["holds"] += 1
-        if p.get("pnl_dollars") is not None:
-            g["pnl"] += p["pnl_dollars"]
-        if p.get("confidence") is not None:
-            g["conf"].append(p["confidence"])
-
-    rows = []
-    for name in sorted(groups):
-        g = groups[name]
-        trades, pnl = g["trades"], g["pnl"]
-        hit_rate = f"{g['trade_hits'] / trades:.0%}" if trades else "—"
-        avg_conf = f"{sum(g['conf']) / len(g['conf']):.0%}" if g["conf"] else "—"
-        pnl_cls = "positive" if pnl > 0 else "negative" if pnl < 0 else ""
-        per_trade = f"${pnl / trades:+.2f}" if trades else "—"
-        display = MODEL_DISPLAY.get(name, name) if group_key == "model_name" else name
-        rows.append(html.Tr([
-            html.Td(display),
-            # "35 · 4 held" rather than "35 of 39": the bare "of" left the
-            # denominator ambiguous (of what? trades? days?). Naming the
-            # second number makes it self-describing.
-            html.Td(html.Span([
-                html.Strong(str(trades)),
-                html.Span(f" · {g['holds']} held", className="scoreboard-muted")
-                if g["holds"] else "",
-            ]), title=f"{trades} BUY/SELL positions taken, "
-                      f"{g['holds']} HOLD days took no position "
-                      f"({g['scored']} predictions scored in total)"),
-            html.Td(hit_rate, title=f"{g['trade_hits']} of {trades} BUY/SELL calls "
-                                    f"went the predicted way (HOLDs excluded)"),
-            html.Td(avg_conf),
-            html.Td(html.Span(f"${pnl:+.2f}", className=pnl_cls),
-                    title=f"{trades} trades x $1,000 notional"),
-            html.Td(html.Span(per_trade, className=pnl_cls)),
-        ]))
-    return rows
-
-
-@callback(
-    Output("scoreboard-modal", "is_open"),
-    Output("scoreboard-content", "children"),
-    Output("scoreboard-symbols", "options"),
-    Output("scoreboard-pending-label", "children"),
-    Input("scoreboard-btn", "n_clicks"),
-    Input("scoreboard-symbols", "value"),
-    Input("scoreboard-date-range", "start_date"),
-    Input("scoreboard-date-range", "end_date"),
-    Input("history-eval-status", "data"),
-    State("scoreboard-modal", "is_open"),
-    prevent_initial_call=True,
-)
-def render_scoreboard(open_clicks, sym_filter, start_date, end_date, _eval_status, is_open):
-    """Populate the Model Scoreboard modal.
-
-    Defaults to ALL symbols and ALL dates; the dropdown and date range
-    narrow the view. Re-renders after an evaluation run.
-    """
-    triggered = ctx.triggered_id
-    if triggered == "scoreboard-btn":
-        if not open_clicks:
-            raise PreventUpdate
-        is_open = True
-    if not is_open:
-        raise PreventUpdate
-
-    try:
-        cache = get_cache()
-        all_preds = cache.list_all_predictions(limit=2000)
-    except Exception as e:
-        logger.warning(f"Scoreboard load failed: {e}")
-        return True, html.Div("Could not load predictions.", className="text-danger"), [], ""
-
-    symbols_available = sorted({p.get("symbol", "") for p in all_preds if p.get("symbol")})
-    options = [{"label": s, "value": s} for s in symbols_available]
-
-    preds = all_preds
-    if sym_filter:
-        wanted = set(sym_filter)
-        preds = [p for p in preds if p.get("symbol") in wanted]
-    if start_date:
-        preds = [p for p in preds if (p.get("prediction_date") or "") >= str(start_date)[:10]]
-    if end_date:
-        preds = [p for p in preds if (p.get("prediction_date") or "") <= str(end_date)[:10]]
-
-    evaluated = [p for p in preds
-                 if p.get("was_correct") is not None or p.get("pnl_dollars") is not None]
-    pending = len(preds) - len(evaluated)
-    pending_label = (f"{pending} pending prediction{'s' if pending != 1 else ''} in current filter"
-                     if pending else "All predictions in filter are evaluated")
-
-    if not evaluated:
-        content = html.Div(
-            [
-                html.I(className="bi bi-trophy",
-                       style={"fontSize": "1.6rem", "opacity": "0.3", "display": "block",
-                              "marginBottom": "10px"}),
-                html.Div("No evaluated predictions match this filter.",
-                         style={"fontWeight": "600"}),
-                html.Div("Run predictions, wait for the target date's close, then Evaluate pending.",
-                         style={"color": "var(--text-secondary)", "fontSize": "0.85rem"}),
-            ],
-            className="history-empty-msg",
-        )
-        return True, content, options, pending_label
-
-    dates = sorted(p.get("prediction_date", "") for p in evaluated)
-    header = html.Div(
-        f"{len(evaluated)} evaluated predictions · "
-        f"{len({p.get('symbol') for p in evaluated})} symbols · "
-        f"{dates[0]} → {dates[-1]}",
-        className="scoreboard-summary",
-    )
-    hint = html.Div([
-        html.Div(
-            "Trades counts BUY/SELL only — each takes a fixed $1,000 notional "
-            "position, held one session and closed at the next close. HOLD days "
-            "take no position, score $0, and are excluded from hit rate.",
-            className="history-scoreboard-hint",
-        ),
-        html.Div(
-            "Hit rate vs avg confidence shows calibration: a model claiming 70% "
-            "should be right ~70% of the time.",
-            className="history-scoreboard-hint",
-        ),
-    ])
-
-    thead = html.Thead(html.Tr([_sb_th("Model"), _sb_th("Trades"), _sb_th("Hit Rate"),
-                                _sb_th("Avg Conf"), _sb_th("P&L"), _sb_th("$/Trade")]))
-    model_table = html.Div(
-        html.Table([thead, html.Tbody(_aggregate_scoreboard(evaluated, "model_name"))],
-                   className="history-data-table"),
-        className="history-table-wrap",
-    )
-
-    sym_thead = html.Thead(html.Tr([_sb_th("Symbol"), _sb_th("Trades"), _sb_th("Hit Rate"),
-                                    _sb_th("Avg Conf"), _sb_th("P&L"), _sb_th("$/Trade")]))
-    symbol_table = html.Div(
-        html.Table([sym_thead, html.Tbody(_aggregate_scoreboard(evaluated, "symbol"))],
-                   className="history-data-table"),
-        className="history-table-wrap",
-    )
-
-    content = html.Div([
-        header,
-        hint,
-        html.Div("By model", className="scoreboard-subtitle"),
-        model_table,
-        html.Div("By symbol", className="scoreboard-subtitle"),
-        symbol_table,
-    ])
-    return True, content, options, pending_label
-
-
 # =============================================================================
 # VIEW FULL REPORT (switch to History tab + expand accordion)
 # =============================================================================
@@ -2898,58 +2968,82 @@ def render_scoreboard(open_clicks, sym_filter, start_date, end_date, _eval_statu
 
 @callback(
     Output("history-filter-symbols", "data"),
-    Output("history-symbol-dropdown", "value"),
-    Input("history-symbol-dropdown", "value"),
+    # Filter bar: Performance and Reports only.
+    Input("history-symbol-dropdown", "value", allow_optional=True),
     Input({"type": "history-recent-chip", "symbol": ALL}, "n_clicks"),
     State("history-filter-symbols", "data"),
     prevent_initial_call=True,
 )
 def update_history_symbol_filter(dropdown_val, chip_clicks, current_filter):
-    """Sync symbol dropdown with filter store; handle recent-chip clicks."""
+    """Write the symbol filter to its store.
+
+    Writes the store only. The dropdown itself is seeded from the store when
+    the filter bar is built, because it exists on two of six routes and an
+    Output on a missing component is a hard error in Dash 4.
+    """
     triggered = ctx.triggered_id
     if isinstance(triggered, dict) and triggered.get("type") == "history-recent-chip":
         if not any(chip_clicks or []):
             raise PreventUpdate
         sym = triggered["symbol"]
         current = list(current_filter or [])
-        if sym not in current:
-            current.append(sym)
-        return current, current
+        if sym in current:
+            raise PreventUpdate
+        current.append(sym)
+        return current
+    # The dropdown unmounting also fires this. Do not let that clear the store.
+    if triggered != "history-symbol-dropdown":
+        raise PreventUpdate
     new_val = list(dropdown_val or [])
-    return new_val, new_val
+    # Writing back a value the store already holds would re-render whatever
+    # depends on it, for no change.
+    if new_val == list(current_filter or []):
+        raise PreventUpdate
+    return new_val
 
 
 @callback(
     Output("history-filter-date-range", "data"),
     Output("history-filter-date-specific", "data"),
-    Output("history-date-picker", "date"),
     Input({"type": "history-date-btn", "range": ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
 def update_history_date_filter(btn_clicks):
-    """Set the date range filter from button group clicks; clear specific date."""
+    """Set the date range filter from the button group; clear any specific date.
+
+    Clearing the picker is implicit: it is seeded from history-filter-date-
+    specific when the bar is rebuilt, which the router does on this write.
+    """
     if not any(btn_clicks or []):
         raise PreventUpdate
     triggered = ctx.triggered_id
     rng = "all"
     if isinstance(triggered, dict):
         rng = triggered.get("range", "all")
-    return rng, None, None
+    return rng, None
 
 
 @callback(
     Output("history-filter-date-specific", "data", allow_duplicate=True),
     Output("history-filter-date-range", "data", allow_duplicate=True),
-    Input("history-date-picker", "date"),
+    # Filter bar: Performance and Reports only.
+    Input("history-date-picker", "date", allow_optional=True),
+    State("history-filter-date-specific", "data"),
     prevent_initial_call=True,
 )
-def update_history_specific_date(picked_date):
+def update_history_specific_date(picked_date, current_specific):
     """Set specific date filter from date picker; reset range on a real pick.
 
     When the picker is cleared programmatically (range button / Clear all),
     leave the range store alone — otherwise clicking "7d" would immediately
     be undone by this callback firing with date=None.
+
+    The equality guard matters because this Input also fires when the picker
+    is re-created by a re-render; writing back the value it was just seeded
+    with would loop.
     """
+    if picked_date == current_specific:
+        raise PreventUpdate
     if not picked_date:
         return None, dash.no_update
     return picked_date, "all"
@@ -2990,87 +3084,13 @@ def set_activity_scope(_clicks):
 
 
 @callback(
-    Output("history-tab-content", "children"),
-    Output("history-applied-filters", "children"),
-    Input("report-history-store", "data"),
-    Input("history-filter-symbols", "data"),
-    Input("history-filter-date-range", "data"),
-    Input("history-filter-date-specific", "data"),
-    Input("history-activity-scope", "data"),
-)
-def render_filtered_history(history_data, filter_symbols, filter_date_range, specific_date,
-                            activity_scope):
-    """Re-render history content when data or filters change."""
-    data = history_data or {}
-    syms = filter_symbols or []
-    dr = filter_date_range or "all"
-    sd = specific_date or None
-
-    sections = build_filtered_history_sections(data, syms, dr, sd,
-                                                activity_scope or "all")
-
-    # Build applied-filter chips
-    chips = []
-    if syms:
-        for s in syms:
-            chips.append(
-                html.Span(
-                    [
-                        s,
-                        html.Button(
-                            "×",
-                            id={"type": "history-remove-filter", "symbol": s},
-                            className="history-filter-chip-remove",
-                        ),
-                    ],
-                    className="history-filter-chip",
-                )
-            )
-    if sd:
-        chips.append(
-            html.Span(
-                [
-                    sd[:10],
-                    html.Button(
-                        "×",
-                        id={"type": "history-remove-date-filter", "range": "specific"},
-                        className="history-filter-chip-remove",
-                    ),
-                ],
-                className="history-filter-chip",
-            )
-        )
-    elif dr and dr != "all":
-        chips.append(
-            html.Span(
-                [
-                    f"Last {dr}",
-                    html.Button(
-                        "×",
-                        id={"type": "history-remove-date-filter", "range": dr},
-                        className="history-filter-chip-remove",
-                    ),
-                ],
-                className="history-filter-chip",
-            )
-        )
-    if chips:
-        chips.append(
-            html.Button("Clear all", id="history-clear-all-filters", className="history-clear-all-link")
-        )
-
-    return sections, chips
-
-
-@callback(
     Output("history-filter-symbols", "data", allow_duplicate=True),
     Output("history-filter-date-range", "data", allow_duplicate=True),
     Output("history-filter-date-specific", "data", allow_duplicate=True),
-    Output("history-symbol-dropdown", "value", allow_duplicate=True),
-    Output("history-date-picker", "date", allow_duplicate=True),
     Input({"type": "history-remove-filter", "symbol": ALL}, "n_clicks"),
     Input({"type": "history-remove-date-filter", "range": ALL}, "n_clicks"),
-    Input("history-clear-all-filters", "n_clicks"),
+    # Rendered only when at least one filter chip is showing.
+    Input("history-clear-all-filters", "n_clicks", allow_optional=True),
     State("history-filter-symbols", "data"),
     State("history-filter-date-range", "data"),
     State("history-filter-date-specific", "data"),
@@ -3090,15 +3110,15 @@ def remove_history_filter(sym_clicks, date_clicks, clear_click, current_symbols,
     triggered = ctx.triggered_id
 
     if triggered == "history-clear-all-filters":
-        return [], "all", None, [], None
+        return [], "all", None
 
     if isinstance(triggered, dict):
         if triggered.get("type") == "history-remove-filter":
             sym = triggered["symbol"]
             new_syms = [s for s in (current_symbols or []) if s != sym]
-            return new_syms, current_range or "all", current_specific, new_syms, dash.no_update
+            return new_syms, current_range or "all", current_specific
         if triggered.get("type") == "history-remove-date-filter":
-            return current_symbols or [], "all", None, current_symbols or [], None
+            return current_symbols or [], "all", None
 
     raise PreventUpdate
 
@@ -3121,7 +3141,6 @@ def toggle_history_section(n_clicks, current_style):
 
 
 @callback(
-    Output("symbol-tabs", "active_tab"),
     Output("ta-report-modal", "is_open"),
     Output("ta-report-modal-title", "children"),
     Output("ta-report-modal-body", "children"),
@@ -3251,7 +3270,8 @@ def load_strategy_data(symbols, _prediction_status):
 
 @callback(
     Output("ensemble-config-drawer", "is_open"),
-    Input("ensemble-config-btn", "n_clicks"),
+    # Gear on the Ensemble signal card, itself rendered by a callback.
+    Input("ensemble-config-btn", "n_clicks", allow_optional=True),
     State("ensemble-config-drawer", "is_open"),
     prevent_initial_call=True,
 )
@@ -3391,8 +3411,9 @@ def recompute_ensemble(ensemble_config, signals):
 
 @callback(
     Output("scheduler-panel-container", "children"),
-    Input("scheduler-refresh", "n_intervals"),
-    Input("scheduler-action-status", "data"),
+    # Both live on the Schedule page, so neither exists on other routes.
+    Input("scheduler-refresh", "n_intervals", allow_optional=True),
+    Input("scheduler-action-status", "data", allow_optional=True),
 )
 def render_scheduler_panel(_n, _action):
     """Redraw the schedule panel from the database.
@@ -3531,72 +3552,13 @@ def _shutdown():
 # =============================================================================
 
 
-@callback(
-    Output("report-confirm-modal", "is_open"),
-    Output("report-confirm-body", "children"),
-    Input("generate-report-btn", "n_clicks"),
-    Input("report-cancel-btn", "n_clicks"),
-    Input("report-confirm-btn", "n_clicks"),
-    State("news-data-store", "data"),
-    State("selected-symbols", "data"),
-    State("report-confirm-modal", "is_open"),
-    prevent_initial_call=True,
-)
-def toggle_report_modal(open_clicks, cancel_clicks, confirm_clicks,
-                        news_data, symbols, is_open):
-    """Open/close the AI Report confirmation modal with data summary."""
-    triggered = ctx.triggered_id
-
-    if triggered in ("report-cancel-btn", "report-confirm-btn"):
-        return False, dash.no_update
-
-    if triggered == "generate-report-btn":
-        if not symbols:
-            return False, dash.no_update
-
-        # Build data summary for the modal
-        articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
-        fetched_at = (news_data or {}).get("fetched_at", "N/A")
-
-        from services.llm_service import get_llm
-        llm = get_llm()
-        provider = getattr(llm, "provider", "unknown") or "none"
-        model_name = llm._get_model() if hasattr(llm, "_get_model") else "unknown"
-
-        # No per-symbol article table here — the live windowed preview below
-        # the Parameters section is the authoritative count (it reflects the
-        # chosen date/window; the raw store count does not and the two tables
-        # side by side read as a contradiction).
-        body = html.Div([
-            html.Div([
-                html.Span("Symbols: ", style={"color": "var(--text-secondary)"}),
-                html.Strong(", ".join(symbols)),
-            ], className="mb-2"),
-            html.Div([
-                html.Span("News store refreshed: ", style={"color": "var(--text-secondary)"}),
-                html.Strong(fetched_at[:19] if fetched_at != "N/A" else "Not fetched yet"),
-            ], className="mb-3"),
-            html.Hr(),
-            # Model and analysis type are user-adjustable in the Parameters
-            # section below — repeating the provider default here as "Model:"
-            # contradicted the picker.
-            html.Div([
-                html.Span("Output: ", style={"color": "var(--text-secondary)"}),
-                html.Strong("Per-symbol analysis + overall summary"),
-                html.Span(f"  ·  provider fallback: {provider}",
-                          style={"color": "var(--text-muted)", "fontSize": "0.8rem"}),
-            ]),
-        ])
-
-        return True, body
-
-    return is_open, dash.no_update
 
 
 @callback(
     Output("ai-json-modal", "is_open"),
     Output("ai-json-body", "children"),
-    Input("ai-json-view-btn", "n_clicks"),
+    # Rendered inside the Overall tab body.
+    Input("ai-json-view-btn", "n_clicks", allow_optional=True),
     State("ai-analysis-store", "data"),
     prevent_initial_call=True,
 )
@@ -3625,10 +3587,10 @@ def download_ai_json(n_clicks, ai_analysis):
 
 
 @callback(
-    Output("ai-report-article-preview", "children"),
-    Input("report-confirm-modal", "is_open"),
-    Input("ai-report-lookback", "value"),
-    Input("ai-report-date", "date"),
+    Output("run-article-preview", "children"),
+    Input("run-modal", "is_open"),
+    Input("run-lookback", "value"),
+    Input("run-date-picker", "date"),
     State("selected-symbols", "data"),
     prevent_initial_call=True,
 )
@@ -3687,9 +3649,8 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, symbols):
 
 
 @callback(
-    Output("predict-date-mode-label", "children"),
-    Output("predict-date-mode-label", "style"),
-    Input("predict-date-picker", "date"),
+    Output("run-date-mode-label", "children"),
+    Input("run-date-picker", "date"),
     prevent_initial_call=True,
 )
 def update_predict_date_label(date_str):
@@ -3718,35 +3679,57 @@ def update_predict_date_label(date_str):
 
 
 @callback(
-    Output("predict-confirm-modal", "is_open"),
-    Output("predict-data-summary", "children"),
-    Output("predict-ensemble-summary", "children"),
-    Input("run-predictions-btn", "n_clicks"),
-    Input("predict-cancel-btn", "n_clicks"),
-    Input("predict-confirm-btn", "n_clicks"),
+    Output("run-modal", "is_open"),
+    Output("run-data-summary", "children"),
+    Output("run-ensemble-summary", "children"),
+    Input("run-analysis-btn", "n_clicks"),
+    Input("home-run-btn", "n_clicks", allow_optional=True),
+    Input("run-cancel-btn", "n_clicks"),
+    Input("run-confirm-btn", "n_clicks"),
     State("stock-data-store", "data"),
     State("selected-symbols", "data"),
     State("ensemble-config-store", "data"),
     State("news-data-store", "data"),
-    State("predict-confirm-modal", "is_open"),
+    State("run-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_predict_modal(open_clicks, cancel_clicks, confirm_clicks,
-                         stock_data, symbols, ensemble_config, news_data, is_open):
-    """Open/close the Predict confirmation modal with data summary."""
+def toggle_run_modal(open_clicks, home_clicks, cancel_clicks, confirm_clicks,
+                     stock_data, symbols, ensemble_config, news_data, is_open):
+    """Open or close the single run dialog, with a summary of the input data.
+
+    Two openers: the toolbar button and the Home call to action. Both land on
+    the same dialog, so there is one place where a run is configured.
+    """
     triggered = ctx.triggered_id
     no_update_body = (dash.no_update, dash.no_update)
+    openers = ("run-analysis-btn", "home-run-btn")
 
-    # Guard: if no trigger matched, don't change modal state
-    if triggered not in ("run-predictions-btn", "predict-cancel-btn", "predict-confirm-btn"):
+    if triggered not in openers + ("run-cancel-btn", "run-confirm-btn"):
         raise PreventUpdate
 
-    if triggered in ("predict-cancel-btn", "predict-confirm-btn"):
+    if triggered in ("run-cancel-btn", "run-confirm-btn"):
         return False, *no_update_body
 
-    if triggered == "run-predictions-btn":
+    if triggered in openers:
+        # Both openers fire this callback when they mount, with their own
+        # n_clicks still None. Checking "either has clicks" is not enough:
+        # the toolbar button never unmounts, so its count survives, and
+        # arriving on Home would then open the dialog by itself. Only the
+        # button that actually triggered may open it.
+        if not {"run-analysis-btn": open_clicks,
+                "home-run-btn": home_clicks}.get(triggered):
+            raise PreventUpdate
         if not symbols:
-            return False, *no_update_body
+            # Opening onto an explanation beats the old behaviour, which was
+            # for the button to do nothing at all with an empty watchlist.
+            return True, html.Div(
+                [
+                    html.Div("No symbols selected", className="empty-state-title"),
+                    html.Div("Add symbols from the Watchlist button in the "
+                             "toolbar, then run.", className="empty-state-note"),
+                ],
+                className="empty-state",
+            ), dash.no_update
 
         stock_data = stock_data or {}
         ensemble_config = ensemble_config or {}
@@ -3832,74 +3815,43 @@ def toggle_predict_modal(open_clicks, cancel_clicks, confirm_clicks,
 # =============================================================================
 
 
+
+
 @callback(
-    Output("full-analysis-modal", "is_open"),
-    Output("full-analysis-body", "children"),
-    Input("full-analysis-btn", "n_clicks"),
-    Input("full-analysis-cancel-btn", "n_clicks"),
-    Input("full-analysis-confirm-btn", "n_clicks"),
-    State("stock-data-store", "data"),
-    State("selected-symbols", "data"),
-    State("news-data-store", "data"),
-    State("full-analysis-modal", "is_open"),
-    prevent_initial_call=True,
+    Output("run-models-section", "style"),
+    Output("run-report-section", "style"),
+    Output("run-recs-section", "style"),
+    Output("run-scope-hint", "children"),
+    Input("run-scope", "value"),
 )
-def toggle_full_analysis_modal(open_clicks, cancel_clicks, confirm_clicks,
-                               stock_data, symbols, news_data, is_open):
-    """Open/close the Full Analysis confirmation modal."""
-    triggered = ctx.triggered_id
-    if triggered not in ("full-analysis-btn", "full-analysis-cancel-btn",
-                         "full-analysis-confirm-btn"):
-        raise PreventUpdate
+def apply_run_scope(scope):
+    """Show only the controls the chosen scope actually uses.
 
-    if triggered in ("full-analysis-cancel-btn", "full-analysis-confirm-btn"):
-        return False, dash.no_update
+    Hidden rather than unmounted: the callbacks that read these values take
+    them as State, and an unmounted State would break the run.
+    """
+    from layouts.modals import RUN_SCOPES
 
-    if triggered == "full-analysis-btn":
-        if not symbols:
-            return False, dash.no_update
-
-        articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
-        sym_rows = []
-        for sym in symbols:
-            sym_data = (stock_data or {}).get(sym, {})
-            bars = "N/A"
-            if sym_data.get("prices"):
-                try:
-                    df = pd.read_json(StringIO(sym_data["prices"]))
-                    bars = str(len(df))
-                except Exception:
-                    pass
-            news_count = len(articles_by_symbol.get(sym, []))
-            sym_rows.append(html.Tr([
-                html.Td(sym), html.Td(bars), html.Td(str(news_count)),
-            ]))
-
-        body = html.Div([
-            html.H6("Symbols", className="mb-2"),
-            dbc.Table(
-                [
-                    html.Thead(html.Tr([
-                        html.Th("Symbol"), html.Th("Bars"), html.Th("Articles"),
-                    ])),
-                    html.Tbody(sym_rows),
-                ],
-                bordered=True, color="dark", size="sm",
-            ),
-        ])
-        return True, body
-
-    return is_open, dash.no_update
+    scope = scope or "full"
+    show, hide = {}, {"display": "none"}
+    hint = next((d for v, _, d in RUN_SCOPES if v == scope), "")
+    return (
+        show if scope in ("models", "full") else hide,
+        show if scope in ("report", "full") else hide,
+        show if scope in ("report", "full") else hide,
+        hint,
+    )
 
 
 @callback(
     Output("full-analysis-requested", "data"),
-    Input("full-analysis-confirm-btn", "n_clicks"),
+    Input("run-confirm-btn", "n_clicks"),
+    State("run-scope", "value"),
     prevent_initial_call=True,
 )
-def set_full_analysis_flag(n_clicks):
-    """Set the full-analysis flag when the user confirms."""
-    if n_clicks:
+def set_full_analysis_flag(n_clicks, scope):
+    """Arm the synthesis stage, but only for a full-pipeline run."""
+    if n_clicks and (scope or "full") == "full":
         return True
     raise PreventUpdate
 

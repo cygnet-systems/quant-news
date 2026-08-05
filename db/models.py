@@ -543,3 +543,38 @@ class LLMUsage(Base):
         Index("ix_llm_usage_stage", "stage", "created_at"),
         Index("ix_llm_usage_run", "run_id"),
     )
+
+
+class WatchlistHistory(Base):
+    """Every distinct symbol group a user has actually pulled data for.
+
+    Previously this was five entries in the browser's localStorage, so it
+    vanished with a cleared cache and never reached a second machine. Rows are
+    never deleted: the subset-merge that keeps the recent-chips list readable
+    (REX superseding REX+WGO's prefix) is a presentation rule, and applying it
+    to storage would throw away the history it exists to preserve.
+
+    Uniqueness is enforced by an expression index on COALESCE(owner_uid, '')
+    rather than a UniqueConstraint, because Postgres treats NULL owners as
+    distinct and anonymous sessions would never bump use_count.
+    """
+
+    __tablename__ = "watchlist_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+    # Sorted and comma-joined, so the same set always keys the same row.
+    symbols_csv: Mapped[str] = mapped_column(Text, nullable=False)
+
+    first_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    use_count: Mapped[int] = mapped_column(Integer, nullable=False,
+                                           server_default=text("1"))
+
+    __table_args__ = (
+        Index("ix_watchlist_history_recent", "owner_uid", "last_used_at"),
+    )

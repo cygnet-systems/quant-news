@@ -10,6 +10,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from layouts.components import (
+    create_indicator_toggles,
     create_news_quick_stats,
     create_recommendation_banner,
     create_sentiment_breakdown,
@@ -107,14 +108,14 @@ def create_loading_state(symbols: list, stage: str = "news") -> html.Div:
 
 
 def create_ai_loading_indicator() -> html.Div:
-    """Create prompt to generate AI analysis via the sidebar button."""
+    """Prompt to generate AI analysis from the toolbar."""
     return html.Div(
         [
             html.Div(
                 [
                     html.I(className="bi bi-file-text", style={"fontSize": "1.2rem", "color": "#17a2b8"}),
                     html.Span(
-                        'Click "AI Report" in sidebar to generate insights',
+                        'Run "AI Report" from the toolbar to generate insights',
                         className="loading-inline-text",
                         style={"color": "var(--text-secondary)"},
                     ),
@@ -985,3 +986,232 @@ def build_tab_content(
         )
 
     return html.Div(children, className="tab-content-inner")
+
+
+def create_main_content() -> html.Div:
+    """Create the main content area with charts.
+
+    Returns:
+        Main content div component.
+    """
+    return html.Div(
+        [
+            # Summary Cards Row
+            html.Div(
+                id="summary-cards",
+                className="summary-cards-row",
+            ),
+
+            # Main Price Chart
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H3(id="chart-title", className="chart-title"),
+                            html.Div(id="chart-subtitle", className="chart-subtitle"),
+                        ],
+                        className="chart-header",
+                    ),
+                    dcc.Loading(
+                        dcc.Graph(
+                            id="price-chart",
+                            className="main-chart",
+                            style={"height": "380px"},
+                            config={
+                                "displayModeBar": True,
+                                "modeBarButtonsToRemove": [
+                                    "lasso2d",
+                                    "select2d",
+                                ],
+                                "displaylogo": False,
+                                "responsive": False,
+                            },
+                        ),
+                        type="circle",
+                        color="#00D4AA",
+                    ),
+                ],
+                className="chart-container price-chart-container",
+            ),
+
+            # Technical Indicators Row
+            html.Div(
+                [
+                    # MACD Chart
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.H4("MACD", className="subplot-title"),
+                                    html.I(
+                                        className="bi bi-info-circle ms-2 info-icon",
+                                        id="macd-info-icon",
+                                    ),
+                                    dbc.Tooltip(
+                                        "Moving Average Convergence Divergence: "
+                                        "MACD Line = EMA(12) - EMA(26), "
+                                        "Signal Line = 9-day EMA of MACD. "
+                                        "Bullish when MACD crosses above Signal.",
+                                        target="macd-info-icon",
+                                        placement="top",
+                                    ),
+                                ],
+                                className="subplot-title-row",
+                            ),
+                            dcc.Loading(
+                                dcc.Graph(
+                                    id="macd-chart",
+                                    className="subplot-chart",
+                                    style={"height": "140px"},
+                                    config={"displayModeBar": False, "responsive": False},
+                                ),
+                                type="circle",
+                                color="#00D4AA",
+                            ),
+                        ],
+                        className="subplot-container",
+                    ),
+                    # RSI Chart
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.H4("RSI", className="subplot-title"),
+                                    html.I(
+                                        className="bi bi-info-circle ms-2 info-icon",
+                                        id="rsi-info-icon",
+                                    ),
+                                    dbc.Tooltip(
+                                        "Relative Strength Index (14-day): "
+                                        "Measures momentum on a 0-100 scale. "
+                                        "Overbought: >70, Oversold: <30.",
+                                        target="rsi-info-icon",
+                                        placement="top",
+                                    ),
+                                ],
+                                className="subplot-title-row",
+                            ),
+                            dcc.Loading(
+                                dcc.Graph(
+                                    id="rsi-chart",
+                                    className="subplot-chart",
+                                    style={"height": "140px"},
+                                    config={"displayModeBar": False, "responsive": False},
+                                ),
+                                type="circle",
+                                color="#00D4AA",
+                            ),
+                        ],
+                        className="subplot-container",
+                    ),
+                ],
+                className="indicators-row",
+            ),
+
+            # Volume Chart
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H4("Volume", className="subplot-title"),
+                            html.I(
+                                className="bi bi-info-circle ms-2 info-icon",
+                                id="volume-info-icon",
+                            ),
+                            dbc.Tooltip(
+                                "Trading Volume: Number of shares traded. "
+                                "Green = up day, Red = down day. "
+                                "Line shows 20-day moving average.",
+                                target="volume-info-icon",
+                                placement="top",
+                            ),
+                        ],
+                        className="subplot-title-row",
+                    ),
+                    dcc.Loading(
+                        dcc.Graph(
+                            id="volume-chart",
+                            className="volume-chart",
+                            style={"height": "110px"},
+                            config={"displayModeBar": False, "responsive": False},
+                        ),
+                        type="circle",
+                        color="#00D4AA",
+                    ),
+                ],
+                className="chart-container volume-container",
+            ),
+        ],
+        className="main-content",
+        id="main-content",
+    )
+
+
+def create_context_panel() -> html.Div:
+    """Create the right context panel with dynamic per-symbol tabs.
+
+    Returns:
+        Context panel div component with:
+        - Panel header with LLM status
+        - Dynamic tabs container (populated by callback based on selected symbols)
+
+    Tab structure: [ Overall ] [ AAPL ] [ GOOGL ] [ MSFT ] ...
+    Each symbol gets its own tab with recommendation + news + sentiment.
+    """
+    return html.Div(
+        [
+            # Panel header (stays outside tabs)
+            html.Div(
+                [
+                    html.H2("Analysis", className="panel-main-title"),
+                    html.Span(id="llm-status", className="llm-status-badge"),
+                    # Background prediction running indicator
+                    html.Span(
+                        [
+                            html.I(className="bi bi-gear-fill spinning-icon"),
+                            " Predicting...",
+                        ],
+                        id="prediction-running-indicator",
+                        className="prediction-running-badge",
+                        style={"display": "none"},
+                    ),
+                    # Hidden — keeps download_report_pdf callback wired
+                    html.Button(id="download-report-btn", style={"display": "none"}),
+                ],
+                className="panel-header-row",
+            ),
+
+            # Dynamic tabs container - populated by update_symbol_tabs callback
+            dcc.Loading(
+                html.Div(id="symbol-tabs-container"),
+                type="circle",
+                color="#00D4AA",
+            ),
+        ],
+        className="context-panel",
+        id="context-panel",
+    )
+
+
+def layout() -> html.Div:
+    """The working surface: charts on the left, per-symbol analysis on the right.
+
+    Indicator toggles live here rather than in the toolbar because they apply
+    to these charts and nowhere else.
+    """
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span("Indicators", className="input-label"),
+                    create_indicator_toggles(),
+                ],
+                className="analyze-indicator-bar",
+            ),
+            html.Div(
+                [create_main_content(), create_context_panel()],
+                className="analyze-grid",
+            ),
+        ],
+        className="page page-analyze",
+    )

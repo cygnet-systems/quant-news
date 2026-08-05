@@ -1,319 +1,17 @@
-"""Main dashboard layout for Quant News Tracker.
+"""Root layout for Quant News Tracker.
 
-This module defines the overall page structure following the
-3-column layout specified in PROJECT.md.
+This module owns the persistent frame only: global stores, the shell (rail,
+toolbar, routed #page-content), and every overlay that must outlive a route
+change. Section content lives in layouts/pages/.
 """
 
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from config import MODEL
-from layouts.components import (
-    create_data_actions,
-    create_ensemble_config_drawer,
-    create_indicator_toggles,
-    create_period_selector,
-    create_stock_input,
-)
-from layouts.modals import (
-    create_data_modal,
-    create_full_analysis_modal,
-    create_predict_confirm_modal,
-    create_report_confirm_modal,
-    create_scoreboard_modal,
-)
-
-
-def create_sidebar() -> html.Div:
-    """Create the left sidebar with stock input and controls.
-
-    Returns:
-        Sidebar div component.
-    """
-    return html.Div(
-        [
-            # Logo/Title
-            html.Div(
-                [
-                    html.H1("QuantNews", className="app-title"),
-                    html.P("Stock Analysis Dashboard", className="app-subtitle"),
-                    # Cygnet SSO identity chip — filled per page load by the
-                    # render_auth_chip callback (sign-in button or uid+logout).
-                    html.Div(id="auth-chip", className="auth-chip mt-1"),
-                ],
-                className="sidebar-header",
-            ),
-            html.Hr(className="sidebar-divider"),
-
-            # Stock Input
-            create_stock_input(),
-
-            html.Hr(className="sidebar-divider"),
-
-            # Period Selector
-            html.Div(
-                [
-                    html.Label("Time Period", className="input-label"),
-                    create_period_selector("1y"),
-                ],
-                className="period-section",
-            ),
-
-            html.Hr(className="sidebar-divider"),
-
-            # Indicator Toggles
-            html.Div(
-                [
-                    html.Label("Indicators", className="input-label"),
-                    create_indicator_toggles(),
-                ],
-                className="indicator-section",
-            ),
-
-            html.Hr(className="sidebar-divider"),
-
-            # Data Actions
-            html.Div(
-                [
-                    html.Label("Data", className="input-label"),
-                    create_data_actions(),
-                ],
-                className="data-section",
-            ),
-
-            # Spacer
-            html.Div(className="sidebar-spacer"),
-
-            # Footer
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Span("Cache: ", className="cache-label"),
-                            html.Span(id="cache-status", className="cache-status-text"),
-                            dbc.Switch(
-                                id="cache-toggle",
-                                value=True,
-                                className="cache-toggle-switch",
-                                style={"marginLeft": "auto"},
-                            ),
-                        ],
-                        className="cache-status-row",
-                        style={"display": "flex", "alignItems": "center"},
-                    ),
-                    html.Div(id="data-source-indicator", className="data-source-row"),
-                ],
-                className="sidebar-footer",
-            ),
-        ],
-        className="sidebar",
-        id="sidebar",
-    )
-
-
-def create_main_content() -> html.Div:
-    """Create the main content area with charts.
-
-    Returns:
-        Main content div component.
-    """
-    return html.Div(
-        [
-            # Summary Cards Row
-            html.Div(
-                id="summary-cards",
-                className="summary-cards-row",
-            ),
-
-            # Main Price Chart
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(id="chart-title", className="chart-title"),
-                            html.Div(id="chart-subtitle", className="chart-subtitle"),
-                        ],
-                        className="chart-header",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="price-chart",
-                            className="main-chart",
-                            style={"height": "380px"},
-                            config={
-                                "displayModeBar": True,
-                                "modeBarButtonsToRemove": [
-                                    "lasso2d",
-                                    "select2d",
-                                ],
-                                "displaylogo": False,
-                                "responsive": False,
-                            },
-                        ),
-                        type="circle",
-                        color="#00D4AA",
-                    ),
-                ],
-                className="chart-container price-chart-container",
-            ),
-
-            # Technical Indicators Row
-            html.Div(
-                [
-                    # MACD Chart
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.H4("MACD", className="subplot-title"),
-                                    html.I(
-                                        className="bi bi-info-circle ms-2 info-icon",
-                                        id="macd-info-icon",
-                                    ),
-                                    dbc.Tooltip(
-                                        "Moving Average Convergence Divergence: "
-                                        "MACD Line = EMA(12) - EMA(26), "
-                                        "Signal Line = 9-day EMA of MACD. "
-                                        "Bullish when MACD crosses above Signal.",
-                                        target="macd-info-icon",
-                                        placement="top",
-                                    ),
-                                ],
-                                className="subplot-title-row",
-                            ),
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="macd-chart",
-                                    className="subplot-chart",
-                                    style={"height": "140px"},
-                                    config={"displayModeBar": False, "responsive": False},
-                                ),
-                                type="circle",
-                                color="#00D4AA",
-                            ),
-                        ],
-                        className="subplot-container",
-                    ),
-                    # RSI Chart
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.H4("RSI", className="subplot-title"),
-                                    html.I(
-                                        className="bi bi-info-circle ms-2 info-icon",
-                                        id="rsi-info-icon",
-                                    ),
-                                    dbc.Tooltip(
-                                        "Relative Strength Index (14-day): "
-                                        "Measures momentum on a 0-100 scale. "
-                                        "Overbought: >70, Oversold: <30.",
-                                        target="rsi-info-icon",
-                                        placement="top",
-                                    ),
-                                ],
-                                className="subplot-title-row",
-                            ),
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="rsi-chart",
-                                    className="subplot-chart",
-                                    style={"height": "140px"},
-                                    config={"displayModeBar": False, "responsive": False},
-                                ),
-                                type="circle",
-                                color="#00D4AA",
-                            ),
-                        ],
-                        className="subplot-container",
-                    ),
-                ],
-                className="indicators-row",
-            ),
-
-            # Volume Chart
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H4("Volume", className="subplot-title"),
-                            html.I(
-                                className="bi bi-info-circle ms-2 info-icon",
-                                id="volume-info-icon",
-                            ),
-                            dbc.Tooltip(
-                                "Trading Volume: Number of shares traded. "
-                                "Green = up day, Red = down day. "
-                                "Line shows 20-day moving average.",
-                                target="volume-info-icon",
-                                placement="top",
-                            ),
-                        ],
-                        className="subplot-title-row",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="volume-chart",
-                            className="volume-chart",
-                            style={"height": "110px"},
-                            config={"displayModeBar": False, "responsive": False},
-                        ),
-                        type="circle",
-                        color="#00D4AA",
-                    ),
-                ],
-                className="chart-container volume-container",
-            ),
-        ],
-        className="main-content",
-        id="main-content",
-    )
-
-
-def create_context_panel() -> html.Div:
-    """Create the right context panel with dynamic per-symbol tabs.
-
-    Returns:
-        Context panel div component with:
-        - Panel header with LLM status
-        - Dynamic tabs container (populated by callback based on selected symbols)
-
-    Tab structure: [ Overall ] [ AAPL ] [ GOOGL ] [ MSFT ] ...
-    Each symbol gets its own tab with recommendation + news + sentiment.
-    """
-    return html.Div(
-        [
-            # Panel header (stays outside tabs)
-            html.Div(
-                [
-                    html.H2("Analysis", className="panel-main-title"),
-                    html.Span(id="llm-status", className="llm-status-badge"),
-                    # Background prediction running indicator
-                    html.Span(
-                        [
-                            html.I(className="bi bi-gear-fill spinning-icon"),
-                            " Predicting...",
-                        ],
-                        id="prediction-running-indicator",
-                        className="prediction-running-badge",
-                        style={"display": "none"},
-                    ),
-                    # Hidden — keeps download_report_pdf callback wired
-                    html.Button(id="download-report-btn", style={"display": "none"}),
-                ],
-                className="panel-header-row",
-            ),
-
-            # Dynamic tabs container - populated by update_symbol_tabs callback
-            dcc.Loading(
-                html.Div(id="symbol-tabs-container"),
-                type="circle",
-                color="#00D4AA",
-            ),
-        ],
-        className="context-panel",
-        id="context-panel",
-    )
+from layouts.components import create_ensemble_config_drawer
+from layouts.modals import create_data_modal, create_run_modal
+from layouts.nav import create_nav_rail, create_topbar, create_watchlist_panel
 
 
 def create_layout() -> html.Div:
@@ -360,6 +58,9 @@ def create_layout() -> html.Div:
             # Activity Log scope. Honoured only for Administrators — the
             # server pins everyone else to their own rows regardless.
             dcc.Store(id="history-activity-scope", data="all", storage_type="local"),
+            # Activity page filters. At root so a filter survives navigating
+            # away and back, like every other filter in the app.
+            dcc.Store(id="activity-since-days", data=0, storage_type="local"),
             dcc.Store(id="history-eval-status", data=None),
             dcc.Store(id="active-tab-store", data=None, storage_type="local"),
 
@@ -493,22 +194,32 @@ def create_layout() -> html.Div:
             dcc.Download(id="download-hist-report"),
             dcc.Download(id="download-ta-report"),
 
-            # Main Layout Grid
+            # The shell. Only #page-content is routed: the stores above and the
+            # modals, downloads, activity panel and toasts below stay mounted
+            # on every route, so navigating never drops state and never leaves
+            # a callback pointing at an Input that no longer exists.
             html.Div(
                 [
-                    create_sidebar(),
-                    create_main_content(),
-                    create_context_panel(),
+                    create_nav_rail(),
+                    html.Div(
+                        [
+                            create_topbar(),
+                            create_watchlist_panel(),
+                            dcc.Loading(
+                                html.Div(id="page-content", className="page-content"),
+                                type="circle",
+                                color="#00D4AA",
+                            ),
+                        ],
+                        className="shell-main",
+                    ),
                 ],
-                className="dashboard-grid",
+                className="app-shell",
             ),
 
             # Modals
             create_data_modal(),
-            create_report_confirm_modal(),
-            create_predict_confirm_modal(),
-            create_full_analysis_modal(),
-            create_scoreboard_modal(),
+            create_run_modal(),
 
             # Hidden retry button for AI analysis failover
             html.Button(id="ai-retry-btn", style={"display": "none"}),

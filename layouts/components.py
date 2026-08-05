@@ -455,36 +455,15 @@ def create_data_actions() -> html.Div:
                 size="sm",
                 outline=True,
             ),
+            # One run action. Predict, AI Report and Full Analysis were three
+            # buttons for three overlapping subsets of the same pipeline, with
+            # two duplicated parameter panels behind them; the subset is now a
+            # choice inside the dialog.
             dbc.Button(
-                [html.I(className="bi bi-cpu me-1"), "Predict"],
-                id="run-predictions-btn",
-                color="warning",
-                size="sm",
-                outline=True,
-            ),
-            dbc.Button(
-                [html.I(className="bi bi-file-text me-1"), "AI Report"],
-                id="generate-report-btn",
-                color="info",
-                size="sm",
-                outline=True,
-                className="btn-full",
-            ),
-            dbc.Button(
-                [html.I(className="bi bi-lightning-fill me-1"), "Full Analysis"],
-                id="full-analysis-btn",
+                [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
+                id="run-analysis-btn",
                 color="success",
                 size="sm",
-                outline=True,
-                className="btn-full",
-            ),
-            dbc.Button(
-                [html.I(className="bi bi-trophy me-1"), "Scoreboard"],
-                id="scoreboard-btn",
-                color="secondary",
-                size="sm",
-                outline=True,
-                className="btn-full",
             ),
         ],
         className="data-actions",
@@ -544,12 +523,12 @@ def create_recommendation_banner(
     Returns:
         Styled recommendation banner component.
     """
-    # Handle loading state — prompt user to click AI Report
+    # Handle loading state — prompt user to run AI Report
     if recommendation == "LOADING":
         return html.Div(
             [
                 html.Div("Awaiting Analysis", className="recommendation-label"),
-                html.Div('Click "AI Report" to analyze', className="recommendation-meta"),
+                html.Div('Run "AI Report" to analyze', className="recommendation-meta"),
             ],
             className="recommendation-banner loading",
         )

@@ -5,9 +5,17 @@ what produced the old Scoreboard-modal / History-tab duplication, where the
 same numbers were reachable two ways and drifted.
 """
 
+import dash_bootstrap_components as dbc
 from dash import html
 
 from layouts.formatters import MODEL_DISPLAY
+from layouts.history_sections import (
+    build_history_filter_bar,
+    build_predictions_section,
+    empty_history_message,
+    filter_history_data,
+)
+from services.dashboard_service import aggregate_predictions
 
 # Column definitions, surfaced as header tooltips. Several of these (Trades vs
 # held, hit rate excluding HOLDs, the $1,000 notional behind P&L) are not
@@ -92,3 +100,117 @@ def scoreboard_table(groups: list[dict], group_key: str,
         ),
         className="history-table-wrap",
     )
+
+
+def scorecard(preds: list[dict]) -> html.Div:
+    """Aggregates by model and by symbol, over whatever is in scope.
+
+    "Evaluated" is not `was_correct is not None`: the evaluator leaves that
+    None for a HOLD while still writing pnl_dollars, so keying on it alone
+    would report scored HOLDs as pending forever.
+    """
+    evaluated = [p for p in preds
+                 if p.get("was_correct") is not None or p.get("pnl_dollars") is not None]
+    pending = len(preds) - len(evaluated)
+
+    eval_bar = html.Div(
+        [
+            html.Span(
+                f"{pending} prediction{'s' if pending != 1 else ''} awaiting "
+                "their target session close" if pending
+                else "Every prediction in scope has been scored",
+                className="perf-pending-label",
+            ),
+            dbc.Button(
+                [html.I(className="bi bi-check2-square me-1"), "Evaluate pending"],
+                id="perf-evaluate-btn", size="sm", outline=True,
+                color="secondary", disabled=not pending,
+            ),
+        ],
+        className="history-eval-bar",
+    )
+
+    if not evaluated:
+        return html.Div([eval_bar, empty_history_message(False, "scored predictions")])
+
+    # Range by TARGET date — the session whose close these were scored
+    # against. Labelling it by prediction_date showed the data cutoff instead,
+    # so a run made this morning for today's close read as "to 2026-08-04" and
+    # looked like today was missing when all of it was present.
+    dates = sorted(p.get("target_date") or p.get("prediction_date", "")
+                   for p in evaluated)
+    summary = html.Div(
+        f"{len(evaluated)} scored predictions · "
+        f"{len({p.get('symbol') for p in evaluated})} symbols · "
+        f"sessions {dates[0]} to {dates[-1]}",
+        className="scoreboard-summary",
+    )
+    hint = html.Div(
+        [
+            html.Div(
+                "Trades counts BUY/SELL only. Each takes a fixed $1,000 notional "
+                "position, held one session and closed at the next close. HOLD "
+                "days take no position, score $0, and are excluded from hit rate.",
+                className="history-scoreboard-hint",
+            ),
+            html.Div(
+                "Hit rate against average confidence shows calibration: a model "
+                "claiming 70% should be right about 70% of the time.",
+                className="history-scoreboard-hint",
+            ),
+        ]
+    )
+
+    return html.Div([
+        eval_bar,
+        summary,
+        hint,
+        html.Div("By model", className="scoreboard-subtitle"),
+        scoreboard_table(aggregate_predictions(evaluated, "model_name"),
+                         "model_name", "Model"),
+        html.Div("By symbol", className="scoreboard-subtitle"),
+        scoreboard_table(aggregate_predictions(evaluated, "symbol"),
+                         "symbol", "Symbol"),
+    ])
+
+
+def layout(history_data=None, filter_symbols=None, filter_date_range="all",
+           specific_date=None) -> html.Div:
+    """Scorecard on top, the per-call log beneath it.
+
+    One surface on purpose. The aggregate used to be a modal and the log a
+    History section, so the same numbers were reachable two ways, each with
+    its own Evaluate button.
+
+    Everything filter-dependent lives inside #archive-body so a filter change
+    rebuilds only that, never the router. Routing on its own Input is what
+    keeps a slow filter response from overwriting a newer page.
+    """
+    return html.Div(
+        [
+            build_history_filter_bar(history_data, filter_symbols,
+                                     filter_date_range, specific_date),
+            html.Div(
+                body(history_data, filter_symbols, filter_date_range,
+                     specific_date),
+                id="archive-body",
+            ),
+        ],
+        className="page page-performance",
+    )
+
+
+def body(history_data=None, filter_symbols=None, filter_date_range="all",
+         specific_date=None) -> list:
+    history_data = history_data or {}
+    buckets = filter_history_data(history_data, filter_symbols,
+                                  filter_date_range, specific_date)
+    preds = buckets["predictions"]
+
+    log = build_predictions_section(preds, deferred=True)
+
+    return [
+        scorecard(preds),
+        html.Div("Prediction log", className="scoreboard-subtitle") if log else None,
+        log,
+    ]

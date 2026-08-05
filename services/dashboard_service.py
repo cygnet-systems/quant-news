@@ -6,11 +6,96 @@ two cannot drift apart.
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import diskcache
 
 from services.cache_service import get_cache
 
 logger = logging.getLogger(__name__)
+
+# Separate from the background-callback cache so a stale dashboard entry can
+# never collide with Dash's own job bookkeeping.
+_MEMO_DIR = Path("cache/dashboard")
+_MEMO_TTL_S = 900
+_memo: diskcache.Cache | None = None
+
+
+def _cache_handle() -> "diskcache.Cache | None":
+    global _memo
+    if _memo is None:
+        try:
+            _MEMO_DIR.mkdir(parents=True, exist_ok=True)
+            _memo = diskcache.Cache(str(_MEMO_DIR))
+        except Exception as e:
+            logger.warning("Dashboard memo cache unavailable: %s", e)
+            return None
+    return _memo
+
+
+def _memo_key(name: str) -> str | None:
+    """Key on who is asking, the newest data, and the pipeline generation.
+
+    PIPELINE_EPOCH is already what gates prediction reuse upstream, so a data
+    fix that changes what the models were fed also invalidates these reads.
+    Returns None when there is nothing to key on, which disables caching
+    rather than risking a wrong hit.
+    """
+    try:
+        from services.analysis_runner import PIPELINE_EPOCH
+    except Exception:
+        PIPELINE_EPOCH = "unknown"
+    try:
+        from services.cache_service import _current_uid
+        uid = _current_uid() or "anon"
+    except Exception:
+        uid = "anon"
+    latest = get_cache().get_latest_prediction_date()
+    if latest is None:
+        return None
+    return f"{name}|{uid}|{latest}|{PIPELINE_EPOCH}"
+
+
+def _memoized(name: str, build):
+    """Read-through cache around a pure query, best-effort.
+
+    Any cache failure falls through to a live read: a dashboard that is slow
+    is better than one that errors.
+    """
+    c = _cache_handle()
+    if c is None:
+        return build()
+    key = _memo_key(name)
+    if key is None:
+        return build()
+    try:
+        hit = c.get(key)
+        if hit is not None:
+            return hit
+    except Exception:
+        return build()
+    value = build()
+    try:
+        c.set(key, value, expire=_MEMO_TTL_S)
+    except Exception:
+        pass
+    return value
+
+
+def invalidate_memo() -> None:
+    """Drop cached reads after predictions or evaluations change.
+
+    Called from the callbacks that observe those two events, so a completed
+    run shows on Home immediately instead of at the end of the TTL.
+    """
+    c = _cache_handle()
+    if c is None:
+        return
+    try:
+        c.clear()
+    except Exception as e:
+        logger.debug("Dashboard memo clear skipped: %s", e)
 
 # Luna's per-symbol verdict is persisted as a prediction row so it gets scored
 # like a model, but it is a synthesis over the others rather than a peer.
@@ -84,6 +169,13 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
 def get_rolling_performance(days: int = 30, group_key: str = "model_name",
                             symbols: list[str] | None = None) -> list[dict]:
     """Trailing-window scorecard, newest `days` of prediction cutoffs."""
+    if symbols is None:
+        return _memoized(f"rolling|{days}|{group_key}",
+                         lambda: _rolling_uncached(days, group_key, None))
+    return _rolling_uncached(days, group_key, symbols)
+
+
+def _rolling_uncached(days, group_key, symbols):
     end = datetime.now().date()
     start = end - timedelta(days=days)
     preds = get_cache().get_predictions_between(start, end, symbols=symbols)
@@ -112,6 +204,11 @@ def get_pnl_series(days: int = 30, symbols: list[str] | None = None) -> list[dic
 
 
 def get_latest_cohort() -> dict:
+    """Memoized wrapper: see _latest_cohort_uncached."""
+    return _memoized("cohort", _latest_cohort_uncached)
+
+
+def _latest_cohort_uncached() -> dict:
     """The most recent prediction cutoff, shaped one row per symbol.
 
     Predictions carry no run id, so the cutoff date is the only grouping the
@@ -169,6 +266,10 @@ def get_latest_cohort() -> dict:
 
 def get_open_predictions(limit: int = 200) -> dict:
     """In-flight calls, grouped by the session they resolve on."""
+    return _memoized(f"open|{limit}", lambda: _open_uncached(limit))
+
+
+def _open_uncached(limit: int) -> dict:
     preds = get_cache().get_open_predictions(limit=limit)
     by_date: dict[str, list] = {}
     for p in preds:
@@ -187,11 +288,19 @@ def get_last_run() -> dict | None:
     The activity log is the only place a run exists as a first-class thing --
     predictions themselves carry no run id -- so title, duration and error
     count come from there while the content comes from the cohort.
+
+    Events emitted outside any run land in an 'adhoc' bucket whose span covers
+    every such event ever recorded, so it sorts to the top and reports a
+    multi-day duration. It is not a run and must not be shown as one.
     """
     try:
         from services import progress_service
-        runs = progress_service.get_activity_runs(limit_runs=1)
+        runs = progress_service.get_activity_runs(limit_runs=25)
     except Exception as e:
         logger.warning("Could not read activity runs: %s", e)
         return None
-    return runs[0] if runs else None
+
+    real = [r for r in runs if r.get("run_id") and r["run_id"] != "adhoc"]
+    if not real:
+        return None
+    return max(real, key=lambda r: r.get("started") or datetime.min)

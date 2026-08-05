@@ -7,7 +7,6 @@ survives navigation, and so their callbacks always have their Inputs mounted.
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from config import API, MODEL
 
 
 def create_data_modal() -> dbc.Modal:
@@ -46,38 +45,6 @@ def create_data_modal() -> dbc.Modal:
         id="data-modal",
         size="xl",
         is_open=False,
-    )
-
-
-def _ai_report_date_picker() -> dcc.DatePickerSingle:
-    """Analysis-date picker: NYSE trading days only.
-
-    Defaults to the NEXT trading day — the session the report is for.
-    Weekends/holidays are unpickable; range is ~13 months back (backtests)
-    through the next session (nothing further ahead is analyzable).
-    """
-    from datetime import date, timedelta
-
-    from utils.trading_calendar import get_next_trading_day, non_trading_days
-
-    today = date.today()
-    default = get_next_trading_day(today)
-    min_d = today - timedelta(days=400)
-    try:
-        disabled = non_trading_days(min_d, default)
-    except Exception:
-        disabled = []  # calendar hiccup: picker still works, just unrestricted
-
-    return dcc.DatePickerSingle(
-        id="ai-report-date",
-        date=default,
-        min_date_allowed=min_d,
-        max_date_allowed=default,
-        disabled_days=disabled,
-        initial_visible_month=default,
-        display_format="YYYY-MM-DD",
-        first_day_of_week=1,
-        className="ai-report-datepicker",
     )
 
 
@@ -144,448 +111,194 @@ def _report_param_selects(prefix: str) -> dict:
     }
 
 
-def create_report_confirm_modal() -> dbc.Modal:
-    """Create confirmation modal for AI Report generation."""
-    params = _report_param_selects("ai-report")
-    return dbc.Modal(
-        [
-            dbc.ModalHeader(
-                dbc.ModalTitle([
-                    html.I(className="bi bi-file-text me-2"),
-                    "Generate AI Report",
-                ]),
-                close_button=True,
-            ),
-            dbc.ModalBody(id="report-confirm-body"),
-            # Adjustable parameters: static (not rebuilt per open) so the
-            # user's choices persist across modal opens within a session.
-            dbc.ModalBody(
-                [
-                    html.Hr(className="mt-0 mb-3"),
-                    html.H6("Parameters", className="mb-2"),
-                    dbc.Row(
-                        [
-                            dbc.Col([
-                                dbc.Label("Analysis date", size="sm"),
-                                # Market days only; default = the session the
-                                # report is FOR (next trading day). Bounds and
-                                # holiday list computed like the sibling
-                                # predict/full-analysis pickers.
-                                _ai_report_date_picker(),
-                            ], width=6),
-                            dbc.Col([
-                                dbc.Label("News window", size="sm"),
-                                params["lookback"],
-                            ], width=6),
-                        ],
-                        className="mb-2",
-                    ),
-                    dbc.Row(
-                        [
-                            dbc.Col([
-                                dbc.Label("Model", size="sm"),
-                                params["model"],
-                            ], width=6),
-                            dbc.Col([
-                                dbc.Label("Analysis type", size="sm"),
-                                params["type"],
-                            ], width=6),
-                        ],
-                    ),
-                    dbc.Row(
-                        [
-                            dbc.Col([
-                                dbc.Label("Recommendations", size="sm"),
-                                params["recs"],
-                            ], width=6),
-                            dbc.Col([
-                                dbc.Label("Recommendations model", size="sm"),
-                                params["recs-model"],
-                            ], width=6),
-                        ],
-                        className="mt-2",
-                    ),
-                    dbc.Checkbox(
-                        id="ai-report-include-research",
-                        value=True,
-                        label=html.Span([
-                            "Deep research report per symbol (recommended) ",
-                            html.Span("— one analyst call writes the full report "
-                                      "+ banner/watch/thesis fields (~30s/symbol). "
-                                      "Uncheck for the fast news-only tier (~15s).",
-                                      className="text-muted",
-                                      style={"fontSize": "0.75rem"}),
-                        ]),
-                        className="mt-2",
-                    ),
-                    # Live article availability for the chosen window/date —
-                    # fetched (point-in-time, DB-cached) so the numbers are
-                    # what generation will actually use, not the stale store.
-                    dcc.Loading(
-                        html.Div(id="ai-report-article-preview",
-                                 className="ai-report-article-preview mt-3"),
-                        type="dot", color="#00D4AA",
-                    ),
-                ],
-                className="pt-0",
-            ),
-            dbc.ModalFooter(
-                [
-                    dbc.Button(
-                        "Cancel",
-                        id="report-cancel-btn",
-                        color="secondary",
-                        className="me-2",
-                    ),
-                    dbc.Button(
-                        [html.I(className="bi bi-play-fill me-1"), "Generate Report"],
-                        id="report-confirm-btn",
-                        color="info",
-                    ),
-                ],
-            ),
-        ],
-        id="report-confirm-modal",
-        is_open=False,
-    )
+# =============================================================================
+# UNIFIED RUN MODAL
+# =============================================================================
+
+RUN_MODELS = [
+    ("kronos_mini", "Kronos", "90 bars OHLCV (min 30)"),
+    ("xgboost_shap", "XGBoost SHAP", "1Y OHLCV + SPY + news (SMA-200)"),
+    ("lightgbm", "LightGBM", "1Y OHLCV + SPY + news (SMA-200)"),
+    ("deberta_sentiment", "DeBERTa Sentiment", "News articles (relevance >= 0.7)"),
+    ("trading_agents", "TradingAgents",
+     "Full research: technicals + fundamentals + news (~60s)"),
+]
+
+RUN_SCOPES = [
+    ("models", "Models only",
+     "Numerical predictions. No LLM report, no recommendations."),
+    ("report", "Report only",
+     "News and research analysis. No model predictions."),
+    ("full", "Full pipeline",
+     "Report, then all models, then the synthesis recommendation."),
+]
 
 
-def create_predict_confirm_modal() -> dbc.Modal:
-    """Create confirmation modal for model predictions.
+def create_run_modal() -> dbc.Modal:
+    """One dialog for every way of starting a run.
 
-    Model and ensemble checkboxes are fixed layout elements (not dynamic)
-    so they can be wired to callbacks. Only the data summary is dynamic.
-    Includes a date picker for backtesting (default: today).
+    Replaces three near-identical modals (Predict, AI Report, Full Analysis)
+    whose parameter panels were duplicated: the report selects existed twice,
+    once as ai-report-* and once as fa-*, and Full Analysis silently
+    overrode the Predict modal's model checkboxes. Scope is now an explicit
+    choice rather than something inferred from which button was pressed, and
+    there is exactly one set of controls behind it.
     """
     from datetime import date
 
-    _ALL_MODELS = [
-        ("kronos_mini", "Kronos", "90 bars OHLCV (min 30)"),
-        ("xgboost_shap", "XGBoost SHAP", "1Y OHLCV + SPY + news (SMA-200)"),
-        ("lightgbm", "LightGBM", "1Y OHLCV + SPY + news (SMA-200)"),
-        ("deberta_sentiment", "DeBERTa Sentiment", "News articles (relevance >= 0.7)"),
-        ("trading_agents", "TradingAgents", "Full research: technicals + fundamentals + news (~60s)"),
-    ]
-
-    model_checks = []
-    for model_id, display, requirement in _ALL_MODELS:
-        model_checks.append(
-            html.Div([
-                dbc.Checkbox(
-                    id={"type": "predict-model-check", "model": model_id},
-                    value=True,
-                    className="me-2",
-                ),
-                html.Span(display, style={"fontWeight": "bold", "marginRight": "8px"}),
-                html.Span(requirement, style={
-                    "color": "var(--text-secondary)", "fontSize": "0.85rem",
-                }),
-            ], className="d-flex align-items-center mb-2")
-        )
-
-    ensemble_check = html.Div([
-        dbc.Checkbox(
-            id="predict-ensemble-check",
-            value=True,
-            className="me-2",
-        ),
-        html.Span("Ensemble", style={"fontWeight": "bold", "marginRight": "8px"}),
-        html.Span(
-            "(combines enabled models from Ensemble Config)",
-            style={"color": "var(--text-secondary)", "fontSize": "0.85rem"},
-        ),
-    ], className="d-flex align-items-center mb-2")
-
-    today = date.today()
-
-    # The picker holds the TARGET session — the close being predicted — and
-    # defaults to the next one whose close has not happened yet. Data is cut
-    # off at the previous trading day, so a Monday target sees through Friday.
     try:
         from utils.trading_calendar import get_default_target_day
         default_target = get_default_target_day()
     except Exception:
-        default_target = today
+        default_target = date.today()
+
+    sel = _report_param_selects("run")
+
+    model_checks = [
+        html.Div(
+            [
+                dbc.Checkbox(id={"type": "run-model-check", "model": mid},
+                             value=True, className="me-2"),
+                html.Span(display, className="run-model-name"),
+                html.Span(requirement, className="run-model-req"),
+            ],
+            className="d-flex align-items-center mb-2",
+        )
+        for mid, display, requirement in RUN_MODELS
+    ]
+
+    def field(label, control, hint=None):
+        return html.Div(
+            [
+                html.Label(label, className="input-label"),
+                control,
+                html.Div(hint, className="run-field-hint") if hint else None,
+            ],
+            className="run-field",
+        )
 
     return dbc.Modal(
         [
             dbc.ModalHeader(
-                dbc.ModalTitle([
-                    html.I(className="bi bi-cpu me-2"),
-                    "Run Predictions",
-                ]),
-                close_button=True,
-            ),
-            dbc.ModalBody([
-                # Dynamic data summary (populated by callback)
-                html.Div(id="predict-data-summary"),
-                html.Hr(),
-                # Target date picker — the session whose close is predicted
-                html.H6("Target Date", className="mb-2"),
-                html.Div([
-                    dcc.DatePickerSingle(
-                        id="predict-date-picker",
-                        date=default_target.isoformat(),
-                        max_date_allowed=default_target.isoformat(),
-                        min_date_allowed="2020-01-01",
-                        display_format="YYYY-MM-DD",
-                        className="predict-date-picker",
-                    ),
-                    html.Span(
-                        id="predict-date-mode-label",
-                        className="ms-2",
-                        style={"fontSize": "0.85rem"},
-                    ),
-                ], className="d-flex align-items-center mb-3"),
-                html.Hr(),
-                # Fixed model selection checkboxes
-                html.H6("Select Models to Run", className="mb-3"),
-                html.Div(model_checks, className="mb-3"),
-                html.Hr(),
-                html.H6("Ensemble", className="mb-3"),
-                ensemble_check,
-                html.Div(id="predict-ensemble-summary", className="mt-2"),
-                html.Div(
-                    [
-                        html.I(className="bi bi-info-circle me-2"),
-                        "Each selected model runs independently. Ensemble "
-                        "combines only the models enabled in Ensemble Config.",
-                    ],
-                    className="text-muted small mt-3",
-                ),
-            ]),
-            dbc.ModalFooter(
-                [
-                    dbc.Button(
-                        "Cancel",
-                        id="predict-cancel-btn",
-                        color="secondary",
-                        className="me-2",
-                    ),
-                    dbc.Button(
-                        [html.I(className="bi bi-play-fill me-1"), "Run Predictions"],
-                        id="predict-confirm-btn",
-                        color="warning",
-                    ),
-                ],
-            ),
-        ],
-        id="predict-confirm-modal",
-        is_open=False,
-        size="lg",
-    )
-
-
-def create_full_analysis_modal() -> dbc.Modal:
-    """Create confirmation modal for Full Analysis (Report + Predictions + Recommendations)."""
-    from datetime import date as _date
-
-    rec_model = MODEL.RECOMMENDATIONS_MODEL
-    rec_provider = MODEL.RECOMMENDATIONS_PROVIDER
-    has_key = bool(API.OPENAI_API_KEY) if rec_provider == "openai" else True
-    params = _report_param_selects("fa")
-
-    _today = _date.today()
-    try:
-        from utils.trading_calendar import get_default_target_day
-        _fa_default = get_default_target_day()
-    except Exception:
-        _fa_default = _today
-
-    return dbc.Modal(
-        [
-            dbc.ModalHeader(
-                dbc.ModalTitle([
-                    html.I(className="bi bi-lightning-fill me-2"),
-                    "Full Analysis",
-                ]),
-                close_button=True,
-            ),
-            dbc.ModalBody([
-                html.Div(id="full-analysis-body"),
-                html.Hr(),
-                html.Div([
-                    html.H6("Target Date", className="mb-1"),
-                    html.Div([
-                        dcc.DatePickerSingle(
-                            id="fa-date-picker",
-                            date=_fa_default.isoformat(),
-                            max_date_allowed=_fa_default.isoformat(),
-                            min_date_allowed="2020-01-01",
-                            display_format="YYYY-MM-DD",
-                            className="predict-date-picker",
-                        ),
-                        html.Span(
-                            "The session whose close is being predicted. All three "
-                            "stages only see data through the PREVIOUS trading day "
-                            "(prices, news, metrics) — a Monday target sees nothing "
-                            "after the preceding Friday's close. Pick a past date to "
-                            "backtest without lookahead bias.",
-                            className="ms-2 text-muted small",
-                            style={"maxWidth": "380px", "display": "inline-block",
-                                   "verticalAlign": "middle"},
-                        ),
-                    ], className="d-flex align-items-center mb-3"),
-                ]),
-                html.Hr(),
-                # Same individual options as the AI Report modal (fa-* ids) —
-                # this flow used to silently read the other modal's state.
-                html.H6("Parameters", className="mb-2"),
-                dbc.Row(
-                    [
-                        dbc.Col([
-                            dbc.Label("News window", size="sm"),
-                            params["lookback"],
-                        ], width=6),
-                        dbc.Col([
-                            dbc.Label("Research model", size="sm"),
-                            params["model"],
-                        ], width=6),
-                    ],
-                    className="mb-2",
-                ),
-                dbc.Row(
-                    [
-                        dbc.Col([
-                            dbc.Label("Analysis type", size="sm"),
-                            params["type"],
-                        ], width=6),
-                    ],
-                    className="mb-2",
-                ),
-                dbc.Row(
-                    [
-                        dbc.Col([
-                            dbc.Label("Recommendations", size="sm"),
-                            params["recs"],
-                        ], width=6),
-                        dbc.Col([
-                            dbc.Label("Recommendations model", size="sm"),
-                            params["recs-model"],
-                        ], width=6),
-                    ],
-                    className="mb-3",
-                ),
-                html.Hr(),
-                html.H6("Pipeline", className="mb-2"),
-                html.Div([
-                    html.Div([
-                        html.Span("1. ", style={"fontWeight": "bold"}),
-                        html.Span("AI Report "),
-                        html.Span("— portfolio news overview",
-                                  style={"color": "var(--text-secondary)", "fontSize": "0.85rem"}),
-                    ], className="mb-1"),
-                    html.Div([
-                        html.Span("2. ", style={"fontWeight": "bold"}),
-                        html.Span("Model Predictions "),
-                        html.Span("— all ML models; per-symbol research report "
-                                  "uses the model selected above",
-                                  style={"color": "var(--text-secondary)", "fontSize": "0.85rem"}),
-                    ], className="mb-1"),
-                    html.Div([
-                        html.Span("3. ", style={"fontWeight": "bold"}),
-                        html.Span("Recommendations "),
-                        html.Span("— synthesis, configured above",
-                                  style={"color": "var(--text-secondary)", "fontSize": "0.85rem"}),
-                    ], className="mb-1"),
-                ], className="mb-3"),
-                html.Div(
-                    [
-                        html.I(className="bi bi-info-circle me-2"),
-                        "Runs all three stages sequentially. "
-                        "Recommendations synthesize the research reports + "
-                        "predictions into actionable advice.",
-                    ],
-                    className="text-muted small",
-                ),
-            ] + ([] if has_key else [
-                html.Div(
-                    [
-                        html.I(className="bi bi-exclamation-triangle me-2"),
-                        f"OPENAI_API_KEY not set — {rec_model} recommendations will be unavailable.",
-                    ],
-                    className="text-warning small mt-2",
-                ),
-            ])),
-            dbc.ModalFooter([
-                dbc.Button(
-                    "Cancel",
-                    id="full-analysis-cancel-btn",
-                    color="secondary",
-                    className="me-2",
-                ),
-                dbc.Button(
-                    [html.I(className="bi bi-lightning-fill me-1"), "Run Full Analysis"],
-                    id="full-analysis-confirm-btn",
-                    color="success",
-                ),
-            ]),
-        ],
-        id="full-analysis-modal",
-        is_open=False,
-        size="lg",
-    )
-
-
-def create_scoreboard_modal() -> dbc.Modal:
-    """Model Scoreboard: calibration and P&L across ALL evaluated predictions.
-
-    Defaults to every symbol and date; filters narrow when needed.
-    """
-    return dbc.Modal(
-        [
-            dbc.ModalHeader(
-                dbc.ModalTitle([
-                    html.I(className="bi bi-trophy me-2"),
-                    "Model Scoreboard",
-                ]),
+                dbc.ModalTitle([html.I(className="bi bi-play-circle me-2"),
+                                "Run analysis"]),
                 close_button=True,
             ),
             dbc.ModalBody([
                 html.Div(
                     [
-                        html.Div(
-                            dcc.Dropdown(
-                                id="scoreboard-symbols",
-                                options=[],
-                                value=[],
-                                multi=True,
-                                searchable=True,
-                                placeholder="All symbols",
-                                className="history-symbol-dropdown",
-                            ),
-                            className="scoreboard-filter-symbols",
+                        html.Label("What to run", className="input-label"),
+                        dbc.RadioItems(
+                            id="run-scope",
+                            options=[{"label": lbl, "value": val}
+                                     for val, lbl, _ in RUN_SCOPES],
+                            value="full",
+                            inline=True,
+                            className="run-scope-radio",
                         ),
-                        html.Div(
-                            dcc.DatePickerRange(
-                                id="scoreboard-date-range",
-                                start_date=None,
-                                end_date=None,
+                        html.Div(id="run-scope-hint", className="run-field-hint"),
+                    ],
+                    className="run-field",
+                ),
+                html.Hr(),
+
+                field(
+                    "Target session",
+                    html.Div(
+                        [
+                            dcc.DatePickerSingle(
+                                id="run-date-picker",
+                                date=default_target.isoformat(),
+                                max_date_allowed=default_target.isoformat(),
+                                min_date_allowed="2020-01-01",
                                 display_format="YYYY-MM-DD",
-                                start_date_placeholder_text="All dates",
-                                end_date_placeholder_text="to date",
-                                clearable=True,
                                 className="predict-date-picker",
                             ),
-                            className="scoreboard-filter-dates",
+                            html.Span(id="run-date-mode-label", className="ms-2"),
+                        ],
+                        className="d-flex align-items-center",
+                    ),
+                    "The close being predicted. Data is cut off at the previous "
+                    "trading day, so a Monday target sees nothing after Friday.",
+                ),
+                html.Div(id="run-data-summary"),
+
+                # --- Models ---
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("Models", className="mb-2"),
+                        html.Div(model_checks),
+                        html.Div(
+                            [
+                                dbc.Checkbox(id="run-ensemble-check", value=True,
+                                             className="me-2"),
+                                html.Span("Ensemble", className="run-model-name"),
+                                html.Span("combines only the models enabled in "
+                                          "Ensemble Config",
+                                          className="run-model-req"),
+                            ],
+                            className="d-flex align-items-center mb-2",
+                        ),
+                        html.Div(id="run-ensemble-summary"),
+                    ],
+                    id="run-models-section",
+                ),
+
+                # --- Report ---
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("Report", className="mb-2"),
+                        html.Div(
+                            [
+                                field("News window", sel["lookback"]),
+                                field("Report model", sel["model"]),
+                                field("Depth", sel["type"]),
+                            ],
+                            className="run-field-grid",
+                        ),
+                        html.Div(
+                            [
+                                dbc.Checkbox(id="run-include-research", value=False,
+                                             className="me-2"),
+                                html.Span("Include per-symbol research reports",
+                                          className="run-model-name"),
+                                html.Span("ignored on Full pipeline, which already "
+                                          "produces them", className="run-model-req"),
+                            ],
+                            className="d-flex align-items-center mb-2",
+                        ),
+                        html.Div(id="run-article-preview",
+                                 className="run-article-preview"),
+                    ],
+                    id="run-report-section",
+                ),
+
+                # --- Recommendations ---
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("Recommendations", className="mb-2"),
+                        html.Div(
+                            [
+                                field("Basis", sel["recs"]),
+                                field("Synthesis model", sel["recs-model"]),
+                            ],
+                            className="run-field-grid",
                         ),
                     ],
-                    className="scoreboard-filter-row",
+                    id="run-recs-section",
                 ),
-                html.Div(id="scoreboard-content"),
             ]),
             dbc.ModalFooter([
-                html.Span(id="scoreboard-pending-label", className="text-muted small me-auto"),
-                dbc.Button(
-                    [html.I(className="bi bi-check2-circle me-1"), "Evaluate pending"],
-                    id="scoreboard-evaluate-btn",
-                    color="success",
-                    size="sm",
-                    outline=True,
-                ),
+                dbc.Button("Cancel", id="run-cancel-btn", color="secondary",
+                           className="me-2"),
+                dbc.Button([html.I(className="bi bi-play-fill me-1"), "Run"],
+                           id="run-confirm-btn", color="success"),
             ]),
         ],
-        id="scoreboard-modal",
+        id="run-modal",
         is_open=False,
         size="lg",
         scrollable=True,
