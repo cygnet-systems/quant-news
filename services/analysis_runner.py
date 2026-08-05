@@ -739,8 +739,12 @@ def run_full_analysis(
 
     recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
 
-    # Best-effort: the JSON report only lands if object storage is up. The
-    # predictions and recommendations above are already durable in Postgres.
+    # The archived JSON is the only durable copy of the portfolio-level report
+    # — predictions and recommendations have their own tables, this does not.
+    # It used to fail silently at INFO, so an object-storage outage cost every
+    # report with nothing to show it had happened.
+    archived = False
+    archive_error = None
     try:
         from services import persistence_service as ps
         merged, _ = merge_research_into_analysis(ai_analysis, signals, priced)
@@ -752,11 +756,17 @@ def run_full_analysis(
             content=json.dumps(merged, default=str, indent=2),
             file_format="json",
         )
+        archived = True
     except Exception as e:
-        logger.info(f"AI report not archived to object storage: {e}")
+        archive_error = str(e)
+        logger.error(f"AI report NOT archived — it is unrecoverable once this "
+                     f"process exits: {e}")
+        prog.emit("error", f"AI report not archived: {str(e)[:120]}")
 
     coverage, degraded = _assess_completeness(
         signals, priced, models, recommendations)
+    if not archived:
+        degraded.append(f"report not archived ({(archive_error or '')[:80]})")
 
     if degraded:
         prog.emit("error", "Full Analysis incomplete — " + "; ".join(degraded))
@@ -775,6 +785,7 @@ def run_full_analysis(
         "actions": {s: v.get("action")
                     for s, v in ((recommendations or {}).get("by_symbol") or {}).items()},
         "model_coverage": coverage,
+        "report_archived": archived,
         "degraded": degraded,
         "duration_s": round((datetime.now() - started).total_seconds(), 1),
     }

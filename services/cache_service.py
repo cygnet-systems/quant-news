@@ -40,6 +40,37 @@ def _sanitize_json(obj):
     return obj
 
 
+def _pred_to_dict(r, include_details: bool = False) -> dict:
+    """Serialize a ModelPrediction row for the UI.
+
+    A superset of what list_all_predictions returns: evaluated_at and
+    target_date are what let a caller tell "not scored yet" apart from
+    "scored as a HOLD", which was_correct alone cannot express.
+    """
+    out = {
+        "id": r.id,
+        "symbol": r.symbol,
+        "model_name": r.model_name,
+        "prediction_date": str(r.prediction_date),
+        "target_date": str(r.target_date),
+        "decision": r.decision,
+        "confidence": r.confidence,
+        "up_probability": r.up_probability,
+        "predicted_close": r.predicted_close,
+        "previous_close": r.previous_close,
+        "actual_close": r.actual_close,
+        "was_correct": r.was_correct,
+        "pnl_dollars": r.pnl_dollars,
+        "model_version": r.model_version,
+        "duration_ms": r.duration_ms,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
+    }
+    if include_details:
+        out["details"] = r.details_json or {}
+    return out
+
+
 def _current_uid():
     """Cygnet SSO uid for this request, or None (anonymous / subprocess)."""
     try:
@@ -1329,6 +1360,82 @@ class CacheService:
                 }
                 for r in rows
             ]
+
+    def get_latest_prediction_date(self) -> "date | None":
+        """The most recent data cutoff any visible prediction was made from.
+
+        The launch screen is built around this cohort rather than around a run,
+        because predictions carry no run id -- the date is the only grouping
+        the schema actually guarantees.
+        """
+        from db.models import ModelPrediction
+        with get_session() as session:
+            return session.execute(
+                select(func.max(ModelPrediction.prediction_date))
+                .where(_visible(ModelPrediction))
+            ).scalar()
+
+    def get_predictions_between(
+        self,
+        start: "date",
+        end: "date",
+        symbols: list[str] | None = None,
+        include_details: bool = False,
+    ) -> list[dict]:
+        """Visible predictions with a cutoff in [start, end], inclusive.
+
+        Date-scoped so callers stop pulling a fixed row count and filtering in
+        Python; hits the (symbol, prediction_date) index. Serves both the
+        single-day cohort (start == end) and trailing-window aggregates.
+
+        details_json is opt-in because it carries per-model payloads that are
+        pure weight on a multi-week range scan.
+        """
+        from db.models import ModelPrediction
+        with get_session() as session:
+            q = (
+                select(ModelPrediction)
+                .where(
+                    _visible(ModelPrediction),
+                    ModelPrediction.prediction_date >= start,
+                    ModelPrediction.prediction_date <= end,
+                )
+                .order_by(
+                    ModelPrediction.prediction_date.desc(),
+                    ModelPrediction.symbol,
+                    ModelPrediction.model_name,
+                )
+            )
+            if symbols:
+                q = q.where(ModelPrediction.symbol.in_([s.upper() for s in symbols]))
+            return [_pred_to_dict(r, include_details) for r in
+                    session.execute(q).scalars().all()]
+
+    def get_open_predictions(self, limit: int = 200) -> list[dict]:
+        """Calls that have been made but cannot be scored yet.
+
+        Unresolved means no actual_close: evaluation is deferred until the
+        target session closes and the evaluator runs, so these are genuinely
+        in flight rather than failed.
+        """
+        from db.models import ModelPrediction
+        today = datetime.now().date()
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction)
+                .where(
+                    _visible(ModelPrediction),
+                    ModelPrediction.actual_close.is_(None),
+                    ModelPrediction.target_date >= today,
+                )
+                .order_by(
+                    ModelPrediction.target_date,
+                    ModelPrediction.symbol,
+                    ModelPrediction.model_name,
+                )
+                .limit(limit)
+            ).scalars().all()
+            return [_pred_to_dict(r) for r in rows]
 
     def get_report_content(self, storage_key: str) -> str | None:
         try:

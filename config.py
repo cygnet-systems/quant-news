@@ -448,15 +448,41 @@ DB: Final = DatabaseConfig()
 
 @dataclass(frozen=True)
 class StorageConfig:
-    """S3-compatible object storage settings."""
+    """S3-compatible object storage settings.
 
-    ENDPOINT_URL: str = os.getenv(
-        "S3_ENDPOINT_URL", "http://localhost:9000"
+    Reads the project's own S3_* names first, then falls back to the standard
+    AWS_* ones. Attaching a bucket on Railway injects the AWS_* set — the
+    names boto3 and every other S3 client already expect — so without this
+    fallback a correctly provisioned bucket looks entirely absent to the app,
+    and report archiving fails silently because uploads are best-effort.
+    Falling back beats copying credentials into a second set of variables.
+    """
+
+    ENDPOINT_URL: str = (
+        os.getenv("S3_ENDPOINT_URL")
+        or os.getenv("AWS_ENDPOINT_URL")
+        or "http://localhost:9000"
     )
-    ACCESS_KEY: str = os.getenv("S3_ACCESS_KEY", "minioadmin")
-    SECRET_KEY: str = os.getenv("S3_SECRET_KEY", "minioadmin")
-    BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "quantnews-reports")
-    REGION: str = os.getenv("S3_REGION", "us-east-1")
+    ACCESS_KEY: str = (
+        os.getenv("S3_ACCESS_KEY")
+        or os.getenv("AWS_ACCESS_KEY_ID")
+        or "minioadmin"
+    )
+    SECRET_KEY: str = (
+        os.getenv("S3_SECRET_KEY")
+        or os.getenv("AWS_SECRET_ACCESS_KEY")
+        or "minioadmin"
+    )
+    BUCKET_NAME: str = (
+        os.getenv("S3_BUCKET_NAME")
+        or os.getenv("AWS_S3_BUCKET_NAME")
+        or "quantnews-reports"
+    )
+    REGION: str = (
+        os.getenv("S3_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
 
 
 STORAGE: Final = StorageConfig()
