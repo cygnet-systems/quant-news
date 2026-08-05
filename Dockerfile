@@ -5,9 +5,19 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libpq-dev && rm -rf /var/lib/apt/lists/*
 
-# Install torch CPU-only first (smaller image)
+# Install torch CPU-only first (smaller image).
+#
+# 2.10.0, not 2.2.0. The old pin silently disabled two of the six models in
+# production while the run still reported success:
+#   - transformers 5.x requires torch >= 2.4 and disables the PyTorch backend
+#     otherwise, so DeBERTa could not load (1 of 20 symbols scored).
+#   - torch 2.2 was built against NumPy 1.x, and the image resolves NumPy 2.x,
+#     so torch's array bridge failed ("_ARRAY_API not found") and Kronos threw
+#     on every symbol (0 of 20).
+# Both models still reported ready=True, because is_ready() does not exercise
+# them. Keep this in step with the version the project runs locally.
 RUN pip install --no-cache-dir \
-    torch==2.2.0+cpu \
+    torch==2.10.0+cpu \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
