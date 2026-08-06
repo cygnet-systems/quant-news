@@ -50,6 +50,26 @@ def _relative(when: datetime | None) -> str:
     return f"in {value}{unit}" if ahead else f"{value}{unit} ago"
 
 
+def _run_log_block(detail: str, label: str = "Run output") -> html.Details:
+    """A run's captured output, collapsed until asked for.
+
+    Scrolls inside its own box: a 400-line log that pushes the schedule off
+    the screen is a log nobody expands twice.
+    """
+    return html.Details(
+        [
+            html.Summary(
+                [label,
+                 html.Span(f" · {len(detail.splitlines())} lines",
+                           className="scheduler-meta")],
+                className="scheduler-detail-summary",
+            ),
+            html.Pre(detail, className="scheduler-detail"),
+        ],
+        className="scheduler-details",
+    )
+
+
 def _status_line(job: dict) -> html.Div:
     if job.get("running"):
         status = "running"
@@ -216,15 +236,7 @@ def _job_card(job: dict) -> dbc.Card:
     )
 
     if job.get("last_detail"):
-        children.append(
-            html.Details(
-                [
-                    html.Summary("Last run output", className="scheduler-detail-summary"),
-                    html.Pre(job["last_detail"], className="scheduler-detail"),
-                ],
-                className="scheduler-details",
-            )
-        )
+        children.append(_run_log_block(job["last_detail"], "Last run output"))
 
     return dbc.Card(dbc.CardBody(children), className="scheduler-card")
 
@@ -361,17 +373,25 @@ def build_scheduler_panel(jobs: list[dict], runs: list[dict] | None = None,
         children.append(_create_form(job_types))
 
     if runs:
-        rows = [
-            html.Tr([
+        rows = []
+        for r in runs:
+            rows.append(html.Tr([
                 html.Td(r["job_id"], className="scheduler-run-job"),
                 html.Td(r["trigger"]),
                 html.Td(r["status"],
                         className=_STATUS_STYLE.get(r["status"], ("", ""))[1]),
                 html.Td(f"{(r['duration_ms'] or 0) // 1000}s"),
                 html.Td(_relative(r["started_at"]), className="scheduler-meta"),
-            ])
-            for r in runs
-        ]
+            ]))
+            # Every run carries its own log, expandable in place. A status
+            # column alone cannot answer "what happened", which is the only
+            # question anyone opens this table to ask.
+            if r.get("detail"):
+                rows.append(html.Tr(
+                    html.Td(_run_log_block(r["detail"]), colSpan=5,
+                            className="scheduler-run-logcell"),
+                    className="scheduler-run-logrow",
+                ))
         children.append(
             html.Div(
                 [

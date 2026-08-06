@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date
+from html import escape as html_escape
 from typing import Optional
 
 import requests
@@ -174,13 +175,20 @@ def run_cost(since, until=None) -> Optional[float]:
 
 
 def notify_analysis(summary: dict, cost: float | None = None,
-                    duration_ms: int | None = None) -> bool:
+                    duration_ms: int | None = None, log: str = "") -> bool:
     """The morning mail: what the platform is calling for today's session."""
     actions = summary.get("actions") or {}
     if not actions:
-        return notify_job_failure(
-            "daily_analysis",
-            "Run finished but produced no recommendations — check the History tab.")
+        # Two different things, and calling both "no recommendations" sent a
+        # failure mail for eleven good runs: the pipeline can genuinely produce
+        # no calls, or the caller can fail to read the summary it printed. Say
+        # which, and show the run's own output either way.
+        reason = ("The run reported success but its summary could not be read, "
+                  "so what it produced is unknown. The predictions may well be "
+                  "stored — check the Schedule page."
+                  if not summary else
+                  "The run completed and produced no per-symbol calls.")
+        return notify_job_failure("daily_analysis", f"{reason}\n\n{log}".strip())
 
     order = {"BUY": 0, "SELL": 1, "HOLD": 2}
     rows = ""
@@ -361,18 +369,31 @@ def notify_partial(job_id: str, reasons: list[str], summary: dict) -> bool:
         )
     body += ('<p style="color:#666;font-size:13px;margin-top:14px">'
              'Today is recorded as not-yet-successful, so /healthz reports it '
-             'overdue. It will not retry on its own — re-run it from '
-             'History &rarr; Scheduled Jobs once the cause is fixed.</p>')
+             'overdue. It will not retry on its own — re-run it from the '
+             'Schedule page once the cause is fixed.</p>')
     return _send(f"⚠️ quant-news: {job_id} partial — {reasons[0] if reasons else 'incomplete'}",
                  _wrap("Partial run", summary.get("target_date", job_id), body))
 
 
 def notify_job_failure(job_id: str, detail: str) -> bool:
+    """The failure mail — carries the run's own output, not a pointer to it.
+
+    A mail that only says "check the app" is a mail that costs a login before
+    it tells you anything, and the tail of the run log is usually the whole
+    diagnosis. The last lines are the ones that matter, so a long log is cut
+    from the front.
+    """
+    tail = (detail or "").strip()
+    if len(tail) > 6000:
+        tail = "…earlier output omitted…\n" + tail[-6000:]
     body = (f'<p>The scheduled job <code>{job_id}</code> did not complete.</p>'
             f'<pre style="background:#f6f6f6;padding:10px;border-radius:4px;'
-            f'font-size:12px;white-space:pre-wrap">{(detail or "")[:2000]}</pre>'
-            f'<p style="color:#666;font-size:13px">Check <code>/healthz</code> '
-            f'and the Activity Log.</p>')
+            f'font-size:12px;white-space:pre-wrap;overflow-x:auto">'
+            f'{html_escape(tail)}</pre>'
+            f'<p style="color:#666;font-size:13px">The full log is on the '
+            f'Schedule page under this job&rsquo;s recent runs; '
+            f'<code>/healthz</code> reports whether the day is still '
+            f'outstanding.</p>')
     return _send(f"❌ quant-news: {job_id} failed", _wrap("Job failed", job_id, body))
 
 

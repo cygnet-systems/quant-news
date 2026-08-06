@@ -84,7 +84,14 @@ def main() -> int:
     from utils.trading_calendar import is_trading_day
 
     if args.only_trading_days and not is_trading_day(datetime.now().date()):
-        print(f"{datetime.now().date()} is not an NYSE session — nothing to do.")
+        today = datetime.now().date()
+        # Says so in the summary as well as in prose: the caller mails on what
+        # it can parse, and an unparseable no-op reads as a run that produced
+        # nothing — which is the same shape as a real failure.
+        if args.json:
+            print(json.dumps({"no_session": True, "date": today.isoformat()}))
+        else:
+            print(f"{today} is not an NYSE session — nothing to do.")
         return 0
 
     if args.command == "evaluate":

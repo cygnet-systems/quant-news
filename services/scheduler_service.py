@@ -48,11 +48,18 @@ CLI = str(PROJECT_ROOT / "scripts" / "daily_analysis.py")
 ANALYSIS_JOB = "daily_analysis"
 EVALUATION_JOB = "daily_evaluation"
 
-# Wall-clock ceiling per run. A 20-symbol analysis is ~11 minutes locally and
-# slower on a CPU-only container; 45 minutes is generous enough not to kill a
-# healthy run and short enough that a hung provider call cannot hold the lock
-# all day.
-JOB_TIMEOUT_SECONDS = 45 * 60
+# Wall-clock ceiling per run. A 20-symbol analysis is ~11 minutes locally but
+# 43 minutes on the CPU-only container (measured 2026-08-06), so the old
+# 45-minute ceiling was two minutes from killing a healthy run. Still short
+# enough that a hung provider call cannot hold the lock all day.
+JOB_TIMEOUT_SECONDS = 75 * 60
+
+# What a person reads afterwards to find out what the run did. The subprocess
+# writes its summary to stdout and its log to stderr; both are kept, because
+# "it said success and I have no idea what happened" is the state this panel
+# exists to prevent.
+RUN_LOG_MAX_CHARS = 16_000
+RUN_LOG_MAX_LINES = 400
 
 _scheduler = None
 _lock = threading.Lock()
@@ -433,24 +440,32 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
 
     prog.emit("run", f"Scheduled job started: {job_id} ({trigger})")
     cmd = _build_command(job)
-    status, detail = "success", ""
+    status, detail, summary = "success", "", {}
     try:
         proc = subprocess.run(
             cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True,
             timeout=JOB_TIMEOUT_SECONDS,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
-        tail = (proc.stdout or "").strip().splitlines()
-        detail = "\n".join(tail[-25:]) if tail else ""
+        # Parse the summary from the WHOLE of stdout, never from the stored
+        # tail. A 20-symbol summary is 53 lines of indented JSON, so a 25-line
+        # tail cannot contain a parseable object — which is why every
+        # scheduled run mailed "produced no recommendations" while having
+        # stored 20 calls and exited zero (2026-08-06).
+        summary = _parse_summary(proc.stdout)
+        detail = _run_log(proc.stdout, proc.stderr)
         if proc.returncode == 2:
             # Ran and stored something, but not everything it was asked for.
             status = "partial"
         elif proc.returncode != 0:
             status = "error"
-            err = (proc.stderr or "").strip().splitlines()
-            detail = (detail + "\n" + "\n".join(err[-15:])).strip()
-    except subprocess.TimeoutExpired:
-        status, detail = "error", f"exceeded {JOB_TIMEOUT_SECONDS}s wall clock"
+    except subprocess.TimeoutExpired as e:
+        status = "error"
+        # The output it managed before the kill is the only evidence of where
+        # it hung, so keep it rather than reporting the ceiling alone.
+        detail = _run_log(e.stdout, e.stderr,
+                          header=f"TIMED OUT: exceeded {JOB_TIMEOUT_SECONDS}s "
+                                 f"wall clock and was killed.")
     except Exception as e:
         status, detail = "error", str(e)
     finally:
@@ -462,12 +477,12 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
                     run.status = status
                     run.finished_at = datetime.now()
                     run.duration_ms = duration_ms
-                    run.detail = detail[:4000] or None
+                    run.detail = detail or None
                 job_row = session.get(ScheduledJob, job_id)
                 if job_row is not None:
                     job_row.last_run_at = started
                     job_row.last_status = status
-                    job_row.last_detail = detail[:4000] or None
+                    job_row.last_detail = detail or None
                     job_row.last_duration_ms = duration_ms
                     if status == "success":
                         job_row.last_success_date = started.date().isoformat()
@@ -478,29 +493,47 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
               f"Scheduled job {job_id}: {status} in {duration_ms // 1000}s")
     logger.info(f"Scheduled job {job_id} finished: {status} ({duration_ms}ms)")
 
-    _notify(job, status, detail, started, duration_ms)
+    # A run that finishes just inside the ceiling is a failure waiting for a
+    # slow provider day, and nothing else would say so until the day it is
+    # killed mid-flight.
+    if duration_ms > 0.8 * JOB_TIMEOUT_SECONDS * 1000:
+        near = (f"{job_id} took {duration_ms // 1000}s of a "
+                f"{JOB_TIMEOUT_SECONDS}s ceiling — raise the timeout or "
+                f"shorten the watchlist before it gets killed mid-run")
+        logger.warning(near)
+        prog.emit("error", near)
+
+    _notify(job, status, summary, detail, started, duration_ms)
     return {"status": status, "detail": detail, "duration_ms": duration_ms}
 
 
-def _notify(job: dict, status: str, detail: str, started: datetime,
+def _notify(job: dict, status: str, summary: dict, log: str, started: datetime,
             duration_ms: int) -> None:
-    """Mail the outcome. Never raises — the run already happened."""
+    """Mail the outcome. Never raises — the run already happened.
+
+    Takes the parsed summary and the run log separately: the summary decides
+    which mail to send, the log is what the mail shows a person.
+    """
     from services import notify_service
 
     try:
         if not notify_service.enabled():
             return
+        # A market holiday is not an outcome worth mailing about — the CLI
+        # no-ops by design when --only-trading-days is set.
+        if summary.get("no_session"):
+            return
         if status == "partial":
-            summary = _parse_summary(detail)
             notify_service.notify_partial(
                 job["id"], summary.get("degraded") or [], summary)
         elif status != "success":
-            notify_service.notify_job_failure(job["id"], detail)
+            notify_service.notify_job_failure(job["id"], log)
         elif job["kind"] == "analysis":
             notify_service.notify_analysis(
-                _parse_summary(detail),
+                summary,
                 cost=notify_service.run_cost(started),
                 duration_ms=duration_ms,
+                log=log,
             )
         elif job["kind"] == "evaluation":
             notify_service.notify_evaluation()
@@ -508,22 +541,56 @@ def _notify(job: dict, status: str, detail: str, started: datetime,
         logger.warning(f"notification for {job['id']} failed: {e}")
 
 
-def _parse_summary(stdout_tail: str) -> dict:
-    """Pull the CLI's JSON summary out of its captured output.
+def _parse_summary(stdout: str) -> dict:
+    """Pull the CLI's JSON summary out of its captured stdout.
 
-    The tail may carry log lines ahead of the JSON, so scan for the first line
-    that opens an object and parse from there rather than assuming position.
+    Must be given the whole of stdout: the object spans as many lines as the
+    watchlist is long. Log lines may precede it, so scan for a line that opens
+    an object and decode from there, tolerating anything printed after it.
     """
     import json
 
-    lines = (stdout_tail or "").splitlines()
-    for i, line in enumerate(lines):
-        if line.strip().startswith("{"):
-            try:
-                return json.loads("\n".join(lines[i:]))
-            except json.JSONDecodeError:
-                continue
+    decoder = json.JSONDecoder()
+    text = stdout or ""
+    for i, line in enumerate(text.splitlines()):
+        if not line.startswith("{"):
+            continue
+        rest = "\n".join(text.splitlines()[i:])
+        try:
+            obj, _ = decoder.raw_decode(rest)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
     return {}
+
+
+def _run_log(stdout: str | None, stderr: str | None, header: str = "") -> str:
+    """The run's own account of itself, for the panel and the failure mail.
+
+    Both streams are kept. Only stdout used to be, and only its last 25 lines,
+    so a run that succeeded left no trace of what it actually did and a run
+    that failed inside the pipeline showed the summary rather than the error.
+    The subprocess logs to stderr (``basicConfig`` writes there), which is the
+    half worth reading.
+    """
+    summary_block = (stdout or "").strip()
+    if header:
+        summary_block = f"{header}\n\n{summary_block}".strip()
+
+    log_lines = (stderr or "").strip().splitlines()
+    if not log_lines:
+        return summary_block[:RUN_LOG_MAX_CHARS]
+
+    dropped = max(0, len(log_lines) - RUN_LOG_MAX_LINES)
+    tail = log_lines[-RUN_LOG_MAX_LINES:]
+    marker = (f"--- run log (last {len(tail)} of {len(log_lines)} lines) ---"
+              if dropped else "--- run log ---")
+    # Trim the log rather than the summary: the summary is what the panel is
+    # read for, and it is bounded while the log is not.
+    budget = max(0, RUN_LOG_MAX_CHARS - len(summary_block) - len(marker) - 4)
+    log_block = "\n".join(tail)[-budget:]
+    return f"{summary_block}\n\n{marker}\n{log_block}".strip()
 
 
 class _AdvisoryLock:
@@ -873,7 +940,16 @@ def shutdown() -> None:
             _scheduler = None
 
 
-def recent_runs(job_id: str | None = None, limit: int = 20) -> list[dict]:
+def recent_runs(job_id: str | None = None, limit: int = 20,
+                detail_chars: int = 4000) -> list[dict]:
+    """Run history, with each run's log abridged for the panel.
+
+    The panel that shows these re-polls every 15 seconds, so shipping every
+    run's full log would send a quarter of a megabyte a minute to each open
+    tab to redraw a five-row table. The abridgement keeps both ends — the
+    summary the run printed and the tail where a failure shows up — and the
+    job card still carries the newest run's log in full.
+    """
     from db.models import JobRun
     from db.session import get_session
     from sqlalchemy import select
@@ -886,5 +962,20 @@ def recent_runs(job_id: str | None = None, limit: int = 20) -> list[dict]:
         return [{
             "id": r.id, "job_id": r.job_id, "trigger": r.trigger,
             "status": r.status, "started_at": r.started_at,
-            "duration_ms": r.duration_ms, "detail": r.detail,
+            "duration_ms": r.duration_ms,
+            "detail": _abridge(r.detail, detail_chars),
         } for r in rows]
+
+
+def _abridge(text: str | None, budget: int) -> str | None:
+    """Keep the head and the tail of a log, drop the middle.
+
+    Both ends carry meaning: the head is the summary the run printed, the tail
+    is where it went wrong. Cutting from either end alone loses one of them.
+    """
+    if not text or budget <= 0 or len(text) <= budget:
+        return text
+    head = budget // 3
+    tail = budget - head
+    return (f"{text[:head]}\n\n… {len(text) - budget} characters omitted …\n\n"
+            f"{text[-tail:]}")

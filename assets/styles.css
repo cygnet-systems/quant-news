@@ -3487,12 +3487,16 @@ body {
 .scheduler-detail {
     margin-top: 6px;
     padding: 8px;
-    max-height: 220px;
+    /* Tall enough to read a stack trace without scrolling twice, short
+       enough that an expanded log does not push the schedule off screen. */
+    max-height: 340px;
     overflow: auto;
     background: var(--bg-primary);
     border: 1px solid var(--border-subtle);
     border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
     font-size: 0.72rem;
+    line-height: 1.5;
     color: var(--text-secondary);
     white-space: pre-wrap;
 }
@@ -3522,6 +3526,17 @@ body {
 
 .scheduler-run-job {
     font-family: 'JetBrains Mono', monospace;
+}
+
+/* The log belongs to the row above it, so it sits flush under it rather than
+   reading as a sixth run with empty columns. */
+.scheduler-run-logrow td {
+    padding-top: 0;
+    border-top: 0;
+}
+
+.scheduler-run-logcell .scheduler-details {
+    margin-top: 0;
 }
 
 .scheduler-empty {
