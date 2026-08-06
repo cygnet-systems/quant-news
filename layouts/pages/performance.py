@@ -113,13 +113,33 @@ def scorecard(preds: list[dict]) -> html.Div:
                  if p.get("was_correct") is not None or p.get("pnl_dollars") is not None]
     pending = len(preds) - len(evaluated)
 
+    right = sum(1 for p in evaluated if p.get("was_correct") is True)
+    wrong = sum(1 for p in evaluated if p.get("was_correct") is False)
+
+    # Counts are the natural handles for "show me those" — reading a number
+    # and then hunting for a filter that reproduces it is the long way round.
+    def _chip(label, outcome, count, extra=""):
+        return html.Button(
+            f"{count} {label}",
+            id={"type": "perf-outcome-chip", "outcome": outcome},
+            className=f"perf-outcome-chip {extra}",
+            disabled=not count,
+            title=f"Show only {label}",
+        )
+
     eval_bar = html.Div(
         [
-            html.Span(
-                f"{pending} prediction{'s' if pending != 1 else ''} awaiting "
-                "their target session close" if pending
-                else "Every prediction in scope has been scored",
-                className="perf-pending-label",
+            html.Div(
+                [
+                    _chip("awaiting their target session close", "pending",
+                          pending, "perf-chip-pending"),
+                    _chip("right", "right", right, "perf-chip-right"),
+                    _chip("wrong", "wrong", wrong, "perf-chip-wrong"),
+                    html.Button("Show all", id={"type": "perf-outcome-chip",
+                                                "outcome": "all"},
+                                className="perf-outcome-chip perf-chip-all"),
+                ],
+                className="perf-outcome-chips",
             ),
             dbc.Button(
                 [html.I(className="bi bi-check2-square me-1"), "Evaluate pending"],
@@ -175,7 +195,7 @@ def scorecard(preds: list[dict]) -> html.Div:
 
 
 def layout(history_data=None, filter_symbols=None, filter_date_range="all",
-           specific_date=None) -> html.Div:
+           specific_date=None, outcome="all") -> html.Div:
     """Scorecard on top, the per-call log beneath it.
 
     One surface on purpose. The aggregate used to be a modal and the log a
@@ -192,7 +212,7 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
                                      filter_date_range, specific_date),
             html.Div(
                 body(history_data, filter_symbols, filter_date_range,
-                     specific_date),
+                     specific_date, outcome),
                 id="archive-body",
             ),
         ],
@@ -201,16 +221,43 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
 
 
 def body(history_data=None, filter_symbols=None, filter_date_range="all",
-         specific_date=None) -> list:
+         specific_date=None, outcome="all") -> list:
     history_data = history_data or {}
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
     preds = buckets["predictions"]
 
-    log = build_predictions_section(preds, deferred=True)
+    # The scorecard always describes the full scope; only the log narrows.
+    # Filtering the aggregates too would make "wrong" show a 0% hit rate,
+    # which is arithmetic rather than information.
+    log_preds = _by_outcome(preds, outcome)
+    log = build_predictions_section(log_preds, deferred=True)
+
+    subtitle = "Prediction log"
+    if outcome != "all":
+        label = {"pending": "awaiting close", "right": "correct",
+                 "wrong": "incorrect"}.get(outcome, outcome)
+        subtitle = f"Prediction log · {label} only ({len(log_preds)})"
 
     return [
         scorecard(preds),
-        html.Div("Prediction log", className="scoreboard-subtitle") if log else None,
+        html.Div(subtitle, className="scoreboard-subtitle") if log else None,
         log,
     ]
+
+
+def _by_outcome(preds: list[dict], outcome: str) -> list[dict]:
+    """Slice the log by how a prediction turned out.
+
+    Pending is "no verdict AND no P&L" for the same reason the scorecard uses
+    it: a scored HOLD has pnl_dollars 0.0 and was_correct None, so keying on
+    the verdict alone would file every scored HOLD as still waiting.
+    """
+    if outcome == "pending":
+        return [p for p in preds if p.get("was_correct") is None
+                and p.get("pnl_dollars") is None]
+    if outcome == "right":
+        return [p for p in preds if p.get("was_correct") is True]
+    if outcome == "wrong":
+        return [p for p in preds if p.get("was_correct") is False]
+    return preds

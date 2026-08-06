@@ -379,7 +379,13 @@ def build_ta_reports_section(ta_reports):
                         [
                             html.Button(
                                 [html.I(className="bi bi-eye me-1"), "View"],
-                                id={"type": "ta-view-btn", "idx": i},
+                                # Keyed by report id, not list position: the
+                                # page renders a filtered list while the
+                                # callback resolved against a differently
+                                # filtered store, so indices did not line up
+                                # and View silently did nothing.
+                                id={"type": "ta-view-btn",
+                                    "report": str(report.get("id", ""))},
                                 className="ta-view-btn",
                             ),
                             html.A(

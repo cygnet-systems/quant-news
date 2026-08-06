@@ -55,6 +55,11 @@ def create_layout() -> html.Div:
             dcc.Store(id="history-filter-symbols", data=[], storage_type="local"),
             dcc.Store(id="history-filter-date-range", data="all", storage_type="local"),
             dcc.Store(id="history-filter-date-specific", data=None, storage_type="local"),
+            # Outcome slice of the prediction log: all | pending | right | wrong.
+            # Session-scoped, not local: "show me the wrong ones" answers a
+            # question you are asking now, and should not still be applied
+            # tomorrow when you wonder where your predictions went.
+            dcc.Store(id="history-filter-outcome", data="all"),
             # Activity Log scope. Honoured only for Administrators — the
             # server pins everyone else to their own rows regardless.
             dcc.Store(id="history-activity-scope", data="all", storage_type="local"),

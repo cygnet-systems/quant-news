@@ -515,7 +515,8 @@ def _init_s3():
 # so leaving /analyze silently stops its chart, news and AI callbacks. Toggling
 # hidden divs instead would keep every callback live on every page.
 def _build_route(path, history_data, filter_symbols, filter_range,
-                 filter_specific, activity_scope, activity_since):
+                 filter_specific, activity_scope, activity_since,
+                 outcome="all"):
     """Build one section. Each page reads only the state it renders."""
     if path == "/analyze":
         return analyze_page.layout()
@@ -525,7 +526,7 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         if path == "/performance":
             return performance_page.layout(
                 history_data or fetch_report_history(only={"predictions"}),
-                filter_symbols, filter_range, filter_specific)
+                filter_symbols, filter_range, filter_specific, outcome)
         return reports_page.layout(
             history_data or fetch_report_history(
                 only={"reports", "recommendations", "trading_agent_reports"}),
@@ -572,9 +573,10 @@ _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule", "/activity"
     State("history-filter-date-specific", "data"),
     State("history-activity-scope", "data"),
     State("activity-since-days", "data"),
+    State("history-filter-outcome", "data"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
-                filter_specific, activity_scope, activity_since):
+                filter_specific, activity_scope, activity_since, outcome):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -592,7 +594,8 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
         path = "/"
     try:
         page = _build_route(path, history_data, filter_symbols, filter_range,
-                            filter_specific, activity_scope, activity_since)
+                            filter_specific, activity_scope, activity_since,
+                            outcome)
         return page, SECTION_TITLES.get(path, "QuantNews")
     except Exception as e:
         logger.exception("Failed to render %s", path)
@@ -655,11 +658,12 @@ def render_filter_chips(filter_symbols, filter_range, filter_specific):
     Input("history-filter-symbols", "data"),
     Input("history-filter-date-range", "data"),
     Input("history-filter-date-specific", "data"),
+    Input("history-filter-outcome", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
 def render_archive_body(history_data, filter_symbols, filter_range,
-                        filter_specific, pathname):
+                        filter_specific, outcome, pathname):
     """Rebuild the filterable part of Performance or Reports.
 
     #archive-body exists only on those two routes, and only their own controls
@@ -669,8 +673,26 @@ def render_archive_body(history_data, filter_symbols, filter_range,
     if path not in ("/performance", "/reports"):
         raise PreventUpdate
     data = history_data or fetch_report_history()
-    page = performance_page if path == "/performance" else reports_page
-    return page.body(data, filter_symbols, filter_range, filter_specific)
+    if path == "/performance":
+        return performance_page.body(data, filter_symbols, filter_range,
+                                     filter_specific, outcome)
+    return reports_page.body(data, filter_symbols, filter_range, filter_specific)
+
+
+@callback(
+    Output("history-filter-outcome", "data"),
+    Input({"type": "perf-outcome-chip", "outcome": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def set_outcome_filter(clicks):
+    """Slice the prediction log by how the calls turned out.
+
+    The counts in the eval bar are the buttons: reading "31 wrong" and then
+    hunting for a control that reproduces that set is the long way round.
+    """
+    if not clicks or not any(c for c in clicks if c):
+        raise PreventUpdate
+    return ctx.triggered_id["outcome"]
 
 
 @callback(
@@ -3161,16 +3183,16 @@ def toggle_history_section(n_clicks, current_style):
     Output("ta-report-modal-title", "children"),
     Output("ta-report-modal-body", "children"),
     Input({"type": "view-full-report-btn", "symbol": ALL}, "n_clicks"),
-    Input({"type": "ta-view-btn", "idx": ALL}, "n_clicks"),
-    State("report-history-store", "data"),
+    Input({"type": "ta-view-btn", "report": ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def jump_to_full_report(view_clicks, ta_view_clicks, history_data):
+def jump_to_full_report(view_clicks, ta_view_clicks):
     """Open the matching research report in the reader modal.
 
-    Replaces the old jump-to-History-accordion behavior: the accordion
-    duplicated the cards' View/PDF affordances, so reports now open in one
-    place, in a modal, from wherever the View button was clicked.
+    Resolves against a live read rather than report-history-store. The store
+    is loaded for the *selected symbols*, while the Reports page renders every
+    recent report, so the two lists differ (often the store holds none at all)
+    and a position-based lookup found nothing.
     """
     all_clicks = (view_clicks or []) + (ta_view_clicks or [])
     if not any(all_clicks):
@@ -3180,19 +3202,21 @@ def jump_to_full_report(view_clicks, ta_view_clicks, history_data):
     if not triggered or not isinstance(triggered, dict):
         raise PreventUpdate
 
-    ta_reports = (history_data or {}).get("trading_agent_reports", []) \
-        if isinstance(history_data, dict) else history_data or []
+    try:
+        ta_reports = get_cache().get_all_trading_agent_reports(limit=500)
+    except Exception as e:
+        logger.warning("Could not load research reports: %s", e)
+        raise PreventUpdate
 
-    report = None
     if triggered.get("type") == "ta-view-btn":
-        idx = triggered.get("idx")
-        if isinstance(idx, int) and 0 <= idx < len(ta_reports):
-            report = ta_reports[idx]
+        wanted = str(triggered.get("report", ""))
+        report = next((r for r in ta_reports if str(r.get("id")) == wanted), None)
     else:
         symbol = triggered.get("symbol", "")
         report = next((r for r in ta_reports if r.get("symbol") == symbol), None)
 
     if not report or not report.get("report_text"):
+        logger.info("No research report body for %s", triggered)
         raise PreventUpdate
 
     from models.single_agent import strip_epilogue

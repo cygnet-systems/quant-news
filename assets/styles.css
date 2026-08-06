@@ -4082,3 +4082,60 @@ body {
 .scheduler-new-body {
     margin-top: 12px;
 }
+
+/* Outcome chips — the eval-bar counts double as filters ------------------- */
+
+.perf-outcome-chips {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.perf-outcome-chip {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border-subtle, #2A2A2A);
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 0.78rem;
+    color: var(--text-secondary, #A0A0A0);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.perf-outcome-chip:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--text-primary, #FFFFFF);
+}
+
+/* Disabled means the count is zero — still readable, just not a handle. */
+.perf-outcome-chip:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
+
+.perf-chip-right:not(:disabled) {
+    color: var(--positive, #00C805);
+    border-color: rgba(0, 200, 5, 0.35);
+}
+
+.perf-chip-wrong:not(:disabled) {
+    color: var(--negative, #FF5000);
+    border-color: rgba(255, 80, 0, 0.35);
+}
+
+.perf-chip-all {
+    margin-left: 4px;
+    border-style: dashed;
+}
+
+.home-status-link {
+    text-decoration: none;
+    cursor: pointer;
+    border-bottom: 1px dotted transparent;
+}
+
+.home-status-link:hover {
+    border-bottom-color: currentColor;
+    filter: brightness(1.15);
+}

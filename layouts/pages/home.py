@@ -131,17 +131,26 @@ def _last_run_header(cohort: dict, last_run: dict | None) -> html.Div:
                 className="negative",
             ))
 
+    # Both counts link to Performance, where the same numbers are filterable
+    # per call. A count you cannot act on is a dead end.
     status = []
     if counts["pending"]:
-        status.append(html.Span(f"{counts['pending']} awaiting close",
-                                className="home-pending-pill"))
+        status.append(dcc.Link(
+            f"{counts['pending']} awaiting close",
+            href="/performance",
+            className="home-pending-pill home-status-link",
+            title="See these predictions on the Performance page",
+        ))
     if counts["resolved"] or counts["held"]:
         pnl_cls = ("positive" if cohort["pnl"] > 0
                    else "negative" if cohort["pnl"] < 0 else "")
-        status.append(html.Span(
+        status.append(dcc.Link(
             f"{counts['resolved'] + counts['held']} scored · "
             f"${cohort['pnl']:+.2f}",
-            className=f"num {pnl_cls}"))
+            href="/performance",
+            className=f"num home-status-link {pnl_cls}",
+            title="See which calls were right or wrong",
+        ))
 
     return html.Div(
         [
