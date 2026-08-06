@@ -60,13 +60,15 @@ class EnsembleModel(BaseModel):
             weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
 
         if not other_results:
+            # No inputs means no vote — an error result is never persisted,
+            # where a 0-confidence HOLD row would be scored as if decided.
             return PredictionResult(
                 model_name=self.name,
                 decision="HOLD",
                 confidence=0.0,
                 up_probability=0.5,
+                error="no individual model results available",
                 details={
-                    "reason": "no individual model results available",
                     "models_enabled": sorted(enabled_models),
                 },
             )
@@ -89,8 +91,8 @@ class EnsembleModel(BaseModel):
                 decision="HOLD",
                 confidence=0.0,
                 up_probability=0.5,
+                error=f"insufficient enabled models ({len(valid)})",
                 details={
-                    "reason": f"insufficient enabled models ({len(valid)})",
                     "models_enabled": sorted(enabled_models),
                     "models_excluded": sorted(excluded),
                     "models_valid": sorted(valid.keys()),

@@ -106,10 +106,10 @@ SYNTHESIS_MODEL = "recommendation_synthesis"
 def resolution_state(pred: dict) -> str:
     """One of 'resolved', 'held' or 'pending' for a single prediction.
 
-    was_correct alone is not enough. The evaluator leaves it None for a HOLD
-    (a HOLD cannot be right or wrong in the directional sense) while still
-    setting pnl_dollars to 0.0, so keying purely on was_correct reports an
-    evaluated HOLD as if it were still awaiting its close.
+    'held' survives only for legacy rows: the evaluator now scores a HOLD
+    against the no-trade band (was_correct is set), so a modern HOLD is
+    'resolved' like everything else. Rows scored before that rule change have
+    was_correct None with a resolved price, and those still read as 'held'.
     """
     if pred.get("was_correct") is not None:
         return "resolved"
@@ -140,6 +140,10 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
             if is_trade:
                 g["trades"] += 1
                 g["trade_hits"] += 1 if p["was_correct"] else 0
+            else:
+                # A scored HOLD still took no position — count it as held so
+                # the "N held" chip survives the HOLD-scoring rule change.
+                g["holds"] += 1
         elif state == "held" and not is_trade:
             g["holds"] += 1
         if p.get("pnl_dollars") is not None:

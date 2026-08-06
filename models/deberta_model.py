@@ -70,16 +70,21 @@ class DeBERTaModel(BaseModel):
         ]
 
         if not relevant:
+            # An abstention, not a call. This used to persist as a 0.3 HOLD,
+            # which made a news outage look like a stored model opinion and
+            # padded the HOLD count with rows no one ever decided.
             return PredictionResult(
                 model_name=self.name,
                 decision="HOLD",
-                confidence=0.3,
+                confidence=0.0,
                 up_probability=0.5,
+                error=(f"no relevant articles "
+                       f"({len(av_news)} in window, 0 over relevance "
+                       f"{MODEL.DEBERTA_RELEVANCE_THRESHOLD})"),
                 details={
                     "confidence_type": "self_reported",
                     "articles_total": len(av_news),
                     "articles_relevant": 0,
-                    "reason": "no relevant articles",
                 },
             )
 

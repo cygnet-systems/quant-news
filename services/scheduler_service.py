@@ -36,7 +36,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -311,7 +311,7 @@ def update_job(job_id: str, **fields) -> bool:
             return False
         for key, value in changes.items():
             setattr(row, key, value)
-        row.updated_at = datetime.now()
+        row.updated_at = datetime.now(timezone.utc)
         try:
             from services.auth_service import current_uid
             row.owner_uid = current_uid()
@@ -375,7 +375,7 @@ def reap_abandoned_runs() -> int:
         ).scalars().all()
         for run in stale:
             run.status = "interrupted"
-            run.finished_at = datetime.now()
+            run.finished_at = datetime.now(timezone.utc)
             run.detail = ((run.detail or "") +
                           "\nProcess ended before the run finished "
                           "(deploy, restart or crash).").strip()
@@ -385,8 +385,8 @@ def reap_abandoned_runs() -> int:
     return reaped
 
 
-def _build_command(job: dict) -> list[str]:
-    params = job.get("params") or {}
+def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
+    params = {**(job.get("params") or {}), **(overrides or {})}
     job_type = JOB_TYPES.get(job["kind"])
     if job_type is None:
         raise ValueError(f"unknown operation type: {job['kind']}")
@@ -397,6 +397,8 @@ def _build_command(job: dict) -> list[str]:
 
     if job.get("symbols_csv"):
         cmd += ["--symbols", job["symbols_csv"]]
+    if params.get("target"):
+        cmd += ["--target", str(params["target"])]
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
     if params.get("lookback"):
@@ -410,8 +412,13 @@ def _build_command(job: dict) -> list[str]:
     return cmd
 
 
-def run_job(job_id: str, trigger: str = "schedule") -> dict:
-    """Execute one job under the advisory lock. Returns a result summary."""
+def run_job(job_id: str, trigger: str = "schedule",
+            overrides: Optional[dict] = None) -> dict:
+    """Execute one job under the advisory lock. Returns a result summary.
+
+    ``overrides`` are merged over the job's stored params for this run only —
+    the backfill path uses this to pass an explicit ``target`` session.
+    """
     from db.models import JobRun, ScheduledJob
     from db.session import get_session
     from services import progress_service as prog
@@ -431,7 +438,7 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
         logger.info(f"{job_id}: another instance holds the lock — skipping")
         return {"status": "skipped", "detail": "held by another instance"}
 
-    started = datetime.now()
+    started = datetime.now(timezone.utc)
     with get_session() as session:
         run = JobRun(job_id=job_id, trigger=trigger, status="running")
         session.add(run)
@@ -439,7 +446,7 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
         run_pk = run.id
 
     prog.emit("run", f"Scheduled job started: {job_id} ({trigger})")
-    cmd = _build_command(job)
+    cmd = _build_command(job, overrides)
     status, detail, summary = "success", "", {}
     try:
         proc = subprocess.run(
@@ -469,13 +476,13 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
     except Exception as e:
         status, detail = "error", str(e)
     finally:
-        duration_ms = int((datetime.now() - started).total_seconds() * 1000)
+        duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         try:
             with get_session() as session:
                 run = session.get(JobRun, run_pk)
                 if run is not None:
                     run.status = status
-                    run.finished_at = datetime.now()
+                    run.finished_at = datetime.now(timezone.utc)
                     run.duration_ms = duration_ms
                     run.detail = detail or None
                 job_row = session.get(ScheduledJob, job_id)
@@ -484,7 +491,9 @@ def run_job(job_id: str, trigger: str = "schedule") -> dict:
                     job_row.last_status = status
                     job_row.last_detail = detail or None
                     job_row.last_duration_ms = duration_ms
-                    if status == "success":
+                    # A back-dated run must not stamp today as done — that
+                    # would make catch-up skip the day's own window.
+                    if status == "success" and not (overrides or {}).get("target"):
                         job_row.last_success_date = started.date().isoformat()
         finally:
             lock.release()
@@ -756,6 +765,72 @@ def _catch_up() -> None:
                     f"{job['minute']:02d} window today — running now")
         run_job(job["id"], trigger="catchup")
 
+    _backfill_missed_sessions()
+
+
+# The furthest back a backfill will reach. Predictions older than this have
+# lost their pre-open news context anyway; a wider hole means the deployment
+# was down long enough that a person should decide what to rerun.
+BACKFILL_MAX_SESSIONS = 5
+
+
+def _backfill_missed_sessions() -> None:
+    """Re-run analysis for recent trading sessions that have no predictions.
+
+    Catch-up above only covers *today*; a container that slept through a
+    window (Railway app sleep freezes the scheduler thread, and APScheduler
+    drops fires older than its misfire grace) used to lose the day for good —
+    there is no per-date ledger, so a five-day gap looked identical to no gap.
+    The ledger here is the predictions table itself: a past session with zero
+    rows targeting it was never analysed, so run it with an explicit
+    ``--target``. Idempotent by construction.
+    """
+    from sqlalchemy import func, select
+
+    from db.models import ModelPrediction
+    from db.session import get_session
+    from utils.trading_calendar import is_trading_day
+
+    analysis_jobs = [
+        j for j in list_jobs()
+        if j["enabled"]
+        and (jt := JOB_TYPES.get(j["kind"])) is not None
+        and jt.verb == "analyze"
+    ]
+    if not analysis_jobs:
+        return
+
+    today = date.today()
+    sessions = [
+        d for d in (today - timedelta(days=n) for n in range(1, 15))
+        if is_trading_day(d)
+    ][:BACKFILL_MAX_SESSIONS]
+
+    missing: list[date] = []
+    with get_session() as session:
+        for d in sessions:
+            count = session.execute(
+                select(func.count()).select_from(ModelPrediction)
+                .where(func.date(ModelPrediction.target_date) == d)
+            ).scalar()
+            if not count:
+                missing.append(d)
+
+    for job in analysis_jobs:
+        for d in sorted(missing):
+            logger.warning(f"Backfill: no predictions target {d} — running "
+                           f"{job['id']} with --target {d}")
+            result = run_job(
+                job["id"], trigger="backfill",
+                overrides={"target": d.isoformat(), "only_trading_days": False},
+            )
+            if result.get("status") not in ("success", "partial"):
+                # One failure means the rest would likely fail the same way
+                # (quota, vendor outage); stop rather than burn the budget.
+                logger.warning(f"Backfill for {d} did not complete "
+                               f"({result.get('status')}) — stopping sweep")
+                return
+
 
 def scheduling_enabled() -> bool:
     """Whether THIS process is allowed to execute jobs.
@@ -910,6 +985,15 @@ def start() -> None:
             # Catch-up runs on the scheduler thread — inline it would block
             # server startup for the length of the job it decides to run.
             _scheduler.add_job(_catch_up, DateTrigger(), id="_catch_up")
+            # And again half-hourly: a container thawed from platform sleep
+            # never re-enters start(), and cron fires older than the misfire
+            # grace are dropped, so the boot-time pass alone cannot recover a
+            # slept-through window. misfire_grace_time=None means "run no
+            # matter how late" — being late is this job's entire purpose.
+            _scheduler.add_job(
+                _catch_up, IntervalTrigger(minutes=30), id="_catch_up_interval",
+                max_instances=1, coalesce=True, misfire_grace_time=None,
+            )
             # Pick up schedule edits made by another instance (or straight in
             # the database) without waiting for a restart.
             _scheduler.add_job(

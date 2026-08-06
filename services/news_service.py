@@ -698,6 +698,23 @@ def fetch_historical_av_news(
             response.raise_for_status()
             data = response.json()
 
+            # Same HTTP-200 throttle signalling as the live fetch above. A
+            # quota response here used to yield an empty corpus, so the model
+            # trained newsless and was cached for the rest of the day with no
+            # warning anywhere. Abort the whole fetch: the remaining slices
+            # share the quota and would fail the same way.
+            for key in ("Note", "Information", "Error Message"):
+                if key in data:
+                    raise NewsUnavailable(
+                        f"Alpha Vantage {key} (historical {cache_symbol}): "
+                        f"{str(data[key])[:200]}"
+                    )
+            if "feed" not in data:
+                raise NewsUnavailable(
+                    f"Alpha Vantage historical response for {cache_symbol} "
+                    f"contained no 'feed' key (keys: {sorted(data)[:6]})"
+                )
+
             for item in data.get("feed", []):
                 url = item.get("url", "")
                 if url in seen_urls:
@@ -710,6 +727,8 @@ def fetch_historical_av_news(
 
                 all_articles.append(parsed)
 
+        except NewsUnavailable:
+            raise
         except Exception as e:
             logger.warning(f"AV news fetch error (month {m}): {e}")
             continue

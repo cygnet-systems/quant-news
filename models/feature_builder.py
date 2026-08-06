@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 # metadata (hardcoded ticker map removed; industry ETF preferred when mapped,
 # e.g. Semiconductors -> SMH, else sector SPDR) -- sector-context features
 # change for any ticker the old map labeled differently.
-FEATURE_VERSION: int = 3
+# v4 (2026-08-06): DB-cached articles expose topics under "topics_json", not
+# "topics" -- every av_*/global_* feature trained as constant 0.0 on cache
+# hits. Both spellings now read; all news-trained models must be refit.
+FEATURE_VERSION: int = 4
 
 INDICATOR_SENTINEL_COLUMN: str = "SMA_50"
 
@@ -295,8 +298,9 @@ class LiveFeatureBuilder:
         n_tech = 0
 
         for article in articles:
-            # topics may be None, a JSON string, or a list depending on source
-            topics = article.get("topics") or []
+            # topics may be None, a JSON string, or a list depending on source;
+            # DB-cached articles carry the raw column name "topics_json"
+            topics = article.get("topics") or article.get("topics_json") or []
             if isinstance(topics, str):
                 try:
                     import json as _json
@@ -349,8 +353,9 @@ class LiveFeatureBuilder:
         topic_scores: dict[str, list[float]] = {t: [] for t in _GLOBAL_TOPICS}
 
         for article in articles:
-            # topics may be None, a JSON string, or a list depending on source
-            topics = article.get("topics") or []
+            # topics may be None, a JSON string, or a list depending on source;
+            # DB-cached articles carry the raw column name "topics_json"
+            topics = article.get("topics") or article.get("topics_json") or []
             if isinstance(topics, str):
                 try:
                     import json as _json

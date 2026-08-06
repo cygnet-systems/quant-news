@@ -164,12 +164,9 @@ def _build_ta_recommendation_section(recommendation: dict) -> str:
     action = sym_rec.get("action", "")
     conviction = sym_rec.get("conviction")
     if action:
-        conviction_str = ""
-        if conviction is not None:
-            try:
-                conviction_str = f" &nbsp;&nbsp;<strong>Conviction:</strong> {int(float(conviction) * 100)}%"
-            except (TypeError, ValueError):
-                conviction_str = f" &nbsp;&nbsp;<strong>Conviction:</strong> {_esc(conviction)}"
+        # Conviction is a HIGH/MEDIUM/LOW label, not a number.
+        conviction_str = (f" &nbsp;&nbsp;<strong>Conviction:</strong> {_esc(conviction)}"
+                          if conviction is not None else "")
         rows.append(f"<div class='action-box'><strong>Action:</strong> {_esc(action)}{conviction_str}</div>")
 
     reasoning = sym_rec.get("reasoning", "")
@@ -206,7 +203,7 @@ def generate_ta_report_pdf(
     recommendation-model reasoning alongside the full agent analysis.
     Returns PDF bytes or None on failure.
     """
-    from models.single_agent import parse_epilogue
+    from models.single_agent import extract_confidence, parse_epilogue
 
     symbol = report.get("symbol", "UNKNOWN")
     decision = report.get("decision", "HOLD")
@@ -216,7 +213,13 @@ def generate_ta_report_pdf(
     model_name = report.get("model_name", "")
     created_at = str(report.get("created_at", ""))[:19]
 
+    # Two different numbers, and the header used to conflate them: the stored
+    # confidence is the track-record-grounded reliability weight (0.5 until a
+    # record exists — it is NOT the model saying "50% sure"), while the LLM's
+    # own conviction lives in the report text's CONFIDENCE line.
     conf_pct = int((confidence or 0) * 100)
+    stated = extract_confidence(report_text)
+    stated_pct = int(round(stated * 100)) if stated is not None else None
 
     # The machine-read epilogue is rendered as a proper panel, not raw JSON.
     structured = parse_epilogue(report_text) or {}
@@ -269,7 +272,8 @@ def generate_ta_report_pdf(
     <h1>{symbol} TradingAgents Report</h1>
     <div class="subtitle">
         <strong>Decision:</strong> {decision}
-        &nbsp;&nbsp;<strong>Confidence:</strong> {conf_pct}%
+        {f'&nbsp;&nbsp;<strong>Stated conviction:</strong> {stated_pct}%' if stated_pct is not None else ''}
+        &nbsp;&nbsp;<strong>Reliability weight:</strong> {conf_pct}%{' (neutral — no track record yet)' if confidence == 0.5 else ''}
         &nbsp;&nbsp;<strong>Trade Date:</strong> {trade_date}
         {model_line}
     </div>

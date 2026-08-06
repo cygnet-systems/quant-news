@@ -256,16 +256,37 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
         logger.warning(f"evaluation notification query failed: {e}")
         return False
 
+    # "Nothing scored" has two very different causes — a holiday, or an
+    # evaluator that keeps skipping the same rows. Check which one before
+    # calling it normal.
+    backlog = {}
+    try:
+        from services.cache_service import get_cache
+        backlog = get_cache().evaluation_backlog()
+    except Exception as e:
+        logger.warning(f"evaluation backlog query failed: {e}")
+
     if not per_model:
-        # Nothing scored is a legitimate outcome (holiday, or the session's
-        # close has not published yet). Say so rather than sending an empty
-        # table that reads like a failure.
+        pending = backlog.get("pending_mature", 0)
+        if pending:
+            by_date = ", ".join(f"{d}: {n}" for d, n in
+                                (backlog.get("by_target_date") or {}).items())
+            return _send(
+                f"EVALUATION STALLED — {pending} mature predictions unscored",
+                _wrap("Nothing scored, but the backlog is not empty",
+                      f"Target session {target}",
+                      f"<p>{pending} predictions whose target session has "
+                      f"closed are still unscored ({by_date}). The evaluator "
+                      f"is skipping them — most likely a missing close for "
+                      f"the target date or a NULL previous_close. This will "
+                      f"not fix itself.</p>"))
         return _send(
             f"No results to score for {target}",
             _wrap("Nothing scored", f"Target session {target}",
-                  "<p>No predictions were ready to evaluate. This is normal on a "
-                  "non-trading day, or when the vendor has not published the "
-                  "session's close yet.</p>"))
+                  "<p>No predictions were ready to evaluate, and no mature "
+                  "prediction is waiting. Normal on a non-trading day, or "
+                  "when the vendor has not published the session's close "
+                  "yet.</p>"))
 
     model_rows = ""
     for r in per_model:
@@ -315,6 +336,14 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
         f'${total_pnl:,.2f} gross, before costs.<br>'
         f'A single day is far too small a sample to read as skill.</p>'
     )
+    if backlog.get("pending_mature"):
+        by_date = ", ".join(f"{d}: {n}" for d, n in
+                            (backlog.get("by_target_date") or {}).items())
+        body += (
+            f'<p style="color:#D93900;font-size:13px;margin-top:8px">'
+            f'⚠ {backlog["pending_mature"]} mature prediction(s) remain '
+            f'unscored ({by_date}) — the evaluator is skipping them.</p>'
+        )
     return _send(
         f"Results {target} — {overall:.0f}% on {total_active} calls, ${total_pnl:,.2f}",
         _wrap("Results", f"Target session {target}", body),

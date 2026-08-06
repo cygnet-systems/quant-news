@@ -352,8 +352,18 @@ class ModelConfig:
     ENSEMBLE_BUY_THRESHOLD: float = 0.15
     ENSEMBLE_SELL_THRESHOLD: float = -0.15
 
-    # Ensemble defaults (initial UI values — user adjusts from dashboard)
-    ENSEMBLE_DEFAULT_ENABLED: tuple[str, ...] = ("kronos_mini", "xgboost_shap")
+    # Ensemble defaults (initial UI values — user adjusts from dashboard).
+    # These are also what the scheduled pipeline votes with (it passes no
+    # ensemble_config), so they must list the full roster: the old 2-model
+    # default meant every production ensemble row was a kronos+xgboost vote
+    # that saturated at confidence 1.0 whenever the pair agreed.
+    ENSEMBLE_DEFAULT_ENABLED: tuple[str, ...] = (
+        "kronos_mini",
+        "xgboost_shap",
+        "lightgbm",
+        "deberta_sentiment",
+        "trading_agents",
+    )
     ENSEMBLE_DEFAULT_WEIGHTS: tuple[tuple[str, float], ...] = (
         ("kronos_mini", 1.0),
         ("xgboost_shap", 1.0),

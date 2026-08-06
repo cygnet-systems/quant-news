@@ -192,6 +192,14 @@ def store_prediction(
             input_data_hash=input_data_hash,
             model_version=model_version,
             duration_ms=duration_ms,
+            # Re-storing an id invalidates any prior evaluation — same rule as
+            # cache_service.store_prediction. Without these explicit Nones the
+            # merge keeps the OLD verdict against the NEW decision, and the
+            # evaluator never revisits a row whose actual_close survived.
+            actual_close=None,
+            was_correct=None,
+            pnl_dollars=None,
+            evaluated_at=None,
         ))
     logger.info(f"Stored prediction: {model_name}/{symbol}@{trade_date}")
 

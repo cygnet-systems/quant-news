@@ -96,10 +96,18 @@ def main() -> int:
 
     if args.command == "evaluate":
         count = evaluate_pending()
-        summary = {"evaluated": count, "at": datetime.now().isoformat()}
+        from services.cache_service import get_cache
+        backlog = get_cache().evaluation_backlog()
+        summary = {"evaluated": count, "backlog": backlog,
+                   "at": datetime.now().isoformat()}
         print(json.dumps(summary) if args.json
-              else f"Evaluated {count} prediction(s)")
-        return 0
+              else f"Evaluated {count} prediction(s); "
+                   f"{backlog['pending_mature']} mature prediction(s) still "
+                   f"unscored")
+        # A clean run leaves no mature prediction unscored. A remaining
+        # backlog is the "evaluated: 0 looked normal" failure shape — exit 2
+        # so the scheduler records it as partial and mails accordingly.
+        return 2 if backlog["pending_mature"] else 0
 
     if args.command == "notify-test":
         from services import notify_service

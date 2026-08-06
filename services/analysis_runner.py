@@ -190,6 +190,7 @@ def run_predictions(
         logger.warning(f"SPY fetch failed: {e}")
 
     needs_historical = bool(selected & {"xgboost_shap", "lightgbm"})
+    training_news_failures: list[str] = []
     historical_global_news: dict = {}
     if needs_historical:
         try:
@@ -199,19 +200,25 @@ def run_predictions(
                 "", months=MODEL.NEWS_LOOKBACK_MONTHS)
         except Exception as e:
             logger.warning(f"Historical global news fetch failed: {e}")
+            training_news_failures.append("_GLOBAL")
 
     results: dict = {}
+    skipped: dict[str, str] = {}
     for symbol in symbols:
         prices_json = (stock_data.get(symbol) or {}).get("prices")
         if not prices_json:
             logger.warning(f"{symbol}: no price data, skipping")
+            skipped[symbol] = "no price data"
             continue
         try:
             df = pd.read_json(StringIO(prices_json))
         except Exception as e:
             logger.warning(f"{symbol}: price frame unreadable: {e}")
+            skipped[symbol] = "price frame unreadable"
             continue
         if df.empty:
+            logger.warning(f"{symbol}: empty price frame, skipping")
+            skipped[symbol] = "empty price frame"
             continue
 
         # The target session's own bar must never be visible — live, that bar
@@ -222,6 +229,7 @@ def run_predictions(
             df = df[df.index <= str(cutoff_date)]
         if df.empty:
             logger.warning(f"{symbol}: no data available as of {cutoff_date}")
+            skipped[symbol] = f"no data as of {cutoff_date}"
             continue
 
         sym_news = news_by_symbol.get(symbol) or []
@@ -245,6 +253,7 @@ def run_predictions(
                     symbol, months=MODEL.NEWS_LOOKBACK_MONTHS)
             except Exception as e:
                 logger.warning(f"{symbol}: historical AV news fetch failed: {e}")
+                training_news_failures.append(symbol)
 
         mode = "backtest" if is_backtest else "live"
         prog.emit("models", f"{symbol}: running {len(selected)} models "
@@ -281,6 +290,8 @@ def run_predictions(
         "predict_date": cutoff_date.isoformat(),
         "target_date": target_date.isoformat(),
         "is_backtest": is_backtest,
+        "skipped_symbols": skipped,
+        "training_news_failures": training_news_failures,
     }
     return results
 
@@ -399,7 +410,10 @@ def persist_predictions(signals: dict) -> tuple[int, int]:
                         decision=result_dict.get("decision", "HOLD"),
                         confidence=result_dict.get("confidence", 0.0),
                         report_text=raw_response,
-                        model_name=details.get("model", ""),
+                        # The model that answered, which after a provider
+                        # fallback is not the one that was asked.
+                        model_name=(details.get("served_by_model")
+                                    or details.get("model", "")),
                         input_tokens=details.get("input_tokens", 0),
                         output_tokens=details.get("output_tokens", 0),
                     )
@@ -610,16 +624,19 @@ def run_recommendations(
     except Exception as e:
         logger.debug(f"Recommendation cache check failed: {e}")
 
-    prog.emit("luna", f"Luna ({ai_analysis.get('recs_model')}) synthesizing "
+    prog.emit("luna", f"Synthesis ({ai_analysis.get('recs_model')}) over "
                       f"{len(symbols)} symbols…")
+    synthesis_started = time.time()
     with usage.track("recommendations", trade_date=trade_date):
         result = get_llm().generate_recommendations(
             ai_analysis, valid_signals, symbols,
             basis=basis,
             model_override=ai_analysis.get("recs_model"),
         )
+    synthesis_ms = int((time.time() - synthesis_started) * 1000)
     if not result:
-        prog.emit("error", "Luna returned empty response — synthesis failed")
+        prog.emit("error", "Synthesis model returned empty response — "
+                           "synthesis failed")
         return None
 
     result["generated_at"] = datetime.now().isoformat()
@@ -629,14 +646,23 @@ def run_recommendations(
     for sym, rec in (result.get("by_symbol") or {}).items():
         action = (rec.get("action") or "").upper()
         if action not in ("BUY", "SELL", "HOLD"):
+            logger.warning(
+                f"{sym}: synthesis action {rec.get('action')!r} is not "
+                f"BUY/SELL/HOLD — dropping this symbol's recommendation")
             continue
+        conviction = str(rec.get("conviction", "")).upper()
+        if conviction not in _CONVICTION_CONF:
+            # An off-menu label ("MODERATE", null) used to store a NULL
+            # confidence with no trace. Treat it as LOW and say so.
+            logger.warning(f"{sym}: synthesis conviction {conviction!r} not in "
+                           f"{sorted(_CONVICTION_CONF)} — treating as LOW")
         try:
             cache.store_prediction(
                 sym, "recommendation_synthesis",
                 {
                     "decision": action,
                     "confidence": _CONVICTION_CONF.get(
-                        str(rec.get("conviction", "")).upper()),
+                        conviction, _CONVICTION_CONF["LOW"]),
                     "up_probability": None,
                     "details": {
                         "synthesis_model": result.get("model_used"),
@@ -654,13 +680,17 @@ def run_recommendations(
 
     if rec_data_hash:
         try:
+            # The model that actually answered, not the one configured — a
+            # fallback run used to be indistinguishable from a primary one.
             ps.store_recommendation(
                 trade_date=trade_date,
                 symbols=symbols,
                 input_data_hash=rec_data_hash,
                 result=result,
-                model_used=MODEL.RECOMMENDATIONS_MODEL,
-                provider_used=MODEL.RECOMMENDATIONS_PROVIDER,
+                model_used=result.get("model_used") or MODEL.RECOMMENDATIONS_MODEL,
+                provider_used=(result.get("provider_used")
+                               or MODEL.RECOMMENDATIONS_PROVIDER),
+                duration_ms=synthesis_ms,
             )
         except Exception as e:
             logger.warning(f"Failed to persist recommendation: {e}")
@@ -761,6 +791,32 @@ def run_full_analysis(
         prog.emit("news", f"No articles in window for: {', '.join(news_empty)} "
                           f"(source responded; the window is genuinely empty)")
 
+    # Archive exactly what the models are about to see. Predictions used to
+    # keep only a news COUNT, so no past call could ever be audited against
+    # its inputs ("what did the model read that morning?" had no answer).
+    try:
+        from services import persistence_service as ps
+        snapshot = {
+            sym: [{k: a.get(k) for k in
+                   ("url", "title", "published_at", "source",
+                    "ticker_relevance_score", "overall_sentiment_score")}
+                  for a in arts]
+            for sym, arts in news_by_symbol.items()
+        }
+        ps.store_report(
+            symbol=None, trade_date=as_of, report_type="news_snapshot",
+            input_data_hash=ps.compute_data_hash(snapshot),
+            content=json.dumps({
+                "as_of": as_of, "lookback_days": lookback_days,
+                "news_unavailable": news_unavailable,
+                "news_empty": news_empty,
+                "articles": snapshot,
+            }, default=str),
+            file_format="json",
+        )
+    except Exception as e:
+        logger.warning(f"news snapshot not archived: {e}")
+
     signals = run_predictions(
         priced, stock_data, news_by_symbol,
         target_date=target_date, cutoff_date=cutoff_date,
@@ -806,6 +862,17 @@ def run_full_analysis(
         signals, priced, models, recommendations)
     if not archived:
         degraded.append(f"report not archived ({(archive_error or '')[:80]})")
+    if news_unavailable:
+        degraded.append(
+            f"news source down for {len(news_unavailable)}/{len(priced)}: "
+            f"{', '.join(news_unavailable)}")
+    meta = signals.get("_meta") or {}
+    if meta.get("training_news_failures"):
+        degraded.append("training news failed for: "
+                        + ", ".join(meta["training_news_failures"]))
+    if meta.get("skipped_symbols"):
+        degraded.append("symbols skipped: " + "; ".join(
+            f"{s} ({why})" for s, why in meta["skipped_symbols"].items()))
 
     if degraded:
         prog.emit("error", "Full Analysis incomplete — " + "; ".join(degraded))
@@ -816,6 +883,8 @@ def run_full_analysis(
     return {
         "symbols": priced,
         "skipped": [s for s in symbols if s not in priced],
+        "news_unavailable": news_unavailable,
+        "news_empty": news_empty,
         "target_date": target_date.isoformat(),
         "as_of": as_of,
         "is_backtest": signals.get("_meta", {}).get("is_backtest", False),
@@ -865,8 +934,17 @@ def _assess_completeness(
     if partial:
         degraded.append("incomplete: " + ", ".join(
             f"{m} {coverage[m]}/{n}" for m in partial))
-    if not (recommendations or {}).get("by_symbol"):
+    by_symbol = (recommendations or {}).get("by_symbol") or {}
+    if not by_symbol:
         degraded.append("no recommendations produced")
+    else:
+        # The synthesis LLM can silently omit symbols from by_symbol; an
+        # emptiness check alone never notices.
+        missing = sorted(set(symbols) - set(by_symbol))
+        if missing:
+            degraded.append(
+                f"synthesis missing {len(missing)}/{len(symbols)} symbols: "
+                f"{', '.join(missing)}")
     return coverage, degraded
 
 

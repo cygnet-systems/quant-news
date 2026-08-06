@@ -19,6 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
+# Never against a shared database: these tests write junk rows (symbol TEST)
+# and load_dotenv() above happily points them at whatever .env names --
+# which is how a TEST symbol ended up in production stock_prices.
+_db = os.environ.get("DATABASE_URL", "")
+if "localhost" not in _db and "127.0.0.1" not in _db:
+    raise SystemExit(f"Refusing to run against non-local DATABASE_URL: {_db.split('@')[-1]}")
+
 
 def test_db_connection():
     """Test Postgres connection."""

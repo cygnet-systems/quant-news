@@ -955,6 +955,43 @@ Provide a 3-4 sentence analysis covering:
         "ensemble": "Ensemble: Configurable weighted majority vote across enabled models",
     }
 
+    @staticmethod
+    def _research_digest(raw: str, budget: int) -> str:
+        """The verdict plus the decision-relevant sections of a research report.
+
+        The report's preamble (the Verdict block) is always kept whole; the
+        `### ` sections are then added in decision-relevance order until the
+        character budget runs out. Sections that are pure input restatement
+        (business context, market regime) are dropped — the synthesis prompt
+        already carries the model signals and the shallow report fields.
+        """
+        from models.single_agent import strip_epilogue
+
+        parts = strip_epilogue(raw).split("\n### ")
+        verdict = parts[0].strip()
+        remaining = budget - len(verdict)
+
+        priority = ("bull", "risk", "trade plan", "news", "technical")
+
+        def rank(section: str) -> int:
+            heading = section.split("\n", 1)[0].lower()
+            return next((i for i, kw in enumerate(priority) if kw in heading),
+                        len(priority))
+
+        keep = []
+        for section in sorted(parts[1:], key=rank):
+            if rank(section) == len(priority) or remaining <= 0:
+                continue
+            text = "### " + section.strip()
+            if len(text) > remaining:
+                text = text[:remaining].rsplit("\n", 1)[0]
+                if len(text) < 200:
+                    continue
+            keep.append(text)
+            remaining -= len(text)
+
+        return "\n\n".join([verdict] + keep)
+
     def generate_recommendations(
         self,
         ai_analysis: dict,
@@ -982,7 +1019,7 @@ Provide a 3-4 sentence analysis covering:
 
         system_prompt = f"""You are a senior portfolio strategist. You receive two independent analyses:
 
-1. AI REPORT: News-based sentiment analysis with recommendation, confidence, key developments, and risk factors per symbol.
+1. AI REPORT: Per-symbol research — a verdict plus the report sections most relevant to the decision (bull/bear case, risk, trade plan, news), and/or news-based sentiment fields (recommendation, confidence, key developments, risk factors).
 2. MODEL PREDICTIONS: Machine learning model outputs (BUY/SELL/HOLD with confidence scores) from multiple quantitative models.
 
 AVAILABLE MODELS:
@@ -1022,6 +1059,13 @@ Respond with ONLY valid JSON matching this schema:
         analysis_by_sym = ai_analysis.get("by_symbol", {})
         overall = ai_analysis.get("overall", {})
 
+        # Research digest budget per symbol. The synthesis used to see only
+        # the ~600-char verdict block — the analysis sections the research
+        # model spent its tokens on were discarded before the one call whose
+        # job is to weigh them against the quant signals. Scale with symbol
+        # count so a 20-name portfolio still fits the context comfortably.
+        research_budget = max(1500, min(6000, 45000 // max(1, len(symbols))))
+
         for symbol in symbols:
             lines = [f"=== {symbol} ==="]
 
@@ -1029,13 +1073,10 @@ Respond with ONLY valid JSON matching this schema:
             sym_report = {} if signals_only else analysis_by_sym.get(symbol, {})
             research = (sym_report.get("research") or {}) if sym_report else {}
             if research.get("raw_response"):
-                # The verdict block is the distilled research call — triggers
-                # and headline reasoning in ~600 chars.
-                verdict = research["raw_response"]
-                cut = verdict.find("\n### ")
-                lines.append("Research report verdict:")
-                lines.append("  " + verdict[:cut if 0 < cut <= 900 else 600]
-                              .strip().replace("\n", "\n  "))
+                digest = self._research_digest(research["raw_response"],
+                                               research_budget)
+                lines.append("Research report (verdict + key sections):")
+                lines.append("  " + digest.replace("\n", "\n  "))
             if sym_report:
                 lines.append(f"AI Report: {sym_report.get('recommendation', 'N/A')} "
                              f"(confidence: {sym_report.get('confidence', 'N/A')})")
@@ -1123,15 +1164,22 @@ Respond with ONLY valid JSON matching this schema:
             **primary_kwargs,
         )
         synthesis_model = primary_model
+        synthesis_provider = primary_provider
+        parsed = _parse_recommendations_json(raw) if raw else None
 
-        if not raw and API.ANTHROPIC_API_KEY:
-            # Primary synthesis model failed even after retries — a completed
-            # AI report + prediction run shouldn't be wasted. Fall back.
+        if parsed is None and API.ANTHROPIC_API_KEY:
+            # Primary synthesis failed — empty response OR unusable JSON (a
+            # truncated payload used to drop the whole day's synthesis on the
+            # floor here). A completed AI report + prediction run shouldn't
+            # be wasted, so re-ask once on the fallback model.
             fallback = os.getenv("RECOMMENDATIONS_FALLBACK_MODEL", "claude-sonnet-4-6")
             if fallback == primary_model:
-                fallback = "claude-sonnet-5"
+                fallback = ("claude-sonnet-4-6" if primary_model == "claude-sonnet-5"
+                            else "claude-sonnet-5")
             logger.warning(
-                f"{primary_model} failed — falling back to {fallback}"
+                f"{primary_model} produced no usable synthesis "
+                f"({'empty' if not raw else 'unparseable'}) — "
+                f"falling back to {fallback}"
             )
             raw = self.generate(
                 user_prompt,
@@ -1142,30 +1190,73 @@ Respond with ONLY valid JSON matching this schema:
                 provider="anthropic",
             )
             synthesis_model = fallback
+            synthesis_provider = "anthropic"
+            parsed = _parse_recommendations_json(raw) if raw else None
 
-        if not raw:
-            logger.warning("Recommendations model returned empty response")
+        if parsed is None:
+            logger.warning("Recommendations synthesis produced no usable JSON "
+                           "from any model")
             return None
 
-        try:
-            clean = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
-            match = re.search(r"\{.*\}", clean, re.DOTALL)
-            if not match:
-                logger.warning("No JSON found in recommendations response")
-                return None
-            parsed = json.loads(match.group())
-            if "overall" not in parsed or "by_symbol" not in parsed:
-                logger.warning("Recommendations JSON missing required keys")
-                return None
-            parsed["model_used"] = synthesis_model
-            parsed["provider_used"] = ("anthropic"
-                                       if synthesis_model != MODEL.RECOMMENDATIONS_MODEL
-                                       else MODEL.RECOMMENDATIONS_PROVIDER)
-            parsed["basis"] = basis
-            return parsed
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"Failed to parse recommendations: {e}")
-            return None
+        parsed["model_used"] = synthesis_model
+        parsed["provider_used"] = synthesis_provider
+        parsed["basis"] = basis
+        return parsed
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """First balanced top-level {...} in ``text``, string-aware.
+
+    The old greedy ``\\{.*\\}`` regex matched from the first ``{`` to the LAST
+    ``}`` in the buffer, so a response truncated mid-object "matched" and then
+    failed json.loads — and a code fence stripped globally could corrupt JSON
+    whose string values themselves contained backticks. Scanning braces with
+    string/escape tracking sidesteps both.
+    """
+    depth = 0
+    start = None
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _parse_recommendations_json(raw: str) -> Optional[dict]:
+    """Parse a synthesis response into its recommendations dict, or None."""
+    candidate = _extract_json_object(raw)
+    if candidate is None:
+        logger.warning("No complete JSON object in recommendations response "
+                       f"({len(raw)} chars — likely truncated output)")
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning(f"Failed to parse recommendations: {e}")
+        return None
+    if not isinstance(parsed, dict) or "overall" not in parsed \
+            or "by_symbol" not in parsed:
+        logger.warning("Recommendations JSON missing required keys")
+        return None
+    return parsed
 
 
 # Singleton instance

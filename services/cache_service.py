@@ -9,7 +9,7 @@ Migrated from DuckDB — same public API, Postgres backend.
 import hashlib
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +38,21 @@ def _sanitize_json(obj):
     if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
         return None
     return obj
+
+
+def _parse_topics(topics_json) -> list:
+    """Deserialize a HistoricalNews.topics_json value to the list form the
+    feature builder consumes. The column may hold a JSON string, an already-
+    decoded list (JSONB), or NULL."""
+    if isinstance(topics_json, list):
+        return topics_json
+    if isinstance(topics_json, str) and topics_json:
+        try:
+            parsed = json.loads(topics_json)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+    return []
 
 
 def _pred_to_dict(r, include_details: bool = False) -> dict:
@@ -181,7 +196,7 @@ class CacheService:
     def cache_news(self, symbol: str, articles: list) -> None:
         from db.models import NewsArticle, CacheMetadata
         symbol = symbol.upper().strip()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         with get_session() as session:
             session.execute(delete(NewsArticle).where(NewsArticle.symbol == symbol))
@@ -344,10 +359,18 @@ class CacheService:
                 cache_df[col] = 0.0 if col != "date" else None
         cache_df = cache_df[required_cols]
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         with get_session() as session:
-            session.execute(delete(StockPrice).where(StockPrice.symbol == symbol))
+            # Replace only the dates this fetch actually covers. Deleting the
+            # whole symbol first meant any short fetch — the evaluator's 3mo
+            # backfill, or a truncated yfinance response — destroyed the full
+            # stored history and silently replaced it with the shorter frame.
+            new_dates = [d for d in cache_df["date"].tolist() if d is not None]
+            session.execute(delete(StockPrice).where(
+                StockPrice.symbol == symbol,
+                StockPrice.date.in_(new_dates),
+            ))
 
             for _, row in cache_df.iterrows():
                 session.add(StockPrice(
@@ -369,14 +392,20 @@ class CacheService:
                     CacheMetadata.data_type == "prices",
                 )
             ).scalar_one_or_none()
+            # Count what the table actually holds — the merge above means the
+            # stored history can be longer than this fetch.
+            total_rows = session.execute(
+                select(func.count()).select_from(StockPrice)
+                .where(StockPrice.symbol == symbol)
+            ).scalar()
             if existing_meta:
                 existing_meta.period = period
                 existing_meta.last_updated = now
-                existing_meta.record_count = len(df)
+                existing_meta.record_count = total_rows
             else:
                 session.add(CacheMetadata(
                     symbol=symbol, data_type="prices", period=period,
-                    last_updated=now, record_count=len(df),
+                    last_updated=now, record_count=total_rows,
                 ))
 
     # =========================================================================
@@ -434,7 +463,7 @@ class CacheService:
                 fifty_two_week_high=info.fifty_two_week_high,
                 fifty_two_week_low=info.fifty_two_week_low,
                 volume=info.volume, avg_volume=info.avg_volume,
-                fetched_at=datetime.now(),
+                fetched_at=datetime.now(timezone.utc),
             ))
             existing_meta = session.execute(
                 select(CacheMetadata).where(
@@ -443,12 +472,12 @@ class CacheService:
                 )
             ).scalar_one_or_none()
             if existing_meta:
-                existing_meta.last_updated = datetime.now()
+                existing_meta.last_updated = datetime.now(timezone.utc)
                 existing_meta.record_count = 1
             else:
                 session.add(CacheMetadata(
                     symbol=info.symbol, data_type="info", period=None,
-                    last_updated=datetime.now(), record_count=1,
+                    last_updated=datetime.now(timezone.utc), record_count=1,
                 ))
 
     # =========================================================================
@@ -600,7 +629,7 @@ class CacheService:
                 feature_values_json=json.dumps(feature_values) if feature_values else None,
                 details_json=_sanitize_json(details) if details else None,
                 input_data_hash=data_hash,
-                created_at=datetime.now(),
+                created_at=datetime.now(timezone.utc),
                 # Re-storing a prediction id invalidates any prior evaluation:
                 # merge() used to keep old actual_close/was_correct/pnl from a
                 # DIFFERENT decision (12% of rows had scores contradicting
@@ -664,11 +693,15 @@ class CacheService:
             return results
 
     def evaluate_predictions(self) -> int:
+        import pytz
+
         from db.models import ModelPrediction, StockPrice
         from models.base import compute_pnl
         from utils.trading_calendar import get_previous_trading_day, is_market_open_today
 
-        today = date.today()
+        # Exchange-local date, not the host's: on the UTC container the host
+        # date rolls over at 20:00 ET, which advanced the cutoff a day early.
+        today = datetime.now(pytz.timezone("US/Eastern")).date()
         cutoff = get_previous_trading_day(today) if is_market_open_today() else today
 
         # Backfill: predictions can't score without the target date's close.
@@ -689,7 +722,11 @@ class CacheService:
                 latest = session.execute(
                     select(func.max(StockPrice.date)).where(StockPrice.symbol == symbol)
                 ).scalar()
-            if latest is None or str(latest) < str(max_target):
+            # <= rather than <: when the stored bar for the target date was
+            # written DURING that session it is a partial intraday print, and
+            # scoring against it is scoring against a price that never closed.
+            # One refresh per pending symbol buys a settled bar.
+            if latest is None or str(latest) <= str(max_target):
                 try:
                     self.get_stock_prices(symbol, period="3mo", force_refresh=True)
                     logger.info(f"Backfilled prices for {symbol} through {max_target}")
@@ -705,6 +742,8 @@ class CacheService:
             ).scalars().all()
 
             evaluated = 0
+            skipped_no_price: list[str] = []
+            skipped_no_prev = 0
             hold_bands: dict = {}
             for pred in pending:
                 actual_row = session.execute(
@@ -715,8 +754,11 @@ class CacheService:
                 ).scalar_one_or_none()
 
                 if actual_row is None:
+                    skipped_no_price.append(
+                        f"{pred.symbol}@{str(pred.target_date)[:10]}")
                     continue
                 if pred.previous_close is None or pred.previous_close <= 0:
+                    skipped_no_prev += 1
                     continue
 
                 actual_close = actual_row
@@ -732,43 +774,95 @@ class CacheService:
                     # this as None made HOLD unfalsifiable, so a model that
                     # holds most of the time never showed a wrong call.
                     move = abs(actual_close - pred.previous_close) / pred.previous_close
-                    was_correct = move <= self._hold_band(
-                        session, pred.symbol, hold_bands)
+                    band = self._hold_band(
+                        session, pred.symbol, hold_bands, pred.target_date)
+                    was_correct = move <= band
+                    # The band drifts as history accrues; without recording
+                    # what this row was judged against, the verdict can never
+                    # be audited or reproduced.
+                    pred.details_json = {
+                        **(pred.details_json or {}),
+                        "hold_eval": {"band": band, "move": move},
+                    }
 
                 pnl = compute_pnl(pred.decision, pred.previous_close, actual_close)
 
                 pred.actual_close = actual_close
                 pred.was_correct = was_correct
                 pred.pnl_dollars = pnl
-                pred.evaluated_at = datetime.now()
+                pred.evaluated_at = datetime.now(timezone.utc)
                 evaluated += 1
 
             if evaluated > 0:
                 logger.info(f"Evaluated {evaluated} predictions")
+            # A skip is not a benign outcome: the row stays unevaluated and
+            # nothing else will ever come back for it, so say so loudly.
+            if skipped_no_price:
+                logger.warning(
+                    f"Evaluation skipped {len(skipped_no_price)} prediction(s) "
+                    f"with no close for their target session: "
+                    f"{', '.join(sorted(set(skipped_no_price))[:10])}")
+            if skipped_no_prev:
+                logger.warning(
+                    f"Evaluation skipped {skipped_no_prev} prediction(s) with "
+                    f"no usable previous_close — these can never score")
 
         return evaluated
 
-    def _hold_band(self, session, symbol: str, _cache: dict) -> float:
+    def evaluation_backlog(self) -> dict:
+        """Mature predictions still unevaluated — the number that should be
+        zero after a healthy evaluation run, and the alarm when it isn't."""
+        import pytz
+
+        from db.models import ModelPrediction
+        from utils.trading_calendar import get_previous_trading_day, is_market_open_today
+
+        today = datetime.now(pytz.timezone("US/Eastern")).date()
+        cutoff = get_previous_trading_day(today) if is_market_open_today() else today
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction.target_date, func.count())
+                .where(
+                    ModelPrediction.actual_close.is_(None),
+                    ModelPrediction.target_date <= cutoff,
+                )
+                .group_by(ModelPrediction.target_date)
+            ).all()
+        return {
+            "pending_mature": sum(n for _, n in rows),
+            "by_target_date": {str(d)[:10]: n for d, n in sorted(rows)},
+        }
+
+    def _hold_band(self, session, symbol: str, _cache: dict,
+                   before_date=None) -> float:
         """No-trade band for a symbol: its own typical absolute daily move.
 
         Judging every name against one fixed percentage compares a utility
         against a biotech. This uses the symbol's median absolute daily return
         so "the session was quiet for this stock" means the same thing
         everywhere. Falls back to the fixed band when history is too short.
+
+        ``before_date`` bounds the history to bars strictly before the
+        prediction's target session — the band a HOLD is judged against must
+        not be derived from prices that hadn't printed yet.
         """
         from db.models import StockPrice
         from config import MODEL
 
-        if symbol in _cache:
-            return _cache[symbol]
+        key = (symbol, str(before_date)[:10] if before_date else None)
+        if key in _cache:
+            return _cache[key]
 
         band = MODEL.HOLD_BAND_PCT
         try:
-            closes = session.execute(
+            stmt = (
                 select(StockPrice.close)
                 .where(StockPrice.symbol == symbol)
                 .order_by(StockPrice.date.asc())
-            ).scalars().all()
+            )
+            if before_date is not None:
+                stmt = stmt.where(StockPrice.date < str(before_date)[:10])
+            closes = session.execute(stmt).scalars().all()
             if len(closes) > MODEL.HOLD_BAND_MIN_HISTORY:
                 moves = [
                     abs(closes[i] - closes[i - 1]) / closes[i - 1]
@@ -785,7 +879,7 @@ class CacheService:
         except Exception as e:
             logger.debug("hold band fallback for %s: %s", symbol, e)
 
-        _cache[symbol] = band
+        _cache[key] = band
         return band
 
     def backfill_hold_scores(self) -> int:
@@ -817,10 +911,15 @@ class CacheService:
                 if not pred.previous_close or pred.previous_close <= 0:
                     continue
                 move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
-                pred.was_correct = move <= self._hold_band(session, pred.symbol, bands)
+                band = self._hold_band(session, pred.symbol, bands, pred.target_date)
+                pred.was_correct = move <= band
+                pred.details_json = {
+                    **(pred.details_json or {}),
+                    "hold_eval": {"band": band, "move": move},
+                }
                 if pred.pnl_dollars is None:
                     pred.pnl_dollars = 0.0
-                pred.evaluated_at = datetime.now()
+                pred.evaluated_at = datetime.now(timezone.utc)
                 updated += 1
 
         if updated:
@@ -850,8 +949,13 @@ class CacheService:
                 if not pred.previous_close or pred.previous_close <= 0:
                     continue
                 move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
-                pred.was_correct = move <= self._hold_band(session, pred.symbol, bands)
-                pred.evaluated_at = datetime.now()
+                band = self._hold_band(session, pred.symbol, bands, pred.target_date)
+                pred.was_correct = move <= band
+                pred.details_json = {
+                    **(pred.details_json or {}),
+                    "hold_eval": {"band": band, "move": move},
+                }
+                pred.evaluated_at = datetime.now(timezone.utc)
                 updated += 1
 
         if updated:
@@ -1035,7 +1139,7 @@ class CacheService:
                         pnl_dollars=ev.get("pnl_dollars"),
                         was_correct=ev.get("was_correct"),
                         signal_metadata_json=json.dumps(ev.get("metadata", {})) if ev.get("metadata") else None,
-                        evaluated_at=datetime.now(),
+                        evaluated_at=datetime.now(timezone.utc),
                     ))
                     inserted += 1
                 except Exception:
@@ -1166,7 +1270,7 @@ class CacheService:
                 total_pnl=metrics.get("total_pnl"),
                 total_trades=metrics.get("total_trades"),
                 metrics_json=metrics,
-                computed_at=datetime.now(),
+                computed_at=datetime.now(timezone.utc),
             ))
 
     def get_strategy_metrics(
@@ -1241,7 +1345,7 @@ class CacheService:
                         overall_sentiment_label=article.get("overall_sentiment_label"),
                         ticker_sentiment_score=article.get("ticker_sentiment_score"),
                         ticker_relevance_score=article.get("ticker_relevance_score"),
-                        fetched_at=datetime.now(),
+                        fetched_at=datetime.now(timezone.utc),
                     ))
                     inserted += 1
                 except Exception:
@@ -1268,6 +1372,7 @@ class CacheService:
                     "title": r.title, "summary": r.summary,
                     "url": r.url, "source": r.source,
                     "topics_json": r.topics_json,
+                    "topics": _parse_topics(r.topics_json),
                     "overall_sentiment_score": r.overall_sentiment_score,
                     "overall_sentiment_label": r.overall_sentiment_label,
                     "ticker_sentiment_score": r.ticker_sentiment_score,
