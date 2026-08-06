@@ -21,8 +21,11 @@ week silently ran on empty news.
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
+from zoneinfo import ZoneInfo
 
 DEFAULT_NEWS_LOOKBACK_DAYS = 14  # wide enough for drawdown-catalyst forensics
+
+_ET = ZoneInfo("US/Eastern")
 
 
 def as_utc(dt: datetime) -> datetime:
@@ -180,5 +183,80 @@ def fetch_point_in_time_news(
             raise av_error
 
     result = filter_articles_as_of(articles, as_of, lookback_days)
+    _PIT_NEWS_CACHE[cache_key] = result
+    return result
+
+
+def overnight_window_bounds(
+    anchor_date: Union[str, datetime],
+    target_date: Union[str, datetime],
+    start_time_et: str = "16:00",
+    end_time_et: str = "09:30",
+) -> tuple[datetime, datetime]:
+    """UTC bounds of the overnight gap: anchor close → target open.
+
+    The premise of the overnight filter: by the anchor session's close, that
+    day's intraday news is already in the closing price. Only what breaks
+    between the close (16:00 ET) and the next session's open (09:30 ET) is
+    new information for the close→open move being predicted. Both boundary
+    times are parameters, not constants — they are a formula the app owner
+    tunes, not a law.
+    """
+    anchor = _coerce_dt(anchor_date)
+    target = _coerce_dt(target_date)
+    if anchor is None or target is None:
+        raise ValueError(f"unparseable window dates: {anchor_date!r}, {target_date!r}")
+    sh, sm = (int(x) for x in start_time_et.split(":"))
+    eh, em = (int(x) for x in end_time_et.split(":"))
+    start_et = datetime(anchor.year, anchor.month, anchor.day, sh, sm, tzinfo=_ET)
+    end_et = datetime(target.year, target.month, target.day, eh, em, tzinfo=_ET)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+
+def fetch_overnight_news(
+    symbol: str,
+    anchor_date: Union[str, datetime],
+    target_date: Union[str, datetime],
+    relevance_threshold: float = 0.7,
+    max_articles: int = 500,
+    start_time_et: str = "16:00",
+    end_time_et: str = "09:30",
+) -> list:
+    """Fetch only the articles in the overnight gap before ``target_date``.
+
+    Live, the window is additionally clamped to *now* — a pre-open run simply
+    sees the overnight news that exists so far. The half-open comparison
+    excludes an article stamped exactly at the open.
+    """
+    start_utc, end_utc = overnight_window_bounds(
+        anchor_date, target_date, start_time_et, end_time_et)
+    now_utc = datetime.now(timezone.utc)
+    end_utc = min(end_utc, now_utc)
+    if end_utc <= start_utc:
+        return []
+
+    cache_key = (symbol.upper(), "overnight", str(anchor_date)[:10],
+                 str(target_date)[:10], relevance_threshold,
+                 start_time_et, end_time_et)
+    if cache_key in _PIT_NEWS_CACHE:
+        return _PIT_NEWS_CACHE[cache_key]
+
+    from services.news_service import fetch_alpha_vantage_news
+
+    articles = fetch_alpha_vantage_news(
+        symbol,
+        max_articles=max_articles,
+        time_from=start_utc.strftime("%Y%m%dT%H%M"),
+        time_to=end_utc.strftime("%Y%m%dT%H%M"),
+        relevance_threshold=relevance_threshold,
+    )
+    # Strict client-side re-check — the vendor bound is advisory here, and
+    # unlike the lookback path an undated article can never qualify (its
+    # position relative to a 17.5-hour window is unknowable).
+    result = [
+        a for a in articles
+        if (pub := _article_pub_date(a)) is not None
+        and start_utc <= as_utc(pub) < end_utc
+    ]
     _PIT_NEWS_CACHE[cache_key] = result
     return result

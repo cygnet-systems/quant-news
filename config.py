@@ -302,6 +302,25 @@ class ModelConfig:
     LABEL_AMBIGUITY_THRESHOLD: float = 0.0015  # 0.15%, set to 0.0 to disable
     NEWS_LOOKBACK_MONTHS: int = 3
 
+    # News window formula for live/scheduled predictions. "lookback" is the
+    # historical default: everything relevant from the past NEWS lookback
+    # days. "overnight" keeps only articles published between the anchor
+    # session's close and the target session's open — the premise being that
+    # anchor-day intraday news is already priced into the anchor close, so
+    # only the overnight tape is NEW information for the move being predicted.
+    # Every parameter is an owner-tunable formula input (env-overridable), and
+    # jobs can override the mode per run via params_json {"news_filter": ...}.
+    NEWS_FILTER_MODE: str = os.getenv("NEWS_FILTER_MODE", "lookback")
+    NEWS_OVERNIGHT_START_ET: str = os.getenv("NEWS_OVERNIGHT_START_ET", "16:00")
+    NEWS_OVERNIGHT_END_ET: str = os.getenv("NEWS_OVERNIGHT_END_ET", "09:30")
+    # The overnight window is short, so it uses the stricter FEATURE-grade
+    # relevance bar (matches DEBERTA_RELEVANCE_THRESHOLD) vs the lookback
+    # path's looser 0.5.
+    NEWS_OVERNIGHT_RELEVANCE: float = float(os.getenv("NEWS_OVERNIGHT_RELEVANCE", "0.7"))
+    # Post-filter ceiling per symbol per window, now that fetching paginates
+    # past AV's page size instead of truncating at 50.
+    NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "500"))
+
     # Decision thresholds (shared across Kronos and XGBoost)
     BUY_THRESHOLD: float = 0.55
     SELL_THRESHOLD: float = 0.45

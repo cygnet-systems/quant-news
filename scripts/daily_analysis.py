@@ -63,6 +63,13 @@ def main() -> int:
                         help="Research/report model (default: gpt-5.6-luna)")
     parser.add_argument("--recs-model", default=None,
                         help="Synthesis model (default: config RECOMMENDATIONS_MODEL)")
+    parser.add_argument("--news-filter", default=None,
+                        choices=["lookback", "overnight"],
+                        help="News window formula: 'lookback' (past N days) or "
+                             "'overnight' (anchor close 16:00 ET to target "
+                             "open 09:30 ET, relevance >= "
+                             "NEWS_OVERNIGHT_RELEVANCE). Default: config "
+                             "NEWS_FILTER_MODE")
     parser.add_argument("--models", default=None,
                         help="Comma-separated model ids to run (default: all)")
     parser.add_argument("--force", action="store_true",
@@ -179,6 +186,7 @@ def main() -> int:
         recs_model=args.recs_model,
         models=models,
         force=args.force,
+        news_filter=args.news_filter,
     )
 
     if args.json:

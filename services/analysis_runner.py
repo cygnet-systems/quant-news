@@ -716,19 +716,23 @@ def run_full_analysis(
     period: str = "2y",
     force_refresh: bool = True,
     force: bool = False,
+    news_filter: Optional[str] = None,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
 
     ``target`` is the session whose close is being predicted (defaults to the
     next unresolved session); data is cut off at the previous trading day.
-    Returns a summary dict — the durable output is in Postgres.
+    ``news_filter`` selects the news window formula ("lookback" | "overnight",
+    default from config). Returns a summary dict — the durable output is in
+    Postgres.
     """
     from config import MODEL
     from services import progress_service as prog
-    from services.news_window import fetch_point_in_time_news
+    from services.news_window import fetch_overnight_news, fetch_point_in_time_news
     from utils.trading_calendar import resolve_target_and_cutoff
 
     recs_model = recs_model or MODEL.RECOMMENDATIONS_MODEL
+    news_filter = (news_filter or MODEL.NEWS_FILTER_MODE).lower()
     target_date, cutoff_date = resolve_target_and_cutoff(target)
     as_of = cutoff_date.isoformat()
     started = datetime.now()
@@ -755,8 +759,18 @@ def run_full_analysis(
         # is retried; a genuine empty window is not a failure to retry.
         for attempt in (1, 2, 3):
             try:
-                articles = fetch_point_in_time_news(
-                    sym, as_of, lookback_days=lookback_days)
+                if news_filter == "overnight":
+                    articles = fetch_overnight_news(
+                        sym, as_of, target_date.isoformat(),
+                        relevance_threshold=MODEL.NEWS_OVERNIGHT_RELEVANCE,
+                        max_articles=MODEL.NEWS_MAX_ARTICLES,
+                        start_time_et=MODEL.NEWS_OVERNIGHT_START_ET,
+                        end_time_et=MODEL.NEWS_OVERNIGHT_END_ET,
+                    )
+                else:
+                    articles = fetch_point_in_time_news(
+                        sym, as_of, lookback_days=lookback_days,
+                        max_articles=MODEL.NEWS_MAX_ARTICLES)
                 break
             except NewsUnavailable as e:
                 logger.warning("%s: news unavailable (attempt %d/3): %s",
@@ -774,7 +788,9 @@ def run_full_analysis(
         if not articles and sym not in news_unavailable:
             news_empty.append(sym)
 
-    prog.emit("news", f"News window {lookback_days}d ending {as_of}: "
+    window_desc = ("overnight close→open" if news_filter == "overnight"
+                   else f"{lookback_days}d lookback")
+    prog.emit("news", f"News window ({window_desc}) ending {as_of}: "
                       f"{sum(len(v) for v in news_by_symbol.values())} articles")
 
     # "The source was down" and "the week was quiet" produce the same empty
@@ -808,6 +824,7 @@ def run_full_analysis(
             input_data_hash=ps.compute_data_hash(snapshot),
             content=json.dumps({
                 "as_of": as_of, "lookback_days": lookback_days,
+                "news_filter": news_filter,
                 "news_unavailable": news_unavailable,
                 "news_empty": news_empty,
                 "articles": snapshot,

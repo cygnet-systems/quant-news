@@ -399,6 +399,8 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
         cmd += ["--symbols", job["symbols_csv"]]
     if params.get("target"):
         cmd += ["--target", str(params["target"])]
+    if params.get("news_filter"):
+        cmd += ["--news-filter", str(params["news_filter"])]
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
     if params.get("lookback"):

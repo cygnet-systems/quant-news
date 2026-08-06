@@ -32,6 +32,11 @@ class NewsUnavailable(RuntimeError):
 # symbol's news window quietly freeze on the day it was first fetched.
 _HISTORICAL_NEWS_MAX_STALENESS_DAYS = 2
 
+# AV's server-side page ceiling, and a runaway guard on the cursor walk.
+# 10 pages x 1000 articles covers any realistic single-symbol window.
+_AV_PAGE_LIMIT = 1000
+_MAX_NEWS_PAGES = 10
+
 
 @dataclass
 class NewsArticle:
@@ -282,14 +287,17 @@ def fetch_alpha_vantage_news(
     sort: str = "LATEST",
     relevance_threshold: float = 0.5,
 ) -> list[NewsArticle]:
-    """Fetch news from Alpha Vantage News API.
+    """Fetch news from Alpha Vantage News API, paginating past the page cap.
 
-    Fetches up to 50 articles from the last 7 days and pre-filters by
-    ticker relevance score >= relevance_threshold to remove noise.
+    AV serves at most 1000 articles per request. Pages are walked newest-first
+    by moving ``time_to`` to just before the oldest article of the previous
+    page, so a busy window is no longer silently truncated — the old
+    single-request version capped every symbol at 50 articles and dropped the
+    oldest (earliest-catalyst) articles first.
 
     Args:
         symbol: Stock ticker symbol.
-        max_articles: Maximum number of articles to return (AV max is 50).
+        max_articles: Maximum articles to return AFTER relevance filtering.
         topics: Comma-separated topics to filter by.
         time_from: Start time in YYYYMMDDTHHMM format. Defaults to 7 days ago.
         time_to: End time in YYYYMMDDTHHMM format.
@@ -307,45 +315,75 @@ def fetch_alpha_vantage_news(
             seven_days_ago = datetime.now() - timedelta(days=7)
             time_from = seven_days_ago.strftime("%Y%m%dT0000")
 
-        params = {
-            "function": "NEWS_SENTIMENT",
-            "tickers": symbol.upper(),
-            "limit": min(max_articles, 50),
-            "apikey": API.ALPHA_VANTAGE_API_KEY,
-            "sort": sort,
-        }
-        if topics:
-            params["topics"] = topics
-        if time_from:
-            params["time_from"] = time_from
-        if time_to:
-            params["time_to"] = time_to
+        raw_items: list[dict] = []
+        seen_urls: set[str] = set()
+        page_time_to = time_to
+        # Pagination only walks backwards through LATEST-sorted pages; other
+        # sort orders get the single-request behaviour they always had.
+        paginate = sort == "LATEST"
 
-        response = requests.get(
-            API.ALPHA_VANTAGE_BASE_URL,
-            params=params,
-            timeout=API.DEFAULT_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
+        for _page in range(_MAX_NEWS_PAGES):
+            params = {
+                "function": "NEWS_SENTIMENT",
+                "tickers": symbol.upper(),
+                "limit": _AV_PAGE_LIMIT,
+                "apikey": API.ALPHA_VANTAGE_API_KEY,
+                "sort": sort,
+            }
+            if topics:
+                params["topics"] = topics
+            if time_from:
+                params["time_from"] = time_from
+            if page_time_to:
+                params["time_to"] = page_time_to
 
-        # Alpha Vantage signals throttling and bad requests with HTTP 200 and
-        # an explanatory body, so raise_for_status sees nothing wrong. Mapping
-        # that to an empty list is what made a rate-limited symbol look like a
-        # symbol with no news: the models then ran on nothing and the report
-        # stated there was no news, which reads as a finding rather than a gap.
-        for key in ("Note", "Information", "Error Message"):
-            if key in data:
-                raise NewsUnavailable(f"Alpha Vantage {key}: "
-                                      f"{str(data[key])[:200]}")
+            response = requests.get(
+                API.ALPHA_VANTAGE_BASE_URL,
+                params=params,
+                timeout=API.DEFAULT_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        if "feed" not in data:
-            raise NewsUnavailable(
-                "Alpha Vantage response contained no 'feed' key "
-                f"(keys: {sorted(data)[:6]})")
+            # Alpha Vantage signals throttling and bad requests with HTTP 200
+            # and an explanatory body, so raise_for_status sees nothing wrong.
+            # Mapping that to an empty list is what made a rate-limited symbol
+            # look like a symbol with no news: the models then ran on nothing
+            # and the report stated there was no news, which reads as a
+            # finding rather than a gap.
+            for key in ("Note", "Information", "Error Message"):
+                if key in data:
+                    raise NewsUnavailable(f"Alpha Vantage {key}: "
+                                          f"{str(data[key])[:200]}")
+
+            if "feed" not in data:
+                raise NewsUnavailable(
+                    "Alpha Vantage response contained no 'feed' key "
+                    f"(keys: {sorted(data)[:6]})")
+
+            feed = data["feed"]
+            new_items = [i for i in feed
+                         if i.get("url") and i["url"] not in seen_urls]
+            for item in new_items:
+                seen_urls.add(item["url"])
+            raw_items.extend(new_items)
+
+            # Last page: short page, nothing new, or pagination disabled.
+            if not paginate or len(feed) < _AV_PAGE_LIMIT or not new_items:
+                break
+            oldest = min((i.get("time_published", "") for i in new_items
+                          if i.get("time_published")), default="")
+            if len(oldest) < 13:
+                break
+            # Next page ends the minute before this page's oldest article.
+            cursor = (datetime.strptime(oldest[:13], "%Y%m%dT%H%M")
+                      - timedelta(minutes=1)).strftime("%Y%m%dT%H%M")
+            if time_from and cursor <= time_from:
+                break
+            page_time_to = cursor
 
         articles = []
-        for item in data["feed"]:
+        for item in raw_items:
             parsed = _parse_av_feed_item(item, symbol)
             if parsed is None:
                 continue
@@ -375,6 +413,10 @@ def fetch_alpha_vantage_news(
                 overall_sentiment_label=parsed["overall_sentiment_label"],
             ))
 
+        if len(articles) > max_articles:
+            logger.info(f"{symbol}: {len(articles)} relevant articles in "
+                        f"window, keeping newest {max_articles}")
+            articles = articles[:max_articles]
         return articles
 
     except NewsUnavailable:
@@ -677,7 +719,7 @@ def fetch_historical_av_news(
         try:
             params: dict = {
                 "function": "NEWS_SENTIMENT",
-                "limit": 200,
+                "limit": _AV_PAGE_LIMIT,
                 "apikey": API.ALPHA_VANTAGE_API_KEY,
                 "sort": "LATEST",
                 "time_from": time_from,
