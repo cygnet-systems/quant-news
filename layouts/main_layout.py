@@ -221,6 +221,14 @@ def create_layout() -> html.Div:
                                 html.Div(id="page-content", className="page-content"),
                                 type="circle",
                                 color="#00D4AA",
+                                # Loading renders its own wrapper div between
+                                # .shell-main and .page-content. Unstyled, that
+                                # div is not a stretching flex child, so
+                                # .page-content had no bounded height to scroll
+                                # within: overflow-y never engaged and
+                                # .shell-main's overflow:hidden simply clipped
+                                # everything past the fold.
+                                parent_className="page-loading-wrap",
                                 target_components={"page-content": "children"},
                                 overlay_style={"visibility": "visible",
                                                "opacity": 0.45},

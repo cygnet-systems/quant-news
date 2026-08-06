@@ -66,8 +66,19 @@ def scoreboard_rows(groups: list[dict], group_key: str) -> list[html.Tr]:
         pnl_cls = "positive" if pnl > 0 else "negative" if pnl < 0 else ""
         display = (MODEL_DISPLAY.get(g["name"], g["name"])
                    if group_key == "model_name" else g["name"])
+        # A symbol row is a question — "what did we actually call on this
+        # name, and when was it right?" — so make it the way to ask it.
+        first_cell = (
+            html.Button(
+                display,
+                id={"type": "perf-symbol-drill", "symbol": g["name"]},
+                className="perf-symbol-drill",
+                title=f"Show only {g['name']}: every call, its date and outcome",
+            )
+            if group_key == "symbol" else display
+        )
         rows.append(html.Tr([
-            html.Td(display),
+            html.Td(first_cell),
             # "35 · 4 held" rather than "35 of 39": the bare "of" left the
             # denominator ambiguous (of what? trades? days?). Naming the
             # second number makes it self-describing.

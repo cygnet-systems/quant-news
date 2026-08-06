@@ -4139,3 +4139,32 @@ body {
     border-bottom-color: currentColor;
     filter: brightness(1.15);
 }
+
+/* dcc.Loading's wrapper sits between .shell-main and .page-content. It has to
+   stretch and allow shrinking, or the scroll container below it is unbounded
+   and the page silently clips at the fold instead of scrolling. */
+.page-loading-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.page-loading-wrap > * {
+    min-height: 0;
+}
+
+.perf-symbol-drill {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text-primary, #FFFFFF);
+    font: inherit;
+    cursor: pointer;
+    border-bottom: 1px dotted rgba(255, 255, 255, 0.25);
+}
+
+.perf-symbol-drill:hover {
+    color: var(--accent-primary, #00D4AA);
+    border-bottom-color: var(--accent-primary, #00D4AA);
+}

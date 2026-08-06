@@ -679,6 +679,71 @@ def render_archive_body(history_data, filter_symbols, filter_range,
     return reports_page.body(data, filter_symbols, filter_range, filter_specific)
 
 
+def _performance_rows(f_symbols, f_range, f_specific, f_outcome) -> list[dict]:
+    """The prediction rows the Performance page is currently rendering.
+
+    Re-derived from the same helpers the page uses rather than scraped from
+    the DOM, so View Data and Export can never disagree with the table above
+    them.
+    """
+    from layouts.history_sections import filter_history_data
+    from layouts.pages.performance import _by_outcome
+
+    data = fetch_report_history(only={"predictions"})
+    preds = filter_history_data(data, f_symbols, f_range or "all",
+                                f_specific)["predictions"]
+    preds = _by_outcome(preds, f_outcome or "all")
+
+    keep = ("symbol", "model_name", "prediction_date", "target_date", "decision",
+            "confidence", "up_probability", "previous_close", "predicted_close",
+            "actual_close", "was_correct", "pnl_dollars")
+    return [{k: p.get(k) for k in keep} for p in preds]
+
+
+# Where the toolbar's data actions mean something. Everything else disables
+# them with a reason: a button that silently does nothing reads as broken,
+# and these two were wired to the Analyze stores on every page.
+_DATA_ACTION_PAGES = {
+    "/analyze": "the loaded price data, indicators and any run output",
+    "/performance": "the predictions in the current filter",
+}
+
+
+@callback(
+    Output("export-data-btn", "disabled"),
+    Output("export-data-btn", "title"),
+    Output("view-data-btn", "disabled"),
+    Output("view-data-btn", "title"),
+    Input("url", "pathname"),
+)
+def toggle_data_action_buttons(pathname):
+    """Enable View Data / Export only where there is data behind them."""
+    path = (pathname or "/").rstrip("/") or "/"
+    what = _DATA_ACTION_PAGES.get(path)
+    if not what:
+        reason = "Nothing to export on this page — open Analyze or Performance"
+        return True, reason, True, reason
+    return (False, f"Download {what}",
+            False, f"View {what} as a table")
+
+
+@callback(
+    Output("history-filter-symbols", "data", allow_duplicate=True),
+    Output("history-filter-outcome", "data", allow_duplicate=True),
+    Input({"type": "perf-symbol-drill", "symbol": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def drill_into_symbol(clicks):
+    """Narrow the page to one symbol: its calls, dates and outcomes.
+
+    Clears any outcome slice on the way in — arriving at a symbol filtered to
+    "wrong only" because of an earlier click would misrepresent its record.
+    """
+    if not clicks or not any(c for c in clicks if c):
+        raise PreventUpdate
+    return [ctx.triggered_id["symbol"]], "all"
+
+
 @callback(
     Output("history-filter-outcome", "data"),
     Input({"type": "perf-outcome-chip", "outcome": ALL}, "n_clicks"),
@@ -2181,14 +2246,42 @@ def update_signals_display(stock_data, symbols):
     Input("modal-close-btn", "n_clicks"),
     State("selected-symbols", "data"),
     State("data-modal", "is_open"),
+    State("url", "pathname"),
+    State("history-filter-symbols", "data"),
+    State("history-filter-date-range", "data"),
+    State("history-filter-date-specific", "data"),
+    State("history-filter-outcome", "data"),
     prevent_initial_call=True,
 )
-def toggle_data_modal(view_click, close_click, symbols, is_open):
-    """Toggle data modal and populate table."""
+def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
+                      f_symbols, f_range, f_specific, f_outcome):
+    """Show the rows behind whatever the current page is rendering.
+
+    The button used to read the Analyze page's stores wherever you clicked
+    it, so on Performance it reported "No stocks selected" and never opened —
+    a control that looked broken rather than inapplicable.
+    """
     triggered = ctx.triggered_id
 
     if triggered == "modal-close-btn":
         return False, dash.no_update
+
+    path = (pathname or "/").rstrip("/") or "/"
+
+    if triggered == "view-data-btn" and path == "/performance":
+        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome)
+        if not rows:
+            return True, html.Div("No predictions in the current filter",
+                                  className="text-muted")
+        import pandas as _pd
+        df = _pd.DataFrame(rows)
+        return True, html.Div([
+            html.Div(f"{len(df)} rows in scope · showing the first 200",
+                     className="scoreboard-summary"),
+            dbc.Table.from_dataframe(df.head(200), striped=True, bordered=True,
+                                     hover=True, responsive=True,
+                                     className="table-dark"),
+        ])
 
     if triggered == "view-data-btn":
         if not symbols:
@@ -2228,16 +2321,35 @@ def toggle_data_modal(view_click, close_click, symbols, is_open):
     State("model-signals-store", "data"),
     State("ai-analysis-store", "data"),
     State("recommendations-store", "data"),
+    State("url", "pathname"),
+    State("history-filter-symbols", "data"),
+    State("history-filter-date-range", "data"),
+    State("history-filter-date-specific", "data"),
+    State("history-filter-outcome", "data"),
     prevent_initial_call=True,
 )
 def export_data(export_click, modal_export_click, symbols, stock_data,
-                indicators, model_signals, ai_analysis, recommendations):
+                indicators, model_signals, ai_analysis, recommendations,
+                pathname, f_symbols, f_range, f_specific, f_outcome):
     """Export everything on screen as a multi-sheet .xlsx.
 
     Replaces the old single-symbol Parquet dump. Sheets are dynamic: prices
     (+ only the toggled indicators) per symbol, then Predictions / AI
     Analysis / Recommendations whenever those stores hold data.
     """
+    path = (pathname or "/").rstrip("/") or "/"
+    if path == "/performance":
+        # Export what the page is showing, filters and all — the scoreboard is
+        # the thing worth taking away from this page, not the Analyze stores.
+        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome)
+        if not rows:
+            raise PreventUpdate
+        import pandas as _pd
+        fname = f"quantnews_predictions_{datetime.now():%Y-%m-%d_%H%M}.csv"
+        from services import progress_service as prog
+        prog.emit("action", f"CSV export: {fname} ({len(rows)} rows)")
+        return dcc.send_data_frame(_pd.DataFrame(rows).to_csv, fname, index=False)
+
     if not symbols:
         raise PreventUpdate
 
@@ -3245,7 +3357,7 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
             style={"fontSize": "0.85rem", "lineHeight": "1.6"},
         ),
     ]
-    return dash.no_update, True, title, body
+    return True, title, body
 
 
 # =============================================================================
