@@ -17,6 +17,16 @@ from config import API
 
 logger = logging.getLogger(__name__)
 
+
+class NewsUnavailable(RuntimeError):
+    """The news source could not be reached or refused the request.
+
+    Distinct from "the window genuinely contains no articles". Callers that
+    cannot tell the two apart end up reporting a vendor outage as a quiet
+    news week.
+    """
+
+
 # How far behind the window end the cached training news may fall before it is
 # refetched. Two days absorbs a weekend with no coverage without letting a
 # symbol's news window quietly freeze on the day it was first fetched.
@@ -178,7 +188,10 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
 
         return articles
 
-    except Exception:
+    except Exception as e:
+        # Lenient on purpose: this is the fallback source. Its caller raises
+        # the primary source's NewsUnavailable when both come back empty.
+        logger.warning("%s: yfinance news failed: %s", symbol, e)
         return []
 
 
@@ -287,7 +300,7 @@ def fetch_alpha_vantage_news(
         List of NewsArticle objects with sentiment data, pre-filtered by relevance.
     """
     if not API.ALPHA_VANTAGE_API_KEY:
-        return []
+        raise NewsUnavailable("no Alpha Vantage API key configured")
 
     try:
         if not time_from:
@@ -316,8 +329,20 @@ def fetch_alpha_vantage_news(
         response.raise_for_status()
         data = response.json()
 
+        # Alpha Vantage signals throttling and bad requests with HTTP 200 and
+        # an explanatory body, so raise_for_status sees nothing wrong. Mapping
+        # that to an empty list is what made a rate-limited symbol look like a
+        # symbol with no news: the models then ran on nothing and the report
+        # stated there was no news, which reads as a finding rather than a gap.
+        for key in ("Note", "Information", "Error Message"):
+            if key in data:
+                raise NewsUnavailable(f"Alpha Vantage {key}: "
+                                      f"{str(data[key])[:200]}")
+
         if "feed" not in data:
-            return []
+            raise NewsUnavailable(
+                "Alpha Vantage response contained no 'feed' key "
+                f"(keys: {sorted(data)[:6]})")
 
         articles = []
         for item in data["feed"]:
@@ -352,8 +377,11 @@ def fetch_alpha_vantage_news(
 
         return articles
 
-    except Exception:
-        return []
+    except NewsUnavailable:
+        raise
+    except Exception as e:
+        # A transport or parse failure is not "there is no news" either.
+        raise NewsUnavailable(f"{type(e).__name__}: {e}") from e
 
 
 def _get_stock_price_change(symbol: str) -> Optional[float]:
@@ -406,20 +434,30 @@ def fetch_news(
     articles: list[NewsArticle] = []
 
     # Try Alpha Vantage first (has sentiment)
+    av_error = None
     if prefer_alpha_vantage and API.ALPHA_VANTAGE_API_KEY:
-        articles = fetch_alpha_vantage_news(
-            symbol,
-            max_articles,
-            topics=topics,
-            time_from=time_from,
-            time_to=time_to,
-            sort=sort,
-            relevance_threshold=relevance_threshold,
-        )
+        try:
+            articles = fetch_alpha_vantage_news(
+                symbol,
+                max_articles,
+                topics=topics,
+                time_from=time_from,
+                time_to=time_to,
+                sort=sort,
+                relevance_threshold=relevance_threshold,
+            )
+        except NewsUnavailable as e:
+            # Named, not swallowed: falling back is fine, pretending the
+            # primary source said "no news" is not.
+            av_error = e
+            logger.warning("%s: Alpha Vantage unavailable (%s), "
+                           "falling back to yfinance", symbol, e)
 
     # Fallback to yfinance if no results
     if not articles:
         articles = fetch_yfinance_news(symbol, max_articles)
+        if not articles and av_error is not None:
+            raise av_error
 
     # Fetch current stock price change if requested
     if include_price_change and articles:

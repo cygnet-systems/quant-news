@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import date as date_cls
 from datetime import datetime
 from io import StringIO
@@ -711,16 +712,54 @@ def run_full_analysis(
         prog.finish_run("Full Analysis aborted — no price data")
         return {"error": "no price data", "symbols": symbols}
 
+    from services.news_service import NewsUnavailable
+
     news_by_symbol: dict[str, list] = {}
+    news_unavailable: list[str] = []   # the source failed
+    news_empty: list[str] = []         # the source answered, with nothing
+
     for sym in priced:
-        try:
-            articles = fetch_point_in_time_news(sym, as_of, lookback_days=lookback_days)
-            news_by_symbol[sym] = [_article_dict(a) for a in articles]
-        except Exception as e:
-            logger.warning(f"{sym}: point-in-time news fetch failed: {e}")
-            news_by_symbol[sym] = []
+        articles = []
+        # Retry with backoff: the vendor throttles, and a loop over a whole
+        # watchlist is exactly the shape that trips it. Only NewsUnavailable
+        # is retried; a genuine empty window is not a failure to retry.
+        for attempt in (1, 2, 3):
+            try:
+                articles = fetch_point_in_time_news(
+                    sym, as_of, lookback_days=lookback_days)
+                break
+            except NewsUnavailable as e:
+                logger.warning("%s: news unavailable (attempt %d/3): %s",
+                               sym, attempt, e)
+                if attempt == 3:
+                    news_unavailable.append(sym)
+                else:
+                    time.sleep(2.0 * attempt)
+            except Exception as e:
+                logger.warning("%s: point-in-time news fetch failed: %s", sym, e)
+                news_unavailable.append(sym)
+                break
+
+        news_by_symbol[sym] = [_article_dict(a) for a in articles]
+        if not articles and sym not in news_unavailable:
+            news_empty.append(sym)
+
     prog.emit("news", f"News window {lookback_days}d ending {as_of}: "
                       f"{sum(len(v) for v in news_by_symbol.values())} articles")
+
+    # "The source was down" and "the week was quiet" produce the same empty
+    # list but mean opposite things, so they are reported separately. Without
+    # this the models run on nothing and the report presents the hole as a
+    # finding ("no company-specific news to confirm the technicals").
+    if news_unavailable:
+        prog.emit("error",
+                  f"News source unavailable for {len(news_unavailable)} of "
+                  f"{len(priced)} symbols: {', '.join(news_unavailable)}. "
+                  f"Their sentiment and research models ran WITHOUT news; "
+                  f"treat those calls as unsupported, not as bearish-neutral.")
+    if news_empty:
+        prog.emit("news", f"No articles in window for: {', '.join(news_empty)} "
+                          f"(source responded; the window is genuinely empty)")
 
     signals = run_predictions(
         priced, stock_data, news_by_symbol,

@@ -4168,3 +4168,22 @@ body {
     color: var(--accent-primary, #00D4AA);
     border-bottom-color: var(--accent-primary, #00D4AA);
 }
+
+/* The outcome chips change the log far below them, so they have to stay in
+   view: clicking "wrong" and seeing nothing move is indistinguishable from a
+   dead control. Sticky within .page-content, which is the scroll container. */
+.history-eval-bar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg-primary, #0d0d0d);
+    padding-top: var(--space-2, 8px);
+    padding-bottom: var(--space-2, 8px);
+}
+
+.history-log-truncated {
+    padding: var(--space-3, 12px);
+    color: var(--text-secondary, #9aa0a6);
+    font-size: 0.85rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}

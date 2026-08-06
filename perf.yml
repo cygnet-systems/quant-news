@@ -1,0 +1,718 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e4]:
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - generic [ref=e8]: 
+        - text: Pipeline Activity500 events
+        - generic [ref=e10]:
+          - button "" [ref=e11] [cursor=pointer]
+          - button "" [ref=e13] [cursor=pointer]
+          - button "" [ref=e15] [cursor=pointer]
+      - generic [ref=e17]:
+        - generic [ref=e18]:
+          - text: 11:01:34
+          - generic [ref=e19]: 
+          - text: "Overall: synthesizing 597 articles across 20 symbols (gpt-5.6-luna)…"
+        - generic [ref=e20]:
+          - text: 11:01:44
+          - generic [ref=e21]: 
+          - text: Luna (claude-sonnet-5) synthesizing 20 symbols…
+        - generic [ref=e22]:
+          - text: 11:02:55
+          - generic [ref=e23]: 
+          - text: Luna finished — PANW=HOLD, BAC=BUY, VZ=HOLD, HWM=BUY, DOC=HOLD, HPQ=HOLD, LUV=HOLD, TPL=SELL, MPWR=BUY, MCD=SELL, ROP=HOLD, ETR=HOLD, CMS=SELL, XYZ=HOLD, HIG=HOLD, IP=HOLD, FLEX=BUY, MET=BUY, FIS=SELL, TYL=HOLD
+        - generic [ref=e24]:
+          - text: 11:02:55
+          - generic [ref=e25]: 
+          - text: Full Analysis complete (scheduled)
+        - generic [ref=e26]:
+          - text: 11:06:19
+          - generic [ref=e27]: 
+          - text: "Scheduled job started: daily_evaluation (manual)"
+        - generic [ref=e28]:
+          - text: 11:06:24
+          - generic [ref=e29]: 
+          - text: "Scheduled evaluation: 0 predictions scored"
+        - generic [ref=e30]:
+          - text: 11:06:27
+          - generic [ref=e31]: 
+          - text: "Strategy evaluation: 42 new evaluations"
+        - generic [ref=e32]:
+          - text: 11:06:28
+          - generic [ref=e33]: 
+          - text: "Scheduled job daily_evaluation: success in 8s"
+        - generic [ref=e34]:
+          - text: 11:25:54
+          - generic [ref=e35]: 
+          - text: "Scheduled job started: daily_evaluation (manual)"
+        - generic [ref=e36]:
+          - text: 11:25:59
+          - generic [ref=e37]: 
+          - text: "Scheduled evaluation: 0 predictions scored"
+        - generic [ref=e38]:
+          - text: 11:26:01
+          - generic [ref=e39]: 
+          - text: "Scheduled job daily_evaluation: success in 6s"
+        - generic [ref=e40]:
+          - text: 16:24:52
+          - generic [ref=e41]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e42]:
+          - text: 16:25:55
+          - generic [ref=e43]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e44]:
+          - text: 16:27:37
+          - generic [ref=e45]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e46]:
+          - text: 16:48:25
+          - generic [ref=e47]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA, AMD, INTC (selection: AAPL, MSFT, NVDA, AMD, INTC)"
+        - generic [ref=e48]:
+          - text: 16:49:42
+          - generic [ref=e49]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e50]:
+          - text: 18:58:17
+          - generic [ref=e51]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e52]:
+          - text: 19:03:23
+          - generic [ref=e53]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e54]:
+          - text: 19:07:24
+          - generic [ref=e55]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e56]:
+          - text: 19:09:55
+          - generic [ref=e57]: 
+          - text: "Symbol removed: IBM"
+        - generic [ref=e58]:
+          - text: 19:09:57
+          - generic [ref=e59]: 
+          - text: "Recent group restored: AAPL, AMD, INTC, MSFT, NVDA"
+        - generic [ref=e60]:
+          - text: 19:12:39
+          - generic [ref=e61]: 
+          - text: "Restored past search: AAPL, AMD, INTC, MSFT, NVDA"
+        - generic [ref=e62]:
+          - text: 19:17:41
+          - generic [ref=e63]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e64]:
+          - text: 19:22:37
+          - generic [ref=e65]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e66]:
+          - text: 19:29:51
+          - generic [ref=e67]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e68]:
+          - text: 19:32:27
+          - generic [ref=e69]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e70]:
+          - text: 19:36:48
+          - generic [ref=e71]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e72]:
+          - text: 19:39:26
+          - generic [ref=e73]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e74]:
+          - text: 22:33:57
+          - generic [ref=e75]: 
+          - text: Symbols cleared (AAPL, AMD, INTC, MSFT, NVDA)
+        - generic [ref=e76]:
+          - text: 23:09:25
+          - generic [ref=e77]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e78]:
+          - text: 23:12:31
+          - generic [ref=e79]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e80]:
+          - text: 23:14:58
+          - generic [ref=e81]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e82]:
+          - text: 23:32:10
+          - generic [ref=e83]: 
+          - text: "Symbol search: added AAPL (selection: AAPL)"
+        - generic [ref=e84]:
+          - text: 23:38:01
+          - generic [ref=e85]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e86]:
+          - text: 23:40:52
+          - generic [ref=e87]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+        - generic [ref=e88]:
+          - text: 00:09:20
+          - generic [ref=e89]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e90]:
+          - text: 00:09:22
+          - generic [ref=e91]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e92]:
+          - text: 00:13:23
+          - generic [ref=e93]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e94]:
+          - text: 00:16:27
+          - generic [ref=e95]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e96]:
+          - text: 00:16:32
+          - generic [ref=e97]: 
+          - text: "Report viewed: MET 2026-08-04"
+        - generic [ref=e98]:
+          - text: 00:17:07
+          - generic [ref=e99]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e100]:
+          - text: 00:18:29
+          - generic [ref=e101]: 
+          - text: "Report viewed: TYL 2026-08-04"
+        - generic [ref=e102]:
+          - text: 00:18:33
+          - generic [ref=e103]: 
+          - text: "Report viewed: MET 2026-08-04"
+        - generic [ref=e104]:
+          - text: 00:23:11
+          - generic [ref=e105]: 
+          - text: "Symbol search: added AAPL, MSFT, NVDA (selection: AAPL, MSFT, NVDA)"
+        - generic [ref=e106]:
+          - text: 00:25:59
+          - generic [ref=e107]: 
+          - text: "Restored past search: AAPL, MSFT, NVDA"
+    - text: 
+    - generic [ref=e108]:
+      - generic [ref=e109]:
+        - generic [ref=e110]: QuantNewsStock analysis
+        - generic [ref=e111]:
+          - link " Home" [ref=e112] [cursor=pointer]:
+            - /url: /
+            - generic [ref=e113]: 
+            - text: Home
+          - link " Analyze" [ref=e114] [cursor=pointer]:
+            - /url: /analyze
+            - generic [ref=e115]: 
+            - text: Analyze
+          - link " Performance" [ref=e116] [cursor=pointer]:
+            - /url: /performance
+            - generic [ref=e117]: 
+            - text: Performance
+          - link " Reports" [ref=e118] [cursor=pointer]:
+            - /url: /reports
+            - generic [ref=e119]: 
+            - text: Reports
+          - link " Schedule" [ref=e120] [cursor=pointer]:
+            - /url: /schedule
+            - generic [ref=e121]: 
+            - text: Schedule
+          - link " Activity" [ref=e122] [cursor=pointer]:
+            - /url: /activity
+            - generic [ref=e123]: 
+            - text: Activity
+        - generic [ref=e124]:
+          - generic [ref=e125]:
+            - generic [ref=e126]: Cache
+            - generic [ref=e127]: No data
+            - checkbox [checked] [ref=e129]
+          - button " Sign in" [ref=e131] [cursor=pointer]:
+            - generic [ref=e132]: 
+            - text: Sign in
+      - generic [ref=e133]:
+        - generic [ref=e134]:
+          - heading "Performance" [level=1] [ref=e136]
+          - generic [ref=e137]:
+            - button " Watchlist" [ref=e138] [cursor=pointer]:
+              - generic [ref=e139]: 
+              - text: Watchlist
+            - group [ref=e140]:
+              - button "1D" [ref=e141] [cursor=pointer]
+              - button "3D" [ref=e142] [cursor=pointer]
+              - button "1W" [ref=e143] [cursor=pointer]
+              - button "2W" [ref=e144] [cursor=pointer]
+              - button "3W" [ref=e145] [cursor=pointer]
+              - button "1M" [ref=e146] [cursor=pointer]
+              - button "3M" [ref=e147] [cursor=pointer]
+              - button "6M" [ref=e148] [cursor=pointer]
+              - button "YTD" [ref=e149] [cursor=pointer]
+              - button "1Y" [ref=e150] [cursor=pointer]
+              - button "2Y" [ref=e151] [cursor=pointer]
+              - button "5Y" [ref=e152] [cursor=pointer]
+            - generic [ref=e153]:
+              - button " Refresh" [ref=e154] [cursor=pointer]:
+                - generic [ref=e155]: 
+                - text: Refresh
+              - button " Export" [ref=e156] [cursor=pointer]:
+                - generic [ref=e157]: 
+                - text: Export
+              - button " View Data" [ref=e158] [cursor=pointer]:
+                - generic [ref=e159]: 
+                - text: View Data
+              - button " Run analysis" [ref=e160] [cursor=pointer]:
+                - generic [ref=e161]: 
+                - text: Run analysis
+        - text:  
+        - generic [ref=e165]:
+          - generic [ref=e166]:
+            - generic [ref=e168]:
+              - textbox
+              - button "Filter by symbol..." [ref=e169] [cursor=pointer]
+            - generic [ref=e174]:
+              - text: "Recent:"
+              - generic [ref=e175]:
+                - button "BAC" [ref=e176] [cursor=pointer]
+                - button "CMS" [ref=e177] [cursor=pointer]
+                - button "DOC" [ref=e178] [cursor=pointer]
+                - button "ETR" [ref=e179] [cursor=pointer]
+                - button "FIS" [ref=e180] [cursor=pointer]
+            - generic [ref=e181]:
+              - generic [ref=e182]:
+                - text: "Date:"
+                - textbox "2026-08-05" [ref=e186]
+              - group [ref=e190]:
+                - button "Today" [ref=e191] [cursor=pointer]
+                - button "7d" [ref=e192] [cursor=pointer]
+                - button "30d" [ref=e193] [cursor=pointer]
+                - button "90d" [ref=e194] [cursor=pointer]
+                - button "All" [ref=e195] [cursor=pointer]
+          - generic [ref=e196]:
+            - generic [ref=e197]:
+              - generic [ref=e198]:
+                - generic [ref=e199]:
+                  - button "140 awaiting their target session close" [ref=e200] [cursor=pointer]
+                  - button "378 right" [ref=e201] [cursor=pointer]
+                  - button "368 wrong" [ref=e202] [cursor=pointer]
+                  - button "Show all" [ref=e203] [cursor=pointer]
+                - button " Evaluate pending" [ref=e204] [cursor=pointer]:
+                  - generic [ref=e205]: 
+                  - text: Evaluate pending
+              - generic [ref=e206]: 746 scored predictions · 37 symbols · sessions 2026-07-14 to 2026-08-04
+              - generic [ref=e207]:
+                - generic [ref=e208]: Trades counts BUY/SELL only. Each takes a fixed $1,000 notional position, held one session and closed at the next close. HOLD days take no position, score $0, and are excluded from hit rate.
+                - generic [ref=e209]: "Hit rate against average confidence shows calibration: a model claiming 70% should be right about 70% of the time."
+              - generic [ref=e210]: By model
+              - table [ref=e212]:
+                - rowgroup [ref=e213]:
+                  - row [ref=e214]:
+                    - columnheader "Model" [ref=e215]
+                    - columnheader "Trades" [ref=e216]
+                    - columnheader "Hit Rate" [ref=e217]
+                    - columnheader "Avg Conf" [ref=e218]
+                    - columnheader "P&L" [ref=e219]
+                    - columnheader "$/Trade" [ref=e220]
+                - rowgroup [ref=e221]:
+                  - row [ref=e222]:
+                    - cell "DeBERTa Sentiment" [ref=e223]
+                    - cell [ref=e224]:
+                      - strong [ref=e226]: "48"
+                    - cell "50%" [ref=e227]
+                    - cell "26%" [ref=e228]
+                    - cell "$+186.98" [ref=e229]
+                    - cell "$+3.90" [ref=e230]
+                  - row [ref=e231]:
+                    - cell "Ensemble" [ref=e232]
+                    - cell [ref=e233]:
+                      - strong [ref=e235]: "97"
+                    - cell "53%" [ref=e236]
+                    - cell "56%" [ref=e237]
+                    - cell "$-82.47" [ref=e238]
+                    - cell "$-0.85" [ref=e239]
+                  - row [ref=e240]:
+                    - cell "Kronos" [ref=e241]
+                    - cell [ref=e242]:
+                      - strong [ref=e244]: "112"
+                    - cell "45%" [ref=e245]
+                    - cell "74%" [ref=e246]
+                    - cell "$-162.05" [ref=e247]
+                    - cell "$-1.45" [ref=e248]
+                  - row [ref=e249]:
+                    - cell "LightGBM" [ref=e250]
+                    - cell [ref=e251]:
+                      - strong [ref=e253]: "119"
+                    - cell "55%" [ref=e254]
+                    - cell "72%" [ref=e255]
+                    - cell "$+154.37" [ref=e256]
+                    - cell "$+1.30" [ref=e257]
+                  - row [ref=e258]:
+                    - cell "Recommendations (LLM)" [ref=e259]
+                    - cell [ref=e260]:
+                      - strong [ref=e262]: "8"
+                    - cell "75%" [ref=e263]
+                    - cell "56%" [ref=e264]
+                    - cell "$+190.17" [ref=e265]
+                    - cell "$+23.77" [ref=e266]
+                  - row [ref=e267]:
+                    - cell "TradingAgents" [ref=e268]
+                    - cell [ref=e269]:
+                      - strong [ref=e271]: "15"
+                    - cell "67%" [ref=e272]
+                    - cell "56%" [ref=e273]
+                    - cell "$+258.56" [ref=e274]
+                    - cell "$+17.24" [ref=e275]
+                  - row [ref=e276]:
+                    - cell "XGBoost SHAP" [ref=e277]
+                    - cell [ref=e278]:
+                      - strong [ref=e280]: "125"
+                    - cell "54%" [ref=e281]
+                    - cell "70%" [ref=e282]
+                    - cell "$+122.67" [ref=e283]
+                    - cell "$+0.98" [ref=e284]
+              - generic [ref=e285]: By symbol
+              - table [ref=e287]:
+                - rowgroup [ref=e288]:
+                  - row [ref=e289]:
+                    - columnheader "Symbol" [ref=e290]
+                    - columnheader "Trades" [ref=e291]
+                    - columnheader "Hit Rate" [ref=e292]
+                    - columnheader "Avg Conf" [ref=e293]
+                    - columnheader "P&L" [ref=e294]
+                    - columnheader "$/Trade" [ref=e295]
+                - rowgroup [ref=e296]:
+                  - row [ref=e297]:
+                    - cell [ref=e298]:
+                      - button "ALRM" [ref=e299] [cursor=pointer]
+                    - cell [ref=e300]:
+                      - strong [ref=e302]: "15"
+                    - cell "80%" [ref=e303]
+                    - cell "61%" [ref=e304]
+                    - cell "$+102.72" [ref=e305]
+                    - cell "$+6.85" [ref=e306]
+                  - row [ref=e307]:
+                    - cell [ref=e308]:
+                      - button "AMBA" [ref=e309] [cursor=pointer]
+                    - cell [ref=e310]:
+                      - strong [ref=e312]: "20"
+                    - cell "55%" [ref=e313]
+                    - cell "56%" [ref=e314]
+                    - cell "$+75.28" [ref=e315]
+                    - cell "$+3.76" [ref=e316]
+                  - row [ref=e317]:
+                    - cell [ref=e318]:
+                      - button "AVA" [ref=e319] [cursor=pointer]
+                    - cell [ref=e320]:
+                      - strong [ref=e322]: "18"
+                    - cell "61%" [ref=e323]
+                    - cell "60%" [ref=e324]
+                    - cell "$-10.94" [ref=e325]
+                    - cell "$-0.61" [ref=e326]
+                  - row [ref=e327]:
+                    - cell [ref=e328]:
+                      - button "BANR" [ref=e329] [cursor=pointer]
+                    - cell [ref=e330]:
+                      - strong [ref=e332]: "18"
+                    - cell "39%" [ref=e333]
+                    - cell "70%" [ref=e334]
+                    - cell "$-7.71" [ref=e335]
+                    - cell "$-0.43" [ref=e336]
+                  - row [ref=e337]:
+                    - cell [ref=e338]:
+                      - button "CAKE" [ref=e339] [cursor=pointer]
+                    - cell [ref=e340]:
+                      - strong [ref=e342]: "16"
+                    - cell "69%" [ref=e343]
+                    - cell "61%" [ref=e344]
+                    - cell "$+130.00" [ref=e345]
+                    - cell "$+8.13" [ref=e346]
+                  - row [ref=e347]:
+                    - cell [ref=e348]:
+                      - button "CPRX" [ref=e349] [cursor=pointer]
+                    - cell [ref=e350]:
+                      - strong [ref=e352]: "14"
+                    - cell "50%" [ref=e353]
+                    - cell "58%" [ref=e354]
+                    - cell "$+0.16" [ref=e355]
+                    - cell "$+0.01" [ref=e356]
+                  - row [ref=e357]:
+                    - cell [ref=e358]:
+                      - button "CRK" [ref=e359] [cursor=pointer]
+                    - cell [ref=e360]:
+                      - strong [ref=e362]: "16"
+                    - cell "19%" [ref=e363]
+                    - cell "66%" [ref=e364]
+                    - cell "$-53.58" [ref=e365]
+                    - cell "$-3.35" [ref=e366]
+                  - row [ref=e367]:
+                    - cell [ref=e368]:
+                      - button "DEA" [ref=e369] [cursor=pointer]
+                    - cell [ref=e370]:
+                      - strong [ref=e372]: "11"
+                    - cell "55%" [ref=e373]
+                    - cell "54%" [ref=e374]
+                    - cell "$+11.07" [ref=e375]
+                    - cell "$+1.01" [ref=e376]
+                  - row [ref=e377]:
+                    - cell [ref=e378]:
+                      - button "EIX" [ref=e379] [cursor=pointer]
+                    - cell [ref=e380]:
+                      - strong [ref=e382]: "4"
+                    - cell "75%" [ref=e383]
+                    - cell "52%" [ref=e384]
+                    - cell "$+16.06" [ref=e385]
+                    - cell "$+4.01" [ref=e386]
+                  - row [ref=e387]:
+                    - cell [ref=e388]:
+                      - button "EPAM" [ref=e389] [cursor=pointer]
+                    - cell [ref=e390]:
+                      - strong [ref=e392]: "14"
+                    - cell "21%" [ref=e393]
+                    - cell "60%" [ref=e394]
+                    - cell "$-65.02" [ref=e395]
+                    - cell "$-4.64" [ref=e396]
+                  - row [ref=e397]:
+                    - cell [ref=e398]:
+                      - button "GVA" [ref=e399] [cursor=pointer]
+                    - cell [ref=e400]:
+                      - strong [ref=e402]: "13"
+                    - cell "54%" [ref=e403]
+                    - cell "53%" [ref=e404]
+                    - cell "$+43.00" [ref=e405]
+                    - cell "$+3.31" [ref=e406]
+                  - row [ref=e407]:
+                    - cell [ref=e408]:
+                      - button "HCC" [ref=e409] [cursor=pointer]
+                    - cell [ref=e410]:
+                      - strong [ref=e412]: "16"
+                    - cell "31%" [ref=e413]
+                    - cell "64%" [ref=e414]
+                    - cell "$-115.52" [ref=e415]
+                    - cell "$-7.22" [ref=e416]
+                  - row [ref=e417]:
+                    - cell [ref=e418]:
+                      - button "IBM" [ref=e419] [cursor=pointer]
+                    - cell [ref=e420]:
+                      - strong [ref=e422]: "4"
+                    - cell "50%" [ref=e423]
+                    - cell "49%" [ref=e424]
+                    - cell "$+0.00" [ref=e425]
+                    - cell "$+0.00" [ref=e426]
+                  - row [ref=e427]:
+                    - cell [ref=e428]:
+                      - button "IMAX" [ref=e429] [cursor=pointer]
+                    - cell [ref=e430]:
+                      - strong [ref=e432]: "7"
+                    - cell "57%" [ref=e433]
+                    - cell "44%" [ref=e434]
+                    - cell "$+0.72" [ref=e435]
+                    - cell "$+0.10" [ref=e436]
+                  - row [ref=e437]:
+                    - cell [ref=e438]:
+                      - button "IOSP" [ref=e439] [cursor=pointer]
+                    - cell [ref=e440]:
+                      - strong [ref=e442]: "13"
+                    - cell "62%" [ref=e443]
+                    - cell "55%" [ref=e444]
+                    - cell "$+87.00" [ref=e445]
+                    - cell "$+6.69" [ref=e446]
+                  - row [ref=e447]:
+                    - cell [ref=e448]:
+                      - button "IOVA" [ref=e449] [cursor=pointer]
+                    - cell [ref=e450]:
+                      - strong [ref=e452]: "23"
+                    - cell "52%" [ref=e453]
+                    - cell "71%" [ref=e454]
+                    - cell "$-715.59" [ref=e455]
+                    - cell "$-31.11" [ref=e456]
+                  - row [ref=e457]:
+                    - cell [ref=e458]:
+                      - button "LXP" [ref=e459] [cursor=pointer]
+                    - cell [ref=e460]:
+                      - strong [ref=e462]: "14"
+                    - cell "29%" [ref=e463]
+                    - cell "58%" [ref=e464]
+                    - cell "$-50.19" [ref=e465]
+                    - cell "$-3.59" [ref=e466]
+                  - row [ref=e467]:
+                    - cell [ref=e468]:
+                      - button "NMIH" [ref=e469] [cursor=pointer]
+                    - cell [ref=e470]:
+                      - strong [ref=e472]: "15"
+                    - cell "47%" [ref=e473]
+                    - cell "58%" [ref=e474]
+                    - cell "$-89.95" [ref=e475]
+                    - cell "$-6.00" [ref=e476]
+                  - row [ref=e477]:
+                    - cell [ref=e478]:
+                      - button "NVDA" [ref=e479] [cursor=pointer]
+                    - cell [ref=e480]:
+                      - strong [ref=e482]: "5"
+                    - cell "20%" [ref=e483]
+                    - cell "69%" [ref=e484]
+                    - cell "$-121.90" [ref=e485]
+                    - cell "$-24.38" [ref=e486]
+                  - row [ref=e487]:
+                    - cell [ref=e488]:
+                      - button "OMCL" [ref=e489] [cursor=pointer]
+                    - cell [ref=e490]:
+                      - strong [ref=e492]: "18"
+                    - cell "44%" [ref=e493]
+                    - cell "69%" [ref=e494]
+                    - cell "$+47.88" [ref=e495]
+                    - cell "$+2.66" [ref=e496]
+                  - row [ref=e497]:
+                    - cell [ref=e498]:
+                      - button "PANW" [ref=e499] [cursor=pointer]
+                    - cell [ref=e500]:
+                      - strong [ref=e502]: "13"
+                    - cell "77%" [ref=e503]
+                    - cell "52%" [ref=e504]
+                    - cell "$+350.45" [ref=e505]
+                    - cell "$+26.96" [ref=e506]
+                  - row [ref=e507]:
+                    - cell [ref=e508]:
+                      - button "PD" [ref=e509] [cursor=pointer]
+                    - cell [ref=e510]:
+                      - strong [ref=e512]: "18"
+                    - cell "72%" [ref=e513]
+                    - cell "65%" [ref=e514]
+                    - cell "$+205.20" [ref=e515]
+                    - cell "$+11.40" [ref=e516]
+                  - row [ref=e517]:
+                    - cell [ref=e518]:
+                      - button "PLAB" [ref=e519] [cursor=pointer]
+                    - cell [ref=e520]:
+                      - strong [ref=e522]: "17"
+                    - cell "53%" [ref=e523]
+                    - cell "69%" [ref=e524]
+                    - cell "$+69.16" [ref=e525]
+                    - cell "$+4.07" [ref=e526]
+                  - row [ref=e527]:
+                    - cell [ref=e528]:
+                      - button "PLAY" [ref=e529] [cursor=pointer]
+                    - cell [ref=e530]:
+                      - strong [ref=e532]: "15"
+                    - cell "40%" [ref=e533]
+                    - cell "58%" [ref=e534]
+                    - cell "$-175.46" [ref=e535]
+                    - cell "$-11.70" [ref=e536]
+                  - row [ref=e537]:
+                    - cell [ref=e538]:
+                      - button "REX" [ref=e539] [cursor=pointer]
+                    - cell [ref=e540]:
+                      - strong [ref=e542]: "18"
+                    - cell "72%" [ref=e543]
+                    - cell "60%" [ref=e544]
+                    - cell "$+118.64" [ref=e545]
+                    - cell "$+6.59" [ref=e546]
+                  - row [ref=e547]:
+                    - cell [ref=e548]:
+                      - button "ROAD" [ref=e549] [cursor=pointer]
+                    - cell [ref=e550]:
+                      - strong [ref=e552]: "15"
+                    - cell "47%" [ref=e553]
+                    - cell "60%" [ref=e554]
+                    - cell "$+254.38" [ref=e555]
+                    - cell "$+16.96" [ref=e556]
+                  - row [ref=e557]:
+                    - cell [ref=e558]:
+                      - button "SM" [ref=e559] [cursor=pointer]
+                    - cell [ref=e560]:
+                      - strong [ref=e562]: "18"
+                    - cell "33%" [ref=e563]
+                    - cell "75%" [ref=e564]
+                    - cell "$-111.37" [ref=e565]
+                    - cell "$-6.19" [ref=e566]
+                  - row [ref=e567]:
+                    - cell [ref=e568]:
+                      - button "SMTC" [ref=e569] [cursor=pointer]
+                    - cell [ref=e570]:
+                      - strong [ref=e572]: "13"
+                    - cell "46%" [ref=e573]
+                    - cell "56%" [ref=e574]
+                    - cell "$+11.10" [ref=e575]
+                    - cell "$+0.85" [ref=e576]
+                  - row [ref=e577]:
+                    - cell [ref=e578]:
+                      - button "SSTK" [ref=e579] [cursor=pointer]
+                    - cell [ref=e580]:
+                      - strong [ref=e582]: "17"
+                    - cell "65%" [ref=e583]
+                    - cell "58%" [ref=e584]
+                    - cell "$+239.55" [ref=e585]
+                    - cell "$+14.09" [ref=e586]
+                  - row [ref=e587]:
+                    - cell [ref=e588]:
+                      - button "SUPN" [ref=e589] [cursor=pointer]
+                    - cell [ref=e590]:
+                      - strong [ref=e592]: "17"
+                    - cell "65%" [ref=e593]
+                    - cell "68%" [ref=e594]
+                    - cell "$+4.94" [ref=e595]
+                    - cell "$+0.29" [ref=e596]
+                  - row [ref=e597]:
+                    - cell [ref=e598]:
+                      - button "SXC" [ref=e599] [cursor=pointer]
+                    - cell [ref=e600]:
+                      - strong [ref=e602]: "12"
+                    - cell "42%" [ref=e603]
+                    - cell "46%" [ref=e604]
+                    - cell "$-5.68" [ref=e605]
+                    - cell "$-0.47" [ref=e606]
+                  - row [ref=e607]:
+                    - cell [ref=e608]:
+                      - button "TSLA" [ref=e609] [cursor=pointer]
+                    - cell [ref=e610]:
+                      - strong [ref=e612]: "5"
+                    - cell "20%" [ref=e613]
+                    - cell "65%" [ref=e614]
+                    - cell "$-36.51" [ref=e615]
+                    - cell "$-7.30" [ref=e616]
+                  - row [ref=e617]:
+                    - cell [ref=e618]:
+                      - button "UE" [ref=e619] [cursor=pointer]
+                    - cell [ref=e620]:
+                      - strong [ref=e622]: "14"
+                    - cell "71%" [ref=e623]
+                    - cell "65%" [ref=e624]
+                    - cell "$+114.55" [ref=e625]
+                    - cell "$+8.18" [ref=e626]
+                  - row [ref=e627]:
+                    - cell [ref=e628]:
+                      - button "UNFI" [ref=e629] [cursor=pointer]
+                    - cell [ref=e630]:
+                      - strong [ref=e632]: "16"
+                    - cell "75%" [ref=e633]
+                    - cell "57%" [ref=e634]
+                    - cell "$+199.46" [ref=e635]
+                    - cell "$+12.47" [ref=e636]
+                  - row [ref=e637]:
+                    - cell [ref=e638]:
+                      - button "USNA" [ref=e639] [cursor=pointer]
+                    - cell [ref=e640]:
+                      - strong [ref=e642]: "14"
+                    - cell "50%" [ref=e643]
+                    - cell "53%" [ref=e644]
+                    - cell "$-31.77" [ref=e645]
+                    - cell "$-2.27" [ref=e646]
+                  - row [ref=e647]:
+                    - cell [ref=e648]:
+                      - button "WGO" [ref=e649] [cursor=pointer]
+                    - cell [ref=e650]:
+                      - strong [ref=e652]: "16"
+                    - cell "62%" [ref=e653]
+                    - cell "49%" [ref=e654]
+                    - cell "$+156.46" [ref=e655]
+                    - cell "$+9.78" [ref=e656]
+                  - row [ref=e657]:
+                    - cell [ref=e658]:
+                      - button "WSFS" [ref=e659] [cursor=pointer]
+                    - cell [ref=e660]:
+                      - strong [ref=e662]: "12"
+                    - cell "50%" [ref=e663]
+                    - cell "46%" [ref=e664]
+                    - cell "$+21.66" [ref=e665]
+                    - cell "$+1.80" [ref=e666]
+            - generic [ref=e667]: Prediction log
+            - generic [ref=e669]:
+              - generic [ref=e670]: 
+              - text: Model Predictions
+              - generic [ref=e671]: "886"
+              - generic [ref=e672]: 
+  - contentinfo

@@ -460,6 +460,14 @@ def build_saved_reports_section(reports):
     )
 
 
+# Rows rendered in the prediction log before it truncates. Deferring the
+# build stopped it blocking page load, but opening the section still painted
+# every row: 886 predictions is 1044 table rows, enough to lock the browser
+# for seconds and read as a crash. The cap is on the SYMBOL groups actually
+# built, and what was dropped is stated rather than silently missing.
+PREDICTION_LOG_MAX_SYMBOLS = 12
+
+
 def build_predictions_section(predictions, deferred: bool = False):
     """The per-call prediction log, grouped by symbol then date.
 
@@ -468,6 +476,10 @@ def build_predictions_section(predictions, deferred: bool = False):
     predictions is several thousand nodes: building it eagerly for a section
     that starts collapsed was most of the weight of the Performance page, and
     heavy enough to make Dash's async component chunks time out.
+
+    Even deferred, the full set is too much to paint at once, so only the most
+    recently active symbols are rendered. Narrow with the symbol filter or a
+    symbol row in the scorecard to see the rest.
     """
     if not predictions:
         return None
@@ -509,8 +521,19 @@ def build_predictions_section(predictions, deferred: bool = False):
     for p in predictions:
         by_symbol.setdefault(p.get("symbol", "?"), []).append(p)
 
+    # Most recently active first, then cap. Alphabetical order would truncate
+    # to whatever happens to start with A, which is never what someone opening
+    # this log is looking for.
+    def _latest(sym):
+        return max((p.get("target_date") or p.get("prediction_date") or "")
+                   for p in by_symbol[sym])
+
+    ordered = sorted(by_symbol, key=_latest, reverse=True)
+    shown = ordered[:PREDICTION_LOG_MAX_SYMBOLS]
+    hidden = ordered[PREDICTION_LOG_MAX_SYMBOLS:]
+
     symbol_groups = []
-    for sym in sorted(by_symbol):
+    for sym in shown:
         sym_preds = by_symbol[sym]
         # Directional hit rate only. HOLDs are now scored too (against the
         # no-trade band), but folding them in here would silently change
@@ -589,9 +612,19 @@ def build_predictions_section(predictions, deferred: bool = False):
         className="history-eval-bar",
     )
 
+    trailer = []
+    if hidden:
+        trailer.append(html.Div(
+            f"Showing the {len(shown)} most recently active symbols. "
+            f"{len(hidden)} more are in scope ({', '.join(hidden[:8])}"
+            f"{'…' if len(hidden) > 8 else ''}) — filter by symbol, or click a "
+            f"symbol in the scorecard above, to see them.",
+            className="history-log-truncated",
+        ))
+
     return collapsible_section(
         "Model Predictions", "predictions",
-        html.Div([eval_bar] + symbol_groups),
+        html.Div([eval_bar] + symbol_groups + trailer),
         icon_class="bi-cpu", default_open=False, count=len(predictions),
     )
 

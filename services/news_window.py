@@ -150,19 +150,34 @@ def fetch_point_in_time_news(
         return _PIT_NEWS_CACHE[cache_key]
 
     # Imported here to avoid a circular import at module load.
-    from services.news_service import fetch_alpha_vantage_news, fetch_yfinance_news
+    from services.news_service import (
+        NewsUnavailable,
+        fetch_alpha_vantage_news,
+        fetch_yfinance_news,
+    )
 
     time_from, time_to = av_time_bounds(as_of, lookback_days)
-    articles = fetch_alpha_vantage_news(
-        symbol,
-        max_articles=max_articles,
-        time_from=time_from,
-        time_to=time_to,
-        relevance_threshold=relevance_threshold,
-    )
+    av_error = None
+    try:
+        articles = fetch_alpha_vantage_news(
+            symbol,
+            max_articles=max_articles,
+            time_from=time_from,
+            time_to=time_to,
+            relevance_threshold=relevance_threshold,
+        )
+    except NewsUnavailable as e:
+        av_error = e
+        articles = []
+
     if not articles:
         # yfinance news has no server-side window; fetch then filter.
         articles = fetch_yfinance_news(symbol, max_articles=max_articles)
+        # Both sources failed. Raising is the point: an empty list here is
+        # indistinguishable from a quiet week, and the caller would store a
+        # prediction made on no news without recording that it had none.
+        if not articles and av_error is not None:
+            raise av_error
 
     result = filter_articles_as_of(articles, as_of, lookback_days)
     _PIT_NEWS_CACHE[cache_key] = result
