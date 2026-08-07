@@ -91,8 +91,8 @@ class JobType:
     description: str
     verb: str                      # the daily_analysis.py subcommand
     needs_symbols: bool = False
-    default_hour: int = 8
-    default_minute: int = 30
+    default_hour: int = 7
+    default_minute: int = 0
 
 
 JOB_TYPES: dict[str, JobType] = {
@@ -102,8 +102,8 @@ JOB_TYPES: dict[str, JobType] = {
         description="Run every model over a watchlist and synthesize the calls",
         verb="analyze",
         needs_symbols=True,
-        default_hour=8,
-        default_minute=30,
+        default_hour=7,
+        default_minute=0,
     ),
     "evaluation": JobType(
         kind="evaluation",
@@ -136,10 +136,11 @@ DEFAULT_JOBS = (
         "id": ANALYSIS_JOB,
         "kind": "analysis",
         "description": "Full Analysis on the watchlist, before the open",
-        # 08:30 ET — an hour before the open, and late enough that the
-        # previous session's bar has settled with the vendor.
-        "hour": 8,
-        "minute": 30,
+        # 07:00 ET — two and a half hours before the open (was 08:30; a
+        # 40-minute container run finishing near the bell left no reading
+        # time). The previous session's bar settled overnight either way.
+        "hour": 7,
+        "minute": 0,
         "days_of_week": "mon-fri",
         "symbols_csv": ("PANW,BAC,VZ,HWM,DOC,HPQ,LUV,TPL,MPWR,MCD,"
                         "ROP,ETR,CMS,XYZ,HIG,IP,FLEX,MET,FIS,TYL"),
