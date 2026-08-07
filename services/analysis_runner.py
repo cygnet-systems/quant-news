@@ -937,10 +937,20 @@ def _assess_completeness(
     """
     expected = set(models or ALL_MODELS) | {"ensemble"}
     coverage = {name: 0 for name in expected}
+    abstained: list[str] = []
     for symbol in symbols:
         for name, result in (signals.get(symbol) or {}).items():
-            if name in coverage and isinstance(result, dict) and not result.get("error"):
+            if name not in coverage or not isinstance(result, dict):
+                continue
+            if not result.get("error"):
                 coverage[name] += 1
+            elif (result.get("details") or {}).get("abstained"):
+                # A model declining for lack of input (DeBERTa on a
+                # quiet-news symbol) is a covered symbol with no opinion,
+                # not a hole in the run — counting it as incomplete made
+                # every thin-news day mail a partial.
+                coverage[name] += 1
+                abstained.append(f"{name}:{symbol}")
 
     n = len(symbols)
     degraded: list[str] = []
@@ -951,6 +961,9 @@ def _assess_completeness(
     if partial:
         degraded.append("incomplete: " + ", ".join(
             f"{m} {coverage[m]}/{n}" for m in partial))
+    if abstained:
+        logger.info("abstentions (no-input, not failures): "
+                    + ", ".join(sorted(abstained)))
     by_symbol = (recommendations or {}).get("by_symbol") or {}
     if not by_symbol:
         degraded.append("no recommendations produced")

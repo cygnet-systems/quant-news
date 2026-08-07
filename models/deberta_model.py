@@ -83,6 +83,10 @@ class DeBERTaModel(BaseModel):
                        f"{MODEL.DEBERTA_RELEVANCE_THRESHOLD})"),
                 details={
                     "confidence_type": "self_reported",
+                    # A quiet-news symbol is expected behaviour, not an
+                    # outage — completeness reports it as an abstention
+                    # instead of marking the whole run partial.
+                    "abstained": True,
                     "articles_total": len(av_news),
                     "articles_relevant": 0,
                 },
