@@ -135,5 +135,7 @@ def create_watchlist_panel() -> dbc.Collapse:
     return dbc.Collapse(
         html.Div(create_stock_input(), className="watchlist-panel-inner"),
         id="watchlist-panel",
-        is_open=False,
+        # Open by default; the watchlist-panel-open store (localStorage)
+        # overrides this on load so a user's close/open choice persists.
+        is_open=True,
     )

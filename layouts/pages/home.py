@@ -4,6 +4,13 @@ Opening the app used to show empty charts. The question it should answer on
 arrival is the one you actually have: what is the current call on each name,
 what did it cost or make, and what is still in flight.
 
+Two panes, one viewport. The left pane is the symbol index — every name in
+the latest cohort with its synthesis call and newest research report, one
+click from the report itself. The right pane is the prediction board for the
+same cohort. Clicking a symbol on the left narrows the board to that name;
+clicking it again widens back out. Neither pane scrolls the page — each
+scrolls internally, so the layout holds at any watchlist size.
+
 Built around the latest prediction cutoff rather than "the last run" because
 predictions carry no run id. The cutoff is also the more useful unit: it
 survives a run being re-executed or topped up one symbol at a time.
@@ -74,7 +81,94 @@ def _resolution_cell(row: dict) -> html.Td:
     )
 
 
-def _cohort_table(cohort: dict) -> html.Div:
+def _report_reader(symbol: str, reports: list[dict]) -> html.Div:
+    """The inline reading pane: the selected symbol's latest report, whole.
+
+    Reading the latest report is the primary flow, so selecting a symbol
+    puts the report itself on the page — not a button that leads to it.
+    Older reports open in the reader modal via their date chips.
+    """
+    if not reports:
+        return html.Div(
+            [
+                html.I(className="bi bi-journal home-reader-empty-icon"),
+                html.Div(f"No research report for {symbol} yet",
+                         className="home-reader-empty-title"),
+                html.Div('Use "New report" on the left to generate one.',
+                         className="home-reader-empty-note"),
+            ],
+            className="home-report-reader home-reader-empty",
+        )
+
+    latest = reports[0]
+    conf = latest.get("confidence")
+    decision = latest.get("decision") or "?"
+    history = [
+        html.Button(
+            r.get("trade_date", ""),
+            id={"type": "ta-view-btn", "report": str(r.get("id", ""))},
+            className="home-reader-hist-chip",
+            title=f"Open the {r.get('trade_date', '')} report "
+                  f"({r.get('decision', '?')})",
+        )
+        for r in reports[1:]
+    ]
+
+    header = html.Div(
+        [
+            html.I(className="bi bi-journal-text home-reader-icon"),
+            html.Span("Research report", className="home-reader-title"),
+            html.Span(
+                decision + (f" {conf:.0%}" if conf is not None else ""),
+                className="home-sym-report-verdict "
+                          + DECISION_CLASS.get(decision, "neutral"),
+            ),
+            html.Span(latest.get("trade_date", ""),
+                      className="num home-reader-date"),
+            html.Span(latest.get("model_name", ""),
+                      className="home-reader-model"),
+            html.Span(
+                ([html.Span("earlier:", className="home-reader-hist-label")]
+                 + history) if history else "",
+                className="home-reader-history",
+            ),
+            html.A(
+                [html.I(className="bi bi-file-earmark-pdf me-1"), "PDF"],
+                href=f"/api/download/ta-report/{latest.get('id', '')}",
+                className="home-reader-action",
+            ),
+            html.Button(
+                [html.I(className="bi bi-arrows-fullscreen me-1"), "Expand"],
+                id={"type": "ta-view-btn", "report": str(latest.get("id", ""))},
+                className="home-reader-action",
+                title="Open in the full-screen reader",
+            ),
+        ],
+        className="home-reader-head",
+    )
+
+    return html.Div(
+        [
+            header,
+            html.Div(
+                dcc.Markdown(latest.get("report_text", ""),
+                             className="ta-report-body"),
+                className="home-report-body",
+            ),
+        ],
+        className="home-report-reader",
+    )
+
+
+def cohort_table(cohort: dict, active_symbol: str | None = None,
+                 symbol_reports: list[dict] | None = None) -> html.Div:
+    """The prediction board, optionally narrowed to one symbol.
+
+    Narrowed, the board compacts to that symbol's row and the remaining
+    space becomes the reading pane with its latest research report.
+    Exposed (not underscored) because the symbol-filter callback re-renders
+    it without rebuilding the whole page.
+    """
     models = cohort["model_names"]
     header = html.Thead(html.Tr(
         [html.Th("Symbol"), html.Th("Prev close")]
@@ -86,8 +180,12 @@ def _cohort_table(cohort: dict) -> html.Div:
            html.Th("Outcome")]
     ))
 
+    symbols = cohort["symbols"]
+    if active_symbol:
+        symbols = [r for r in symbols if r["symbol"] == active_symbol]
+
     rows = []
-    for row in cohort["symbols"]:
+    for row in symbols:
         prev = row.get("previous_close")
         rows.append(html.Tr(
             [
@@ -100,10 +198,31 @@ def _cohort_table(cohort: dict) -> html.Div:
                _resolution_cell(row)]
         ))
 
-    return html.Div(
+    children = []
+    if active_symbol:
+        children.append(html.Div(
+            [
+                html.Span(f"Showing {active_symbol} only",
+                          className="home-filter-note-text"),
+                html.Button(
+                    [html.I(className="bi bi-x-lg me-1"), "Show all"],
+                    id={"type": "home-sym-btn", "symbol": active_symbol},
+                    className="home-filter-clear",
+                ),
+            ],
+            className="home-filter-note",
+        ))
+    board_cls = "history-table-wrap home-board-scroll"
+    if active_symbol:
+        # One row: let the reading pane have the flex space instead.
+        board_cls += " home-board-compact"
+    children.append(html.Div(
         html.Table([header, html.Tbody(rows)], className="history-data-table"),
-        className="history-table-wrap",
-    )
+        className=board_cls,
+    ))
+    if active_symbol:
+        children.append(_report_reader(active_symbol, symbol_reports or []))
+    return html.Div(children)
 
 
 def _last_run_header(cohort: dict, last_run: dict | None) -> html.Div:
@@ -161,28 +280,26 @@ def _last_run_header(cohort: dict, last_run: dict | None) -> html.Div:
     )
 
 
-def _open_predictions(open_preds: dict) -> html.Div:
+def _inflight_strip(open_preds: dict) -> html.Div:
+    """One line per unresolved target session — not a card of its own."""
     if not open_preds["total"]:
-        return html.Div("Nothing in flight. Every call has been scored.",
-                        className="home-empty-note")
-    blocks = []
+        return html.Div("Nothing in flight — every call has been scored.",
+                        className="home-inflight home-empty-note")
+    lines = []
     for d in open_preds["dates"]:
-        blocks.append(html.Div(
+        syms = d["symbols"]
+        shown = ", ".join(syms[:10]) + ("…" if len(syms) > 10 else "")
+        lines.append(html.Div(
             [
-                html.Div(
-                    [
-                        html.Span(d["target_date"], className="num home-open-date"),
-                        html.Span(f"{len(d['predictions'])} calls · "
-                                  f"{len(d['symbols'])} symbols",
-                                  className="home-meta-label"),
-                    ],
-                    className="home-open-head",
-                ),
-                html.Div(", ".join(d["symbols"]), className="home-open-symbols"),
+                html.Span("In flight", className="home-meta-label"),
+                html.Span(d["target_date"], className="num home-open-date"),
+                html.Span(f"{len(d['predictions'])} calls · "
+                          f"{len(syms)} symbols", className="home-meta-label"),
+                html.Span(shown, className="home-open-symbols", title=", ".join(syms)),
             ],
-            className="home-open-block",
+            className="home-inflight-line",
         ))
-    return html.Div(blocks)
+    return html.Div(lines, className="home-inflight")
 
 
 def _rolling(rolling: list[dict], days: int) -> html.Div:
@@ -218,34 +335,117 @@ def _rolling(rolling: list[dict], days: int) -> html.Div:
     return html.Div(cells, className="home-stat-row")
 
 
-def _job_status(jobs: list[dict]) -> html.Div:
+def _symbol_row(row: dict, report: dict | None, active: bool) -> html.Div:
+    """One name on the index: the call, the report, and the way in.
+
+    The whole header line is a button — the row IS the filter control for
+    the board on the right. The report line keeps its own View button, which
+    opens the shared reader modal (the ta-view-btn pattern is global).
+    """
+    sym = row["symbol"]
+    prev = row.get("previous_close")
+
+    header = html.Button(
+        [
+            html.Span(sym, className="home-sym-name"),
+            html.Span(f"{prev:.2f}" if prev is not None else "",
+                      className="num home-sym-close"),
+            _decision_chip(row.get("synthesis")),
+        ],
+        id={"type": "home-sym-btn", "symbol": sym},
+        className="home-sym-head",
+        title=f"Read {sym}'s latest report and narrow the board to it"
+              if not active else "Back to all symbols",
+    )
+
+    if report:
+        conf = report.get("confidence")
+        report_line = html.Div(
+            [
+                html.I(className="bi bi-journal-text home-sym-report-icon"),
+                html.Span(
+                    (report.get("decision") or "?")
+                    + (f" {conf:.0%}" if conf is not None else ""),
+                    className="home-sym-report-verdict "
+                              + DECISION_CLASS.get(report.get("decision"), "neutral"),
+                ),
+                html.Span(report.get("trade_date", ""),
+                          className="num home-sym-report-date"),
+                html.Button(
+                    "View",
+                    id={"type": "ta-view-btn", "report": str(report.get("id", ""))},
+                    className="home-sym-report-view",
+                    title="Open the research report",
+                ),
+            ],
+            className="home-sym-report",
+        )
+    else:
+        report_line = html.Div(
+            [
+                html.I(className="bi bi-journal home-sym-report-icon"),
+                html.Span("no report yet", className="home-sym-report-none"),
+            ],
+            className="home-sym-report",
+        )
+
+    return html.Div(
+        [header, report_line],
+        className="home-sym-row" + (" active" if active else ""),
+    )
+
+
+def symbol_list(cohort: dict, reports_by_symbol: dict | None,
+                active_symbol: str | None = None,
+                search: str = "") -> list:
+    """The left-pane index rows, filtered by the search box if non-empty."""
+    reports_by_symbol = reports_by_symbol or {}
+    needle = (search or "").strip().upper()
+    rows = [r for r in cohort["symbols"]
+            if not needle or needle in r["symbol"]]
+    if not rows:
+        return [html.Div(f'No symbol matching "{needle}"',
+                         className="home-empty-note")]
+    return [
+        _symbol_row(r, reports_by_symbol.get(r["symbol"]),
+                    active=(r["symbol"] == active_symbol))
+        for r in rows
+    ]
+
+
+def _jobs_line(jobs: list[dict]) -> html.Div:
+    """The scheduler, reduced to a heartbeat: name, time, last outcome."""
     if not jobs:
-        return html.Div("No scheduled jobs configured.",
-                        className="home-empty-note")
-    rows = []
+        return html.Div(
+            dcc.Link("No scheduled jobs — set one up", href="/schedule",
+                     className="home-card-link"),
+            className="home-jobs-line",
+        )
+    parts = []
     for j in jobs:
-        # scheduler_service returns a datetime here, not an ISO string.
-        raw = j.get("last_run_at")
-        last = raw.strftime("%Y-%m-%d %H:%M") if hasattr(raw, "strftime") else (
-            str(raw)[:16].replace("T", " ") if raw else "never")
         status = j.get("last_status") or "never run"
         cls = ("negative" if status == "error"
                else "positive" if status == "success" else "")
-        rows.append(html.Div(
+        parts.append(html.Span(
             [
+                html.I(className=f"bi bi-circle-fill home-job-dot {cls}"),
                 html.Span(j.get("id", ""), className="home-job-name"),
-                html.Span(f"{j.get('hour', 0):02d}:{j.get('minute', 0):02d} "
-                          f"{j.get('days_of_week', '')}",
+                html.Span(f"{j.get('hour', 0):02d}:{j.get('minute', 0):02d}",
                           className="num home-meta-label"),
-                html.Span(status, className=cls),
-                html.Span(last, className="num home-meta-label"),
             ],
-            className="home-job-row",
+            className="home-job-pill",
+            title=f"{j.get('id', '')}: {status}, runs "
+                  f"{j.get('hour', 0):02d}:{j.get('minute', 0):02d} "
+                  f"{j.get('days_of_week', '')}",
         ))
-    return html.Div(rows)
+    parts.append(dcc.Link("Schedule", href="/schedule",
+                          className="home-card-link"))
+    return html.Div(parts, className="home-jobs-line")
 
 
-def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30) -> html.Div:
+def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
+           reports_by_symbol=None, active_symbol=None,
+           symbol_reports=None) -> html.Div:
     """Assemble the launch screen from already-shaped data."""
     if not cohort or not cohort.get("prediction_date"):
         return html.Div(
@@ -266,50 +466,89 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30) -> html
             className="page page-home",
         )
 
-    def card(title, body, subtitle=None, action=None):
-        return html.Div(
-            [
-                html.Div(
-                    [
-                        html.H2(title, className="home-card-title"),
-                        html.Span(subtitle, className="home-card-subtitle")
-                        if subtitle else "",
-                        action if action is not None else "",
-                    ],
-                    className="home-card-titlerow",
-                ),
-                body,
-            ],
-            className="home-card",
-        )
-
-    return html.Div(
+    left = html.Div(
         [
-            card(
-                "Latest calls",
-                html.Div([_last_run_header(cohort, last_run),
-                          _cohort_table(cohort)]),
-                subtitle="the most recent prediction cutoff",
-                action=dbc.Button(
-                    [html.I(className="bi bi-lightning-fill me-1"), "Run analysis"],
-                    id="home-run-btn", size="sm", color="success", outline=True,
-                ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H2("Symbols", className="home-card-title"),
+                            html.Span(str(len(cohort["symbols"])),
+                                      className="home-count-badge num"),
+                        ],
+                        className="home-left-titlerow",
+                    ),
+                    dcc.Input(
+                        id="home-symbol-search",
+                        type="text",
+                        placeholder="Filter symbols…",
+                        debounce=False,
+                        className="home-symbol-search",
+                        autoComplete="off",
+                    ),
+                ],
+                className="home-left-head",
+            ),
+            html.Div(
+                symbol_list(cohort, reports_by_symbol, active_symbol),
+                id="home-symbol-list",
+                className="home-symbol-list",
             ),
             html.Div(
                 [
-                    card("In flight", _open_predictions(open_preds),
-                         subtitle="made, not yet scoreable"),
-                    card(f"Last {rolling_days} days", _rolling(rolling, rolling_days),
-                         subtitle="hit rate on BUY/SELL only",
-                         action=dcc.Link("Performance", href="/performance",
-                                         className="home-card-link")),
+                    dbc.Button(
+                        [html.I(className="bi bi-plus-lg me-1"), "New report"],
+                        id="reports-new-btn", size="sm", color="success",
+                        className="home-new-report-btn",
+                    ),
+                    _jobs_line(jobs),
                 ],
-                className="home-two-col",
+                className="home-left-foot",
             ),
-            card("Scheduled jobs", _job_status(jobs),
-                 subtitle="the app's own clock",
-                 action=dcc.Link("Schedule", href="/schedule",
-                                 className="home-card-link")),
         ],
-        className="page page-home",
+        className="home-left",
     )
+
+    right = html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H2("Latest calls", className="home-card-title"),
+                            html.Span("the most recent prediction cutoff",
+                                      className="home-card-subtitle"),
+                        ],
+                        className="home-right-titlerow",
+                    ),
+                    dbc.Button(
+                        [html.I(className="bi bi-lightning-fill me-1"),
+                         "Run analysis"],
+                        id="home-run-btn", size="sm", color="success",
+                        outline=True,
+                    ),
+                ],
+                className="home-right-head",
+            ),
+            _last_run_header(cohort, last_run),
+            html.Div(
+                [
+                    html.Span(f"Last {rolling_days}d",
+                              className="home-card-title-sm",
+                              title=f"Hit rate on BUY/SELL calls over the "
+                                    f"last {rolling_days} days"),
+                    _rolling(rolling, rolling_days),
+                    dcc.Link("Performance", href="/performance",
+                             className="home-card-link"),
+                ],
+                className="home-rolling",
+            ),
+            html.Div(cohort_table(cohort, active_symbol,
+                                  symbol_reports=symbol_reports),
+                     id="home-cohort-table"),
+            _inflight_strip(open_preds),
+        ],
+        className="home-right",
+    )
+
+    return html.Div([left, right], className="page page-home home-split")

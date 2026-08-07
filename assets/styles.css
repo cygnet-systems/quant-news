@@ -2507,10 +2507,63 @@ body {
     gap: 2px;
 }
 
+/* Reports page — action bar above the archive */
+.reports-action-bar {
+    background-color: var(--bg-secondary, #1C1C1C);
+    border: 1px solid var(--border-subtle, #2A2A2A);
+    border-radius: 10px;
+    padding: 14px 18px;
+}
+
+.reports-bar-title {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+}
+
+.reports-bar-sub {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    margin-top: 2px;
+}
+
+/* Research reports — one group per symbol, newest first */
+.ta-symbol-group {
+    margin-bottom: 16px;
+}
+
+.ta-group-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 4px 2px 8px;
+    border-bottom: 1px solid var(--border-subtle, #2A2A2A);
+    margin-bottom: 8px;
+}
+
+.ta-group-symbol {
+    font-weight: 700;
+    font-size: 0.95rem;
+    letter-spacing: 0.03em;
+    color: var(--text-primary);
+}
+
+.ta-group-count {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.ta-group-latest {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+}
+
 /* TradingAgents report cards */
 .ta-cards-grid {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
     gap: 8px;
     margin-bottom: 12px;
 }
@@ -3755,6 +3808,436 @@ body {
     color: var(--text-secondary);
     font-size: var(--text-sm);
     padding: var(--space-3) 0;
+}
+
+/* --- Home split: symbol index left, prediction board right ------------- */
+/* Fills the scroll container exactly, so the page itself never scrolls:
+   each pane owns its overflow instead. */
+
+.home-split {
+    display: grid;
+    grid-template-columns: 340px minmax(0, 1fr);
+    /* minmax(0, …) on the row too: an implicit auto row sizes to content,
+       which lets a long symbol list push the whole grid past the viewport. */
+    grid-template-rows: minmax(0, 1fr);
+    gap: var(--space-5);
+    height: 100%;
+}
+
+.home-left {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--card-radius);
+    padding: var(--space-4);
+}
+
+.home-left-head { margin-bottom: var(--space-3); }
+
+.home-left-titlerow {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+}
+
+.home-count-badge {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+    padding: 1px 8px;
+}
+
+.home-symbol-search {
+    width: 100%;
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    padding: 6px 10px;
+}
+
+.home-symbol-search:focus {
+    outline: none;
+    border-color: var(--border-focus);
+}
+
+.home-symbol-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0 calc(-1 * var(--space-2));
+    padding: 0 var(--space-2);
+}
+
+.home-sym-row {
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: var(--space-2);
+    margin-bottom: 2px;
+}
+
+.home-sym-row:hover { background-color: var(--bg-tertiary); }
+
+.home-sym-row.active {
+    background-color: var(--bg-tertiary);
+    border-color: var(--border-focus);
+}
+
+.home-sym-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    color: var(--text-primary);
+    text-align: left;
+}
+
+.home-sym-name {
+    font-weight: 700;
+    font-size: var(--text-sm);
+    letter-spacing: 0.02em;
+}
+
+.home-sym-close { color: var(--text-secondary); font-size: var(--text-xs); }
+
+.home-sym-head .home-chip { margin-left: auto; }
+
+.home-sym-report {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    margin-top: 4px;
+    font-size: var(--text-xs);
+}
+
+.home-sym-report-icon { color: var(--text-muted); font-size: var(--text-xs); }
+
+.home-sym-report-verdict { font-weight: 600; }
+
+.home-sym-report-date { color: var(--text-muted); }
+
+.home-sym-report-none { color: var(--text-muted); }
+
+.home-sym-report-view {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--accent-primary);
+    font-size: var(--text-2xs);
+    padding: 1px 8px;
+    cursor: pointer;
+}
+
+.home-sym-report-view:hover { border-color: var(--accent-primary); }
+
+.home-left-foot {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    margin-top: var(--space-2);
+}
+
+.home-new-report-btn { width: 100%; }
+
+.home-jobs-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+}
+
+.home-jobs-line .home-card-link { margin-left: auto; }
+
+.home-job-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+    padding: 2px 8px;
+}
+
+.home-job-dot { font-size: 7px; color: var(--text-muted); }
+
+.home-right {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    gap: var(--space-3);
+}
+
+.home-right-head,
+.home-right-titlerow {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+}
+
+.home-right-head { justify-content: space-between; }
+
+#home-cohort-table {
+    flex: 1 1 auto;
+    /* The floor lives on the flex container, not the scroller inside it —
+       a child min-height would just paint over whatever follows when the
+       column runs out of room. Kept modest: past the floor the page may
+       scroll a little, below it the board is too short to read at all. */
+    min-height: 180px;
+    display: flex;
+    flex-direction: column;
+}
+
+#home-cohort-table > div {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    flex: 1 1 auto;
+}
+
+.home-board-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+/* Narrowed to one symbol: the single-row board takes its natural height and
+   the reading pane below gets the flex space. */
+.home-board-scroll.home-board-compact {
+    flex: 0 0 auto;
+}
+
+/* --- Inline report reading pane -------------------------------------- */
+
+/* Reading mode. Selecting a symbol makes its report the point of the page:
+   the portfolio-wide strips step aside, the split may grow past the
+   viewport (reading earns the scroll), and the symbol index sticks so
+   switching names never requires scrolling back up. */
+.home-split:has(.home-report-reader) {
+    height: auto;
+    min-height: 100%;
+}
+
+.home-split:has(.home-report-reader) .home-left {
+    max-height: calc(100vh - 140px);
+    position: sticky;
+    top: 0;
+    align-self: start;
+}
+
+.home-right:has(.home-report-reader) .home-rolling,
+.home-right:has(.home-report-reader) .home-inflight {
+    display: none;
+}
+
+.home-report-reader {
+    flex: 1 1 auto;
+    min-height: 420px;
+    display: flex;
+    flex-direction: column;
+    margin-top: var(--space-3);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--card-radius);
+    overflow: hidden;
+}
+
+.home-reader-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+}
+
+.home-reader-icon { color: var(--accent-primary); }
+
+.home-reader-title { font-weight: 600; color: var(--text-primary); }
+
+.home-reader-date { color: var(--text-secondary); font-size: var(--text-xs); }
+
+.home-reader-model { color: var(--text-muted); font-size: var(--text-xs); }
+
+.home-reader-history {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.home-reader-hist-label { color: var(--text-muted); font-size: var(--text-2xs); }
+
+.home-reader-hist-chip {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    color: var(--text-secondary);
+    font-size: var(--text-2xs);
+    padding: 1px 8px;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+}
+
+.home-reader-hist-chip:hover { color: var(--text-primary); border-color: var(--border-focus); }
+
+.home-reader-action {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--accent-primary);
+    font-size: var(--text-xs);
+    padding: 2px 10px;
+    cursor: pointer;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.home-reader-action:hover { border-color: var(--accent-primary); color: var(--accent-hover); }
+
+.home-reader-history + .home-reader-action { margin-left: 0; }
+
+.home-reader-head > .home-reader-action:first-of-type { margin-left: 0; }
+
+.home-report-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--space-3) var(--space-4);
+    font-size: 0.85rem;
+    line-height: 1.6;
+}
+
+.home-reader-empty {
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: var(--space-6);
+    gap: var(--space-2);
+}
+
+.home-reader-empty-icon { font-size: 1.6rem; opacity: 0.3; }
+
+.home-reader-empty-title { font-weight: 600; }
+
+.home-reader-empty-note { color: var(--text-secondary); font-size: var(--text-sm); }
+
+/* Keep the header readable while the board scrolls under it. */
+.home-board-scroll thead th {
+    position: sticky;
+    top: 0;
+    background-color: var(--bg-secondary);
+    z-index: 1;
+}
+
+.home-filter-note {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-1) 0 var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+}
+
+.home-filter-clear {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    padding: 1px 10px;
+    cursor: pointer;
+}
+
+.home-filter-clear:hover { color: var(--text-primary); border-color: var(--border-focus); }
+
+.home-inflight {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: var(--space-2);
+    font-size: var(--text-sm);
+}
+
+.home-inflight-line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    padding: 2px 0;
+    min-width: 0;
+}
+
+.home-inflight-line .home-open-symbols {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Rolling performance as a slim chip strip: ONE line — it scrolls sideways
+   rather than wrapping, so the board below keeps the vertical room. */
+.home-rolling {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    padding-bottom: 2px;
+}
+
+.home-rolling .home-stat-row {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: var(--space-2);
+}
+
+.home-rolling .home-stat { white-space: nowrap; flex: 0 0 auto; }
+
+.home-rolling .home-stat {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: var(--text-xs);
+}
+
+.home-rolling .home-stat-name { font-size: var(--text-xs); }
+
+.home-rolling .home-stat-big {
+    font-size: var(--text-sm);
+    font-weight: 700;
+    line-height: inherit;
+}
+
+.home-rolling .home-stat-sub { font-size: var(--text-2xs); }
+
+.home-rolling .home-card-link { margin-left: auto; }
+
+.home-card-title-sm {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+/* Narrow screens: fall back to a normally scrolling single column. */
+@media (max-width: 1100px) {
+    .home-split { grid-template-columns: 1fr; height: auto; }
+    .home-left { max-height: 420px; }
 }
 
 /* =============================================================================

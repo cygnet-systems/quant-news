@@ -168,9 +168,15 @@ Then the analysis, as sections in this order. Formatting rules:
    or sector-wide repricing? (omit this section only if no peer block was provided)
 6. Fundamentals — valuation and quality, only as they bear on the 1-5 day window
 7. News & Catalysts — macro vs sector vs company-specific; is anything new?
-8. Risk — systematic / sector / idiosyncratic; name the single biggest risk to
+8. Bull vs Bear — the debate, not a summary. First "**Bull:**" with the 2-3
+   strongest arguments FOR upside, each anchored to a specific number or article
+   in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
+   same standard. Argue each side at full strength — do not soften the side you
+   disagree with. The Read line states which side wins over 1-5 sessions and on
+   what evidence the loser's case would take over.
+9. Risk — systematic / sector / idiosyncratic; name the single biggest risk to
    THIS call and the falsification conditions that would flip it
-9. Trade Plan — stance; the key levels verbatim (support, resistance, SMAs);
+10. Trade Plan — stance; the key levels verbatim (support, resistance, SMAs);
    invalidation (which close or level kills the thesis); what to watch next session
 """
 
@@ -182,7 +188,7 @@ Then the analysis, as sections in this order. Formatting rules:
 EPILOGUE_INSTRUCTIONS = """
 == STRUCTURED EPILOGUE (mandatory) ==
 
-After section 9, END your response with exactly one fenced JSON block — valid
+After section 10, END your response with exactly one fenced JSON block — valid
 JSON, double quotes, no comments, and NOTHING after the closing fence:
 
 ```json
@@ -408,6 +414,19 @@ def _news_block(articles: list, n: int = 20) -> str:
     return "\n".join(lines)
 
 
+def _dollars(v) -> str:
+    """1234567890 -> "$1.23B". The prompt forbids raw unformatted values, so
+    the block must not contain them either."""
+    if not isinstance(v, (int, float)) or pd.isna(v):
+        return "n/a"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    for cut, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= cut:
+            return f"{sign}${v / cut:.2f}{suffix}"
+    return f"{sign}${v:.0f}"
+
+
 def _fundamentals_block(symbol: str, as_of: str) -> str:
     """Compact fundamentals via yfinance, filtered to fiscalDateEnding <= as_of.
 
@@ -421,8 +440,13 @@ def _fundamentals_block(symbol: str, as_of: str) -> str:
         import yfinance as yf
         if symbol not in _FUND_CACHE:
             tk = yf.Ticker(symbol)
-            _FUND_CACHE[symbol] = (tk.info or {}, tk.quarterly_financials)
-        info, fin = _FUND_CACHE[symbol]
+            try:
+                cashflow = tk.quarterly_cashflow
+            except Exception:
+                cashflow = None
+            _FUND_CACHE[symbol] = (tk.info or {}, tk.quarterly_financials,
+                                   cashflow)
+        info, fin, cashflow = _FUND_CACHE[symbol]
         cutoff = pd.Timestamp(as_of)
         parts = []
         pe = info.get("trailingPE"); fpe = info.get("forwardPE")
@@ -430,20 +454,53 @@ def _fundamentals_block(symbol: str, as_of: str) -> str:
         if any(v is not None for v in (pe, fpe, mcap, margin)):
             parts.append(
                 f"Trailing P/E: {_fmt(pe)} | Forward P/E: {_fmt(fpe)} | "
-                f"Market cap: {mcap or 'n/a'} | Profit margin: "
+                f"Market cap: {_dollars(mcap)} | Profit margin: "
                 f"{_fmt(margin*100,1) if isinstance(margin,(int,float)) else 'n/a'}%"
             )
         if fin is not None and not fin.empty:
-            cols = [c for c in fin.columns if pd.to_datetime(c) <= cutoff]
+            cols = sorted(c for c in fin.columns if pd.to_datetime(c) <= cutoff)
             if cols:
-                latest = sorted(cols)[-1]
+                latest = cols[-1]
                 col = fin[latest]
                 rev = col.get("Total Revenue"); ni = col.get("Net Income")
                 parts.append(
                     f"Latest quarter (period ending {str(latest)[:10]}): "
-                    f"Revenue {rev if pd.notna(rev) else 'n/a'}, "
-                    f"Net income {ni if pd.notna(ni) else 'n/a'}"
+                    f"Revenue {_dollars(rev)}, Net income {_dollars(ni)}"
                 )
+                # Year-over-year growth: the same fiscal quarter a year back,
+                # matched within ~45 days so an off-cycle fiscal calendar
+                # never pairs Q2 against Q3.
+                target = pd.to_datetime(latest) - pd.DateOffset(years=1)
+                yoy_col = min(cols[:-1], default=None,
+                              key=lambda c: abs((pd.to_datetime(c) - target).days))
+                if (yoy_col is not None
+                        and abs((pd.to_datetime(yoy_col) - target).days) <= 45):
+                    prev_rev = fin[yoy_col].get("Total Revenue")
+                    prev_ni = fin[yoy_col].get("Net Income")
+                    growth = []
+                    if pd.notna(rev) and pd.notna(prev_rev) and prev_rev:
+                        growth.append(
+                            f"Revenue YoY: {(rev / prev_rev - 1) * 100:+.1f}%")
+                    if pd.notna(ni) and pd.notna(prev_ni):
+                        # A negative base makes the ratio meaningless — state
+                        # the swing instead of a nonsense percentage.
+                        if prev_ni > 0:
+                            growth.append(
+                                f"Net income YoY: {(ni / prev_ni - 1) * 100:+.1f}%")
+                        elif ni > 0 >= prev_ni:
+                            growth.append("Net income YoY: swung to profit "
+                                          f"from {_dollars(prev_ni)} loss")
+                    if growth:
+                        growth.append(f"(vs quarter ending {str(yoy_col)[:10]})")
+                        parts.append(" | ".join(growth))
+        if cashflow is not None and not cashflow.empty:
+            ccols = sorted(c for c in cashflow.columns
+                           if pd.to_datetime(c) <= cutoff)
+            if ccols:
+                fcf = cashflow[ccols[-1]].get("Free Cash Flow")
+                if pd.notna(fcf):
+                    parts.append(f"Free cash flow (quarter ending "
+                                 f"{str(ccols[-1])[:10]}): {_dollars(fcf)}")
         return "\n".join(parts) if parts else "Fundamentals not available."
     except Exception as e:
         logger.debug(f"fundamentals fetch failed for {symbol}: {e}")

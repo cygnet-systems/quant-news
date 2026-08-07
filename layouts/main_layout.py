@@ -31,6 +31,14 @@ def create_layout() -> html.Div:
             # Recent symbol GROUPS (list of lists, newest first, capped) —
             # local so past sessions' watchlists survive restarts.
             dcc.Store(id="recent-symbol-groups", data=[], storage_type="local"),
+            # Watchlist editor visibility. Open by default so a new user lands
+            # on the symbol input, not on a hunt for the toggle; local so a
+            # deliberate close sticks across sessions.
+            dcc.Store(id="watchlist-panel-open", data=True, storage_type="local"),
+            # Home prediction-board symbol narrow. Session-scoped on purpose:
+            # "show me AAPL" answers a question you are asking now, not one
+            # you want still applied tomorrow.
+            dcc.Store(id="home-symbol-filter", data=None),
             dcc.Store(id="current-period", data="1y", storage_type="local"),
             dcc.Store(id="stock-data-store", data={}),
             dcc.Store(id="news-data-store", data={}),

@@ -1036,6 +1036,40 @@ class CacheService:
                 for r in rows
             ]
 
+    def latest_reports_by_symbol(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        """Newest research report per symbol, without the report body.
+
+        One DISTINCT ON query instead of a query per symbol — the Home page
+        needs "does this name have a report, and what did it say" for every
+        row, and report_text would drag megabytes through the session for a
+        headline that only needs the verdict fields.
+        """
+        from db.models import TradingAgentReport
+        with get_session() as session:
+            stmt = (
+                select(TradingAgentReport.id, TradingAgentReport.symbol,
+                       TradingAgentReport.trade_date, TradingAgentReport.decision,
+                       TradingAgentReport.confidence, TradingAgentReport.model_name,
+                       TradingAgentReport.created_at)
+                .where(_visible(TradingAgentReport))
+                .distinct(TradingAgentReport.symbol)
+                .order_by(TradingAgentReport.symbol,
+                          TradingAgentReport.created_at.desc())
+            )
+            if symbols:
+                stmt = stmt.where(TradingAgentReport.symbol.in_(
+                    [s.upper() for s in symbols]))
+            return {
+                r.symbol: {
+                    "id": r.id, "symbol": r.symbol,
+                    "trade_date": str(r.trade_date),
+                    "decision": r.decision, "confidence": r.confidence,
+                    "model_name": r.model_name,
+                    "created_at": str(r.created_at),
+                }
+                for r in session.execute(stmt)
+            }
+
     def get_all_trading_agent_reports(self, limit: int = 50) -> list[dict]:
         from db.models import TradingAgentReport
         with get_session() as session:

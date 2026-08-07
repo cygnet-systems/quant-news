@@ -322,6 +322,10 @@ def filter_history_data(history_data, filter_symbols, filter_date_range,
 
 
 def empty_history_message(has_filters: bool, noun: str = "data") -> html.Div:
+    # The Reports page has its own generate affordance; everywhere else the
+    # run lives behind the toolbar's Run analysis button.
+    action = ('use "New report" above to generate one'
+              if noun == "reports" else "run Full Analysis to generate data")
     return html.Div(
         [
             html.I(className="bi bi-clock-history",
@@ -331,9 +335,9 @@ def empty_history_message(has_filters: bool, noun: str = "data") -> html.Div:
                      else f"No {noun} yet",
                      style={"fontWeight": "600", "marginBottom": "4px"}),
             html.Div(
-                "Adjust the filters above, or run Full Analysis to generate data."
+                f"Adjust the filters above, or {action}."
                 if has_filters else
-                "Run Full Analysis to generate data.",
+                f"{action[0].upper()}{action[1:]}.",
                 style={"color": "var(--text-secondary)", "fontSize": "0.85rem"},
             ),
         ],
@@ -341,79 +345,110 @@ def empty_history_message(has_filters: bool, noun: str = "data") -> html.Div:
     )
 
 
-def build_ta_reports_section(ta_reports):
-    """Research reports, the richest artifact a run produces."""
-    if not ta_reports:
-        return None
-    ta_cards = []
-    for i, report in enumerate(ta_reports):
-        symbol = report.get("symbol", "")
-        decision = report.get("decision", "HOLD")
-        confidence = report.get("confidence", 0)
-        trade_date = report.get("trade_date", "")
-        input_tokens = report.get("input_tokens", 0)
-        output_tokens = report.get("output_tokens", 0)
+def _ta_report_card(report):
+    symbol = report.get("symbol", "")
+    decision = report.get("decision", "HOLD")
+    confidence = report.get("confidence", 0)
+    trade_date = report.get("trade_date", "")
+    input_tokens = report.get("input_tokens", 0)
+    output_tokens = report.get("output_tokens", 0)
 
-        conf_pct = int((confidence or 0) * 100)
-        dec_cls = "positive" if decision == "BUY" else "negative" if decision == "SELL" else "neutral"
+    conf_pct = int((confidence or 0) * 100)
+    dec_cls = "positive" if decision == "BUY" else "negative" if decision == "SELL" else "neutral"
 
-        ta_cards.append(
+    return html.Div(
+        [
             html.Div(
                 [
-                    html.Div(
-                        [
-                            html.Span(symbol, className="ta-card-symbol"),
-                            html.Span(decision, className=f"history-decision {dec_cls}"),
-                            html.Span(f"{conf_pct}%", className="ta-card-conf"),
-                        ],
-                        className="ta-card-header",
+                    html.Span(symbol, className="ta-card-symbol"),
+                    html.Span(decision, className=f"history-decision {dec_cls}"),
+                    html.Span(f"{conf_pct}%", className="ta-card-conf"),
+                ],
+                className="ta-card-header",
+            ),
+            html.Div(
+                [
+                    html.Span(trade_date, className="ta-card-date"),
+                    html.Span(f"{input_tokens + output_tokens:,} tokens", className="ta-card-meta"),
+                ],
+                className="ta-card-meta-row",
+            ),
+            html.Div(
+                [
+                    html.Button(
+                        [html.I(className="bi bi-eye me-1"), "View"],
+                        # Keyed by report id, not list position: the
+                        # page renders a filtered list while the
+                        # callback resolved against a differently
+                        # filtered store, so indices did not line up
+                        # and View silently did nothing.
+                        id={"type": "ta-view-btn",
+                            "report": str(report.get("id", ""))},
+                        className="ta-view-btn",
                     ),
-                    html.Div(
-                        [
-                            html.Span(trade_date, className="ta-card-date"),
-                            html.Span(f"{input_tokens + output_tokens:,} tokens", className="ta-card-meta"),
-                        ],
-                        className="ta-card-meta-row",
+                    html.A(
+                        [html.I(className="bi bi-file-earmark-pdf me-1"), "PDF"],
+                        href=f"/api/download/ta-report/{report.get('id', 0)}",
+                        className="ta-pdf-btn",
                     ),
-                    html.Div(
-                        [
-                            html.Button(
-                                [html.I(className="bi bi-eye me-1"), "View"],
-                                # Keyed by report id, not list position: the
-                                # page renders a filtered list while the
-                                # callback resolved against a differently
-                                # filtered store, so indices did not line up
-                                # and View silently did nothing.
-                                id={"type": "ta-view-btn",
-                                    "report": str(report.get("id", ""))},
-                                className="ta-view-btn",
-                            ),
-                            html.A(
-                                [html.I(className="bi bi-file-earmark-pdf me-1"), "PDF"],
-                                href=f"/api/download/ta-report/{report.get('id', 0)}",
-                                className="ta-pdf-btn",
-                            ),
-                            html.A(
-                                [html.I(className="bi bi-table me-1"), "Data"],
-                                href=(f"/api/download/report-inputs?symbols={symbol}"
-                                      f"&date={trade_date}"),
-                                className="ta-pdf-btn",
-                                title="Download the point-in-time inputs this report used (.xlsx)",
-                            ),
-                        ],
-                        className="ta-card-actions",
+                    html.A(
+                        [html.I(className="bi bi-table me-1"), "Data"],
+                        href=(f"/api/download/report-inputs?symbols={symbol}"
+                              f"&date={trade_date}"),
+                        className="ta-pdf-btn",
+                        title="Download the point-in-time inputs this report used (.xlsx)",
                     ),
                 ],
-                className="ta-report-card",
-            )
-        )
+                className="ta-card-actions",
+            ),
+        ],
+        className="ta-report-card",
+    )
+
+
+def build_ta_reports_section(ta_reports):
+    """Research reports, the richest artifact a run produces.
+
+    Grouped by symbol so a ticker's report history reads as a timeline
+    rather than being interleaved with every other name in the archive.
+    Symbols are ordered by their newest report; within a symbol the rows
+    keep the store's newest-first order.
+    """
+    if not ta_reports:
+        return None
+
+    by_symbol: dict[str, list] = {}
+    for report in ta_reports:
+        by_symbol.setdefault(report.get("symbol", "?"), []).append(report)
+
+    groups = []
+    for symbol, reports in by_symbol.items():
+        latest = reports[0]
+        groups.append(html.Div(
+            [
+                html.Div(
+                    [
+                        html.Span(symbol, className="ta-group-symbol"),
+                        html.Span(f"{len(reports)} report"
+                                  f"{'s' if len(reports) != 1 else ''}",
+                                  className="ta-group-count"),
+                        html.Span(f"latest {latest.get('trade_date', '')}",
+                                  className="ta-group-latest"),
+                    ],
+                    className="ta-group-header",
+                ),
+                html.Div([_ta_report_card(r) for r in reports],
+                         className="ta-cards-grid"),
+            ],
+            className="ta-symbol-group",
+        ))
 
     # Cards only — View opens the report in a modal. The old duplicate
     # accordion stack below the cards (two ways to open the same report)
     # is gone.
     return collapsible_section(
-        "TradingAgents Reports", "ta",
-        html.Div(ta_cards, className="ta-cards-grid"),
+        "Research Reports", "ta",
+        html.Div(groups),
         icon_class="bi-robot", default_open=True, count=len(ta_reports),
     )
 
@@ -456,7 +491,8 @@ def build_saved_reports_section(reports):
             ], className="history-data-table"),
             className="history-table-wrap",
         ),
-        icon_class="bi-file-earmark-text", default_open=False, count=len(reports),
+        # Open on arrival: a collapsed archive reads as an empty one.
+        icon_class="bi-file-earmark-text", default_open=True, count=len(reports),
     )
 
 
@@ -676,7 +712,8 @@ def build_recommendations_section(recommendations):
             ], className="history-data-table"),
             className="history-table-wrap",
         ),
-        icon_class="bi-lightning", default_open=False, count=len(recommendations),
+        # Open on arrival: a collapsed archive reads as an empty one.
+        icon_class="bi-lightning", default_open=True, count=len(recommendations),
     )
 
 

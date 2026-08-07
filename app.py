@@ -516,7 +516,7 @@ def _init_s3():
 # hidden divs instead would keep every callback live on every page.
 def _build_route(path, history_data, filter_symbols, filter_range,
                  filter_specific, activity_scope, activity_since,
-                 outcome="all"):
+                 outcome="all", home_symbol=None):
     """Build one section. Each page reads only the state it renders."""
     if path == "/analyze":
         return analyze_page.layout()
@@ -555,7 +555,47 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         last_run=ds.get_last_run(),
         jobs=jobs,
         rolling_days=HOME_ROLLING_DAYS,
+        reports_by_symbol=_home_reports_by_symbol(),
+        active_symbol=home_symbol,
+        symbol_reports=_home_symbol_reports(home_symbol),
     )
+
+
+def _home_symbol_reports(symbol: str | None) -> list[dict]:
+    """Recent reports for one symbol, newest first, epilogue pre-stripped.
+
+    Feeds the Home reading pane. Stripping happens here so the layout module
+    never imports the models package."""
+    if not symbol:
+        return []
+    try:
+        from models.single_agent import strip_epilogue
+        reports = get_cache().get_trading_agent_reports(symbol, limit=5)
+        for r in reports:
+            r["report_text"] = strip_epilogue(r.get("report_text") or "")
+        return reports
+    except Exception as e:
+        logger.warning("Could not read %s reports for Home: %s", symbol, e)
+        return []
+
+
+_home_reports_memo: dict = {}
+
+
+def _home_reports_by_symbol() -> dict:
+    """Newest research report per symbol for the Home index. Best-effort:
+    Home must render even if the reports table is unreachable. Short-TTL
+    memo because the search box re-renders the index per keystroke."""
+    hit = _home_reports_memo.get("v")
+    if hit and (time.monotonic() - hit[0]) < 3.0:
+        return hit[1]
+    try:
+        result = get_cache().latest_reports_by_symbol()
+    except Exception as e:
+        logger.warning("Could not read latest reports for Home: %s", e)
+        return {}
+    _home_reports_memo["v"] = (time.monotonic(), result)
+    return result
 
 
 HOME_ROLLING_DAYS = 30
@@ -574,9 +614,11 @@ _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule", "/activity"
     State("history-activity-scope", "data"),
     State("activity-since-days", "data"),
     State("history-filter-outcome", "data"),
+    State("home-symbol-filter", "data"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
-                filter_specific, activity_scope, activity_since, outcome):
+                filter_specific, activity_scope, activity_since, outcome,
+                home_symbol):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -595,7 +637,7 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     try:
         page = _build_route(path, history_data, filter_symbols, filter_range,
                             filter_specific, activity_scope, activity_since,
-                            outcome)
+                            outcome, home_symbol=home_symbol)
         return page, SECTION_TITLES.get(path, "QuantNews")
     except Exception as e:
         logger.exception("Failed to render %s", path)
@@ -761,14 +803,79 @@ def set_outcome_filter(clicks):
 
 
 @callback(
-    Output("watchlist-panel", "is_open"),
+    Output("watchlist-panel-open", "data"),
     Input("watchlist-toggle-btn", "n_clicks"),
-    State("watchlist-panel", "is_open"),
+    State("watchlist-panel-open", "data"),
     prevent_initial_call=True,
 )
 def toggle_watchlist_panel(n_clicks, is_open):
-    """Reveal the symbol editor under the toolbar."""
-    return not is_open if n_clicks else is_open
+    """Reveal or hide the symbol editor under the toolbar."""
+    if not n_clicks:
+        raise PreventUpdate
+    return not is_open
+
+
+@callback(
+    Output("home-symbol-filter", "data"),
+    Input({"type": "home-sym-btn", "symbol": ALL}, "n_clicks"),
+    State("home-symbol-filter", "data"),
+    prevent_initial_call=True,
+)
+def toggle_home_symbol(clicks, current):
+    """Narrow the Home prediction board to one symbol, or widen back out.
+
+    The symbol rows on the left ARE the filter control — clicking the active
+    one (or the board's own "Show all" chip, which reuses the same pattern
+    id) clears the narrow.
+    """
+    if not clicks or not any(c for c in clicks if c):
+        raise PreventUpdate
+    sym = ctx.triggered_id["symbol"]
+    return None if sym == current else sym
+
+
+@callback(
+    Output("home-symbol-list", "children"),
+    Output("home-cohort-table", "children"),
+    Input("home-symbol-filter", "data"),
+    Input("home-symbol-search", "value", allow_optional=True),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def render_home_panes(active_symbol, search, pathname):
+    """Re-render the symbol index and the prediction board together.
+
+    One callback for both so the row highlight and the board can never
+    disagree about which symbol is active. Only fires from Home's own
+    controls, so the Outputs are always mounted (see render_archive_body
+    for the same pattern).
+    """
+    path = (pathname or "/").rstrip("/") or "/"
+    if path != "/":
+        raise PreventUpdate
+    from services import dashboard_service as ds
+    cohort = ds.get_latest_cohort()
+    if not cohort or not cohort.get("prediction_date"):
+        raise PreventUpdate
+    return (
+        home_page.symbol_list(cohort, _home_reports_by_symbol(),
+                              active_symbol, search or ""),
+        home_page.cohort_table(cohort, active_symbol,
+                               symbol_reports=_home_symbol_reports(active_symbol)),
+    )
+
+
+@callback(
+    Output("watchlist-panel", "is_open"),
+    Input("watchlist-panel-open", "data"),
+)
+def sync_watchlist_panel(is_open):
+    """Drive the Collapse from the persisted store.
+
+    Runs on load too, so the panel opens by default for new users and honours
+    a returning user's last open/closed choice from localStorage.
+    """
+    return True if is_open is None else bool(is_open)
 
 
 # =============================================================================
@@ -2938,15 +3045,20 @@ def fetch_report_history(symbols=None, only=None) -> dict:
     try:
         cache = get_cache()
 
-        # TradingAgents reports — load for selected symbols or all if none selected
+        # Research reports — the recent archive for everyone, plus deeper
+        # per-symbol history for the current watchlist. Loading ONLY the
+        # watchlist made every other symbol's past reports unreachable: the
+        # filter bar narrows what was loaded, it cannot load more.
         ta_reports = []
-        if not wanted("trading_agent_reports"):
-            pass
-        elif symbols:
-            for symbol in symbols:
-                ta_reports.extend(cache.get_trading_agent_reports(symbol, limit=10))
-        else:
-            ta_reports = cache.get_all_trading_agent_reports(limit=30)
+        if wanted("trading_agent_reports"):
+            ta_reports = cache.get_all_trading_agent_reports(limit=60)
+            if symbols:
+                seen = {r.get("id") for r in ta_reports}
+                for symbol in symbols:
+                    ta_reports.extend(
+                        r for r in cache.get_trading_agent_reports(symbol, limit=10)
+                        if r.get("id") not in seen
+                    )
         ta_reports.sort(key=lambda r: r.get("created_at", ""), reverse=True)
         result["trading_agent_reports"] = ta_reports
 
@@ -3900,8 +4012,10 @@ def update_predict_date_label(date_str):
     Output("run-modal", "is_open"),
     Output("run-data-summary", "children"),
     Output("run-ensemble-summary", "children"),
+    Output("run-scope", "value"),
     Input("run-analysis-btn", "n_clicks"),
     Input("home-run-btn", "n_clicks", allow_optional=True),
+    Input("reports-new-btn", "n_clicks", allow_optional=True),
     Input("run-cancel-btn", "n_clicks"),
     Input("run-confirm-btn", "n_clicks"),
     State("stock-data-store", "data"),
@@ -3911,31 +4025,38 @@ def update_predict_date_label(date_str):
     State("run-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_run_modal(open_clicks, home_clicks, cancel_clicks, confirm_clicks,
-                     stock_data, symbols, ensemble_config, news_data, is_open):
+def toggle_run_modal(open_clicks, home_clicks, reports_clicks, cancel_clicks,
+                     confirm_clicks, stock_data, symbols, ensemble_config,
+                     news_data, is_open):
     """Open or close the single run dialog, with a summary of the input data.
 
-    Two openers: the toolbar button and the Home call to action. Both land on
-    the same dialog, so there is one place where a run is configured.
+    Three openers: the toolbar button, the Home call to action, and the
+    Reports page's New Report button. All land on the same dialog, so there
+    is one place where a run is configured; the Reports opener presets the
+    scope to "report" so the dialog opens on the controls that matter there.
     """
     triggered = ctx.triggered_id
     no_update_body = (dash.no_update, dash.no_update)
-    openers = ("run-analysis-btn", "home-run-btn")
+    openers = ("run-analysis-btn", "home-run-btn", "reports-new-btn")
+    # Only the Reports opener repoints the scope — the others keep whatever
+    # the user last chose.
+    scope = "report" if triggered == "reports-new-btn" else dash.no_update
 
     if triggered not in openers + ("run-cancel-btn", "run-confirm-btn"):
         raise PreventUpdate
 
     if triggered in ("run-cancel-btn", "run-confirm-btn"):
-        return False, *no_update_body
+        return False, *no_update_body, dash.no_update
 
     if triggered in openers:
-        # Both openers fire this callback when they mount, with their own
+        # All openers fire this callback when they mount, with their own
         # n_clicks still None. Checking "either has clicks" is not enough:
         # the toolbar button never unmounts, so its count survives, and
         # arriving on Home would then open the dialog by itself. Only the
         # button that actually triggered may open it.
         if not {"run-analysis-btn": open_clicks,
-                "home-run-btn": home_clicks}.get(triggered):
+                "home-run-btn": home_clicks,
+                "reports-new-btn": reports_clicks}.get(triggered):
             raise PreventUpdate
         if not symbols:
             # Opening onto an explanation beats the old behaviour, which was
@@ -3947,7 +4068,7 @@ def toggle_run_modal(open_clicks, home_clicks, cancel_clicks, confirm_clicks,
                              "toolbar, then run.", className="empty-state-note"),
                 ],
                 className="empty-state",
-            ), dash.no_update
+            ), dash.no_update, scope
 
         stock_data = stock_data or {}
         ensemble_config = ensemble_config or {}
@@ -4023,9 +4144,9 @@ def toggle_run_modal(open_clicks, home_clicks, cancel_clicks, confirm_clicks,
             *ens_items,
         ], style={"fontSize": "0.85rem"})
 
-        return True, data_summary, ens_summary
+        return True, data_summary, ens_summary, scope
 
-    return is_open, *no_update_body
+    return is_open, *no_update_body, dash.no_update
 
 
 # =============================================================================
