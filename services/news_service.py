@@ -14,6 +14,7 @@ from typing import Optional
 import requests
 
 from config import API
+from services.rate_limiter import alpha_vantage_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +338,8 @@ def fetch_alpha_vantage_news(
             if page_time_to:
                 params["time_to"] = page_time_to
 
+            # Pace against the shared quota before spending a call.
+            alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
             response = requests.get(
                 API.ALPHA_VANTAGE_BASE_URL,
                 params=params,
@@ -732,6 +735,8 @@ def fetch_historical_av_news(
                     "economy_macro,economy_fiscal,economy_monetary,financial_markets"
                 )
 
+            # Pace against the shared quota before spending a call.
+            alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
             response = requests.get(
                 API.ALPHA_VANTAGE_BASE_URL,
                 params=params,

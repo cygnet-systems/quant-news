@@ -655,6 +655,53 @@ def _sym_thesis_html(thesis: dict) -> list[str]:
     return rows
 
 
+def _sym_positioning_quality_html(sym: dict) -> list[str]:
+    """Options positioning + Bad Apples quality screen for one symbol's
+    chapter. Empty when the payload predates these sections."""
+    rows: list[str] = []
+    pos = sym.get("positioning") or {}
+    if pos.get("pc_volume") is not None or pos.get("pc_oi") is not None:
+        pcv = f"{pos['pc_volume']:.2f}" if pos.get("pc_volume") is not None else "n/a"
+        pcoi = f"{pos['pc_oi']:.2f}" if pos.get("pc_oi") is not None else "n/a"
+        rows.append(
+            f"<p><strong>Options Positioning</strong> (chain as of "
+            f"{_esc(pos.get('as_of', '?'))}): P/C volume {pcv} "
+            f"({pos.get('put_volume', 0):,} puts / {pos.get('call_volume', 0):,} calls), "
+            f"P/C open interest {pcoi} — {_esc(pos.get('read', ''))}</p>"
+        )
+    quality = sym.get("quality") or {}
+    if quality.get("total_checks"):
+        flag = str(quality.get("flag", "")).replace("_", " ").upper()
+        rows.append(
+            f"<p><strong>Quality Screen (Bad Apples)</strong> as of "
+            f"{_esc(quality.get('as_of', '?'))}: {_esc(flag)} — "
+            f"{quality['total_fails']}/{quality['total_checks']} checks failed</p>"
+        )
+        failed = quality.get("failed_checks") or []
+        if failed:
+            rows.append("<ul>")
+            rows.extend(
+                f"<li>{_esc(f['check'])}: {_esc(f['value'])}"
+                + (f" ({_esc(f['note'])})" if f.get("note") else "") + "</li>"
+                for f in failed[:8]
+            )
+            rows.append("</ul>")
+        red_flags = quality.get("red_flags") or []
+        if red_flags:
+            rows.append("<p><strong>News red flags</strong> "
+                        "(keyword-matched headlines):</p><ul>")
+            rows.extend(
+                f"<li>[{_esc(h['category'])}] {_esc(h['headline'])}"
+                + (f" ({_esc(h['date'])})" if h.get("date") else "") + "</li>"
+                for h in red_flags[:6]
+            )
+            rows.append("</ul>")
+    if rows:
+        rows.append("<p class='meta'>Positioning and quality shade conviction "
+                    "and sizing — neither is a standalone timing signal.</p>")
+    return rows
+
+
 def _build_ai_analysis_section(
     ai_analysis: dict | None,
     symbols: list[str],
@@ -752,6 +799,7 @@ def _build_ai_analysis_section(
                 )
 
         # Shared panels — identical for both tiers.
+        rows.extend(_sym_positioning_quality_html(sym))
         if sym.get("sentiment_explanation"):
             rows.append(f"<p><strong>News vs. Technicals:</strong> "
                         f"{_esc(sym['sentiment_explanation'])}</p>")

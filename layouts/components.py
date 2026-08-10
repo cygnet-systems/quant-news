@@ -102,79 +102,6 @@ def create_metric_card(
     )
 
 
-def create_stock_input() -> html.Div:
-    """Create the stock symbol input component.
-
-    Returns:
-        Div containing input and quick-add buttons.
-    """
-    return html.Div(
-        [
-            html.Label("Enter Stock Symbols", className="input-label"),
-            dbc.InputGroup(
-                [
-                    dbc.Input(
-                        id="symbol-input",
-                        type="text",
-                        placeholder="MSFT, AAPL, NVDA...",
-                        className="symbol-input",
-                    ),
-                    dbc.Button(
-                        "Add",
-                        id="add-symbol-btn",
-                        color="primary",
-                        className="add-btn",
-                    ),
-                ],
-                className="mb-2",
-            ),
-            html.Div(id="symbol-tags", className="symbol-tags"),
-            dbc.Button(
-                [html.I(className="bi bi-x-circle me-1"), "Clear all"],
-                id="clear-symbols-btn",
-                size="sm",
-                outline=True,
-                color="secondary",
-                className="clear-symbols-btn mt-1",
-                style={"display": "none"},  # shown only when symbols selected
-            ),
-            # Recent searches: whole symbol GROUPS, so a past multi-symbol
-            # session is one click to restore (replaced the static quick-add
-            # tickers, which never matched what anyone was actually watching).
-            html.Div(
-                [
-                    html.Span("Recent: ", className="quick-add-label"),
-                    html.Div(id="recent-groups", className="quick-add-buttons"),
-                ],
-                className="quick-add-section mt-2",
-            ),
-        ],
-        className="stock-input-container",
-    )
-
-
-def create_symbol_tag(symbol: str) -> html.Div:
-    """Create a removable symbol tag/chip.
-
-    Args:
-        symbol: Stock ticker symbol.
-
-    Returns:
-        Tag component with remove button.
-    """
-    return html.Div(
-        [
-            html.Span(symbol, className="tag-text"),
-            html.Button(
-                "x",
-                id={"type": "remove-symbol", "symbol": symbol},
-                className="tag-remove",
-            ),
-        ],
-        className="symbol-tag",
-    )
-
-
 def create_news_card(
     title: str,
     source: str,
@@ -426,48 +353,41 @@ def create_cache_status_badge(
     )
 
 
-def create_data_actions() -> html.Div:
-    """Create data action buttons (refresh, export, view).
+def create_data_actions(include_refresh: bool = True) -> html.Div:
+    """Page-local data actions (refresh, export, view).
 
-    Returns:
-        Div with action buttons.
+    Rendered on the pages whose data they act on — Analyze (all three) and
+    Performance (export/view only). The ids are fixed and shared across the
+    two pages; only one page is mounted at a time, so this is the same
+    single-mount pattern as reports-new-btn. Their callbacks take these as
+    allow_optional Inputs because four of the six routes render neither.
     """
-    return html.Div(
-        [
-            dbc.Button(
-                [html.I(className="bi bi-arrow-clockwise me-1"), "Refresh"],
-                id="refresh-data-btn",
-                color="secondary",
-                size="sm",
-                outline=True,
-            ),
-            dbc.Button(
-                [html.I(className="bi bi-download me-1"), "Export"],
-                id="export-data-btn",
-                color="secondary",
-                size="sm",
-                outline=True,
-            ),
-            dbc.Button(
-                [html.I(className="bi bi-table me-1"), "View Data"],
-                id="view-data-btn",
-                color="secondary",
-                size="sm",
-                outline=True,
-            ),
-            # One run action. Predict, AI Report and Full Analysis were three
-            # buttons for three overlapping subsets of the same pipeline, with
-            # two duplicated parameter panels behind them; the subset is now a
-            # choice inside the dialog.
-            dbc.Button(
-                [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
-                id="run-analysis-btn",
-                color="success",
-                size="sm",
-            ),
-        ],
-        className="data-actions",
-    )
+    buttons = []
+    if include_refresh:
+        buttons.append(dbc.Button(
+            [html.I(className="bi bi-arrow-clockwise me-1"), "Refresh"],
+            id="refresh-data-btn",
+            color="secondary",
+            size="sm",
+            outline=True,
+        ))
+    buttons.extend([
+        dbc.Button(
+            [html.I(className="bi bi-download me-1"), "Export"],
+            id="export-data-btn",
+            color="secondary",
+            size="sm",
+            outline=True,
+        ),
+        dbc.Button(
+            [html.I(className="bi bi-table me-1"), "View Data"],
+            id="view-data-btn",
+            color="secondary",
+            size="sm",
+            outline=True,
+        ),
+    ])
+    return html.Div(buttons, className="data-actions")
 
 
 def create_empty_state(message: str = "No data to display") -> html.Div:

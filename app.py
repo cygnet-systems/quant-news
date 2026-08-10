@@ -19,6 +19,7 @@ from pathlib import Path
 import dash
 import diskcache
 import pandas as pd
+import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, callback, ctx, html, ALL, MATCH, dcc
 from dash import DiskcacheManager
@@ -59,7 +60,6 @@ from layouts.components import (
     calculate_period_label,
     create_metric_card,
     create_overview_empty_state,
-    create_symbol_tag,
 )
 from layouts.main_layout import create_layout
 from layouts.formatters import MODEL_DISPLAY, json_report_to_markdown
@@ -516,17 +516,18 @@ def _init_s3():
 # hidden divs instead would keep every callback live on every page.
 def _build_route(path, history_data, filter_symbols, filter_range,
                  filter_specific, activity_scope, activity_since,
-                 outcome="all", home_symbol=None):
+                 outcome="all", model="all", home_symbol=None,
+                 watchlist=None, period=None, home_cutoff=None):
     """Build one section. Each page reads only the state it renders."""
     if path == "/analyze":
-        return analyze_page.layout()
+        return analyze_page.layout(period or "1y")
     if path in ("/performance", "/reports"):
         # Live read, not the store: see fetch_report_history. Each page asks
         # only for the buckets it renders.
         if path == "/performance":
             return performance_page.layout(
                 history_data or fetch_report_history(only={"predictions"}),
-                filter_symbols, filter_range, filter_specific, outcome)
+                filter_symbols, filter_range, filter_specific, outcome, model)
         return reports_page.layout(
             history_data or fetch_report_history(
                 only={"reports", "recommendations", "trading_agent_reports"}),
@@ -548,17 +549,138 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         jobs = scheduler_service.list_jobs()
     except Exception as e:
         logger.warning("Could not read scheduled jobs for Home: %s", e)
+    recent = []
+    try:
+        from services import watchlist_service
+        recent = watchlist_service.recent_groups(limit=5)
+    except Exception as e:
+        logger.warning("Could not read recent groups for Home: %s", e)
+    cutoffs = ds.get_available_cutoffs()
     return home_page.layout(
-        cohort=ds.get_latest_cohort(),
+        cohort=ds.get_cohort(home_cutoff),
         open_preds=ds.get_open_predictions(),
         rolling=ds.get_rolling_performance(days=HOME_ROLLING_DAYS),
-        last_run=ds.get_last_run(),
+        last_run=ds.get_last_run() if not home_cutoff else None,
         jobs=jobs,
         rolling_days=HOME_ROLLING_DAYS,
         reports_by_symbol=_home_reports_by_symbol(),
         active_symbol=home_symbol,
         symbol_reports=_home_symbol_reports(home_symbol),
+        watchlist=watchlist or [],
+        recent_groups=recent,
+        symbol_detail=_home_symbol_detail(home_symbol),
+        cutoffs=cutoffs,
+        active_cutoff=home_cutoff or (cutoffs[0] if cutoffs else None),
     )
+
+
+def _serialize_articles(articles) -> list[dict]:
+    """NewsArticle objects -> the store/UI dict shape (shared by the news
+    store callback, the Home research pane and the run-input gap fill)."""
+    return [
+        {
+            "id": a.id,
+            "symbol": a.symbol,
+            "title": a.title,
+            "source": a.source,
+            "url": a.url,
+            "published_at": a.published_at.isoformat(),
+            "summary": a.summary,
+            "sentiment": a.sentiment,
+            "sentiment_score": a.sentiment_score,
+            "impact": a.impact,
+            "price_change_percent": a.price_change_percent,
+            "ticker_relevance_score": a.ticker_relevance_score,
+            "topics": a.topics,
+            "overall_sentiment_score": a.overall_sentiment_score,
+            "overall_sentiment_label": a.overall_sentiment_label,
+        }
+        for a in (articles or [])
+    ]
+
+
+def _fill_run_inputs(symbols, stock_data, news_data=None):
+    """Fetch OHLCV/news for run symbols the browser stores don't cover.
+
+    The stores only ever hold watchlist symbols; a run scoped to the last
+    cohort or a single non-watchlist name fills its own gaps here, through
+    the same cache layer the store fetch uses. Blocking — call it from the
+    background run subprocess or via asyncio.to_thread.
+    """
+    stock_data = dict(stock_data or {})
+    news = dict(news_data or {})
+    articles = dict(news.get("articles_by_symbol") or {})
+    for sym in symbols:
+        if not (stock_data.get(sym) or {}).get("prices"):
+            try:
+                df, meta = get_cache().get_stock_prices(sym, "1y")
+                df = add_indicators_to_df(df)
+                stock_data[sym] = {
+                    "prices": df.to_json(date_format="iso"),
+                    "metrics": calculate_performance_metrics(df),
+                    "signals": get_latest_signals(df),
+                    "period": "1y",
+                    "from_cache": meta.get("from_cache", False),
+                }
+            except Exception as e:
+                logger.warning("Run input: price fetch failed for %s: %s",
+                               sym, e)
+        if news_data is not None and not articles.get(sym):
+            try:
+                articles[sym] = _serialize_articles(fetch_news_cached(sym))
+            except Exception as e:
+                logger.warning("Run input: news fetch failed for %s: %s",
+                               sym, e)
+                articles[sym] = []
+    if news_data is not None:
+        news["articles_by_symbol"] = articles
+        news.setdefault("symbols", list(symbols))
+        return stock_data, news
+    return stock_data
+
+
+def _home_symbol_detail(symbol: str | None) -> dict | None:
+    """Chart + news for the Home research pane, fetched server-side.
+
+    Works for ANY symbol — watchlist or last-run cohort — which is the
+    point: a cohort-only name used to have no path to its chart or news
+    without re-typing it into the watchlist. Prices and news both come
+    through the normal cache layer, so a cached symbol costs two quick
+    Postgres reads and an uncached one a single provider fetch.
+    """
+    if not symbol:
+        return None
+    detail: dict = {"figure": None, "signals": {}, "articles": []}
+    try:
+        df, _meta = get_cache().get_stock_prices(symbol, "6mo")
+        df = add_indicators_to_df(df)
+        if not df.empty:
+            detail["signals"] = get_latest_signals(df)
+            closes = df["Close"]
+            dates = df["Date"] if "Date" in df.columns else df.index
+            fig = go.Figure(go.Scatter(
+                x=list(dates), y=list(closes), mode="lines",
+                line={"color": COLORS.ACCENT_PRIMARY, "width": 1.6},
+                hovertemplate="%{x|%Y-%m-%d} · %{y:.2f}<extra></extra>",
+            ))
+            fig.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin={"l": 40, "r": 12, "t": 8, "b": 24},
+                height=240,
+                showlegend=False,
+                xaxis={"showgrid": False},
+                yaxis={"gridcolor": "#242424"},
+            )
+            detail["figure"] = fig
+    except Exception as e:
+        logger.warning("Home detail: price fetch failed for %s: %s", symbol, e)
+    try:
+        detail["articles"] = _serialize_articles(fetch_news_cached(symbol))
+    except Exception as e:
+        logger.warning("Home detail: news fetch failed for %s: %s", symbol, e)
+    return detail
 
 
 def _home_symbol_reports(symbol: str | None) -> list[dict]:
@@ -585,8 +707,15 @@ _home_reports_memo: dict = {}
 def _home_reports_by_symbol() -> dict:
     """Newest research report per symbol for the Home index. Best-effort:
     Home must render even if the reports table is unreachable. Short-TTL
-    memo because the search box re-renders the index per keystroke."""
-    hit = _home_reports_memo.get("v")
+    memo because the search box re-renders the index per keystroke.
+    Keyed by viewer uid: visibility is per-user, so one user's memo must
+    never serve another's private rows."""
+    try:
+        from services.auth_service import current_uid
+        key = current_uid() or "anon"
+    except Exception:
+        key = "anon"
+    hit = _home_reports_memo.get(key)
     if hit and (time.monotonic() - hit[0]) < 3.0:
         return hit[1]
     try:
@@ -594,7 +723,7 @@ def _home_reports_by_symbol() -> dict:
     except Exception as e:
         logger.warning("Could not read latest reports for Home: %s", e)
         return {}
-    _home_reports_memo["v"] = (time.monotonic(), result)
+    _home_reports_memo[key] = (time.monotonic(), result)
     return result
 
 
@@ -614,11 +743,15 @@ _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule", "/activity"
     State("history-activity-scope", "data"),
     State("activity-since-days", "data"),
     State("history-filter-outcome", "data"),
+    State("history-filter-model", "data"),
     State("home-symbol-filter", "data"),
+    State("selected-symbols", "data"),
+    State("current-period", "data"),
+    State("home-cutoff-date", "data"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
                 filter_specific, activity_scope, activity_since, outcome,
-                home_symbol):
+                model, home_symbol, watchlist, period, home_cutoff):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -637,7 +770,9 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     try:
         page = _build_route(path, history_data, filter_symbols, filter_range,
                             filter_specific, activity_scope, activity_since,
-                            outcome, home_symbol=home_symbol)
+                            outcome, model, home_symbol=home_symbol,
+                            watchlist=watchlist, period=period,
+                            home_cutoff=home_cutoff)
         return page, SECTION_TITLES.get(path, "QuantNews")
     except Exception as e:
         logger.exception("Failed to render %s", path)
@@ -660,15 +795,18 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     State("history-filter-symbols", "data"),
     State("history-filter-date-range", "data"),
     State("history-filter-date-specific", "data"),
+    State("history-filter-model", "data"),
     prevent_initial_call=True,
 )
-def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specific):
+def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specific,
+                          model):
     """Build the prediction log the first time its section is opened."""
     if not n_clicks:
         raise PreventUpdate
+    from layouts.pages.performance import _by_model
     buckets = filter_history_data(fetch_report_history(), filter_symbols,
                                   filter_range, filter_specific)
-    section = build_predictions_section(buckets["predictions"])
+    section = build_predictions_section(_by_model(buckets["predictions"], model))
     if section is None:
         return html.Div("No predictions match this filter.",
                         className="history-empty-msg")
@@ -701,11 +839,12 @@ def render_filter_chips(filter_symbols, filter_range, filter_specific):
     Input("history-filter-date-range", "data"),
     Input("history-filter-date-specific", "data"),
     Input("history-filter-outcome", "data"),
+    Input("history-filter-model", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
 def render_archive_body(history_data, filter_symbols, filter_range,
-                        filter_specific, outcome, pathname):
+                        filter_specific, outcome, model, pathname):
     """Rebuild the filterable part of Performance or Reports.
 
     #archive-body exists only on those two routes, and only their own controls
@@ -717,11 +856,12 @@ def render_archive_body(history_data, filter_symbols, filter_range,
     data = history_data or fetch_report_history()
     if path == "/performance":
         return performance_page.body(data, filter_symbols, filter_range,
-                                     filter_specific, outcome)
+                                     filter_specific, outcome, model)
     return reports_page.body(data, filter_symbols, filter_range, filter_specific)
 
 
-def _performance_rows(f_symbols, f_range, f_specific, f_outcome) -> list[dict]:
+def _performance_rows(f_symbols, f_range, f_specific, f_outcome,
+                      f_model="all") -> list[dict]:
     """The prediction rows the Performance page is currently rendering.
 
     Re-derived from the same helpers the page uses rather than scraped from
@@ -729,11 +869,12 @@ def _performance_rows(f_symbols, f_range, f_specific, f_outcome) -> list[dict]:
     them.
     """
     from layouts.history_sections import filter_history_data
-    from layouts.pages.performance import _by_outcome
+    from layouts.pages.performance import _by_model, _by_outcome
 
     data = fetch_report_history(only={"predictions"})
     preds = filter_history_data(data, f_symbols, f_range or "all",
                                 f_specific)["predictions"]
+    preds = _by_model(preds, f_model or "all")
     preds = _by_outcome(preds, f_outcome or "all")
 
     keep = ("symbol", "model_name", "prediction_date", "target_date", "decision",
@@ -742,31 +883,9 @@ def _performance_rows(f_symbols, f_range, f_specific, f_outcome) -> list[dict]:
     return [{k: p.get(k) for k in keep} for p in preds]
 
 
-# Where the toolbar's data actions mean something. Everything else disables
-# them with a reason: a button that silently does nothing reads as broken,
-# and these two were wired to the Analyze stores on every page.
-_DATA_ACTION_PAGES = {
-    "/analyze": "the loaded price data, indicators and any run output",
-    "/performance": "the predictions in the current filter",
-}
-
-
-@callback(
-    Output("export-data-btn", "disabled"),
-    Output("export-data-btn", "title"),
-    Output("view-data-btn", "disabled"),
-    Output("view-data-btn", "title"),
-    Input("url", "pathname"),
-)
-def toggle_data_action_buttons(pathname):
-    """Enable View Data / Export only where there is data behind them."""
-    path = (pathname or "/").rstrip("/") or "/"
-    what = _DATA_ACTION_PAGES.get(path)
-    if not what:
-        reason = "Nothing to export on this page — open Analyze or Performance"
-        return True, reason, True, reason
-    return (False, f"Download {what}",
-            False, f"View {what} as a table")
+# Export and View Data render only on the pages whose data they act on
+# (Analyze, Performance) — see create_data_actions. Their callbacks take them
+# as allow_optional Inputs; there is no disabled state to manage anymore.
 
 
 @callback(
@@ -803,16 +922,25 @@ def set_outcome_filter(clicks):
 
 
 @callback(
-    Output("watchlist-panel-open", "data"),
-    Input("watchlist-toggle-btn", "n_clicks"),
-    State("watchlist-panel-open", "data"),
+    Output("history-filter-model", "data"),
+    # Model dropdown: Performance only.
+    Input("history-model-dropdown", "value", allow_optional=True),
+    State("history-filter-model", "data"),
     prevent_initial_call=True,
 )
-def toggle_watchlist_panel(n_clicks, is_open):
-    """Reveal or hide the symbol editor under the toolbar."""
-    if not n_clicks:
+def set_model_filter(value, current):
+    """Write the scoreboard's model filter to its store.
+
+    Writes the store only — the dropdown is seeded from it when the page is
+    built, because it exists on one of six routes and an Output on a missing
+    component is a hard error in Dash 4. The equality guard matters: this
+    Input also fires when the dropdown is (re)mounted with the value it was
+    just seeded with, and writing that back would re-render the body for no
+    change.
+    """
+    if value is None or value == (current or "all"):
         raise PreventUpdate
-    return not is_open
+    return value
 
 
 @callback(
@@ -835,47 +963,82 @@ def toggle_home_symbol(clicks, current):
 
 
 @callback(
+    Output("home-cutoff-date", "data"),
+    Input("home-cutoff-dropdown", "value", allow_optional=True),
+    State("home-cutoff-date", "data"),
+    prevent_initial_call=True,
+)
+def set_home_cutoff(value, current):
+    """Point the Home board at a past prediction cutoff.
+
+    Selecting the newest cutoff stores None, so the board tracks "latest"
+    again as new runs land instead of pinning to what happened to be newest
+    at click time. The equality guard also swallows the firing that happens
+    when navigation mounts the dropdown with its seeded value.
+    """
+    if not value:
+        raise PreventUpdate
+    from services import dashboard_service as ds
+    cutoffs = ds.get_available_cutoffs()
+    normalized = None if (cutoffs and value == cutoffs[0]) else value
+    if normalized == (current or None):
+        raise PreventUpdate
+    return normalized
+
+
+@callback(
     Output("home-symbol-list", "children"),
     Output("home-cohort-table", "children"),
+    Output("home-board-title", "children"),
+    Output("home-meta-wrap", "children"),
     Input("home-symbol-filter", "data"),
     Input("home-symbol-search", "value", allow_optional=True),
+    # The rail shows watchlist membership, so it re-renders when the
+    # watchlist changes (add/remove/clear/restore); the board follows the
+    # cutoff override. Guarded to Home below — the stores fire everywhere
+    # but the Outputs exist on one route.
+    Input("selected-symbols", "data"),
+    Input("home-cutoff-date", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
-def render_home_panes(active_symbol, search, pathname):
-    """Re-render the symbol index and the prediction board together.
+def render_home_panes(active_symbol, search, watchlist, cutoff, pathname):
+    """Re-render the symbol rail, the board, and its date header together.
 
-    One callback for both so the row highlight and the board can never
-    disagree about which symbol is active. Only fires from Home's own
-    controls, so the Outputs are always mounted (see render_archive_body
-    for the same pattern).
+    One callback for all four so the row highlight, the board, and the
+    "predicting X, data through Y" line can never disagree about which
+    symbol or cutoff is active. Only fires from Home's own controls, so the
+    Outputs are always mounted (see render_archive_body for the pattern).
     """
     path = (pathname or "/").rstrip("/") or "/"
     if path != "/":
         raise PreventUpdate
     from services import dashboard_service as ds
-    cohort = ds.get_latest_cohort()
-    if not cohort or not cohort.get("prediction_date"):
+    cohort = ds.get_cohort(cutoff)
+    if (not cohort or not cohort.get("prediction_date")) and not watchlist:
         raise PreventUpdate
+    rail = home_page.symbol_list(cohort, _home_reports_by_symbol(),
+                                 active_symbol, search or "",
+                                 watchlist=watchlist or [])
+    # Typing in the filter box only narrows the rail. The board (and the
+    # per-symbol chart/news fetch behind it) rebuilds only when the
+    # selection, the watchlist or the cutoff actually changed.
+    if ctx.triggered_id == "home-symbol-search":
+        return rail, dash.no_update, dash.no_update, dash.no_update
+    if not cohort or not cohort.get("prediction_date"):
+        return rail, dash.no_update, dash.no_update, dash.no_update
+    cutoffs = ds.get_available_cutoffs()
     return (
-        home_page.symbol_list(cohort, _home_reports_by_symbol(),
-                              active_symbol, search or ""),
+        rail,
         home_page.cohort_table(cohort, active_symbol,
-                               symbol_reports=_home_symbol_reports(active_symbol)),
+                               symbol_reports=_home_symbol_reports(active_symbol),
+                               symbol_detail=_home_symbol_detail(active_symbol)),
+        home_page.board_title(cutoffs, cutoff or (cutoffs[0] if cutoffs else None)),
+        # Run-time/error metadata belongs to the latest run only; a
+        # historical cutoff shows its cohort's own dates and outcomes.
+        home_page.last_run_header(cohort, ds.get_last_run() if not cutoff
+                                  else None),
     )
-
-
-@callback(
-    Output("watchlist-panel", "is_open"),
-    Input("watchlist-panel-open", "data"),
-)
-def sync_watchlist_panel(is_open):
-    """Drive the Collapse from the persisted store.
-
-    Runs on load too, so the panel opens by default for new users and honours
-    a returning user's last open/closed choice from localStorage.
-    """
-    return True if is_open is None else bool(is_open)
 
 
 # =============================================================================
@@ -942,19 +1105,25 @@ def restore_past_search(clicks):
 @callback(
     Output("selected-symbols", "data"),
     Output("symbol-input", "value"),
-    Input("add-symbol-btn", "n_clicks"),
+    # symbol-input lives in the always-mounted watchlist strip under the
+    # toolbar, so the watchlist is editable from every page. clear-symbols
+    # sits in the Home rail's ⋯ menu (one route → allow_optional). Two
+    # remove patterns exist because the strip chips and the Home rail rows
+    # are mounted at the same time on Home, and duplicate component ids are
+    # a hard error.
     Input("symbol-input", "n_submit"),
-    Input("clear-symbols-btn", "n_clicks"),
-    Input({"type": "recent-group", "idx": ALL}, "n_clicks"),
+    Input("clear-symbols-btn", "n_clicks", allow_optional=True),
+    Input({"type": "add-symbol", "symbol": ALL}, "n_clicks"),
     Input({"type": "remove-symbol", "symbol": ALL}, "n_clicks"),
+    Input({"type": "wl-remove", "symbol": ALL}, "n_clicks"),
     State("symbol-input", "value"),
     State("selected-symbols", "data"),
-    State("recent-symbol-groups", "data"),
     prevent_initial_call=True,
 )
-def manage_symbols(add_click, input_submit, clear_click, group_clicks,
-                   remove_clicks, input_value, current_symbols, recent_groups):
-    """Handle adding, removing, clearing, and restoring symbol selections."""
+def manage_symbols(input_submit, clear_click, add_clicks,
+                   remove_clicks, wl_remove_clicks, input_value,
+                   current_symbols):
+    """Handle adding, removing and clearing watchlist symbols."""
     current_symbols = current_symbols or []
 
     # Get the triggered context safely
@@ -967,9 +1136,9 @@ def manage_symbols(add_click, input_submit, clear_click, group_clicks,
     if triggered is None:
         raise PreventUpdate
 
-    # Handle add button — or Enter in the input, which previously did nothing
-    if triggered in ("add-symbol-btn", "symbol-input"):
-        if not (add_click or input_submit) or not input_value:
+    # Enter in the rail combobox adds whatever was typed
+    if triggered == "symbol-input":
+        if not input_submit or not input_value:
             raise PreventUpdate
         # Accept comma- AND space-separated input ("AAPL, MSFT" / "AAPL MSFT")
         # — the industry-standard multi-ticker search convention.
@@ -984,7 +1153,7 @@ def manage_symbols(add_click, input_submit, clear_click, group_clicks,
                                 f" (selection: {', '.join(current_symbols)})")
         return current_symbols, ""
 
-    # Clear the whole selection in one click
+    # Clear the whole selection in one click (rail ⋯ menu)
     if triggered == "clear-symbols-btn":
         if not clear_click:
             raise PreventUpdate
@@ -992,24 +1161,23 @@ def manage_symbols(add_click, input_submit, clear_click, group_clicks,
         prog.emit("action", f"Symbols cleared ({', '.join(current_symbols) or 'none'})")
         return [], dash.no_update
 
-    # Restore a recent group — REPLACES the selection (that's the point:
-    # one click back to a previous watchlist, not a merge)
-    if isinstance(triggered, dict) and triggered.get("type") == "recent-group":
-        if not any(c and c > 0 for c in group_clicks):
+    # One-click ＋ on a from-last-run rail row
+    if isinstance(triggered, dict) and triggered.get("type") == "add-symbol":
+        if not any(c and c > 0 for c in add_clicks):
             raise PreventUpdate
-        idx = triggered.get("idx")
-        groups = recent_groups or []
-        if not isinstance(idx, int) or idx >= len(groups):
-            raise PreventUpdate
-        from services import progress_service as prog
-        prog.emit("action", f"Recent group restored: {', '.join(groups[idx])}")
-        return list(groups[idx]), dash.no_update
+        symbol = triggered["symbol"]
+        if symbol not in current_symbols:
+            current_symbols = current_symbols + [symbol]
+            from services import progress_service as prog
+            prog.emit("action", f"Symbol added to watchlist: {symbol}")
+        return current_symbols, dash.no_update
 
-    # Handle remove buttons
-    if isinstance(triggered, dict) and triggered.get("type") == "remove-symbol":
-        # Find which button was clicked by checking n_clicks values
-        clicked_any = any(c and c > 0 for c in remove_clicks)
-        if not clicked_any:
+    # Handle remove buttons — the Home rail rows and the global strip chips
+    if isinstance(triggered, dict) \
+            and triggered.get("type") in ("remove-symbol", "wl-remove"):
+        clicks = (remove_clicks if triggered["type"] == "remove-symbol"
+                  else wl_remove_clicks)
+        if not any(c and c > 0 for c in clicks):
             raise PreventUpdate
         symbol = triggered["symbol"]
         if symbol in current_symbols:
@@ -1019,6 +1187,32 @@ def manage_symbols(add_click, input_submit, clear_click, group_clicks,
         return current_symbols, dash.no_update
 
     raise PreventUpdate
+
+
+@callback(
+    Output("watchlist-strip-chips", "children"),
+    Input("selected-symbols", "data"),
+)
+def render_watchlist_strip(symbols):
+    """The always-visible watchlist chips under the toolbar."""
+    if not symbols:
+        return html.Span("empty — type a symbol and press Enter",
+                         className="wl-strip-empty")
+    return [
+        html.Span(
+            [
+                html.Span(sym, className="wl-chip-text"),
+                html.Button(
+                    "✕",
+                    id={"type": "wl-remove", "symbol": sym},
+                    className="wl-chip-remove",
+                    title=f"Remove {sym} from the watchlist",
+                ),
+            ],
+            className="wl-chip",
+        )
+        for sym in symbols
+    ]
 
 
 @callback(
@@ -1065,79 +1259,6 @@ def record_recent_group(stock_data, symbols, groups):
     return [new] + groups[:4]
 
 
-@callback(
-    Output("recent-symbol-groups", "data", allow_duplicate=True),
-    Input("url", "pathname"),
-    prevent_initial_call="initial_duplicate",
-)
-def hydrate_recent_groups(_pathname):
-    """Seed the chips from durable history on every page load.
-
-    The store is browser-local, so without this a fresh browser (or a cleared
-    cache) starts with no recent groups even though the account has years of
-    them. It also has to write the store, not just the chips: the chip click
-    handler restores by index into this same list.
-    """
-    from services import watchlist_service
-    groups = watchlist_service.recent_groups(limit=5)
-    if not groups:
-        raise PreventUpdate
-    return groups
-
-
-@callback(
-    Output("recent-groups", "children"),
-    Input("recent-symbol-groups", "data"),
-)
-def render_recent_groups(groups):
-    """Render recent symbol groups as one-click restore chips."""
-    groups = groups or []
-    if not groups:
-        return html.Span("none yet — add symbols to build history",
-                         className="recent-groups-empty")
-    chips = []
-    for i, group in enumerate(groups[:5]):
-        label = ", ".join(group[:3]) + (f" +{len(group) - 3}" if len(group) > 3 else "")
-        chips.append(dbc.Button(
-            label,
-            id={"type": "recent-group", "idx": i},
-            size="sm",
-            outline=True,
-            color="secondary",
-            className="quick-add-btn me-1 mb-1",
-            title=", ".join(group),
-        ))
-    return chips
-
-
-@callback(
-    Output("symbol-tags", "children"),
-    Input("selected-symbols", "data"),
-)
-def update_symbol_tags(symbols):
-    """Update the symbol tags display."""
-    if not symbols:
-        return html.Div(
-            [
-                html.I(className="bi bi-info-circle me-2"),
-                html.Span("Add stocks using the input above or a recent group"),
-            ],
-            className="text-muted",
-            style={"fontSize": "12px", "padding": "8px 0"},
-        )
-
-    return [create_symbol_tag(sym) for sym in symbols]
-
-
-@callback(
-    Output("clear-symbols-btn", "style"),
-    Input("selected-symbols", "data"),
-)
-def toggle_clear_button(symbols):
-    """Clear-all only makes sense when there is something to clear."""
-    return {} if symbols else {"display": "none"}
-
-
 # =============================================================================
 # DATA FETCHING CALLBACKS
 # =============================================================================
@@ -1170,7 +1291,8 @@ _PERIOD_CONFIG = {
     Output("data-source-indicator", "children"),
     Input("selected-symbols", "data"),
     Input("current-period", "data"),
-    Input("refresh-data-btn", "n_clicks"),
+    # Refresh lives on Analyze's action bar now — absent on other routes.
+    Input("refresh-data-btn", "n_clicks", allow_optional=True),
     Input("cache-enabled", "data"),
     # Fires on load so a refresh rehydrates charts from the restored symbol
     # list. Returns the empty state when there are no symbols, so a fresh
@@ -1194,8 +1316,12 @@ async def fetch_stock_data_callback(symbols, period, refresh_click, cache_enable
     cache = get_cache()
     triggered = ctx.triggered_id
     # Force refresh if button clicked OR if cache is disabled
-    force_refresh = triggered == "refresh-data-btn" or not cache_enabled
-    if triggered == "refresh-data-btn":
+    # refresh_click guard: the button is Analyze-local, so this callback also
+    # fires when navigation mounts it (n_clicks None) — that must not force
+    # a cache-bypassing refetch.
+    force_refresh = ((triggered == "refresh-data-btn" and bool(refresh_click))
+                     or not cache_enabled)
+    if triggered == "refresh-data-btn" and refresh_click:
         from services import progress_service as prog
         prog.emit("action", f"Data refresh forced ({len(symbols)} symbols, "
                             f"period {period})")
@@ -1555,7 +1681,7 @@ def update_cache_enabled(toggle_value):
 @callback(
     Output("news-data-store", "data"),
     Input("selected-symbols", "data"),
-    Input("refresh-data-btn", "n_clicks"),
+    Input("refresh-data-btn", "n_clicks", allow_optional=True),
     Input("cache-enabled", "data"),
     # See fetch_stock_data_callback: fires on load to rehydrate after a refresh.
     prevent_initial_call=False,
@@ -1575,26 +1701,7 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     def _fetch_one(symbol):
         """Blocking per-symbol news fetch — runs in a worker thread."""
         articles = fetch_news_cached(symbol) if cache_enabled else fetch_news(symbol)
-        return [
-            {
-                "id": a.id,
-                "symbol": a.symbol,
-                "title": a.title,
-                "source": a.source,
-                "url": a.url,
-                "published_at": a.published_at.isoformat(),
-                "summary": a.summary,
-                "sentiment": a.sentiment,
-                "sentiment_score": a.sentiment_score,
-                "impact": a.impact,
-                "price_change_percent": a.price_change_percent,
-                "ticker_relevance_score": a.ticker_relevance_score,
-                "topics": a.topics,
-                "overall_sentiment_score": a.overall_sentiment_score,
-                "overall_sentiment_label": a.overall_sentiment_label,
-            }
-            for a in (articles or [])
-        ]
+        return _serialize_articles(articles)
 
     sem = asyncio.Semaphore(APP.NEWS_FETCH_CONCURRENCY)
 
@@ -1626,20 +1733,20 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     Input("ai-retry-btn", "n_clicks"),
     State("run-scope", "value"),
     State("news-data-store", "data"),
-    State("selected-symbols", "data"),
+    State("run-symbols-store", "data"),
     State("stock-data-store", "data"),
     State("run-date-picker", "date"),
     State("run-lookback", "value"),
     State("run-model", "value"),
     State("run-type", "value"),
-    State("run-include-research", "value"),
     State("run-recs", "value"),
     State("run-recs-model", "value"),
+    State("run-evidence", "value"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols,
-                               stock_data, run_date, lookback, model, depth,
-                               research, recs, recs_model):
+async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
+                               run_symbols, stock_data, run_date, lookback,
+                               model, depth, recs, recs_model, run_evidence):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1657,8 +1764,21 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
     scope = scope or "full"
     if ctx.triggered_id == "run-confirm-btn" and scope == "models":
         raise PreventUpdate
-    if not (n_clicks or retry_clicks) or not news_data or not news_data.get("articles_by_symbol"):
+    # The run's symbol set comes from the dialog (watchlist / last cohort /
+    # custom), not from the watchlist directly. The store news is only a
+    # fallback here — the report does its own point-in-time fetch per
+    # symbol — so an empty news store must not block a run.
+    symbols = (run_symbols or {}).get("symbols") or []
+    if not (n_clicks or retry_clicks) or not symbols:
         raise PreventUpdate
+
+    # Metric/signal context for symbols outside the browser stores (e.g. a
+    # cohort-scoped or single-symbol run) is fetched server-side.
+    missing = [s for s in symbols
+               if not ((stock_data or {}).get(s) or {}).get("prices")]
+    if missing:
+        stock_data = await asyncio.to_thread(
+            _fill_run_inputs, symbols, stock_data)
 
     # Target date: the session whose close is being predicted, taken from the
     # Full Analysis picker when that flow triggered this, else the AI Report
@@ -1675,15 +1795,25 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
 
     # One set of controls, read once. There is no longer a second, hidden
     # parameter panel for another flow to read by mistake.
-    lookback_days = int(lookback or 7)
+    overnight_news = lookback == "overnight"
+    lookback_days = 1 if overnight_news else int(lookback or 7)
+    window_desc = ("overnight close→open" if overnight_news
+                   else f"{lookback_days}d")
     report_model = model or "gpt-5.6-luna"
     include_thesis_flag = (depth or "thesis") != "standard"
     recs_mode = recs or "auto"
     recs_model_val = recs_model or "claude-sonnet-5"
+    # Terminal-derived evidence blocks (modal checklist); None only before
+    # the modal has rendered once — treat as the default, both on.
+    evidence_sel = (sorted(run_evidence) if run_evidence is not None
+                    else ["options", "quality"])
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
-    # Full pipeline already produces research through the prediction stage;
-    # running it here too would double the LLM spend for identical output.
-    include_research = bool(research) and not is_full
+    # Per-symbol analysis is always the full research agent now — the shallow
+    # summarize_news_structured pass produced a thinner second opinion on the
+    # same data and was removed (2026-08-08). Full pipeline still gets its
+    # research through the prediction stage's trading_agents model; running
+    # it here too would double the LLM spend for identical output.
+    include_research = not is_full
 
     from services import progress_service as prog
     if is_full:
@@ -1691,19 +1821,22 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
                        f"target {target_str} (data through {as_of_str})"
                        + (" (backtest)" if is_backtest else ""))
     prog.emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
-    prog.emit("action", f"Options: model={report_model}, window={lookback_days}d, "
+    prog.emit("action", f"Options: model={report_model}, window={window_desc}, "
                         f"type={'thesis' if include_thesis_flag else 'standard'}, "
-                        f"research={'on' if include_research else 'pipeline' if is_full else 'off'}, "
+                        f"research={'pipeline' if is_full else 'on'}, "
                         f"recs={recs_mode} ({recs_model_val}), "
                         f"target {target_str}, data through {as_of_str}")
 
     articles_by_symbol = news_data.get("articles_by_symbol", {})
 
     # News window: the SAME point-in-time fetch the modal preview showed —
-    # windowed [as_of - lookback, as_of], DB-cached, lookahead-safe. The
-    # dcc.Store's articles are only a fallback: they hold whatever the last
-    # background refresh grabbed, which may not cover the chosen window.
-    from services.news_window import fetch_point_in_time_news, filter_articles_as_of
+    # windowed [as_of - lookback, as_of] (or the overnight close→open gap),
+    # lookahead-safe. The dcc.Store's articles are only a fallback: they hold
+    # whatever the last background refresh grabbed, which may not cover the
+    # chosen window.
+    from config import MODEL as _M
+    from services.news_window import (
+        fetch_overnight_news, fetch_point_in_time_news, filter_articles_as_of)
 
     def _art_dict(a):
         return {
@@ -1726,17 +1859,33 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
     windowed: dict[str, list] = {}
     for sym in (symbols or []):
         try:
-            fetched = fetch_point_in_time_news(sym, as_of_str, lookback_days=lookback_days)
+            if overnight_news:
+                fetched = fetch_overnight_news(
+                    sym, as_of_str, target_str,
+                    relevance_threshold=_M.NEWS_OVERNIGHT_RELEVANCE,
+                    max_articles=_M.NEWS_MAX_ARTICLES,
+                    start_time_et=_M.NEWS_OVERNIGHT_START_ET,
+                    end_time_et=_M.NEWS_OVERNIGHT_END_ET,
+                )
+            else:
+                fetched = fetch_point_in_time_news(
+                    sym, as_of_str, lookback_days=lookback_days)
             windowed[sym] = [_art_dict(a) for a in fetched]
         except Exception as e:
-            logger.warning(f"PIT news fetch failed for {sym}, falling back to store: {e}")
+            logger.warning(f"news fetch failed for {sym}, falling back to store: {e}")
             windowed[sym] = filter_articles_as_of(
                 articles_by_symbol.get(sym, []), as_of_str, lookback_days=lookback_days)
     articles_by_symbol = windowed
     total_articles = sum(len(a) for a in articles_by_symbol.values())
-    prog.emit("news", f"News window {lookback_days}d ending {as_of_str} "
-                      f"(target {target_str} minus 1 trading day): "
-                      f"{total_articles} articles fetched (point-in-time)")
+    if overnight_news:
+        prog.emit("news", f"Overnight window {as_of_str} {_M.NEWS_OVERNIGHT_START_ET} ET "
+                          f"→ {target_str} {_M.NEWS_OVERNIGHT_END_ET} ET "
+                          f"(relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE}): "
+                          f"{total_articles} articles fetched (point-in-time)")
+    else:
+        prog.emit("news", f"News window {lookback_days}d ending {as_of_str} "
+                          f"(target {target_str} minus 1 trading day): "
+                          f"{total_articles} articles fetched (point-in-time)")
 
     # Check persistent cache (Postgres + S3) before running LLM
     if _s3_available and ctx.triggered_id != "ai-retry-btn":
@@ -1746,16 +1895,17 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
                 "news": articles_by_symbol,
                 "symbols": sorted(symbols or []),
                 "as_of": as_of_str,
-                # v4-merged: research epilogue feeds banner/watch/thesis;
-                # Full Analysis no longer runs the shallow per-symbol pass.
+                # v5-flowq: per-symbol options positioning + quality screen
+                # ride the payload (and the research/portfolio prompts).
                 # Model, window and analysis type key the cache — switching
                 # model must not serve the other model's cached report.
-                "schema": "v4-merged",
+                "schema": "v5-flowq",
                 "model": report_model,
-                "lookback": lookback_days,
+                "lookback": "overnight" if overnight_news else lookback_days,
                 "thesis": include_thesis_flag,
                 "research": include_research,
                 "recs": recs_mode,
+                "evidence": evidence_sel,
             })
             cached = ps.get_cached_report(None, as_of_str, "ai_report", data_hash)
             if cached:
@@ -1848,6 +1998,26 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
             profile = get_company_profile(symbol)
             if profile:
                 blocks["profile"] = profile
+
+            # Options positioning + Bad Apples quality screen — both are
+            # as-of-safe and cached per (symbol, as_of) inside their services.
+            # Gated by the modal's Evidence-blocks checklist.
+            if "options" in evidence_sel:
+                from services.options_service import (
+                    get_put_call_metrics, format_options_block,
+                )
+                block = format_options_block(
+                    symbol, get_put_call_metrics(symbol, as_of_str))
+                if block:
+                    blocks["options"] = block
+            if "quality" in evidence_sel:
+                from services.bad_apples_service import (
+                    analyze_symbol as _ba_analyze, format_bad_apples_block,
+                )
+                block = format_bad_apples_block(
+                    symbol, _ba_analyze(symbol, as_of_str))
+                if block:
+                    blocks["quality"] = block
         except Exception as e:
             logger.warning(f"Validated block build failed for {symbol}: {e}")
         extra_blocks_by_symbol[symbol] = blocks
@@ -1956,29 +2126,15 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
             aio_tasks.append(_run_task("research", symbol, _run_research, symbol))
             prog.emit("ta", f"{symbol}: research report starting ({report_model})…")
 
-    # When the research report runs, it IS the per-symbol text analysis —
-    # running the shallow summary beside it paid twice for one answer.
-    # Full Analysis is the same situation through a different door: its
-    # prediction pipeline always runs the trading_agents model, so the
-    # research text arrives via the signals store — running the shallow
-    # pass beside it produced a second, thinner opinion on the same data
-    # that could contradict the research verdict in the same tab.
-    # The portfolio-level overall call below still runs either way (the
-    # research reports are single-symbol and cannot replace it).
-    if not include_research and not is_full:
-        for symbol, articles in symbol_tasks.items():
-            sym_stock = {symbol: enriched_stock_data.get(symbol, {})}
-            aio_tasks.append(_run_task(
-                "symbol", symbol, llm.summarize_news_structured, articles, [symbol],
-                stock_data=sym_stock,
-                as_of_date=as_of_str,
-                extra_blocks=extra_blocks_by_symbol.get(symbol, {}),
-                include_thesis=include_thesis_flag,
-                model=report_model,
-                provider=report_provider,
-            ))
-            prog.emit("ai", f"{symbol}: analyzing {len(articles)} articles "
-                            f"({report_model})…")
+    # The research report IS the per-symbol text analysis. The shallow
+    # summarize_news_structured per-symbol pass that used to run instead of
+    # it was removed 2026-08-08: it produced a thinner opinion on the same
+    # data that could contradict the research verdict in the same tab, and
+    # cost an extra LLM call per symbol. Full Analysis still gets its
+    # research from the prediction stage's trading_agents model, so nothing
+    # runs here in that scope. The portfolio-level overall call below is
+    # separate either way (the research reports are single-symbol and
+    # cannot replace it).
 
     # The overall shallow call is Luna's understudy: when research runs
     # per symbol AND Luna will synthesize the portfolio view, it adds a
@@ -2054,6 +2210,16 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
         prog.emit("ai", f"AI Report complete ({len(result['by_symbol'])} symbols) — "
                         "model predictions next")
 
+    # Per-symbol options positioning + quality screen ride the payload so the
+    # synthesis prompt and every renderer read one source. After the failed
+    # check (an entry per symbol must not mask an empty report), off the event
+    # loop (both services hit the network on a cache miss).
+    if not result.get("failed"):
+        from services.analysis_runner import attach_positioning_quality
+        result = await asyncio.to_thread(
+            attach_positioning_quality, result, symbols or [], as_of_str,
+            evidence_sel)
+
     # Store to Postgres/S3 for future cache hits
     if _s3_available and not result.get("failed"):
         try:
@@ -2062,16 +2228,17 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data, symbols
                 "news": articles_by_symbol,
                 "symbols": sorted(symbols or []),
                 "as_of": as_of_str,
-                # v4-merged: research epilogue feeds banner/watch/thesis;
-                # Full Analysis no longer runs the shallow per-symbol pass.
+                # v5-flowq: per-symbol options positioning + quality screen
+                # ride the payload (and the research/portfolio prompts).
                 # Model, window and analysis type key the cache — switching
                 # model must not serve the other model's cached report.
-                "schema": "v4-merged",
+                "schema": "v5-flowq",
                 "model": report_model,
-                "lookback": lookback_days,
+                "lookback": "overnight" if overnight_news else lookback_days,
                 "thesis": include_thesis_flag,
                 "research": include_research,
                 "recs": recs_mode,
+                "evidence": evidence_sel,
             })
             ps.store_report(
                 symbol=None,
@@ -2231,111 +2398,6 @@ def update_llm_status(news_data):
     return f"LLM: {llm.provider}"
 
 
-@callback(
-    Output("signals-display", "children"),
-    Input("stock-data-store", "data"),
-    State("selected-symbols", "data"),
-)
-def update_signals_display(stock_data, symbols):
-    """Update technical signals display."""
-    if not stock_data or not symbols:
-        return html.Div(
-            [
-                html.I(className="bi bi-activity", style={"fontSize": "20px", "opacity": "0.5", "display": "block", "marginBottom": "8px"}),
-                html.Span("Select stocks to view signals"),
-            ],
-            className="empty-state",
-            style={"padding": "16px", "fontSize": "13px"},
-        )
-
-    symbol = symbols[0]
-    if symbol not in stock_data:
-        return html.Div(
-            [
-                html.I(className="bi bi-exclamation-triangle", style={"fontSize": "20px", "opacity": "0.5", "display": "block", "marginBottom": "8px"}),
-                html.Span("No signal data available"),
-            ],
-            className="empty-state",
-            style={"padding": "16px", "fontSize": "13px"},
-        )
-
-    signals = stock_data[symbol].get("signals", {})
-
-    if not signals:
-        return html.Div(
-            [
-                html.I(className="bi bi-dash-circle", style={"fontSize": "20px", "opacity": "0.5", "display": "block", "marginBottom": "8px"}),
-                html.Span("No signals available for this stock"),
-            ],
-            className="empty-state",
-            style={"padding": "16px", "fontSize": "13px"},
-        )
-
-    # Tooltips explaining each signal type
-    signal_tooltips = {
-        "rsi": "RSI (14-day): Overbought >70, Oversold <30",
-        "macd": "MACD (12/26/9): Bullish when MACD crosses above Signal",
-        "trend_50": "Price position relative to 50-day SMA",
-        "trend_200": "Price position relative to 200-day SMA (long-term)",
-        "cross": "Golden Cross = SMA 50 > SMA 200 (Bullish), Death Cross = opposite",
-        "bollinger": "Price position relative to Bollinger Bands (20-day, ±2σ)",
-        "stochastic": "Stochastic (14/3): Overbought >80, Oversold <20",
-        "momentum": "Price momentum based on rate of change",
-    }
-
-    signal_items = []
-
-    for key, val in signals.items():
-        if isinstance(val, dict):
-            signal_text = val.get("signal", str(val))
-            is_bullish = val.get("bullish", None)
-
-            if is_bullish is True:
-                color_class = "signal-bullish"
-            elif is_bullish is False:
-                color_class = "signal-bearish"
-            else:
-                # Check signal text for sentiment
-                if "bullish" in signal_text.lower() or "above" in signal_text.lower():
-                    color_class = "signal-bullish"
-                elif "bearish" in signal_text.lower() or "below" in signal_text.lower():
-                    color_class = "signal-bearish"
-                else:
-                    color_class = "signal-neutral"
-
-            # Create unique ID for tooltip target
-            signal_id = f"signal-{key}"
-
-            # Get tooltip text for this signal type
-            tooltip_text = signal_tooltips.get(key, f"{key.replace('_', ' ').title()} indicator")
-
-            signal_items.append(
-                html.Div(
-                    [
-                        html.Span(
-                            key.replace("_", " ").title(),
-                            className="signal-name",
-                            id=signal_id,
-                        ),
-                        dbc.Tooltip(tooltip_text, target=signal_id, placement="left"),
-                        html.Span(signal_text.replace("_", " ").title(), className=f"signal-value {color_class}"),
-                    ],
-                    className="signal-item",
-                )
-            )
-
-    if not signal_items:
-        return html.Div(
-            [
-                html.I(className="bi bi-dash-circle", style={"fontSize": "20px", "opacity": "0.5", "display": "block", "marginBottom": "8px"}),
-                html.Span("No signals detected"),
-            ],
-            className="empty-state",
-            style={"padding": "16px", "fontSize": "13px"},
-        )
-    return signal_items
-
-
 # =============================================================================
 # HISTORICAL REPORT DOWNLOAD
 # =============================================================================
@@ -2349,7 +2411,7 @@ def update_signals_display(stock_data, symbols):
 @callback(
     Output("data-modal", "is_open"),
     Output("data-table-container", "children"),
-    Input("view-data-btn", "n_clicks"),
+    Input("view-data-btn", "n_clicks", allow_optional=True),
     Input("modal-close-btn", "n_clicks"),
     State("selected-symbols", "data"),
     State("data-modal", "is_open"),
@@ -2358,10 +2420,11 @@ def update_signals_display(stock_data, symbols):
     State("history-filter-date-range", "data"),
     State("history-filter-date-specific", "data"),
     State("history-filter-outcome", "data"),
+    State("history-filter-model", "data"),
     prevent_initial_call=True,
 )
 def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
-                      f_symbols, f_range, f_specific, f_outcome):
+                      f_symbols, f_range, f_specific, f_outcome, f_model):
     """Show the rows behind whatever the current page is rendering.
 
     The button used to read the Analyze page's stores wherever you clicked
@@ -2373,10 +2436,17 @@ def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
     if triggered == "modal-close-btn":
         return False, dash.no_update
 
+    # The button is page-local now (allow_optional Input), so this callback
+    # also fires when navigation MOUNTS it, with n_clicks still None — that
+    # firing must not open the modal.
+    if triggered == "view-data-btn" and not view_click:
+        raise PreventUpdate
+
     path = (pathname or "/").rstrip("/") or "/"
 
     if triggered == "view-data-btn" and path == "/performance":
-        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome)
+        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome,
+                                 f_model)
         if not rows:
             return True, html.Div("No predictions in the current filter",
                                   className="text-muted")
@@ -2420,11 +2490,11 @@ def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
 
 @callback(
     Output("download-data", "data"),
-    Input("export-data-btn", "n_clicks"),
+    Input("export-data-btn", "n_clicks", allow_optional=True),
     Input("modal-export-btn", "n_clicks"),
     State("selected-symbols", "data"),
     State("stock-data-store", "data"),
-    State("indicator-toggles", "value"),
+    State("indicator-toggles", "value", allow_optional=True),
     State("model-signals-store", "data"),
     State("ai-analysis-store", "data"),
     State("recommendations-store", "data"),
@@ -2433,22 +2503,28 @@ def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
     State("history-filter-date-range", "data"),
     State("history-filter-date-specific", "data"),
     State("history-filter-outcome", "data"),
+    State("history-filter-model", "data"),
     prevent_initial_call=True,
 )
 def export_data(export_click, modal_export_click, symbols, stock_data,
                 indicators, model_signals, ai_analysis, recommendations,
-                pathname, f_symbols, f_range, f_specific, f_outcome):
+                pathname, f_symbols, f_range, f_specific, f_outcome, f_model):
     """Export everything on screen as a multi-sheet .xlsx.
 
     Replaces the old single-symbol Parquet dump. Sheets are dynamic: prices
     (+ only the toggled indicators) per symbol, then Predictions / AI
     Analysis / Recommendations whenever those stores hold data.
     """
+    # Mount-firing guard (see toggle_data_modal): navigating to a page that
+    # renders the button must not trigger a download.
+    if ctx.triggered_id == "export-data-btn" and not export_click:
+        raise PreventUpdate
     path = (pathname or "/").rstrip("/") or "/"
     if path == "/performance":
         # Export what the page is showing, filters and all — the scoreboard is
         # the thing worth taking away from this page, not the Analyze stores.
-        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome)
+        rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome,
+                                 f_model)
         if not rows:
             raise PreventUpdate
         import pandas as _pd
@@ -2660,23 +2736,30 @@ def update_period(clicks, current_period):
     Input("run-confirm-btn", "n_clicks"),
     State("run-scope", "value"),
     State("stock-data-store", "data"),
-    State("selected-symbols", "data"),
+    State("run-symbols-store", "data"),
     State("ensemble-config-store", "data"),
     State("news-data-store", "data"),
     State({"type": "run-model-check", "model": ALL}, "value"),
     State("run-ensemble-check", "value"),
+    State({"type": "run-ens-member", "model": ALL}, "value"),
+    State({"type": "run-ens-weight", "model": ALL}, "value"),
+    State("run-ensemble-method", "value"),
+    State("run-ensemble-min-agree", "value"),
     State("run-date-picker", "date"),
     State("run-model", "value"),
     State("run-type", "value"),
+    State("run-evidence", "value"),
     background=True,
     running=[
         (Output("prediction-running-indicator", "style"), {"display": "block"}, {"display": "none"}),
     ],
     prevent_initial_call=True,
 )
-def generate_model_signals(n_clicks, scope, stock_data, symbols, ensemble_config,
-                           news_data, model_checks, run_ensemble,
-                           predict_date_str, research_model, research_depth):
+def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
+                           ensemble_config, news_data, model_checks,
+                           run_ensemble, ens_members, ens_weights, ens_method,
+                           ens_min_agree, predict_date_str, research_model,
+                           research_depth, run_evidence):
     """Generate model predictions in a background subprocess.
 
     Supports backtesting: when the selected as-of date is in the past, OHLCV
@@ -2688,8 +2771,14 @@ def generate_model_signals(n_clicks, scope, stock_data, symbols, ensemble_config
     scope = scope or "full"
     if scope == "report":
         raise PreventUpdate
-    if not n_clicks or not stock_data or not symbols:
+    symbols = (run_symbols or {}).get("symbols") or []
+    if not n_clicks or not symbols:
         raise PreventUpdate
+
+    # Symbols outside the browser stores (cohort- or custom-scoped runs)
+    # fetch their own OHLCV and news here, in the background subprocess.
+    stock_data, news_data = _fill_run_inputs(symbols, stock_data,
+                                             news_data or {})
 
     # The model checkboxes are now honoured on every scope. Full pipeline used
     # to overwrite them with [True] * 5, so the boxes you unticked ran anyway.
@@ -2702,6 +2791,9 @@ def generate_model_signals(n_clicks, scope, stock_data, symbols, ensemble_config
         research_kwargs = {
             "research_model": research_model or None,
             "include_thesis": (research_depth or "thesis") != "standard",
+            # Modal checklist; None only before the modal has rendered once.
+            "evidence": sorted(run_evidence) if run_evidence is not None
+                        else ["options", "quality"],
         }
     else:
         # Models-only owns the feed; the full pipeline started it already.
@@ -2731,6 +2823,30 @@ def generate_model_signals(n_clicks, scope, stock_data, symbols, ensemble_config
     for model_id, checked in zip(_ALL_MODEL_IDS, model_checks or []):
         if checked:
             selected_models.add(model_id)
+
+    # Build the ensemble config from the dialog's own controls: they are what
+    # the user sees at click time, whereas the store State could still be one
+    # sync callback behind the last edit. The store keeps the same values for
+    # the drawer and live recompute.
+    from config import MODEL as _MODEL
+    if ens_members is not None:
+        weights = {}
+        for model_id, w in zip(_ALL_MODEL_IDS, ens_weights or []):
+            try:
+                weights[model_id] = round(float(w), 1)
+            except (TypeError, ValueError):
+                weights[model_id] = 1.0
+        try:
+            min_agree_val = int(ens_min_agree)
+        except (TypeError, ValueError):
+            min_agree_val = _MODEL.ENSEMBLE_MIN_AGREE
+        ensemble_config = {
+            "enabled_models": [m for m, on in zip(_ALL_MODEL_IDS, ens_members)
+                               if on],
+            "weights": weights,
+            "method": ens_method or _MODEL.ENSEMBLE_DEFAULT_METHOD,
+            "min_agree": min_agree_val,
+        }
 
     try:
         from services.prediction_service import get_prediction_service
@@ -2988,10 +3104,23 @@ def evaluate_predictions_now(n_clicks):
             msg = f"Evaluated {count} prediction{'s' if count != 1 else ''} against actual closing prices."
             icon = "success"
         else:
-            msg = ("No predictions could be evaluated yet — either their target date "
-                   "hasn't closed, or the closing prices haven't been fetched "
-                   "(load the symbol to refresh price data).")
-            icon = "warning"
+            # Zero is the usual outcome — the 6pm scheduler and post-backtest
+            # auto-eval normally score everything first. Only warn when mature
+            # rows are genuinely stuck without a close to score against.
+            backlog = cache.evaluation_backlog()
+            pending = backlog.get("pending_mature", 0)
+            if pending:
+                dates = ", ".join(sorted(backlog.get("by_target_date", {}))[:4])
+                msg = (f"{pending} prediction{'s' if pending != 1 else ''} "
+                       f"due for scoring could not be evaluated — no closing "
+                       f"price stored for target date{'s' if pending != 1 else ''} "
+                       f"{dates}. Load those symbols to refresh price data.")
+                icon = "warning"
+            else:
+                msg = ("All caught up — every matured prediction is already "
+                       "scored. The rest will be evaluable once their target "
+                       "date closes.")
+                icon = "success"
         return {"evaluated": count, "at": datetime.now().isoformat()}, True, msg, icon
     except Exception as e:
         logger.warning(f"Manual evaluation failed: {e}")
@@ -3557,18 +3686,37 @@ def toggle_ensemble_drawer(n_clicks, is_open):
     Input({"type": "ensemble-weight-slider", "model": ALL}, "value"),
     Input({"type": "ensemble-weight-input", "model": ALL}, "value"),
     Input("ensemble-reset-btn", "n_clicks"),
+    Input("ensemble-config-drawer", "is_open"),
+    State("ensemble-config-store", "data"),
     prevent_initial_call=True,
 )
-def sync_ensemble_config(switches, slider_values, input_values, reset_clicks):
+def sync_ensemble_config(switches, slider_values, input_values, reset_clicks,
+                         drawer_open, current_store):
     """Single callback to sync ensemble config from UI controls to store.
 
-    Handles switches, sliders, number inputs, and reset button.
-    Returns store data + updated UI state (disabled flags, synced values).
+    Handles switches, sliders, number inputs, and reset button. Returns
+    store data + updated UI state (disabled flags, synced values). Method
+    and min_agree are edited in the Run dialog, not here — carry them
+    through unchanged so a drawer edit doesn't silently reset them.
     """
     from config import MODEL
 
     model_order = ["kronos_mini", "xgboost_shap", "lightgbm", "deberta_sentiment", "trading_agents"]
     triggered = ctx.triggered_id
+    current_store = current_store or {}
+
+    # Drawer opened: the store may have been edited from the Run dialog while
+    # the drawer's controls sat stale. Repaint them from the store.
+    if triggered == "ensemble-config-drawer":
+        if not drawer_open:
+            raise PreventUpdate
+        enabled = set(current_store.get("enabled_models")
+                      or MODEL.ENSEMBLE_DEFAULT_ENABLED)
+        weights = current_store.get("weights") or dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+        disabled = [m not in enabled for m in model_order]
+        vals = [float(weights.get(m, 1.0)) for m in model_order]
+        return (dash.no_update, disabled, disabled[:], vals, vals[:],
+                [m in enabled for m in model_order])
 
     # Reset to defaults
     if triggered == "ensemble-reset-btn":
@@ -3577,6 +3725,8 @@ def sync_ensemble_config(switches, slider_values, input_values, reset_clicks):
         store = {
             "enabled_models": list(default_enabled),
             "weights": default_weights,
+            "method": MODEL.ENSEMBLE_DEFAULT_METHOD,
+            "min_agree": MODEL.ENSEMBLE_MIN_AGREE,
         }
         slider_disabled = [m not in default_enabled for m in model_order]
         input_disabled = slider_disabled[:]
@@ -3622,7 +3772,12 @@ def sync_ensemble_config(switches, slider_values, input_values, reset_clicks):
         slider_disabled.append(not is_on)
         input_disabled.append(not is_on)
 
-    store = {"enabled_models": enabled, "weights": weights}
+    store = {
+        "enabled_models": enabled,
+        "weights": weights,
+        "method": current_store.get("method", MODEL.ENSEMBLE_DEFAULT_METHOD),
+        "min_agree": current_store.get("min_agree", MODEL.ENSEMBLE_MIN_AGREE),
+    }
     return store, slider_disabled, input_disabled, slider_out, input_out, switches
 
 
@@ -3668,6 +3823,181 @@ def recompute_ensemble(ensemble_config, signals):
     return updated
 
 
+@callback(
+    Output({"type": "run-ens-member", "model": ALL}, "value"),
+    Output({"type": "run-ens-weight", "model": ALL}, "value"),
+    Output("run-ensemble-method", "value"),
+    Output("run-ensemble-min-agree", "value"),
+    Input("run-modal", "is_open"),
+    State("ensemble-config-store", "data"),
+    prevent_initial_call=True,
+)
+def populate_run_ensemble(is_open, store):
+    """Paint the Run dialog's ensemble controls from the shared store.
+
+    The store is the single source of truth (also edited from the signal-card
+    drawer), so the dialog must reflect it on open rather than whatever its
+    controls held last time.
+    """
+    if not is_open:
+        raise PreventUpdate
+    from config import MODEL
+
+    store = store or {}
+    enabled = set(store.get("enabled_models") or MODEL.ENSEMBLE_DEFAULT_ENABLED)
+    weights = store.get("weights") or dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+    member_ids = [o["id"]["model"] for o in ctx.outputs_list[0]]
+    weight_ids = [o["id"]["model"] for o in ctx.outputs_list[1]]
+    return (
+        [m in enabled for m in member_ids],
+        [float(weights.get(m, 1.0)) for m in weight_ids],
+        store.get("method") or MODEL.ENSEMBLE_DEFAULT_METHOD,
+        int(store.get("min_agree") or MODEL.ENSEMBLE_MIN_AGREE),
+    )
+
+
+@callback(
+    Output("ensemble-config-store", "data", allow_duplicate=True),
+    Input({"type": "run-ens-member", "model": ALL}, "value"),
+    Input({"type": "run-ens-weight", "model": ALL}, "value"),
+    Input("run-ensemble-method", "value"),
+    Input("run-ensemble-min-agree", "value"),
+    State("ensemble-config-store", "data"),
+    prevent_initial_call=True,
+)
+def sync_run_ensemble(members, weight_vals, method, min_agree, current):
+    """Run-dialog ensemble controls → shared store.
+
+    Writing the store (rather than reading these controls at run time) keeps
+    one config for the run itself, the drawer, and the live recompute of
+    already-displayed signals.
+    """
+    from config import MODEL
+
+    member_ids = [i["id"]["model"] for i in ctx.inputs_list[0]]
+    weight_ids = [i["id"]["model"] for i in ctx.inputs_list[1]]
+    enabled = [m for m, on in zip(member_ids, members or []) if on]
+    weights = {}
+    for m, v in zip(weight_ids, weight_vals or []):
+        try:
+            weights[m] = round(float(v), 1)
+        except (TypeError, ValueError):
+            weights[m] = 1.0
+    try:
+        min_agree = int(min_agree)
+    except (TypeError, ValueError):
+        min_agree = MODEL.ENSEMBLE_MIN_AGREE
+
+    store = {
+        "enabled_models": enabled,
+        "weights": weights,
+        "method": method or MODEL.ENSEMBLE_DEFAULT_METHOD,
+        "min_agree": min_agree,
+    }
+    # The open-dialog repaint triggers this callback with the store's own
+    # values; writing them back would recompute the ensemble for nothing.
+    if store == (current or {}):
+        raise PreventUpdate
+    return store
+
+
+@callback(
+    Output("run-ensemble-method-hint", "children"),
+    Output("run-ensemble-min-agree-wrap", "style"),
+    Output({"type": "run-ens-weight", "model": ALL}, "disabled"),
+    Input("run-ensemble-method", "value"),
+    Input("run-ensemble-min-agree", "value"),
+)
+def run_ensemble_method_ui(method, min_agree):
+    """Explain the chosen method and hide the controls it ignores.
+
+    The explanation is a formula plus one worked example rather than a
+    sentence: the methods differ only in how DIRECTION is decided, and the
+    same four members resolve to BUY under the vote methods and HOLD under
+    the other two. That divergence is the thing worth choosing between, and
+    prose does not show it.
+    """
+    from config import MODEL
+    from layouts.modals import ENSEMBLE_METHODS, ensemble_method_detail
+
+    method = method or MODEL.ENSEMBLE_DEFAULT_METHOD
+    hints = {val: hint for val, _, hint in ENSEMBLE_METHODS}
+    n_weights = len(ctx.outputs_list[2])
+    is_agreement = method == "agreement"
+    try:
+        gate = int(min_agree)
+    except (TypeError, ValueError):
+        gate = MODEL.ENSEMBLE_MIN_AGREE
+    body = html.Div([
+        html.Div(hints.get(method, ""), className="run-field-hint"),
+        ensemble_method_detail(method, gate),
+    ])
+    return (
+        body,
+        {} if is_agreement else {"display": "none"},
+        [is_agreement] * n_weights,
+    )
+
+
+@callback(
+    Output("run-ensemble-body", "style"),
+    Output("run-ensemble-summary", "children"),
+    Input("run-ensemble-check", "value"),
+    Input({"type": "run-model-check", "model": ALL}, "value"),
+    Input({"type": "run-ens-member", "model": ALL}, "value"),
+    Input("run-ensemble-method", "value"),
+    Input("run-ensemble-min-agree", "value"),
+)
+def run_ensemble_effective(ens_on, run_checks, members, method, min_agree):
+    """Say what the ensemble will actually combine — before the run.
+
+    Membership only counts for models that are also checked to RUN, and the
+    ensemble abstains below 2 valid members. Both used to be discovered
+    after a run as an 'insufficient enabled models' row; surface them here.
+    """
+    from config import MODEL
+
+    if not ens_on:
+        return {"display": "none"}, None
+
+    run_ids = [i["id"]["model"] for i in ctx.inputs_list[1]]
+    member_ids = [i["id"]["model"] for i in ctx.inputs_list[2]]
+    running = {m for m, on in zip(run_ids, run_checks or []) if on}
+    chosen = {m for m, on in zip(member_ids, members or []) if on}
+    effective = [m for m in member_ids if m in chosen and m in running]
+    skipped = sorted(chosen - running)
+
+    def warn(text):
+        return html.Div([html.I(className="bi bi-exclamation-triangle me-1"),
+                         text],
+                        style={"fontSize": "0.85rem",
+                               "color": "var(--warning, #ffc107)"})
+
+    if len(effective) < 2:
+        return {}, warn(
+            f"Ensemble will abstain: it needs at least 2 member models that "
+            f"are also checked to run (currently {len(effective)})."
+        )
+
+    try:
+        min_agree = int(min_agree)
+    except (TypeError, ValueError):
+        min_agree = MODEL.ENSEMBLE_MIN_AGREE
+    if method == "agreement" and min_agree > len(effective):
+        return {}, warn(
+            f"Consensus gate can never open: it requires {min_agree} "
+            f"agreeing models but only {len(effective)} members are running."
+        )
+
+    names = ", ".join(MODEL_DISPLAY.get(m, m) for m in effective)
+    note = (f" — {', '.join(MODEL_DISPLAY.get(m, m) for m in skipped)} "
+            f"not running, so not counted" if skipped else "")
+    return {}, html.Div(
+        f"Combines {len(effective)} models: {names}{note}",
+        style={"fontSize": "0.85rem", "color": "var(--text-muted)"},
+    )
+
+
 # =============================================================================
 # SCHEDULER PANEL (History tab)
 # =============================================================================
@@ -3711,9 +4041,11 @@ def render_scheduler_panel(_n, _action):
     State({"type": "sched-tz", "job": MATCH}, "value"),
     # Only the analysis job renders a symbol box.
     State({"type": "sched-symbols", "job": MATCH}, "value", allow_optional=True),
+    State({"type": "sched-visibility", "job": MATCH}, "value"),
     prevent_initial_call=True,
 )
-def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols):
+def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
+                  visibility):
     """Persist one job's schedule and reschedule it immediately."""
     if not n_clicks:
         raise PreventUpdate
@@ -3731,6 +4063,7 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols):
         "minute": minute,
         "days_of_week": days,
         "timezone": tz,
+        "is_public": visibility != "private",
     }
     if symbols is not None:
         cleaned = ",".join(
@@ -3762,9 +4095,11 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols):
     State("sched-new-days", "value"),
     State("sched-new-tz", "value"),
     State("sched-new-symbols", "value"),
+    State("sched-new-visibility", "value"),
     prevent_initial_call=True,
 )
-def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols):
+def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols,
+                         visibility):
     """Add a job of any registered operation type."""
     if not n_clicks:
         raise PreventUpdate
@@ -3792,6 +4127,7 @@ def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols):
         kind=kind, description=(name or "").strip(), hour=hour, minute=minute,
         days_of_week=days, timezone=tz, symbols_csv=cleaned or None,
         params={"only_trading_days": True},
+        is_public=visibility != "private",
     )
     if not job_id:
         return dash.no_update, html.Span("Could not create the job",
@@ -3921,28 +4257,44 @@ def download_ai_json(n_clicks, ai_analysis):
     Input("run-modal", "is_open"),
     Input("run-lookback", "value"),
     Input("run-date-picker", "date"),
-    State("selected-symbols", "data"),
+    # Input, not State: editing the run's symbol set refreshes the counts.
+    Input("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-async def preview_ai_report_articles(is_open, lookback, ai_date, symbols):
+async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
     """Fetch and show article availability for the chosen window BEFORE
     generation — the same point-in-time fetch generation uses, so the
     preview counts are the counts, not an estimate from the news store.
 
     Async: fires on modal open, so the live vendor fetch runs in a worker
     thread instead of freezing the UI thread pool."""
+    symbols = (run_symbols or {}).get("symbols") or []
     if not is_open or not symbols:
         raise PreventUpdate
 
-    from utils.trading_calendar import get_next_trading_day
-    from services.news_window import fetch_point_in_time_news
-    from datetime import date as date_cls
+    from config import MODEL as _M
+    from utils.trading_calendar import resolve_target_and_cutoff
+    from services.news_window import fetch_overnight_news, fetch_point_in_time_news
 
-    as_of = str(ai_date)[:10] if ai_date else get_next_trading_day(date_cls.today()).isoformat()
-    lookback_days = int(lookback or 7)
+    # Same target/cutoff resolution as generation: the window ends at the
+    # cutoff (previous trading day), not the target — previewing a window
+    # ending at the target overstated what the report would actually see.
+    picked = str(ai_date)[:10] if ai_date else None
+    target_d, as_of_d = resolve_target_and_cutoff(picked)
+    as_of, target = as_of_d.isoformat(), target_d.isoformat()
+    overnight = lookback == "overnight"
+    lookback_days = 1 if overnight else int(lookback or 7)
 
     def _count(sym):
         try:
+            if overnight:
+                return len(fetch_overnight_news(
+                    sym, as_of, target,
+                    relevance_threshold=_M.NEWS_OVERNIGHT_RELEVANCE,
+                    max_articles=_M.NEWS_MAX_ARTICLES,
+                    start_time_et=_M.NEWS_OVERNIGHT_START_ET,
+                    end_time_et=_M.NEWS_OVERNIGHT_END_ET,
+                ))
             return len(fetch_point_in_time_news(sym, as_of, lookback_days=lookback_days))
         except Exception as e:
             logger.debug(f"article preview fetch failed for {sym}: {e}")
@@ -3964,10 +4316,16 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, symbols):
             html.Td(str(n), style={"textAlign": "right"}),
         ]))
 
+    window_label = (
+        f" in the overnight window {as_of} {_M.NEWS_OVERNIGHT_START_ET} ET → "
+        f"{target} {_M.NEWS_OVERNIGHT_END_ET} ET (relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE})"
+        if overnight else
+        f" in the {lookback_days}-day window ending {as_of} (data cutoff for target {target})"
+    )
     return html.Div([
         html.Div([
             html.Strong(f"{total} articles"),
-            html.Span(f" in the {lookback_days}-day window ending {as_of}",
+            html.Span(window_label,
                       style={"color": "var(--text-secondary)"}),
         ], className="mb-1"),
         dbc.Table(
@@ -3980,6 +4338,9 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, symbols):
 
 @callback(
     Output("run-date-mode-label", "children"),
+    # Every return path below is (children, style); with only the children
+    # Output declared, Dash rendered the style dict as part of the label.
+    Output("run-date-mode-label", "style"),
     Input("run-date-picker", "date"),
     prevent_initial_call=True,
 )
@@ -4008,145 +4369,285 @@ def update_predict_date_label(date_str):
         ], {"fontSize": "0.85rem", "color": "var(--warning, #ffc107)"}
 
 
+def _run_data_summary(symbols, stock_data, news_data):
+    """The dialog's per-symbol input summary for the resolved run set.
+
+    A symbol outside the browser stores shows "at run time" — its data is
+    fetched server-side when the run starts (see _fill_run_inputs), so an
+    empty row here is a statement of when, not a problem.
+    """
+    if not symbols:
+        return html.Div(
+            [
+                html.Div("No symbols selected", className="empty-state-title"),
+                html.Div("Pick a source above or add a symbol to this run.",
+                         className="empty-state-note"),
+            ],
+            className="empty-state",
+        )
+    stock_data = stock_data or {}
+    articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
+    sym_rows = []
+    for sym in symbols:
+        sym_data = stock_data.get(sym, {})
+        data_points = "—"
+        date_range = "—"
+        source = "at run time"
+        if sym_data.get("prices"):
+            try:
+                df = pd.read_json(StringIO(sym_data["prices"]))
+                data_points = str(len(df))
+                if not df.empty and "Date" in df.columns:
+                    date_range = (
+                        f"{str(df['Date'].min())[:10]} to "
+                        f"{str(df['Date'].max())[:10]}"
+                    )
+                elif not df.empty:
+                    date_range = (
+                        f"{str(df.index.min())[:10]} to "
+                        f"{str(df.index.max())[:10]}"
+                    )
+                source = ("Cached" if sym_data.get("from_cache")
+                          else "Live")
+            except Exception:
+                pass
+        news_count = len(articles_by_symbol.get(sym, []))
+        sym_rows.append(html.Tr([
+            html.Td(sym), html.Td(data_points),
+            html.Td(date_range),
+            html.Td(str(news_count) if sym in articles_by_symbol else "—"),
+            html.Td(source),
+        ]))
+
+    return html.Div([
+        html.H6("Stock Data", className="mb-3"),
+        dbc.Table(
+            [
+                html.Thead(html.Tr([
+                    html.Th("Symbol"), html.Th("Bars"),
+                    html.Th("Date Range"), html.Th("Articles"),
+                    html.Th("Source"),
+                ])),
+                html.Tbody(sym_rows),
+            ],
+            bordered=True, color="dark", size="sm",
+        ),
+    ])
+
+
+def _run_source_options(watchlist, cohort_syms):
+    return [
+        {"label": f"Watchlist ({len(watchlist)})", "value": "watchlist",
+         "disabled": not watchlist},
+        {"label": f"Last run ({len(cohort_syms)})", "value": "cohort",
+         "disabled": not cohort_syms},
+        {"label": "Custom", "value": "custom"},
+    ]
+
+
 @callback(
     Output("run-modal", "is_open"),
     Output("run-data-summary", "children"),
-    Output("run-ensemble-summary", "children"),
     Output("run-scope", "value"),
+    Output("run-symbols-store", "data"),
+    Output("run-symbols-source", "options"),
+    Output("run-symbols-source", "value"),
     Input("run-analysis-btn", "n_clicks"),
-    Input("home-run-btn", "n_clicks", allow_optional=True),
     Input("reports-new-btn", "n_clicks", allow_optional=True),
+    Input({"type": "new-report-btn", "symbol": ALL}, "n_clicks"),
     Input("run-cancel-btn", "n_clicks"),
     Input("run-confirm-btn", "n_clicks"),
     State("stock-data-store", "data"),
     State("selected-symbols", "data"),
-    State("ensemble-config-store", "data"),
     State("news-data-store", "data"),
     State("run-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_run_modal(open_clicks, home_clicks, reports_clicks, cancel_clicks,
-                     confirm_clicks, stock_data, symbols, ensemble_config,
+def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
+                     confirm_clicks, stock_data, watchlist,
                      news_data, is_open):
-    """Open or close the single run dialog, with a summary of the input data.
+    """Open or close the single run dialog, preset by where it was opened.
 
-    Three openers: the toolbar button, the Home call to action, and the
-    Reports page's New Report button. All land on the same dialog, so there
-    is one place where a run is configured; the Reports opener presets the
-    scope to "report" so the dialog opens on the controls that matter there.
+    Two kinds of opener, deliberately: the toolbar button (the ONE global
+    entry point — it starts from the watchlist and whatever scope was last
+    chosen) and contextual shortcuts that carry their context in — the
+    Reports page's New Report (scope=report, watchlist) and any per-symbol
+    New-report button (scope=report, just that symbol). The old Home header
+    duplicate, which carried no context at all, is gone.
     """
     triggered = ctx.triggered_id
-    no_update_body = (dash.no_update, dash.no_update)
-    openers = ("run-analysis-btn", "home-run-btn", "reports-new-btn")
-    # Only the Reports opener repoints the scope — the others keep whatever
-    # the user last chose.
-    scope = "report" if triggered == "reports-new-btn" else dash.no_update
-
-    if triggered not in openers + ("run-cancel-btn", "run-confirm-btn"):
-        raise PreventUpdate
+    no_sym_update = (dash.no_update,) * 3
 
     if triggered in ("run-cancel-btn", "run-confirm-btn"):
-        return False, *no_update_body, dash.no_update
+        return (False, dash.no_update, dash.no_update) + no_sym_update
 
-    if triggered in openers:
-        # All openers fire this callback when they mount, with their own
-        # n_clicks still None. Checking "either has clicks" is not enough:
-        # the toolbar button never unmounts, so its count survives, and
-        # arriving on Home would then open the dialog by itself. Only the
-        # button that actually triggered may open it.
-        if not {"run-analysis-btn": open_clicks,
-                "home-run-btn": home_clicks,
-                "reports-new-btn": reports_clicks}.get(triggered):
+    is_context_btn = (isinstance(triggered, dict)
+                      and triggered.get("type") == "new-report-btn")
+    if triggered not in ("run-analysis-btn", "reports-new-btn") \
+            and not is_context_btn:
+        raise PreventUpdate
+
+    # All openers fire this callback when they mount with n_clicks still
+    # None. Only the control that actually triggered may open the dialog.
+    if is_context_btn:
+        if not (ctx.triggered and ctx.triggered[0].get("value")):
             raise PreventUpdate
-        if not symbols:
-            # Opening onto an explanation beats the old behaviour, which was
-            # for the button to do nothing at all with an empty watchlist.
-            return True, html.Div(
+    elif not {"run-analysis-btn": open_clicks,
+              "reports-new-btn": reports_clicks}.get(triggered):
+        raise PreventUpdate
+
+    watchlist = [s for s in (watchlist or []) if s]
+    cohort_syms = []
+    try:
+        from services import dashboard_service as ds
+        cohort = ds.get_latest_cohort() or {}
+        cohort_syms = [r["symbol"] for r in cohort.get("symbols") or []]
+    except Exception as e:
+        logger.warning("Run dialog: could not read latest cohort: %s", e)
+
+    scope = dash.no_update
+    if is_context_btn:
+        scope = "report"
+        source = "custom"
+        run_symbols = [triggered.get("symbol")]
+    elif triggered == "reports-new-btn":
+        scope = "report"
+        source = "watchlist" if watchlist else "cohort"
+        run_symbols = watchlist or cohort_syms
+    else:
+        source = "watchlist" if watchlist else "cohort"
+        run_symbols = watchlist or cohort_syms
+
+    store = {
+        "source": source,
+        "symbols": run_symbols,
+        "watchlist": watchlist,
+        "cohort": cohort_syms,
+    }
+    return (
+        True,
+        _run_data_summary(run_symbols, stock_data, news_data),
+        scope,
+        store,
+        _run_source_options(watchlist, cohort_syms),
+        source,
+    )
+
+
+@callback(
+    Output("model-info-modal", "is_open"),
+    Output("model-info-title", "children"),
+    Output("model-info-body", "children"),
+    Input({"type": "run-model-info", "model": ALL}, "n_clicks"),
+    Input("model-info-close-btn", "n_clicks"),
+    State("run-evidence", "value"),
+    State("run-type", "value"),
+    prevent_initial_call=True,
+)
+def toggle_model_info(info_clicks, close_click, run_evidence, depth):
+    """Model explainer for researchers, opened from the ⓘ icons in the Run
+    dialog. TradingAgents' body embeds the verbatim research prompt with the
+    context-block list reflecting the Evidence checkboxes AS SELECTED NOW —
+    reopen after changing them to see the updated preview."""
+    trig = ctx.triggered_id
+    if trig == "model-info-close-btn":
+        return False, dash.no_update, dash.no_update
+    # Pattern inputs fire once with n_clicks=None when the modal mounts.
+    if not isinstance(trig, dict) or not any(c for c in (info_clicks or []) if c):
+        raise PreventUpdate
+    from layouts.model_info import MODEL_EXPLAINERS, build_model_info_body
+    model_id = trig.get("model", "")
+    title = MODEL_EXPLAINERS.get(model_id, {}).get("title", model_id)
+    body = build_model_info_body(
+        model_id,
+        evidence=run_evidence if run_evidence is not None
+                 else ["options", "quality"],
+        include_thesis=(depth or "thesis") != "standard",
+    )
+    return True, title, body
+
+
+@callback(
+    Output("run-symbols-store", "data", allow_duplicate=True),
+    Output("run-symbol-add", "value"),
+    Input("run-symbols-source", "value"),
+    Input({"type": "run-sym-remove", "symbol": ALL}, "n_clicks"),
+    Input("run-symbol-add", "n_submit"),
+    State("run-symbol-add", "value"),
+    State("run-symbols-store", "data"),
+    prevent_initial_call=True,
+)
+def set_run_symbols(source, remove_clicks, add_submit, add_value, store):
+    """Edit the run's symbol set without touching the watchlist.
+
+    Switching source swaps in that set wholesale; removing a chip or adding
+    a symbol turns the set custom (the radio follows via its options, the
+    label stays honest). The store's watchlist/cohort snapshots were taken
+    when the dialog opened, which is the set the user was looking at.
+    """
+    store = dict(store or {})
+    symbols = list(store.get("symbols") or [])
+    triggered = ctx.triggered_id
+
+    if triggered == "run-symbols-source":
+        if not source or source == store.get("source"):
+            raise PreventUpdate  # echo of the open-time preset
+        if source in ("watchlist", "cohort"):
+            store["symbols"] = list(store.get(source) or [])
+        store["source"] = source
+        return store, dash.no_update
+
+    if isinstance(triggered, dict) and triggered.get("type") == "run-sym-remove":
+        if not any(c and c > 0 for c in remove_clicks):
+            raise PreventUpdate
+        sym = triggered.get("symbol")
+        store["symbols"] = [s for s in symbols if s != sym]
+        store["source"] = "custom"
+        return store, dash.no_update
+
+    if triggered == "run-symbol-add":
+        if not add_submit or not add_value:
+            raise PreventUpdate
+        new_symbols = [s.strip().upper()
+                       for s in re.split(r"[,\s]+", add_value) if s.strip()]
+        store["symbols"] = symbols + [s for s in new_symbols
+                                      if s and s not in symbols]
+        store["source"] = "custom"
+        return store, ""
+
+    raise PreventUpdate
+
+
+@callback(
+    Output("run-symbols-chips", "children"),
+    Output("run-symbols-source", "value", allow_duplicate=True),
+    Input("run-symbols-store", "data"),
+    prevent_initial_call=True,
+)
+def render_run_symbol_chips(store):
+    """Chips for the effective run set, each removable for this run only."""
+    store = store or {}
+    symbols = store.get("symbols") or []
+    if not symbols:
+        chips = [html.Span("No symbols — add one below or pick a source.",
+                           className="run-symbols-empty")]
+    else:
+        chips = [
+            html.Span(
                 [
-                    html.Div("No symbols selected", className="empty-state-title"),
-                    html.Div("Add symbols from the Watchlist button in the "
-                             "toolbar, then run.", className="empty-state-note"),
+                    html.Span(sym, className="run-symchip-text"),
+                    html.Button(
+                        "✕",
+                        id={"type": "run-sym-remove", "symbol": sym},
+                        className="run-symchip-remove",
+                        title=f"Drop {sym} from this run",
+                    ),
                 ],
-                className="empty-state",
-            ), dash.no_update, scope
-
-        stock_data = stock_data or {}
-        ensemble_config = ensemble_config or {}
-        enabled = ensemble_config.get("enabled_models", [])
-        weights = ensemble_config.get("weights", {})
-
-        # Symbol data summary table
-        articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
-        sym_rows = []
-        for sym in symbols:
-            sym_data = stock_data.get(sym, {})
-            data_points = "N/A"
-            date_range = "N/A"
-            if sym_data.get("prices"):
-                try:
-                    df = pd.read_json(StringIO(sym_data["prices"]))
-                    data_points = str(len(df))
-                    if not df.empty and "Date" in df.columns:
-                        date_range = (
-                            f"{str(df['Date'].min())[:10]} to "
-                            f"{str(df['Date'].max())[:10]}"
-                        )
-                    elif not df.empty:
-                        date_range = (
-                            f"{str(df.index.min())[:10]} to "
-                            f"{str(df.index.max())[:10]}"
-                        )
-                except Exception:
-                    pass
-            from_cache = sym_data.get("from_cache", False)
-            source = "Cached" if from_cache else "Live"
-            news_count = len(articles_by_symbol.get(sym, []))
-            sym_rows.append(html.Tr([
-                html.Td(sym), html.Td(data_points),
-                html.Td(date_range), html.Td(str(news_count)),
-                html.Td(source),
-            ]))
-
-        data_summary = html.Div([
-            html.H6("Stock Data", className="mb-3"),
-            dbc.Table(
-                [
-                    html.Thead(html.Tr([
-                        html.Th("Symbol"), html.Th("Bars"),
-                        html.Th("Date Range"), html.Th("Articles"),
-                        html.Th("Source"),
-                    ])),
-                    html.Tbody(sym_rows),
-                ],
-                bordered=True, color="dark", size="sm",
-            ),
-        ])
-
-        # Ensemble config summary (compact inline)
-        all_models = ["kronos_mini", "xgboost_shap", "lightgbm",
-                      "deberta_sentiment", "trading_agents"]
-        ens_items = []
-        for m in all_models:
-            display = MODEL_DISPLAY.get(m, m)
-            in_ens = m in enabled
-            w = weights.get(m, 1.0)
-            style = (
-                {"color": "var(--positive)"}
-                if in_ens
-                else {"color": "var(--text-muted)", "textDecoration": "line-through"}
+                className="run-symchip",
             )
-            ens_items.append(
-                html.Span(f"{display} (w={w:.1f})", style=style, className="me-3")
-            )
-
-        ens_summary = html.Div([
-            html.Span("Enabled: ", style={"color": "var(--text-secondary)"}),
-            *ens_items,
-        ], style={"fontSize": "0.85rem"})
-
-        return True, data_summary, ens_summary, scope
-
-    return is_open, *no_update_body, dash.no_update
+            for sym in symbols
+        ]
+    return chips, store.get("source") or "custom"
 
 
 # =============================================================================
@@ -4207,10 +4708,11 @@ from services.analysis_runner import (  # noqa: E402
     Input("ai-analysis-store", "data"),
     Input("model-signals-store", "data"),
     State("full-analysis-requested", "data"),
-    State("selected-symbols", "data"),
+    State("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-async def generate_recommendations_callback(ai_analysis, model_signals, requested, symbols):
+async def generate_recommendations_callback(ai_analysis, model_signals,
+                                            requested, run_symbols):
     """Generate recommendations when their inputs are ready.
 
     Fires for the Full Analysis flow (requested flag) AND for AI Report runs
@@ -4227,6 +4729,7 @@ async def generate_recommendations_callback(ai_analysis, model_signals, requeste
     if not ai_analysis or ai_analysis.get("failed"):
         raise PreventUpdate
     basis = basis or "news+signals"  # Full Analysis default
+    symbols = (run_symbols or {}).get("symbols") or []
 
     valid_signals = {
         k: v for k, v in (model_signals or {}).items()

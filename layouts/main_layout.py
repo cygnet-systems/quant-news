@@ -10,8 +10,10 @@ from dash import dcc, html
 
 from config import MODEL
 from layouts.components import create_ensemble_config_drawer
-from layouts.modals import create_data_modal, create_run_modal
-from layouts.nav import create_nav_rail, create_topbar, create_watchlist_panel
+from layouts.modals import (
+    create_data_modal, create_model_info_modal, create_run_modal,
+)
+from layouts.nav import create_nav_rail, create_topbar, create_watchlist_strip
 
 
 def create_layout() -> html.Div:
@@ -31,14 +33,18 @@ def create_layout() -> html.Div:
             # Recent symbol GROUPS (list of lists, newest first, capped) —
             # local so past sessions' watchlists survive restarts.
             dcc.Store(id="recent-symbol-groups", data=[], storage_type="local"),
-            # Watchlist editor visibility. Open by default so a new user lands
-            # on the symbol input, not on a hunt for the toggle; local so a
-            # deliberate close sticks across sessions.
-            dcc.Store(id="watchlist-panel-open", data=True, storage_type="local"),
+            # The symbol set for the CURRENT run-dialog session: shape
+            # {"source", "symbols", "watchlist", "cohort"}. Session-scoped on
+            # purpose — a one-off run tweak should not survive a reload.
+            dcc.Store(id="run-symbols-store", data={}),
             # Home prediction-board symbol narrow. Session-scoped on purpose:
             # "show me AAPL" answers a question you are asking now, not one
             # you want still applied tomorrow.
             dcc.Store(id="home-symbol-filter", data=None),
+            # Home board cutoff override (None = latest). Session-scoped for
+            # the same reason: "what did we call last Tuesday" is a question
+            # for now, and tomorrow's launch screen should open on today.
+            dcc.Store(id="home-cutoff-date", data=None),
             dcc.Store(id="current-period", data="1y", storage_type="local"),
             dcc.Store(id="stock-data-store", data={}),
             dcc.Store(id="news-data-store", data={}),
@@ -54,6 +60,8 @@ def create_layout() -> html.Div:
             dcc.Store(id="ensemble-config-store", data={
                 "enabled_models": list(MODEL.ENSEMBLE_DEFAULT_ENABLED),
                 "weights": dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS),
+                "method": MODEL.ENSEMBLE_DEFAULT_METHOD,
+                "min_agree": MODEL.ENSEMBLE_MIN_AGREE,
             }, storage_type="local"),
 
             # Historical data store (reports, predictions, recommendations)
@@ -68,6 +76,9 @@ def create_layout() -> html.Div:
             # question you are asking now, and should not still be applied
             # tomorrow when you wonder where your predictions went.
             dcc.Store(id="history-filter-outcome", data="all"),
+            # Model slice of the scoreboard: "all" or one model_name.
+            # Session-scoped for the same reason as the outcome slice.
+            dcc.Store(id="history-filter-model", data="all"),
             # Activity Log scope. Honoured only for Administrators — the
             # server pins everyone else to their own rows regardless.
             dcc.Store(id="history-activity-scope", data="all", storage_type="local"),
@@ -217,7 +228,7 @@ def create_layout() -> html.Div:
                     html.Div(
                         [
                             create_topbar(),
-                            create_watchlist_panel(),
+                            create_watchlist_strip(),
                             # target_components pins this to route changes.
                             # By default a Loading reacts to every callback
                             # writing anywhere inside it, so a filter change
@@ -252,6 +263,7 @@ def create_layout() -> html.Div:
             # Modals
             create_data_modal(),
             create_run_modal(),
+            create_model_info_modal(),
 
             # Hidden retry button for AI analysis failover
             html.Button(id="ai-retry-btn", style={"display": "none"}),

@@ -29,12 +29,23 @@ logger = logging.getLogger(__name__)
 
 
 def _current_uid():
-    """Cygnet SSO uid for this request, or None (anonymous / headless)."""
+    """Uid to attribute writes to: the signed-in user in a request thread,
+    or the owning user of a scheduled run (QUANTNEWS_RUN_OWNER). None means
+    anonymous/public."""
     try:
-        from services.auth_service import current_uid
-        return current_uid()
+        from services.auth_service import effective_uid
+        return effective_uid()
     except Exception:
         return None
+
+
+def _default_public() -> bool:
+    """Public unless this process is a private scheduled run."""
+    try:
+        from services.auth_service import run_is_public
+        return run_is_public()
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +211,11 @@ def store_prediction(
             was_correct=None,
             pnl_dollars=None,
             evaluated_at=None,
+            # Ownership must ride the merge too: this writer used to omit it,
+            # and merge() then NULLed owner_uid on rows the cache_service
+            # writer had stamped — silently un-owning them.
+            owner_uid=_current_uid(),
+            is_public=_default_public(),
         ))
     logger.info(f"Stored prediction: {model_name}/{symbol}@{trade_date}")
 
@@ -295,7 +311,7 @@ def store_report(
                 size_bytes=size_bytes,
                 metadata_json=metadata,
                 owner_uid=_current_uid(),
-                is_public=True,
+                is_public=_default_public(),
             ))
 
     logger.info(f"Stored report: {storage_key} ({size_bytes} bytes)")
@@ -347,7 +363,7 @@ def store_recommendation(
             result_json=result,
             duration_ms=duration_ms,
             owner_uid=_current_uid(),
-            is_public=True,
+            is_public=_default_public(),
         ))
     logger.info(f"Stored recommendation: {trade_date} ({len(symbols)} symbols)")
 

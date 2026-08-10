@@ -176,12 +176,40 @@ def seed_default_jobs() -> None:
             logger.info(f"Seeded scheduled job: {spec['id']}")
 
 
+def _viewer() -> tuple[Optional[str], bool]:
+    """(uid, is_admin) for the current request; anonymous -> (None, False)."""
+    try:
+        from services.auth_service import current_user
+        u = current_user()
+        return (u.uid, u.is_admin) if u else (None, False)
+    except Exception:
+        return (None, False)
+
+
+def can_manage_job(owner_uid: Optional[str],
+                   viewer: tuple[Optional[str], bool] | None = None) -> bool:
+    """Whether the current viewer may edit/delete a job.
+
+    Unowned (legacy) jobs are manageable by anyone, owned jobs by their
+    owner and Administrators. This is the write-side rule; visibility is
+    list_jobs' read-side rule.
+    """
+    uid, is_admin = viewer if viewer is not None else _viewer()
+    return is_admin or owner_uid is None or owner_uid == uid
+
+
 def list_jobs() -> list[dict]:
-    """Every job with its schedule, last outcome and next fire time."""
+    """The jobs this viewer may see, own jobs first.
+
+    Visibility: public jobs and your own; Administrators see everything.
+    Own-first ordering because everyone cares about their own schedules
+    more than the shared ones, even when both matter.
+    """
     from db.models import ScheduledJob
     from db.session import get_session
     from sqlalchemy import select
 
+    uid, is_admin = _viewer()
     with get_session() as session:
         rows = session.execute(
             select(ScheduledJob).order_by(ScheduledJob.hour, ScheduledJob.minute)
@@ -202,8 +230,15 @@ def list_jobs() -> list[dict]:
             "last_detail": r.last_detail,
             "last_duration_ms": r.last_duration_ms,
             "last_success_date": r.last_success_date,
-        } for r in rows]
+            "owner_uid": r.owner_uid,
+            "is_public": bool(r.is_public),
+            "is_mine": bool(uid and r.owner_uid == uid),
+            "can_manage": can_manage_job(r.owner_uid, (uid, is_admin)),
+        } for r in rows
+            if is_admin or bool(r.is_public) or r.owner_uid is None
+            or (uid and r.owner_uid == uid)]
 
+    jobs.sort(key=lambda j: (not j["is_mine"], j["hour"], j["minute"]))
     for job in jobs:
         job["next_run_at"] = _next_run_at(job["id"])
         job["running"] = job["id"] in _running_jobs()
@@ -218,7 +253,8 @@ def list_jobs() -> list[dict]:
 def create_job(kind: str, description: str, hour: int, minute: int,
                days_of_week: str = "mon-fri", timezone: str = "US/Eastern",
                symbols_csv: str | None = None,
-               params: dict | None = None) -> Optional[str]:
+               params: dict | None = None,
+               is_public: bool = True) -> Optional[str]:
     """Add a scheduled job. Returns its id, or None if the type is unknown.
 
     The id is derived from the description so the run history and the
@@ -253,6 +289,9 @@ def create_job(kind: str, description: str, hour: int, minute: int,
             symbols_csv=symbols_csv if job_type.needs_symbols else None,
             params_json=params or {},
             owner_uid=_owner_uid(),
+            # An anonymous session cannot own a private job — nobody could
+            # ever see it again — so ownerless jobs are forced public.
+            is_public=bool(is_public) or _owner_uid() is None,
         ))
 
     _reschedule(job_id)
@@ -273,6 +312,10 @@ def delete_job(job_id: str) -> bool:
     with get_session() as session:
         row = session.get(ScheduledJob, job_id)
         if row is None:
+            return False
+        if not can_manage_job(row.owner_uid):
+            logger.warning(f"delete_job: viewer may not delete {job_id} "
+                           f"(owned by {row.owner_uid})")
             return False
         session.delete(row)
 
@@ -301,7 +344,7 @@ def update_job(job_id: str, **fields) -> bool:
     from db.session import get_session
 
     writable = {"enabled", "hour", "minute", "days_of_week", "timezone",
-                "symbols_csv", "params_json", "description"}
+                "symbols_csv", "params_json", "description", "is_public"}
     changes = {k: v for k, v in fields.items() if k in writable}
     if not changes:
         return False
@@ -310,14 +353,21 @@ def update_job(job_id: str, **fields) -> bool:
         row = session.get(ScheduledJob, job_id)
         if row is None:
             return False
+        if not can_manage_job(row.owner_uid):
+            logger.warning(f"update_job: viewer may not edit {job_id} "
+                           f"(owned by {row.owner_uid})")
+            return False
         for key, value in changes.items():
             setattr(row, key, value)
         row.updated_at = datetime.now(timezone.utc)
-        try:
-            from services.auth_service import current_uid
-            row.owner_uid = current_uid()
-        except Exception:
-            pass
+        # Editing used to REASSIGN ownership to whoever saved (and an
+        # anonymous edit nulled it). Ownership now only flows one way:
+        # a signed-in editor claims a legacy unowned job, nothing else.
+        if row.owner_uid is None:
+            row.owner_uid = _owner_uid()
+        # A job that goes private without an owner would vanish for everyone.
+        if not row.is_public and row.owner_uid is None:
+            row.is_public = True
 
     _reschedule(job_id)
     logger.info(f"Scheduled job {job_id} updated: {sorted(changes)}")
@@ -431,7 +481,8 @@ def run_job(job_id: str, trigger: str = "schedule",
         if row is None:
             return {"status": "error", "detail": f"unknown job {job_id}"}
         job = {"id": row.id, "kind": row.kind, "symbols_csv": row.symbols_csv,
-               "params": row.params_json or {}, "enabled": row.enabled}
+               "params": row.params_json or {}, "enabled": row.enabled,
+               "owner_uid": row.owner_uid, "is_public": bool(row.is_public)}
 
     if not job["enabled"] and trigger == "schedule":
         return {"status": "skipped", "detail": "job disabled"}
@@ -443,7 +494,8 @@ def run_job(job_id: str, trigger: str = "schedule",
 
     started = datetime.now(timezone.utc)
     with get_session() as session:
-        run = JobRun(job_id=job_id, trigger=trigger, status="running")
+        run = JobRun(job_id=job_id, trigger=trigger, status="running",
+                     owner_uid=job["owner_uid"])
         session.add(run)
         session.flush()
         run_pk = run.id
@@ -451,11 +503,21 @@ def run_job(job_id: str, trigger: str = "schedule",
     prog.emit("run", f"Scheduled job started: {job_id} ({trigger})")
     cmd = _build_command(job, overrides)
     status, detail, summary = "success", "", {}
+    # Run under the job owner's identity: the subprocess has no request
+    # context, so the uid travels by env. Everything the run writes
+    # (predictions, reports, activity rows) is attributed to the owner, and
+    # a private job's output is private to them (auth_service.effective_uid
+    # / run_is_public read these; progress_service reads QUANTNEWS_USER).
+    run_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if job["owner_uid"]:
+        run_env["QUANTNEWS_RUN_OWNER"] = job["owner_uid"]
+        run_env["QUANTNEWS_USER"] = job["owner_uid"]
+    run_env["QUANTNEWS_RUN_PUBLIC"] = "1" if job["is_public"] else "0"
     try:
         proc = subprocess.run(
             cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True,
             timeout=JOB_TIMEOUT_SECONDS,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=run_env,
         )
         # Parse the summary from the WHOLE of stdout, never from the stored
         # tail. A 20-symbol summary is 53 lines of indented JSON, so a 25-line

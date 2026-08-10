@@ -10,8 +10,10 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from layouts.components import (
+    create_data_actions,
     create_indicator_toggles,
     create_news_quick_stats,
+    create_period_selector,
     create_recommendation_banner,
     create_sentiment_breakdown,
     create_top_headlines,
@@ -684,6 +686,94 @@ def build_overall_tab_content(
     return html.Div(children, className="tab-content-inner")
 
 
+_QUALITY_FLAG_STYLE = {
+    "clean": ("CLEAN", "var(--positive)"),
+    "caution": ("CAUTION", "var(--warning, #e6a817)"),
+    "bad_apple": ("BAD APPLE", "var(--negative)"),
+}
+
+
+def create_positioning_quality_section(analysis: dict) -> html.Div | None:
+    """Options positioning + Bad Apples quality screen panel.
+
+    Renders whatever of the two datasets the payload carries; None when a
+    run predates them or both fetches failed.
+    """
+    pos = (analysis or {}).get("positioning") or {}
+    quality = (analysis or {}).get("quality") or {}
+    if not pos and not quality.get("total_checks"):
+        return None
+
+    children = [html.Div(
+        [html.I(className="bi bi-activity me-2"), "Positioning & Quality"],
+        className="section-title",
+    )]
+
+    if pos.get("pc_volume") is not None or pos.get("pc_oi") is not None:
+        pcv = f"{pos['pc_volume']:.2f}" if pos.get("pc_volume") is not None else "n/a"
+        pcoi = f"{pos['pc_oi']:.2f}" if pos.get("pc_oi") is not None else "n/a"
+        read = pos.get("read", "")
+        read_color = ("var(--negative)" if read == "put-tilted"
+                      else "var(--positive)" if read == "call-tilted"
+                      else "var(--text-secondary)")
+        children.append(html.Div([
+            html.Strong("Options flow: "),
+            f"P/C volume {pcv} ({pos.get('put_volume', 0):,} puts / "
+            f"{pos.get('call_volume', 0):,} calls) · P/C open interest {pcoi} ",
+            html.Span(read.replace("-", " "),
+                      style={"color": read_color, "fontWeight": "600"}),
+            html.Span(f" · chain as of {pos.get('as_of', '')}",
+                      style={"color": "var(--text-secondary)", "fontSize": "0.78rem"}),
+        ], className="key-developments-content", style={"marginBottom": "8px"}))
+
+    if quality.get("total_checks"):
+        label, color = _QUALITY_FLAG_STYLE.get(
+            quality.get("flag", ""), (str(quality.get("flag", "")).upper(),
+                                      "var(--text-secondary)"))
+        q_children = [
+            html.Strong("Quality screen: "),
+            html.Span(label, style={"color": color, "fontWeight": "600"}),
+            html.Span(f" — {quality['total_fails']}/{quality['total_checks']}"
+                      f" checks failed"),
+        ]
+        failed = quality.get("failed_checks") or []
+        if failed:
+            q_children.append(html.Ul(
+                [html.Li(f"{f['check']}: {f['value']}"
+                         + (f" ({f['note']})" if f.get("note") else ""))
+                 for f in failed[:8]],
+                style={"marginTop": "6px", "marginBottom": "0",
+                       "paddingLeft": "18px", "fontSize": "0.8rem",
+                       "lineHeight": "1.5",
+                       "color": "var(--text-secondary)"},
+            ))
+        children.append(html.Div(q_children, className="key-developments-content"))
+
+    red_flags = quality.get("red_flags") or []
+    if red_flags:
+        children.append(html.Div([
+            html.Strong("News red flags: "),
+            html.Ul(
+                [html.Li([
+                    html.Span(f"[{h['category']}] ",
+                              style={"color": "var(--negative)",
+                                     "fontWeight": "600"}),
+                    f"{h['headline']}" + (f" ({h['date']})" if h.get("date") else ""),
+                ]) for h in red_flags[:6]],
+                style={"marginTop": "6px", "marginBottom": "0",
+                       "paddingLeft": "18px", "fontSize": "0.8rem",
+                       "lineHeight": "1.5"},
+            ),
+        ], className="key-developments-content", style={"marginTop": "8px"}))
+
+    children.append(html.Div(
+        "Positioning and quality shade conviction and sizing — neither is a "
+        "standalone timing signal.",
+        className="research-report-footnote",
+    ))
+    return html.Div(children, className="key-developments")
+
+
 def build_tab_content(
     articles: list,
     analysis: dict,
@@ -822,6 +912,12 @@ def build_tab_content(
             ],
             className="key-developments research-report-section",
         ))
+
+    # -- Options Positioning & Quality Screen (per-symbol tabs only) --
+    if not is_overall:
+        pq_section = create_positioning_quality_section(analysis)
+        if pq_section:
+            children.append(pq_section)
 
     # -- Key Developments --
     if analysis and analysis.get("key_developments"):
@@ -1193,14 +1289,24 @@ def create_context_panel() -> html.Div:
     )
 
 
-def layout() -> html.Div:
+def layout(period: str = "1y") -> html.Div:
     """The working surface: charts on the left, per-symbol analysis on the right.
 
-    Indicator toggles live here rather than in the toolbar because they apply
-    to these charts and nowhere else.
+    The period selector and the data actions (refresh / export / view data)
+    live here rather than in the global toolbar for the same reason the
+    indicator toggles always did: they apply to these charts and this data,
+    and nowhere else. `period` seeds the selector from the current-period
+    store so navigating here reflects the persisted choice.
     """
     return html.Div(
         [
+            html.Div(
+                [
+                    create_period_selector(period if period else "1y"),
+                    create_data_actions(include_refresh=True),
+                ],
+                className="analyze-action-bar",
+            ),
             html.Div(
                 [
                     html.Span("Indicators", className="input-label"),

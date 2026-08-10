@@ -78,6 +78,10 @@ def _pred_to_dict(r, include_details: bool = False) -> dict:
         "pnl_dollars": r.pnl_dollars,
         "model_version": r.model_version,
         "duration_ms": r.duration_ms,
+        # "ok" | "empty" | "unavailable" | None (predates the column). A call
+        # made while the news source was down is not comparable to one made on
+        # a full window, so the UI marks it rather than averaging it in.
+        "news_status": r.news_status,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
     }
@@ -87,12 +91,24 @@ def _pred_to_dict(r, include_details: bool = False) -> dict:
 
 
 def _current_uid():
-    """Cygnet SSO uid for this request, or None (anonymous / subprocess)."""
+    """Uid to attribute writes/reads to: the signed-in user in a request
+    thread, or the owning user of a scheduled run (QUANTNEWS_RUN_OWNER in
+    the run subprocess). None means anonymous/public."""
     try:
-        from services.auth_service import current_uid
-        return current_uid()
+        from services.auth_service import effective_uid
+        return effective_uid()
     except Exception:
         return None
+
+
+def _default_public() -> bool:
+    """Visibility for new rows: public unless this process is a private
+    scheduled run (QUANTNEWS_RUN_PUBLIC=0)."""
+    try:
+        from services.auth_service import run_is_public
+        return run_is_public()
+    except Exception:
+        return True
 
 
 def _visible(model_cls):
@@ -628,6 +644,11 @@ class CacheService:
                 training_samples=training_samples,
                 feature_values_json=json.dumps(feature_values) if feature_values else None,
                 details_json=_sanitize_json(details) if details else None,
+                # "ok" | "empty" | "unavailable". NULL for rows written before
+                # this was tracked, which is not the same as "ok".
+                news_status=(result.get("news_status")
+                             or details.get("news_status")),
+                ensemble_method=details.get("method"),
                 input_data_hash=data_hash,
                 created_at=datetime.now(timezone.utc),
                 # Re-storing a prediction id invalidates any prior evaluation:
@@ -639,10 +660,10 @@ class CacheService:
                 was_correct=None,
                 pnl_dollars=None,
                 evaluated_at=None,
-                # Ownership: stamped from the signed-in user; everything is
-                # public by default until a privacy toggle exists.
+                # Ownership: the signed-in user or the scheduled run's
+                # owner; private only for private scheduled runs.
                 owner_uid=_current_uid(),
-                is_public=True,
+                is_public=_default_public(),
             ))
 
     def has_predictions_for_today(self, symbol: str) -> bool:
@@ -1012,7 +1033,7 @@ class CacheService:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 owner_uid=_current_uid(),
-                is_public=True,
+                is_public=_default_public(),
             ))
 
     def get_trading_agent_reports(self, symbol: str, limit: int = 20) -> list[dict]:
@@ -1021,6 +1042,7 @@ class CacheService:
             rows = session.execute(
                 select(TradingAgentReport)
                 .where(TradingAgentReport.symbol == symbol.upper())
+                .where(_visible(TradingAgentReport))
                 .order_by(TradingAgentReport.created_at.desc())
                 .limit(limit)
             ).scalars().all()
@@ -1032,6 +1054,7 @@ class CacheService:
                     "report_text": r.report_text, "model_name": r.model_name,
                     "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
                     "created_at": str(r.created_at),
+                    "owner_uid": r.owner_uid,
                 }
                 for r in rows
             ]
@@ -1050,7 +1073,7 @@ class CacheService:
                 select(TradingAgentReport.id, TradingAgentReport.symbol,
                        TradingAgentReport.trade_date, TradingAgentReport.decision,
                        TradingAgentReport.confidence, TradingAgentReport.model_name,
-                       TradingAgentReport.created_at)
+                       TradingAgentReport.created_at, TradingAgentReport.owner_uid)
                 .where(_visible(TradingAgentReport))
                 .distinct(TradingAgentReport.symbol)
                 .order_by(TradingAgentReport.symbol,
@@ -1066,6 +1089,7 @@ class CacheService:
                     "decision": r.decision, "confidence": r.confidence,
                     "model_name": r.model_name,
                     "created_at": str(r.created_at),
+                    "owner_uid": r.owner_uid,
                 }
                 for r in session.execute(stmt)
             }
@@ -1513,6 +1537,24 @@ class CacheService:
                 select(func.max(ModelPrediction.prediction_date))
                 .where(_visible(ModelPrediction))
             ).scalar()
+
+    def get_prediction_dates(self, limit: int = 90) -> list["date"]:
+        """Every distinct prediction cutoff, newest first.
+
+        Feeds the Home cutoff selector: the board can be pointed at any past
+        cutoff, not only the latest, so "what did we call that morning" is
+        one dropdown away instead of a Performance-page filter safari.
+        """
+        from db.models import ModelPrediction
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction.prediction_date)
+                .where(_visible(ModelPrediction))
+                .distinct()
+                .order_by(ModelPrediction.prediction_date.desc())
+                .limit(limit)
+            ).scalars().all()
+            return list(rows)
 
     def get_predictions_between(
         self,

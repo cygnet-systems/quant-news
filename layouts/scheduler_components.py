@@ -100,12 +100,35 @@ def _job_card(job: dict) -> dbc.Card:
     # Whether this operation takes a symbol list is the type's business, not
     # something this renderer should know per kind.
     is_analysis = job.get("needs_symbols", job["kind"] == "analysis")
+    # can_manage is decided server-side (owner, admin, or legacy unowned) —
+    # the service re-checks on every write, so this only shapes the UI.
+    can_manage = job.get("can_manage", True)
+
+    if job.get("is_mine"):
+        owner_badge = dbc.Badge("mine", color="success",
+                                className="scheduler-owner-badge",
+                                title="You own this schedule")
+    elif job.get("owner_uid"):
+        owner_badge = dbc.Badge(f"by {job['owner_uid']}", color="dark",
+                                className="scheduler-owner-badge",
+                                title="Owned by another user")
+    else:
+        owner_badge = None
+    visibility_badge = None
+    if not job.get("is_public", True):
+        visibility_badge = dbc.Badge(
+            [html.I(className="bi bi-lock-fill me-1"), "private"],
+            color="warning", className="scheduler-owner-badge",
+            title="Only you (and Administrators) see this schedule; its "
+                  "runs write private predictions and reports",
+        )
 
     header = html.Div(
         [
             dbc.Switch(
                 id={"type": "sched-enabled", "job": job_id},
                 value=bool(job["enabled"]),
+                disabled=not can_manage,
                 className="scheduler-switch",
             ),
             html.Div(
@@ -116,6 +139,8 @@ def _job_card(job: dict) -> dbc.Card:
                                       className="scheduler-job-title"),
                             dbc.Badge(job.get("type_label") or job["kind"],
                                       color="secondary", className="scheduler-type-badge"),
+                            owner_badge,
+                            visibility_badge,
                         ],
                         className="scheduler-title-row",
                     ),
@@ -134,7 +159,11 @@ def _job_card(job: dict) -> dbc.Card:
                 html.I(className="bi bi-trash"),
                 id={"type": "sched-delete", "job": job_id},
                 size="sm", color="danger", outline=True,
-                title="Delete this job (its run history is kept)",
+                disabled=not can_manage,
+                title="Delete this job (its run history is kept)"
+                      if can_manage else
+                      f"Only {job.get('owner_uid') or 'the owner'} or an "
+                      f"Administrator can delete this job",
                 className="scheduler-delete-btn",
             ),
         ],
@@ -152,6 +181,7 @@ def _job_card(job: dict) -> dbc.Card:
                                 id={"type": "sched-hour", "job": job_id},
                                 type="number", min=0, max=23, step=1,
                                 value=job["hour"], size="sm",
+                                disabled=not can_manage,
                                 className="scheduler-time-input",
                             ),
                             html.Span(":", className="scheduler-time-sep"),
@@ -159,6 +189,7 @@ def _job_card(job: dict) -> dbc.Card:
                                 id={"type": "sched-minute", "job": job_id},
                                 type="number", min=0, max=59, step=1,
                                 value=job["minute"], size="sm",
+                                disabled=not can_manage,
                                 className="scheduler-time-input",
                             ),
                         ],
@@ -175,6 +206,7 @@ def _job_card(job: dict) -> dbc.Card:
                         options=_DAY_CHOICES,
                         value=job["days_of_week"],
                         size="sm",
+                        disabled=not can_manage,
                     ),
                 ],
                 className="scheduler-field",
@@ -188,6 +220,25 @@ def _job_card(job: dict) -> dbc.Card:
                                  ("US/Eastern", "US/Central", "US/Pacific", "UTC")],
                         value=job["timezone"],
                         size="sm",
+                        disabled=not can_manage,
+                    ),
+                ],
+                className="scheduler-field",
+            ),
+            html.Div(
+                [
+                    dbc.Label("Visibility", className="scheduler-label"),
+                    dbc.Select(
+                        id={"type": "sched-visibility", "job": job_id},
+                        options=[
+                            {"label": "Public", "value": "public"},
+                            {"label": "Private (only me)", "value": "private"},
+                        ],
+                        value="public" if job.get("is_public", True) else "private",
+                        size="sm",
+                        # Private needs an owner to be visible to anyone at
+                        # all; the service enforces the same rule on write.
+                        disabled=not can_manage or not job.get("owner_uid"),
                     ),
                 ],
                 className="scheduler-field",
@@ -208,6 +259,7 @@ def _job_card(job: dict) -> dbc.Card:
                         value=job.get("symbols_csv") or "",
                         placeholder="PANW,BAC,VZ,…",
                         rows=2, size="sm",
+                        disabled=not can_manage,
                         className="scheduler-symbols",
                     ),
                     html.Small(
@@ -227,6 +279,7 @@ def _job_card(job: dict) -> dbc.Card:
                     [html.I(className="bi bi-save me-1"), "Save schedule"],
                     id={"type": "sched-save", "job": job_id},
                     size="sm", color="secondary", outline=True,
+                    disabled=not can_manage,
                 ),
                 html.Span(id={"type": "sched-feedback", "job": job_id},
                           className="scheduler-feedback"),
@@ -315,6 +368,25 @@ def _create_form(job_types: list[dict]) -> html.Div:
                                                  ("US/Eastern", "US/Central",
                                                   "US/Pacific", "UTC")],
                                         value="US/Eastern", size="sm",
+                                    ),
+                                ],
+                                className="scheduler-field",
+                            ),
+                            html.Div(
+                                [
+                                    dbc.Label("Visibility", className="scheduler-label"),
+                                    dbc.Select(
+                                        id="sched-new-visibility",
+                                        options=[
+                                            {"label": "Private (only me)",
+                                             "value": "private"},
+                                            {"label": "Public", "value": "public"},
+                                        ],
+                                        # Your schedule is yours by default;
+                                        # anonymous sessions are forced public
+                                        # by the service (nobody could see an
+                                        # ownerless private job again).
+                                        value="private", size="sm",
                                     ),
                                 ],
                                 className="scheduler-field",

@@ -138,7 +138,7 @@ def fetch_point_in_time_news(
     symbol: str,
     as_of: Union[str, datetime],
     lookback_days: int = DEFAULT_NEWS_LOOKBACK_DAYS,
-    max_articles: int = 50,
+    max_articles: Optional[int] = None,
     relevance_threshold: float = 0.5,
 ) -> list:
     """Fetch ticker news bounded to ``[as_of - lookback, as_of]`` (no lookahead).
@@ -147,8 +147,19 @@ def fetch_point_in_time_news(
     re-applies :func:`filter_articles_as_of` as a belt-and-suspenders guard (a
     vendor's inclusive bound can still leak the midnight-after article). Falls
     back to yfinance news (also as-of filtered) when AV returns nothing.
+
+    ``max_articles`` defaults to the config ceiling (NEWS_MAX_ARTICLES) — a
+    hardcoded 50 here was what silently capped the report/preview paths after
+    the fetch itself learned to paginate.
     """
-    cache_key = (symbol.upper(), str(as_of)[:10], lookback_days)
+    if max_articles is None:
+        from config import MODEL
+        max_articles = MODEL.NEWS_MAX_ARTICLES
+
+    # max_articles and relevance are part of the key: a smaller earlier fetch
+    # must not be served to a caller asking for the full window.
+    cache_key = (symbol.upper(), str(as_of)[:10], lookback_days,
+                 max_articles, relevance_threshold)
     if cache_key in _PIT_NEWS_CACHE:
         return _PIT_NEWS_CACHE[cache_key]
 

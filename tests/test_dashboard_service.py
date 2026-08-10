@@ -100,10 +100,11 @@ class TestAggregate:
         assert aggregate_predictions(preds, "model_name")[0]["avg_confidence"] == 0.7
 
     def test_synthesis_is_a_distinct_group(self):
-        """Luna's verdict is stored as a prediction row but is not a peer model.
+        """Luna's verdict is scored as its own row in the scorecards.
 
-        Callers that report "models that ran" filter it out; the aggregator
-        itself must keep it separable rather than silently folding it in.
+        It makes a fresh call over reports + signals, so it competes as a
+        peer (2026-08-08 decision); the aggregator must keep it as its own
+        group rather than folding it into any member model's stats.
         """
         preds = [
             pred(model="kronos_mini", correct=True, pnl=10.0),

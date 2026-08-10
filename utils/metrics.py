@@ -255,6 +255,8 @@ def compute_peer_relative_strength(
 
         own_mo, own_wk = _rets(symbol)
         if own_mo is None:
+            logger.warning(f"Peer RS: no usable OHLCV for {symbol} itself — "
+                           f"block omitted")
             return ""
         lines = [f"[Peer relative strength — returns"
                  + (f" through {as_of}" if as_of else "") + "]"]
@@ -266,6 +268,9 @@ def compute_peer_relative_strength(
                 peer_rets.append(mo)
                 lines.append(f"{p}: {_fmt_pair(mo, wk)}")
         if not peer_rets:
+            logger.warning(f"Peer RS: all {len(peers)} peer fetches failed "
+                           f"for {symbol} ({', '.join(peers[:6])}) — "
+                           f"block omitted")
             return ""
         avg = sum(peer_rets) / len(peer_rets)
         lines.append(f"Peer average: {avg:+.1f}% (1mo) | {symbol} vs peers: {own_mo - avg:+.1f}pp")

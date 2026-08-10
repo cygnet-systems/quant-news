@@ -104,7 +104,8 @@ class TradingAgentsModel(BaseModel):
         # OHLCV, the event-calendar gate, peer relative strength, and a computed
         # SPY regime. These are computed here — not asserted by the LLM — and
         # are all lookahead-safe.
-        extra_blocks = self._build_extra_context(symbol, ohlcv_df, as_of)
+        extra_blocks = self._build_extra_context(
+            symbol, ohlcv_df, as_of, evidence=kwargs.get("evidence"))
 
         # Deferred reflection: resolve any past decisions whose outcome is now
         # known (lookahead-safe — only outcomes on/before as_of) and inject the
@@ -231,9 +232,16 @@ class TradingAgentsModel(BaseModel):
         return confidence, up_probability, source, emp_n
 
     def _build_extra_context(
-        self, symbol: str, ohlcv_df: pd.DataFrame, as_of: str
+        self, symbol: str, ohlcv_df: pd.DataFrame, as_of: str,
+        evidence: "list[str] | set[str] | None" = None,
     ) -> list[str]:
-        """Assemble validated, lookahead-safe context blocks for the prompt."""
+        """Assemble validated, lookahead-safe context blocks for the prompt.
+
+        ``evidence`` gates the optional Terminal-derived blocks per run
+        (Run-Analysis modal checklist): "options" and "quality". None means
+        both — the scheduled/default path.
+        """
+        evidence = set(evidence) if evidence is not None else {"options", "quality"}
         extra_blocks: list[str] = []
         try:
             # Callers may pass None to request a fresh fetch (stale-cache
@@ -271,6 +279,18 @@ class TradingAgentsModel(BaseModel):
                 )
                 if block:
                     extra_blocks.append(block)
+                else:
+                    # Name the gap instead of dropping the block silently —
+                    # the report used to read "peers not in data" with no way
+                    # to tell a fetch failure from a symbol with no peers.
+                    logger.warning(f"{symbol}: peer RS block empty "
+                                   f"(peers: {', '.join(peers[:6])})")
+                    extra_blocks.append(
+                        f"[Peer relative strength — UNAVAILABLE]\n"
+                        f"Known peers: {', '.join(peers[:8])}. Their price "
+                        f"data could not be fetched for this run; do not "
+                        f"infer relative performance."
+                    )
 
             # SPY regime with actual SMAs — the regime gate should not rest on
             # eyeballed price ranges.
@@ -295,6 +315,33 @@ class TradingAgentsModel(BaseModel):
                     )
             except Exception as e:
                 logger.debug(f"SPY regime block failed: {e}")
+
+            # Options positioning (point-in-time chain) and the Bad Apples
+            # quality screen. Both blocks state their own interpretation
+            # limits — positioning context and risk framing, not timing.
+            if "options" in evidence:
+                try:
+                    from services.options_service import (
+                        get_put_call_metrics, format_options_block,
+                    )
+                    block = format_options_block(
+                        symbol, get_put_call_metrics(symbol, as_of))
+                    if block:
+                        extra_blocks.append(block)
+                except Exception as e:
+                    logger.debug(f"Options block failed: {e}")
+
+            if "quality" in evidence:
+                try:
+                    from services.bad_apples_service import (
+                        analyze_symbol as _ba_analyze, format_bad_apples_block,
+                    )
+                    block = format_bad_apples_block(
+                        symbol, _ba_analyze(symbol, as_of))
+                    if block:
+                        extra_blocks.append(block)
+                except Exception as e:
+                    logger.debug(f"Bad apples block failed: {e}")
         except Exception as e:
             logger.warning(f"Extra context build failed for {symbol}: {e}")
         return extra_blocks

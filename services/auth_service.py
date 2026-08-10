@@ -229,6 +229,33 @@ def current_uid() -> Optional[str]:
     return u.uid if u else None
 
 
+def effective_uid() -> Optional[str]:
+    """The uid content writes should be attributed to.
+
+    In a request thread this is the signed-in user (ContextVar, set by the
+    ASGI middleware). In a scheduled-run subprocess there is no request, so
+    scheduler_service exports the owning user's uid as QUANTNEWS_RUN_OWNER —
+    that is how a private daily job's predictions and reports land under
+    their owner instead of the anonymous public bucket.
+    """
+    uid = current_uid()
+    if uid:
+        return uid
+    import os
+    return os.environ.get("QUANTNEWS_RUN_OWNER") or None
+
+
+def run_is_public() -> bool:
+    """Default visibility for content written by the current process.
+
+    Interactive writes stay public (unchanged behavior); a scheduled run for
+    a private job exports QUANTNEWS_RUN_PUBLIC=0 so everything it writes is
+    private to the job's owner.
+    """
+    import os
+    return os.environ.get("QUANTNEWS_RUN_PUBLIC", "1") != "0"
+
+
 def set_current_user(user: Optional[CurrentUser]):
     return _current_user.set(user)
 

@@ -675,7 +675,9 @@ CRITICAL RULES:
         eb = extra_blocks or {}
         validated_context = ""
         for key, label in (("profile", "COMPANY PROFILE"), ("metrics", "VALIDATED METRICS"),
-                           ("events", "EVENT CALENDAR"), ("peers", "PEER RELATIVE STRENGTH")):
+                           ("events", "EVENT CALENDAR"), ("peers", "PEER RELATIVE STRENGTH"),
+                           ("options", "OPTIONS POSITIONING"),
+                           ("quality", "QUALITY SCREEN (BAD APPLES)")):
             if eb.get(key):
                 validated_context += f"\n{label}:\n{eb[key]}\n"
 
@@ -1028,6 +1030,7 @@ AVAILABLE MODELS:
 YOUR ROLE:
 - Synthesize both inputs into specific, actionable recommendations per symbol
 - When the AI report and model predictions DISAGREE, this is the most valuable signal — explain WHY they disagree and which to trust in this context
+- Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa) — they are context that shades conviction, never a standalone reason to flip a direction
 - Explain which models are most relevant for each symbol's situation
 - Provide an overall portfolio-level summary
 - Be direct and specific. No hedging.
@@ -1095,6 +1098,28 @@ Respond with ONLY valid JSON matching this schema:
                         lines.append(f"  Regime/systematic risks: {str(thesis['regime_risks'])[:200]}")
             else:
                 lines.append("AI Report: Not available")
+
+            # Options positioning and quality screen: validated data, not text
+            # analysis — included even on a signals-only basis.
+            ctx_entry = analysis_by_sym.get(symbol, {})
+            pos = ctx_entry.get("positioning") or {}
+            if pos.get("pc_volume") is not None:
+                lines.append(
+                    f"Options positioning (as of {pos.get('as_of', 'n/a')}): "
+                    f"P/C volume {pos['pc_volume']:.2f}, "
+                    f"P/C open-interest {pos['pc_oi']:.2f} — {pos.get('read', '')}"
+                    if pos.get("pc_oi") is not None else
+                    f"Options positioning (as of {pos.get('as_of', 'n/a')}): "
+                    f"P/C volume {pos['pc_volume']:.2f} — {pos.get('read', '')}")
+            quality = ctx_entry.get("quality") or {}
+            if quality.get("total_checks"):
+                failed = ", ".join(f["check"] for f in
+                                   (quality.get("failed_checks") or [])[:6])
+                lines.append(
+                    f"Quality screen (Bad Apples, as of {quality.get('as_of', 'n/a')}): "
+                    f"{str(quality.get('flag', '')).upper()} — "
+                    f"{quality['total_fails']}/{quality['total_checks']} checks failed"
+                    + (f" ({failed})" if failed else ""))
 
             # Model prediction data
             sym_signals = model_signals.get(symbol, {})

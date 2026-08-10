@@ -64,6 +64,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "7 days", "value": "7"},
                 {"label": "14 days", "value": "14"},
                 {"label": "30 days", "value": "30"},
+                {"label": "Overnight (close → open)", "value": "overnight"},
             ],
             value="7",
             size="sm",
@@ -133,6 +134,233 @@ RUN_SCOPES = [
      "Report, then all models, then the synthesis recommendation."),
 ]
 
+# (value, label, what-it-does hint). The hints are honest about what the
+# platform's own evals found — the selector is only useful if it tells you
+# when each method actually differs.
+ENSEMBLE_METHODS = [
+    ("confidence_weighted", "Confidence-weighted vote",
+     "Each vote counts weight x the model's stated confidence. Evals here "
+     "found member confidence carries little calibration signal, so this "
+     "mostly tracks the majority vote."),
+    ("majority", "Weighted majority vote",
+     "One model, one vote, scaled by its weight. Confidence ignored — the "
+     "transparent baseline."),
+    ("prob_mean", "Mean up-probability",
+     "Weighted mean of the members' up-probabilities, thresholded. The "
+     "best-calibrated signal the members publish (drives the ensemble's "
+     "confidence in every method)."),
+    ("agreement", "Consensus gate",
+     "BUY/SELL only when at least N members back one direction and none "
+     "back the other; otherwise HOLD. Weights ignored. Trades far less, but "
+     "replaying it over stored history did NOT show the surviving trades "
+     "being better — at the default gate of 3 it traded 40 times and hit "
+     "42.5%. Raise the gate only if you want fewer positions, not because "
+     "it is known to be more accurate."),
+]
+
+# One scenario, run through every method, so the choice can be made by seeing
+# the answers diverge rather than by reading four descriptions. These four
+# members are deliberately split: two BUY, one SELL, one HOLD. The numbers are
+# not illustrative-but-approximate — tests/test_ensemble_methods.py replays
+# this exact scenario through EnsembleModel and fails if any documented figure
+# drifts from what the combiner really produces.
+ENSEMBLE_EXAMPLE_MEMBERS = [
+    # (model, decision, confidence, up_probability, weight)
+    ("Kronos",   "BUY",  0.55, 0.55, 1.0),
+    ("XGBoost",  "BUY",  0.80, 0.68, 1.5),
+    ("LightGBM", "SELL", 0.60, 0.42, 1.0),
+    ("DeBERTa",  "HOLD", 0.30, 0.50, 0.5),
+]
+
+# Direction is all that changes between methods. Confidence and up-probability
+# always come from the weighted mean member probability, which is why the
+# example resolves to the same 56% either way — worth seeing, because it means
+# switching method changes WHAT you trade, never how sure the ensemble claims
+# to be.
+ENSEMBLE_EXAMPLE_PROB = 0.56
+
+ENSEMBLE_METHOD_DETAIL = {
+    "confidence_weighted": {
+        "formula": "score = Σ (weight × confidence × dir) ÷ Σ (weight × confidence)",
+        "uses": "weights + each model's confidence",
+        "ignores": "up-probabilities",
+        "steps": [
+            "Kronos   1.0 × 0.55 × (+1) = +0.55",
+            "XGBoost  1.5 × 0.80 × (+1) = +1.20",
+            "LightGBM 1.0 × 0.60 × (−1) = −0.60",
+            "DeBERTa  0.5 × 0.30 × ( 0) =  0.00   (HOLD adds weight, no direction)",
+            "score = +1.15 ÷ 2.50 = +0.46",
+        ],
+        "verdict": "BUY",
+        "why": "+0.46 clears the +0.15 buy threshold. XGBoost's high weight "
+               "and high confidence outrun LightGBM's dissent.",
+    },
+    "majority": {
+        "formula": "score = Σ (weight × dir) ÷ Σ weight",
+        "uses": "weights only",
+        "ignores": "confidence and up-probabilities",
+        "steps": [
+            "Kronos   1.0 × (+1) = +1.00",
+            "XGBoost  1.5 × (+1) = +1.50",
+            "LightGBM 1.0 × (−1) = −1.00",
+            "DeBERTa  0.5 × ( 0) =  0.00",
+            "score = +1.50 ÷ 4.00 = +0.375",
+        ],
+        "verdict": "BUY",
+        "why": "Same call as confidence-weighting, but by a narrower margin: "
+               "dropping confidence costs XGBoost its extra pull.",
+    },
+    "prob_mean": {
+        "formula": "p = Σ (weight × p_up) ÷ Σ weight,   score = (p − 0.5) × 2",
+        "uses": "weights + each model's published up-probability",
+        "ignores": "the BUY/SELL labels themselves",
+        "steps": [
+            "Kronos   1.0 × 0.55 = 0.550",
+            "XGBoost  1.5 × 0.68 = 1.020",
+            "LightGBM 1.0 × 0.42 = 0.420",
+            "DeBERTa  0.5 × 0.50 = 0.250",
+            "p = 2.24 ÷ 4.00 = 0.56  →  score = (0.56 − 0.5) × 2 = +0.12",
+        ],
+        "verdict": "HOLD",
+        "why": "+0.12 falls short of +0.15, so the same inputs that produced "
+               "a BUY above produce no trade. The labels said buy; the "
+               "probabilities behind them were only mildly bullish.",
+    },
+    "agreement": {
+        "formula": "BUY if buy_votes ≥ N and sell_votes = 0   "
+                   "(SELL mirrored); else HOLD",
+        "uses": "the vote count only",
+        "ignores": "weights, confidence and up-probabilities",
+        "steps": [
+            "BUY votes  = 2   (Kronos, XGBoost)",
+            "SELL votes = 1   (LightGBM)",
+            "HOLD votes = 1   (DeBERTa, counts toward neither side)",
+            "Needs ≥ 3 on one side AND 0 on the other → gate stays shut",
+        ],
+        "verdict": "HOLD",
+        "why": "One dissenter is enough to veto, regardless of its weight. "
+               "This trades far less often by design — run "
+               "scripts/replay_ensemble_methods.py to see how that has "
+               "actually scored on your own history before relying on it.",
+    },
+}
+
+
+def ensemble_method_detail(method: str, min_agree: int = 3) -> html.Div:
+    """Formula, worked example and outcome for one combination method.
+
+    The selector used to carry a sentence each, which said what a method was
+    called but not what it would do to your run. Showing one scenario resolved
+    four ways makes the choice concrete: the same four members produce BUY
+    under both vote methods and HOLD under the other two.
+    """
+    d = ENSEMBLE_METHOD_DETAIL.get(method)
+    if not d:
+        return html.Div()
+
+    verdict_cls = {"BUY": "positive", "SELL": "negative"}.get(d["verdict"], "neutral")
+
+    members = html.Table(
+        [
+            html.Thead(html.Tr([
+                html.Th("Model"), html.Th("Call"), html.Th("Conf"),
+                html.Th("P(up)"), html.Th("Weight"),
+            ])),
+            html.Tbody([
+                html.Tr([
+                    html.Td(name),
+                    html.Td(dec, className=f"ens-ex-call ens-ex-{dec.lower()}"),
+                    html.Td(f"{conf:.0%}", className="num"),
+                    html.Td(f"{p:.2f}", className="num"),
+                    html.Td(f"{w:g}", className="num"),
+                ])
+                for name, dec, conf, p, w in ENSEMBLE_EXAMPLE_MEMBERS
+            ]),
+        ],
+        className="ens-ex-table",
+    )
+
+    steps = d["steps"]
+    if method == "agreement":
+        # The gate's threshold is user-set, so echo the live value rather than
+        # the default baked into the example text.
+        steps = [st.replace("≥ 3", f"≥ {min_agree}") for st in steps]
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span("Formula", className="ens-ex-label"),
+                    html.Code(d["formula"], className="ens-ex-formula"),
+                ],
+                className="ens-ex-row",
+            ),
+            html.Div(
+                [
+                    html.Span("Uses", className="ens-ex-label"),
+                    html.Span(d["uses"], className="ens-ex-uses"),
+                    html.Span("Ignores", className="ens-ex-label ms-3"),
+                    html.Span(d["ignores"], className="ens-ex-ignores"),
+                ],
+                className="ens-ex-row",
+            ),
+            html.Details(
+                [
+                    html.Summary("Worked example", className="ens-ex-summary"),
+                    html.Div(
+                        [
+                            members,
+                            html.Pre("\n".join(steps), className="ens-ex-steps"),
+                            html.Div(
+                                [
+                                    html.Span("Ensemble says", className="ens-ex-label"),
+                                    html.Span(d["verdict"],
+                                              className=f"ens-ex-verdict {verdict_cls}"),
+                                    html.Span(f"at {ENSEMBLE_EXAMPLE_PROB:.0%} confidence",
+                                              className="ens-ex-conf"),
+                                ],
+                                className="ens-ex-verdict-row",
+                            ),
+                            html.Div(d["why"], className="ens-ex-why"),
+                            html.Div(
+                                "Confidence is the weighted mean up-probability "
+                                "in every method, so switching method changes "
+                                "which trades you take, not how sure the "
+                                "ensemble claims to be.",
+                                className="ens-ex-note",
+                            ),
+                        ],
+                        className="ens-ex-body",
+                    ),
+                ],
+                className="ens-ex",
+            ),
+        ],
+    )
+
+
+def create_model_info_modal() -> dbc.Modal:
+    """Explainer modal opened by the ⓘ icons in the Run dialog's model list.
+
+    Body is filled by the open callback from layouts.model_info — for
+    TradingAgents it includes the live prompt preview reflecting the
+    Evidence-blocks checklist at the moment it was opened.
+    """
+    return dbc.Modal(
+        [
+            dbc.ModalHeader(dbc.ModalTitle(id="model-info-title")),
+            dbc.ModalBody(id="model-info-body", className="model-info-body"),
+            dbc.ModalFooter(
+                dbc.Button("Close", id="model-info-close-btn",
+                           color="secondary", size="sm"),
+            ),
+        ],
+        id="model-info-modal",
+        size="lg",
+        scrollable=True,
+        is_open=False,
+    )
+
 
 def create_run_modal() -> dbc.Modal:
     """One dialog for every way of starting a run.
@@ -146,11 +374,23 @@ def create_run_modal() -> dbc.Modal:
     """
     from datetime import date
 
+    # The target is a market session, so weekends and holidays are not
+    # choosable. Greying them out states the rule in the calendar rather than
+    # letting a run be configured against a date that cannot resolve.
+    picker_min = "2020-01-01"
     try:
-        from utils.trading_calendar import get_default_target_day
+        from utils.trading_calendar import get_default_target_day, non_trading_days
         default_target = get_default_target_day()
+        closed_days = [d.isoformat()
+                       for d in non_trading_days(picker_min, default_target)]
     except Exception:
+        # A calendar failure must not cost the dialog: an open picker with
+        # every day selectable still works, and the runner resolves the
+        # session itself.
         default_target = date.today()
+        closed_days = []
+
+    from config import MODEL
 
     sel = _report_param_selects("run")
 
@@ -161,11 +401,115 @@ def create_run_modal() -> dbc.Modal:
                              value=True, className="me-2"),
                 html.Span(display, className="run-model-name"),
                 html.Span(requirement, className="run-model-req"),
+                # Explainer for researchers: what the model is, what it
+                # reads, and how far to trust it. TradingAgents' opens the
+                # live prompt preview reflecting the Evidence checkboxes.
+                html.I(
+                    className="bi bi-info-circle run-model-info-btn ms-auto",
+                    id={"type": "run-model-info", "model": mid},
+                    title=f"What is {display}?",
+                    style={"cursor": "pointer",
+                           "color": "var(--text-secondary)"},
+                ),
             ],
             className="d-flex align-items-center mb-2",
         )
         for mid, display, requirement in RUN_MODELS
     ]
+
+    default_enabled = set(MODEL.ENSEMBLE_DEFAULT_ENABLED)
+    default_weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+    member_rows = [
+        html.Div(
+            [
+                dbc.Checkbox(id={"type": "run-ens-member", "model": mid},
+                             value=mid in default_enabled, className="me-2"),
+                html.Span(display, className="run-model-name"),
+                dcc.Input(
+                    id={"type": "run-ens-weight", "model": mid},
+                    type="number", min=0.1, max=2.0, step=0.1,
+                    value=default_weights.get(mid, 1.0),
+                    className="ensemble-weight-input",
+                    style={"width": "70px"},
+                ),
+            ],
+            className="d-flex align-items-center mb-1",
+        )
+        for mid, display, _ in RUN_MODELS
+    ]
+
+    ensemble_section = html.Div(
+        [
+            html.Div(
+                [
+                    dbc.Checkbox(id="run-ensemble-check", value=True,
+                                 className="me-2"),
+                    html.Span("Ensemble", className="run-model-name"),
+                    html.Span("combines the member models configured below",
+                              className="run-model-req"),
+                    html.I(
+                        className="bi bi-info-circle run-model-info-btn ms-auto",
+                        id={"type": "run-model-info", "model": "ensemble"},
+                        title="What is the Ensemble?",
+                        style={"cursor": "pointer",
+                               "color": "var(--text-secondary)"},
+                    ),
+                ],
+                className="d-flex align-items-center mb-2",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Label("Combination method",
+                                               className="input-label"),
+                                    dbc.Select(
+                                        id="run-ensemble-method",
+                                        options=[{"label": lbl, "value": val}
+                                                 for val, lbl, _ in ENSEMBLE_METHODS],
+                                        value=MODEL.ENSEMBLE_DEFAULT_METHOD,
+                                        size="sm",
+                                    ),
+                                ],
+                                className="run-field",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Min. agreeing models",
+                                               className="input-label"),
+                                    dcc.Input(
+                                        id="run-ensemble-min-agree",
+                                        type="number", min=2, max=len(RUN_MODELS),
+                                        step=1, value=MODEL.ENSEMBLE_MIN_AGREE,
+                                        className="ensemble-weight-input",
+                                        style={"width": "70px"},
+                                    ),
+                                ],
+                                id="run-ensemble-min-agree-wrap",
+                                className="run-field",
+                            ),
+                        ],
+                        className="run-field-grid",
+                    ),
+                    html.Div(id="run-ensemble-method-hint",
+                             className="run-field-hint mb-2"),
+                    html.Div(
+                        [
+                            html.Label("Members and weights",
+                                       className="input-label"),
+                            html.Div(member_rows),
+                        ],
+                        className="run-field",
+                    ),
+                    html.Div(id="run-ensemble-summary"),
+                ],
+                id="run-ensemble-body",
+                className="ms-4",
+            ),
+        ],
+    )
 
     def field(label, control, hint=None):
         return html.Div(
@@ -185,6 +529,41 @@ def create_run_modal() -> dbc.Modal:
                 close_button=True,
             ),
             dbc.ModalBody([
+                # --- Symbols ---
+                # The set a run acts on used to be an invisible rule (always
+                # the watchlist). It is now the dialog's first question, preset
+                # by whichever control opened it: the toolbar button starts
+                # from the watchlist, a per-symbol "New report" starts from
+                # that one symbol. Edits apply to this run only.
+                html.Div(
+                    [
+                        html.Label("Symbols", className="input-label"),
+                        dbc.RadioItems(
+                            id="run-symbols-source",
+                            options=[],  # filled with live counts on open
+                            inline=True,
+                            className="run-scope-radio",
+                        ),
+                        html.Div(id="run-symbols-chips",
+                                 className="run-symbols-chips"),
+                        dbc.Input(
+                            id="run-symbol-add",
+                            type="text",
+                            placeholder="Add a symbol to this run… (Enter)",
+                            size="sm",
+                            className="run-symbol-add",
+                            autoComplete="off",
+                        ),
+                        html.Div(
+                            "Applies to this run only — the watchlist is "
+                            "not changed.",
+                            className="run-field-hint",
+                        ),
+                    ],
+                    className="run-field",
+                ),
+                html.Hr(),
+
                 html.Div(
                     [
                         html.Label("What to run", className="input-label"),
@@ -210,7 +589,8 @@ def create_run_modal() -> dbc.Modal:
                                 id="run-date-picker",
                                 date=default_target.isoformat(),
                                 max_date_allowed=default_target.isoformat(),
-                                min_date_allowed="2020-01-01",
+                                min_date_allowed=picker_min,
+                                disabled_days=closed_days,
                                 display_format="YYYY-MM-DD",
                                 className="predict-date-picker",
                             ),
@@ -229,18 +609,7 @@ def create_run_modal() -> dbc.Modal:
                         html.Hr(),
                         html.H6("Models", className="mb-2"),
                         html.Div(model_checks),
-                        html.Div(
-                            [
-                                dbc.Checkbox(id="run-ensemble-check", value=True,
-                                             className="me-2"),
-                                html.Span("Ensemble", className="run-model-name"),
-                                html.Span("combines only the models enabled in "
-                                          "Ensemble Config",
-                                          className="run-model-req"),
-                            ],
-                            className="d-flex align-items-center mb-2",
-                        ),
-                        html.Div(id="run-ensemble-summary"),
+                        ensemble_section,
                     ],
                     id="run-models-section",
                 ),
@@ -258,19 +627,31 @@ def create_run_modal() -> dbc.Modal:
                             ],
                             className="run-field-grid",
                         ),
-                        html.Div(
-                            [
-                                dbc.Checkbox(id="run-include-research", value=False,
-                                             className="me-2"),
-                                html.Span("Include per-symbol research reports",
-                                          className="run-model-name"),
-                                html.Span("ignored on Full pipeline, which already "
-                                          "produces them", className="run-model-req"),
-                            ],
-                            className="d-flex align-items-center mb-2",
-                        ),
                         html.Div(id="run-article-preview",
                                  className="run-article-preview"),
+                        # Terminal-derived evidence blocks, selectable per
+                        # run. Both default on; the research prompt, the
+                        # synthesis evidence and the rendered report sections
+                        # follow this choice.
+                        html.Div(
+                            [
+                                html.Div("Evidence blocks",
+                                         className="run-field-label"),
+                                dbc.Checklist(
+                                    id="run-evidence",
+                                    options=[
+                                        {"label": "Options positioning (put/call)",
+                                         "value": "options"},
+                                        {"label": "Quality screen (Bad Apples + news red flags)",
+                                         "value": "quality"},
+                                    ],
+                                    value=["options", "quality"],
+                                    inline=True,
+                                    className="run-evidence-checklist",
+                                ),
+                            ],
+                            className="mt-2",
+                        ),
                     ],
                     id="run-report-section",
                 ),

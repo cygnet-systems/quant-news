@@ -435,6 +435,32 @@ def _create_ensemble_card(result: dict) -> html.Div:
             )
         )
 
+        # Combination method (with the consensus tally when gating applies)
+        method = details.get("method")
+        if method:
+            method_label = {
+                "confidence_weighted": "Confidence-weighted vote",
+                "majority": "Weighted majority vote",
+                "prob_mean": "Mean up-probability",
+                "agreement": "Consensus gate",
+            }.get(method, method)
+            if method == "agreement":
+                method_label += (
+                    f" ({details.get('buy_votes', 0)} buy / "
+                    f"{details.get('sell_votes', 0)} sell, "
+                    f"need {details.get('min_agree', '?')})"
+                )
+            card_children.append(
+                html.Div(
+                    [
+                        html.Span("Method:", className="signal-card-detail-label"),
+                        html.Span(method_label,
+                                  className="signal-card-detail-value"),
+                    ],
+                    className="signal-card-detail-row",
+                )
+            )
+
         # Weight composition bar
         weights_used = details.get("weights_used", {})
         if weights_used:

@@ -1,11 +1,12 @@
-"""Live ensemble model — weighted majority vote across individual models.
+"""Live ensemble model — combines individual models under a selectable method.
 
 Runs after all individual models complete (Phase 3). Receives their
 results via other_results kwarg. Uses ensemble_config from the UI
-to determine which models participate and their weights.
+to determine which models participate, their weights, and how the
+votes are combined (see METHODS).
 
 All configuration is transparent — metadata shows exactly which
-models voted, their weights, and the computed score.
+models voted, their weights, the method, and the computed score.
 """
 
 import logging
@@ -19,6 +20,22 @@ from models.base import BaseModel, PredictionResult
 logger = logging.getLogger(__name__)
 
 _DIRECTION_MAP = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.0}
+
+# Combination methods. Every method takes its confidence/up_probability from
+# the weighted mean member probability (the calibrated formula — see the Brier
+# note in predict()); they differ only in how the DIRECTION is decided.
+#   confidence_weighted — each vote counts weight x the member's own
+#       confidence. Platform evals found member confidence carries little
+#       calibration signal, so this mostly behaves like `majority` with noise.
+#   majority — each vote counts its config weight only. One model, one
+#       (weighted) vote; transparent baseline.
+#   prob_mean — direction from the weighted mean up-probability itself,
+#       thresholded. The best-calibrated signal the members publish.
+#   agreement — trade only on consensus: at least `min_agree` members back one
+#       direction and none back the other, else HOLD. Weights are ignored.
+#       Cuts trade count, which matters because whipsaw — not direction — is
+#       the documented failure mode (R2000 diversity test, 2026-07).
+METHODS = ("confidence_weighted", "majority", "prob_mean", "agreement")
 
 
 class EnsembleModel(BaseModel):
@@ -45,7 +62,8 @@ class EnsembleModel(BaseModel):
 
         Optional kwargs:
             ensemble_config: dict — from UI store:
-                {"enabled_models": [...], "weights": {model: weight, ...}}
+                {"enabled_models": [...], "weights": {model: weight, ...},
+                 "method": one of METHODS, "min_agree": int}
                 If not provided, uses config defaults.
         """
         other_results = kwargs.get("other_results", {})
@@ -56,8 +74,19 @@ class EnsembleModel(BaseModel):
             enabled_models = set(ensemble_config.get("enabled_models", []))
             weights = ensemble_config.get("weights", {})
         else:
+            ensemble_config = {}
             enabled_models = set(MODEL.ENSEMBLE_DEFAULT_ENABLED)
             weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+
+        method = ensemble_config.get("method") or MODEL.ENSEMBLE_DEFAULT_METHOD
+        if method not in METHODS:
+            logger.warning(f"unknown ensemble method {method!r}, using default")
+            method = MODEL.ENSEMBLE_DEFAULT_METHOD
+        try:
+            min_agree = int(ensemble_config.get("min_agree")
+                            or MODEL.ENSEMBLE_MIN_AGREE)
+        except (TypeError, ValueError):
+            min_agree = MODEL.ENSEMBLE_MIN_AGREE
 
         if not other_results:
             # No inputs means no vote — an error result is never persisted,
@@ -99,13 +128,14 @@ class EnsembleModel(BaseModel):
                 },
             )
 
-        # Confidence-weighted vote: each model's vote counts as
-        # (config weight x its own confidence). This decides the DIRECTION.
-        # It deliberately does not decide the confidence — see below.
+        # The vote weight decides the DIRECTION only, per `method`. It
+        # deliberately does not decide the confidence — see below.
         weighted_score = 0.0
         total_weight = 0.0
         prob_sum = 0.0
         prob_weight = 0.0
+        buy_votes = 0
+        sell_votes = 0
         votes = {}
         weights_used = {}
 
@@ -116,9 +146,18 @@ class EnsembleModel(BaseModel):
             model_conf = float(model_conf) if model_conf is not None else 0.5
             direction = _DIRECTION_MAP.get(decision, 0.0)
 
-            effective = weight * model_conf
+            if method == "confidence_weighted":
+                effective = weight * model_conf
+            elif method == "agreement":
+                effective = 1.0
+            else:  # majority, prob_mean — config weight only
+                effective = weight
             weighted_score += effective * direction
             total_weight += effective
+            if direction > 0:
+                buy_votes += 1
+            elif direction < 0:
+                sell_votes += 1
             votes[model_name] = f"{decision} ({model_conf:.0%})"
             weights_used[model_name] = round(effective, 3)
 
@@ -137,12 +176,30 @@ class EnsembleModel(BaseModel):
                 decision="HOLD",
                 confidence=0.0,
                 up_probability=0.5,
-                details={"reason": "zero total weight"},
+                details={"reason": "zero total weight", "method": method},
             )
 
-        normalized = weighted_score / total_weight
+        mean_member_p = prob_sum / prob_weight if prob_weight else 0.5
 
-        if normalized > MODEL.ENSEMBLE_BUY_THRESHOLD:
+        # `normalized` is the directional score in [-1, 1] that the standard
+        # thresholds are applied to; what it measures depends on the method.
+        if method == "prob_mean":
+            normalized = (mean_member_p - 0.5) * 2.0
+        else:
+            normalized = weighted_score / total_weight
+
+        if method == "agreement":
+            # Consensus gate: trade only when enough members back one side
+            # and nobody backs the other. min_agree above the number of
+            # running members means the gate can never open — the UI warns,
+            # and the details below make the abstention auditable.
+            if buy_votes >= min_agree and sell_votes == 0:
+                action = "BUY"
+            elif sell_votes >= min_agree and buy_votes == 0:
+                action = "SELL"
+            else:
+                action = "HOLD"
+        elif normalized > MODEL.ENSEMBLE_BUY_THRESHOLD:
             action = "BUY"
         elif normalized < MODEL.ENSEMBLE_SELL_THRESHOLD:
             action = "SELL"
@@ -160,8 +217,26 @@ class EnsembleModel(BaseModel):
         # 0.381 to 0.255 (holdout); a constant 0.5 forecast scores 0.25, so the
         # old formula was worse than declining to answer. It adds no edge — it
         # stops the ensemble overstating what it knows.
-        up_probability = prob_sum / prob_weight if prob_weight else 0.5
+        up_probability = mean_member_p
         confidence = min(abs(up_probability - 0.5) * 2, 1.0)
+
+        details = {
+            "method": method,
+            "votes": votes,
+            "weights_used": weights_used,
+            "weighted_score": round(weighted_score, 3),
+            "normalized_score": round(normalized, 3),
+            "direction_agreement": round(abs(normalized), 3),
+            "models_enabled": sorted(enabled_models),
+            "models_excluded": sorted(excluded),
+            "models_used": len(valid),
+        }
+        if method == "agreement":
+            details.update({
+                "buy_votes": buy_votes,
+                "sell_votes": sell_votes,
+                "min_agree": min_agree,
+            })
 
         # `normalized` is retained as a directional-agreement diagnostic. It is
         # a measure of consensus, not of confidence, and is named accordingly.
@@ -170,14 +245,5 @@ class EnsembleModel(BaseModel):
             decision=action,
             confidence=round(confidence, 2),
             up_probability=round(up_probability, 4),
-            details={
-                "votes": votes,
-                "weights_used": weights_used,
-                "weighted_score": round(weighted_score, 3),
-                "normalized_score": round(normalized, 3),
-                "direction_agreement": round(abs(normalized), 3),
-                "models_enabled": sorted(enabled_models),
-                "models_excluded": sorted(excluded),
-                "models_used": len(valid),
-            },
+            details=details,
         )

@@ -77,6 +77,13 @@ class APIConfig:
     # Alpha Vantage (news)
     ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
     ALPHA_VANTAGE_BASE_URL: str = "https://www.alphavantage.co/query"
+    # Calls per minute permitted across every process on this host. A run over
+    # a 20-symbol watchlist issues one paginated fetch per symbol back to back,
+    # which is what trips the quota; the limiter paces those instead of
+    # letting the vendor answer 200-with-an-apology. Free tier is 25 per DAY,
+    # so set this to 0 there and rely on caching. 0 disables limiting.
+    ALPHA_VANTAGE_CALLS_PER_MIN: int = int(
+        os.getenv("ALPHA_VANTAGE_CALLS_PER_MIN", "70"))
 
     # Request settings
     DEFAULT_TIMEOUT: int = 30
@@ -390,6 +397,17 @@ class ModelConfig:
         ("deberta_sentiment", 1.0),
         ("trading_agents", 1.0),
     )
+
+    # How member votes are combined. The scheduled pipeline (which passes no
+    # ensemble_config) uses this default, so changing it changes production
+    # ensemble rows from that day forward.
+    #   confidence_weighted — weight x member confidence votes on direction
+    #   majority            — weight-only votes; member confidence ignored
+    #   prob_mean           — weighted mean of member up-probabilities
+    #   agreement           — trade only when >= ENSEMBLE_MIN_AGREE members
+    #                         back one direction and none back the other
+    ENSEMBLE_DEFAULT_METHOD: str = "confidence_weighted"
+    ENSEMBLE_MIN_AGREE: int = 3
 
     # Legacy strategy weights (used by ensemble_vote strategy)
     ENSEMBLE_KRONOS_WEIGHT: float = 1.1

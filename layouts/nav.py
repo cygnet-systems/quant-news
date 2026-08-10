@@ -1,9 +1,11 @@
 """The application shell: a section rail on the left, a global toolbar on top.
 
-The rail carries navigation only. Controls that scope every section (the
-watchlist, the period, the run action) sit in the toolbar, because putting them
-in the rail is what made the old sidebar a mixture of "where am I going" and
-"what am I looking at".
+The rail carries navigation only. The toolbar carries the page title and the
+one genuinely global action, Run analysis. Everything else that used to live
+here (period selector, refresh, export, view-data, the watchlist editor) was
+page-local pretending to be global: two of the buttons sat permanently
+disabled on four of the six pages. Those controls now render on the pages
+they operate on, and the watchlist editor is the Home symbol rail.
 
 Predictions and Performance are deliberately one section. Splitting the
 aggregate from the per-call log is what produced the old Scoreboard-modal and
@@ -11,13 +13,7 @@ History-tab duplication, where the same numbers were reachable two ways.
 """
 
 import dash_bootstrap_components as dbc
-from dash import html
-
-from layouts.components import (
-    create_data_actions,
-    create_period_selector,
-    create_stock_input,
-)
+from dash import dcc, html
 
 # (path, label, bootstrap icon). Order is the rail order.
 NAV_SECTIONS = [
@@ -93,12 +89,11 @@ def create_nav_rail() -> html.Div:
 
 
 def create_topbar() -> html.Div:
-    """Global toolbar: where you are, what you are looking at, what to run.
+    """Global toolbar: where you are, plus the one global action.
 
-    The watchlist editor is a Collapse rather than a Popover so its inputs stay
-    mounted while hidden. Several callbacks take symbol-input and the recent
-    chips as fixed-id Inputs, and Dash 4 errors on an Input that is not in the
-    layout.
+    run-analysis-btn must stay mounted on every route — toggle_run_modal takes
+    it as a fixed-id Input, and it is the single entry point to the run dialog
+    (page-local shortcuts use the {"type": "new-report-btn"} pattern instead).
     """
     return html.Div(
         [
@@ -111,18 +106,12 @@ def create_topbar() -> html.Div:
             ),
 
             html.Div(
-                [
-                    dbc.Button(
-                        [html.I(className="bi bi-sliders me-1"), "Watchlist"],
-                        id="watchlist-toggle-btn",
-                        size="sm",
-                        outline=True,
-                        color="secondary",
-                        className="watchlist-toggle-btn",
-                    ),
-                    create_period_selector("1y"),
-                    create_data_actions(),
-                ],
+                dbc.Button(
+                    [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
+                    id="run-analysis-btn",
+                    color="success",
+                    size="sm",
+                ),
                 className="topbar-actions",
             ),
         ]
@@ -130,12 +119,29 @@ def create_topbar() -> html.Div:
     )
 
 
-def create_watchlist_panel() -> dbc.Collapse:
-    """The symbol editor, revealed under the toolbar."""
-    return dbc.Collapse(
-        html.Div(create_stock_input(), className="watchlist-panel-inner"),
-        id="watchlist-panel",
-        # Open by default; the watchlist-panel-open store (localStorage)
-        # overrides this on load so a user's close/open choice persists.
-        is_open=True,
+def create_watchlist_strip() -> html.Div:
+    """The watchlist, always in view and editable from every page.
+
+    One slim row under the toolbar: chips with a remove ✕ and an inline add
+    box. This is THE editor — the Home rail shows the same set with more
+    context (calls, reports, membership groups) but its input only filters.
+    Chips use the wl-remove pattern, distinct from the rail rows'
+    remove-symbol pattern, because both surfaces are mounted at once on Home
+    and duplicate component ids are a hard error.
+    """
+    return html.Div(
+        [
+            html.Span("Watchlist", className="wl-strip-label"),
+            html.Div(id="watchlist-strip-chips", className="wl-strip-chips"),
+            dcc.Input(
+                id="symbol-input",
+                type="text",
+                placeholder="Add symbol… (Enter)",
+                debounce=False,
+                autoComplete="off",
+                className="wl-strip-add",
+            ),
+        ],
+        className="watchlist-strip",
+        id="watchlist-strip",
     )

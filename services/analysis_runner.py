@@ -45,7 +45,14 @@ ALL_MODELS: tuple[str, ...] = (
 #
 # 2026-08-05.1 — sector-lookup race fixed. Predictions written before this
 # may hold sector features that are a duplicate of SPY.
-PIPELINE_EPOCH = "2026-08-05.1"
+# 2026-08-08.1 — research prompts now carry options positioning (put/call)
+# and the Bad Apples quality screen; earlier research predictions were made
+# without them.
+# 2026-08-08.2 — quality screen adds the PIT news red-flag scan (leadership/
+# layoffs/legal/guidance/short-seller/dilution) as an 18th check.
+# 2026-08-08.3 — quality screen grows to 20 checks (short interest, analyst
+# revision momentum); evidence-set selection stamped per prediction.
+PIPELINE_EPOCH = "2026-08-08.3"
 
 # Conviction labels map to nominal confidences for display only — backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -107,6 +114,47 @@ def merge_research_into_analysis(
     return {**ai_analysis, "by_symbol": by_sym}, True
 
 
+def attach_positioning_quality(
+    ai_analysis: dict | None,
+    symbols: list | None,
+    as_of: str,
+    evidence: Optional[Iterable[str]] = None,
+) -> dict:
+    """Stash options positioning and the Bad Apples quality screen into
+    ``ai_analysis["by_symbol"]`` so the synthesis prompt, the on-screen
+    report, the PDF and the markdown export all read one payload.
+
+    Idempotent — symbols that already carry both keys (a cached report from a
+    run that had them) are skipped; both services cache per (symbol, as_of),
+    so a re-attach after a cache restore costs one fetch per missing symbol.
+    """
+    ai_analysis = ai_analysis or {}
+    evidence = set(evidence) if evidence is not None else {"options", "quality"}
+    by_sym = dict(ai_analysis.get("by_symbol") or {})
+    for sym in (symbols or []):
+        entry = dict(by_sym.get(sym) or {})
+        if "options" in evidence and "positioning" not in entry:
+            try:
+                from services.options_service import get_put_call_metrics
+                entry["positioning"] = get_put_call_metrics(sym, as_of)
+            except Exception as e:
+                logger.warning(f"{sym}: options positioning failed: {e}")
+                entry["positioning"] = None
+        # Recompute when absent OR when the stored dict predates the news
+        # red-flag scan — a cached report must not freeze an older screen.
+        stale_quality = (isinstance(entry.get("quality"), dict)
+                         and "red_flags" not in entry["quality"])
+        if "quality" in evidence and ("quality" not in entry or stale_quality):
+            try:
+                from services.bad_apples_service import analyze_symbol, summarize
+                entry["quality"] = summarize(analyze_symbol(sym, as_of))
+            except Exception as e:
+                logger.warning(f"{sym}: quality screen failed: {e}")
+                entry["quality"] = entry.get("quality") or None
+        by_sym[sym] = entry
+    return {**ai_analysis, "by_symbol": by_sym}
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 — market data
 # ---------------------------------------------------------------------------
@@ -160,8 +208,10 @@ def run_predictions(
     cutoff_date: date_cls,
     models: Optional[set[str]] = None,
     research_model: Optional[str] = None,
+    news_status_by_symbol: Optional[dict[str, str]] = None,
     include_thesis: bool = True,
     force: bool = False,
+    evidence: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run every model for each symbol as of ``cutoff_date``.
 
@@ -172,6 +222,9 @@ def run_predictions(
     is reused rather than re-run — the research call is an LLM round trip per
     symbol, so repeating a run that nothing has changed under is pure spend.
     ``force`` re-runs regardless.
+
+    ``evidence`` selects the optional Terminal-derived context blocks
+    ("options", "quality") from the Run-Analysis modal; None means both.
     """
     from services import progress_service as prog
     from services import usage_service as usage
@@ -179,6 +232,8 @@ def run_predictions(
     from services.stock_data import fetch_stock_data as fetch_ohlcv
 
     selected = set(models or ALL_MODELS)
+    evidence_set = (sorted(evidence) if evidence is not None
+                    else ["options", "quality"])
     service = get_prediction_service()
     is_backtest = target_date < date_cls.today()
 
@@ -237,7 +292,8 @@ def run_predictions(
         if not force:
             reused = _reusable_predictions(
                 symbol, cutoff_date, selected, df,
-                research_model=research_model, news_count=len(sym_news))
+                research_model=research_model, news_count=len(sym_news),
+                evidence=evidence_set)
             if reused:
                 results[symbol] = reused
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
@@ -271,15 +327,25 @@ def run_predictions(
                 as_of=str(cutoff_date),
                 research_model=research_model,
                 include_thesis=include_thesis,
+                evidence=evidence_set,
             )
         # Stamp what these were produced under, so a later run can tell
         # whether they are still valid rather than assuming they are.
+        # "The source failed" and "the window was quiet" both yield zero
+        # articles. Carrying the difference onto the prediction is what lets
+        # the scoreboard separate a supported call from a blind one.
+        sym_status = (news_status_by_symbol or {}).get(
+            symbol, "ok" if sym_news else "empty")
+
         for entry in results[symbol].values():
             if isinstance(entry, dict) and not entry.get("error"):
+                entry["news_status"] = sym_status
                 entry.setdefault("details", {})
                 if isinstance(entry["details"], dict):
                     entry["details"]["pipeline_epoch"] = PIPELINE_EPOCH
+                    entry["details"]["evidence"] = evidence_set
                     entry["details"].setdefault("news_count", len(sym_news))
+                    entry["details"].setdefault("news_status", sym_status)
 
         decisions = {m: r.get("decision") for m, r in results[symbol].items()
                      if isinstance(r, dict) and not r.get("error")}
@@ -303,6 +369,7 @@ def _reusable_predictions(
     df: pd.DataFrame,
     research_model: Optional[str],
     news_count: int,
+    evidence: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """Stored predictions for this exact analysis, or None to re-run.
 
@@ -356,6 +423,26 @@ def _reusable_predictions(
     if research_model and research.get("model") not in (None, "", research_model):
         logger.info(f"{symbol}: stored research came from "
                     f"{research.get('model')}, asked for {research_model} — re-running")
+        return None
+
+    # The evidence set is part of what the research model was FED — a report
+    # written with the quality screen must not be served to a run that
+    # excluded it (and vice versa).
+    if evidence is not None and "trading_agents" in stored:
+        # Rows from this epoch but before the stamp existed were always fed
+        # both blocks — that's what the default was.
+        stored_evidence = research.get("evidence") or ["options", "quality"]
+        if sorted(stored_evidence) != sorted(evidence):
+            logger.info(f"{symbol}: stored research evidence "
+                        f"{stored_evidence} != requested {sorted(evidence)} "
+                        f"— re-running")
+            return None
+
+    # A blind prediction must not be cached indefinitely: if the source was
+    # down when it was made, re-running is exactly what we want next time.
+    if research.get("news_status") == "unavailable":
+        logger.info(f"{symbol}: stored prediction was made without news "
+                    f"(source unavailable) — re-running")
         return None
 
     stored_news = research.get("news_count")
@@ -467,6 +554,7 @@ def build_ai_report(
     stock_data: Optional[dict] = None,
     lookback_days: int = 7,
     include_thesis: bool = True,
+    evidence: Optional[Iterable[str]] = None,
 ) -> dict:
     """Portfolio-level AI analysis for the run.
 
@@ -510,7 +598,8 @@ def build_ai_report(
     # Same cache key the AI Report callback uses, so a scheduled run and a UI
     # run over identical scope share one entry instead of each paying.
     cache_key = _report_cache_key(news_by_symbol, symbols, as_of, report_model,
-                                  lookback_days, include_thesis)
+                                  lookback_days, include_thesis,
+                                  evidence=evidence)
     try:
         from services import persistence_service as ps
         cached = ps.get_cached_report(None, as_of, "ai_report",
@@ -552,19 +641,22 @@ def build_ai_report(
 
 def _report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
                       report_model: str, lookback_days: int,
-                      include_thesis: bool) -> dict:
+                      include_thesis: bool,
+                      evidence: Optional[Iterable[str]] = None) -> dict:
     """Same hash inputs the AI Report callback uses, so a scheduled run and a
     UI run of identical scope share one cache entry."""
     return {
         "news": news_by_symbol,
         "symbols": sorted(symbols),
         "as_of": as_of,
-        "schema": "v4-merged",
+        "schema": "v5-flowq",
         "model": report_model,
         "lookback": lookback_days,
         "thesis": include_thesis,
         "research": False,
         "recs": "auto",
+        "evidence": (sorted(evidence) if evidence is not None
+                     else ["options", "quality"]),
     }
 
 
@@ -717,6 +809,7 @@ def run_full_analysis(
     force_refresh: bool = True,
     force: bool = False,
     news_filter: Optional[str] = None,
+    evidence: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
 
@@ -834,11 +927,19 @@ def run_full_analysis(
     except Exception as e:
         logger.warning(f"news snapshot not archived: {e}")
 
+    news_status_by_symbol = {
+        sym: ("unavailable" if sym in news_unavailable
+              else "empty" if sym in news_empty else "ok")
+        for sym in priced
+    }
+
     signals = run_predictions(
         priced, stock_data, news_by_symbol,
         target_date=target_date, cutoff_date=cutoff_date,
         models=models, research_model=report_model,
         include_thesis=include_thesis, force=force,
+        news_status_by_symbol=news_status_by_symbol,
+        evidence=evidence,
     )
     stored, evaluated = persist_predictions(signals)
 
@@ -846,8 +947,12 @@ def run_full_analysis(
         priced, news_by_symbol, cutoff_date,
         report_model=report_model, recs_model=recs_model,
         stock_data=stock_data, lookback_days=lookback_days,
-        include_thesis=include_thesis,
+        include_thesis=include_thesis, evidence=evidence,
     )
+    # After the cache check on purpose: a restored report predating these
+    # sections gets them attached instead of silently lacking them.
+    ai_analysis = attach_positioning_quality(ai_analysis, priced, as_of,
+                                             evidence=evidence)
 
     recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
 
@@ -864,7 +969,7 @@ def run_full_analysis(
             symbol=None, trade_date=as_of, report_type="ai_report",
             input_data_hash=ps.compute_data_hash(_report_cache_key(
                 news_by_symbol, priced, as_of, report_model,
-                lookback_days, include_thesis)),
+                lookback_days, include_thesis, evidence=evidence)),
             content=json.dumps(merged, default=str, indent=2),
             file_format="json",
         )

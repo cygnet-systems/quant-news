@@ -269,6 +269,18 @@ class ModelPrediction(Base):
     feature_values_json: Mapped[str | None] = mapped_column(Text)
     details_json: Mapped[dict | None] = mapped_column(JSONB)
 
+    # Whether the news the models were meant to read actually arrived:
+    # "ok" (articles), "empty" (source answered, window genuinely quiet), or
+    # "unavailable" (the source failed). A prediction made blind scores the
+    # same as any other, so without this column the scoreboard silently mixes
+    # supported calls with unsupported ones. NULL means the run predates this
+    # column, which is not the same as "ok".
+    news_status: Mapped[str | None] = mapped_column(String(16))
+
+    # Which combination method produced an ensemble call. NULL for every other
+    # model, and for ensemble rows written before it was recorded.
+    ensemble_method: Mapped[str | None] = mapped_column(String(32))
+
     # Cache invalidation
     input_data_hash: Mapped[str | None] = mapped_column(String(64))
 
@@ -288,6 +300,8 @@ class ModelPrediction(Base):
         Index("ix_model_pred_sym_date", "symbol", "prediction_date"),
         Index("ix_model_pred_hash", "input_data_hash"),
         Index("ix_model_pred_owner", "owner_uid"),
+        Index("ix_model_pred_news_status", "news_status", "prediction_date"),
+        Index("ix_model_pred_ens_method", "ensemble_method", "prediction_date"),
     )
 
 
@@ -472,6 +486,11 @@ class ScheduledJob(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     owner_uid: Mapped[str | None] = mapped_column(String(64))
+    # Private schedules exist per user; public ones are visible to everyone
+    # (and to the Home jobs strip). Legacy rows stay public.
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False,
+                                            server_default=text("true"),
+                                            default=True)
 
 
 class JobRun(Base):

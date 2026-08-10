@@ -97,9 +97,12 @@ def invalidate_memo() -> None:
     except Exception as e:
         logger.debug("Dashboard memo clear skipped: %s", e)
 
-# Luna's per-symbol verdict is persisted as a prediction row so it gets scored
-# like a model, but it is a synthesis over the others rather than a peer.
-# Counting it as "a model that ran" double-counts the same evidence.
+# Luna's per-symbol verdict is persisted as a prediction row and scored like a
+# model. It IS counted in the scorecards and the P&L series: although it reads
+# the other models' output, it makes its own call over reports + signals — a
+# distinct prediction, exactly like the ensemble row, which was always counted.
+# The name is still special-cased where the LAYOUT differs: the Home cohort
+# board gives it its own slot instead of a column in the models grid.
 SYNTHESIS_MODEL = "recommendation_synthesis"
 
 
@@ -183,8 +186,7 @@ def _rolling_uncached(days, group_key, symbols):
     end = datetime.now().date()
     start = end - timedelta(days=days)
     preds = get_cache().get_predictions_between(start, end, symbols=symbols)
-    return aggregate_predictions(
-        [p for p in preds if p["model_name"] != SYNTHESIS_MODEL], group_key)
+    return aggregate_predictions(preds, group_key)
 
 
 def get_pnl_series(days: int = 30, symbols: list[str] | None = None) -> list[dict]:
@@ -195,7 +197,7 @@ def get_pnl_series(days: int = 30, symbols: list[str] | None = None) -> list[dic
 
     daily: dict[str, float] = {}
     for p in preds:
-        if p["model_name"] == SYNTHESIS_MODEL or p.get("pnl_dollars") is None:
+        if p.get("pnl_dollars") is None:
             continue
         daily[p["prediction_date"]] = daily.get(p["prediction_date"], 0.0) + p["pnl_dollars"]
 
@@ -208,20 +210,34 @@ def get_pnl_series(days: int = 30, symbols: list[str] | None = None) -> list[dic
 
 
 def get_latest_cohort() -> dict:
-    """Memoized wrapper: see _latest_cohort_uncached."""
-    return _memoized("cohort", _latest_cohort_uncached)
+    """The latest cutoff's cohort (memoized)."""
+    return get_cohort(None)
 
 
-def _latest_cohort_uncached() -> dict:
-    """The most recent prediction cutoff, shaped one row per symbol.
+def get_cohort(prediction_date: str | None = None) -> dict:
+    """Memoized wrapper: see _cohort_uncached. None means the latest cutoff."""
+    key = f"cohort:{prediction_date or 'latest'}"
+    return _memoized(key, lambda: _cohort_uncached(prediction_date))
+
+
+def get_available_cutoffs(limit: int = 90) -> list[str]:
+    """Distinct prediction cutoffs, newest first, as ISO strings."""
+    return _memoized(f"cutoffs:{limit}",
+                     lambda: [str(d) for d in
+                              get_cache().get_prediction_dates(limit=limit)])
+
+
+def _cohort_uncached(prediction_date: str | None = None) -> dict:
+    """One prediction cutoff, shaped one row per symbol.
 
     Predictions carry no run id, so the cutoff date is the only grouping the
     schema guarantees. For the launch screen that is also the more truthful
-    unit: it answers "what is the current call on each name", which survives a
-    run being re-executed or topped up symbol by symbol.
+    unit: it answers "what was the call on each name as of this cutoff",
+    which survives a run being re-executed or topped up symbol by symbol.
+    ``prediction_date=None`` means the most recent cutoff.
     """
     cache = get_cache()
-    latest = cache.get_latest_prediction_date()
+    latest = prediction_date or cache.get_latest_prediction_date()
     if latest is None:
         return {"prediction_date": None, "symbols": [], "model_names": [],
                 "counts": {"resolved": 0, "held": 0, "pending": 0},

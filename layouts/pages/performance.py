@@ -6,8 +6,9 @@ same numbers were reachable two ways and drifted.
 """
 
 import dash_bootstrap_components as dbc
-from dash import html
+from dash import dcc, html
 
+from layouts.components import create_data_actions
 from layouts.formatters import MODEL_DISPLAY
 from layouts.history_sections import (
     build_history_filter_bar,
@@ -53,8 +54,57 @@ def scoreboard_header(first_label: str) -> html.Thead:
         [sb_th(first_label)] + [sb_th(c) for c in SCOREBOARD_COLUMNS]))
 
 
-def scoreboard_rows(groups: list[dict], group_key: str) -> list[html.Tr]:
-    """Render aggregate rows from services.dashboard_service.aggregate_predictions."""
+def trade_detail_table(trades: list[dict]) -> html.Table:
+    """Every scored call behind one symbol row, newest session first."""
+
+    def _row(p):
+        decision = p.get("decision", "HOLD")
+        dec_cls = ("positive" if decision == "BUY"
+                   else "negative" if decision == "SELL" else "neutral")
+        conf = p.get("confidence")
+        correct = p.get("was_correct")
+        if correct is True:
+            result, result_cls = "✓ right", "positive"
+        elif correct is False:
+            result, result_cls = "✗ wrong", "negative"
+        else:
+            # A scored HOLD: it has P&L (0) but no directional verdict.
+            result, result_cls = "—", ""
+        pnl = p.get("pnl_dollars")
+        pnl_cls = ("positive" if pnl and pnl > 0
+                   else "negative" if pnl and pnl < 0 else "")
+        return html.Tr([
+            html.Td(p.get("target_date") or p.get("prediction_date", "?"),
+                    title=f"As-of {p.get('prediction_date', '?')}, scored "
+                          f"against the {p.get('target_date', '?')} close"),
+            html.Td(MODEL_DISPLAY.get(p.get("model_name", ""),
+                                      p.get("model_name", ""))),
+            html.Td(html.Span(decision, className=f"history-decision {dec_cls}")),
+            html.Td(f"{int(conf * 100)}%" if conf else "—", className="num"),
+            html.Td(html.Span(result, className=result_cls)),
+            html.Td(html.Span(f"${pnl:+.2f}" if pnl is not None else "—",
+                              className=f"num {pnl_cls}")),
+        ])
+
+    # Date descending, model ascending: sort by model, then stably by date.
+    ordered = sorted(trades, key=lambda p: p.get("model_name") or "")
+    ordered.sort(key=lambda p: p.get("target_date")
+                 or p.get("prediction_date") or "", reverse=True)
+    return html.Table([
+        html.Thead(html.Tr([html.Th(h) for h in
+                            ["Date", "Model", "Signal", "Conf", "Result", "P&L"]])),
+        html.Tbody([_row(p) for p in ordered]),
+    ], className="history-data-table history-pred-table")
+
+
+def scoreboard_rows(groups: list[dict], group_key: str,
+                    trades_by_symbol: dict | None = None) -> list[html.Tr]:
+    """Render aggregate rows from services.dashboard_service.aggregate_predictions.
+
+    With trades_by_symbol (symbol rows only), each row also gets a hidden
+    sibling <tr> holding its individual trades, toggled by the chevron via the
+    generic history-section-toggle callback (section "sbrow-{sym}").
+    """
     rows = []
     for g in groups:
         trades, pnl, holds = g["trades"], g["pnl"], g["holds"]
@@ -68,6 +118,8 @@ def scoreboard_rows(groups: list[dict], group_key: str) -> list[html.Tr]:
                    if group_key == "model_name" else g["name"])
         # A symbol row is a question — "what did we actually call on this
         # name, and when was it right?" — so make it the way to ask it.
+        sym_trades = (trades_by_symbol or {}).get(g["name"]) \
+            if group_key == "symbol" else None
         first_cell = (
             html.Button(
                 display,
@@ -77,6 +129,18 @@ def scoreboard_rows(groups: list[dict], group_key: str) -> list[html.Tr]:
             )
             if group_key == "symbol" else display
         )
+        if sym_trades:
+            sect = f"sbrow-{g['name']}"
+            first_cell = html.Div([
+                first_cell,
+                html.Span(
+                    html.I(className="bi bi-chevron-down history-chevron ms-auto",
+                           id={"type": "history-section-chevron", "section": sect}),
+                    id={"type": "history-section-toggle", "section": sect},
+                    className="perf-row-expand",
+                    title=f"Show each {g['name']} trade in place",
+                ),
+            ], className="perf-symbol-cell")
         rows.append(html.Tr([
             html.Td(first_cell),
             # "35 · 4 held" rather than "35 of 39": the bare "of" left the
@@ -97,16 +161,27 @@ def scoreboard_rows(groups: list[dict], group_key: str) -> list[html.Tr]:
                     title=f"{trades} trades x $1,000 notional"),
             html.Td(html.Span(per_trade, className=f"num {pnl_cls}")),
         ]))
+        if sym_trades:
+            rows.append(html.Tr(
+                html.Td(
+                    html.Div(trade_detail_table(sym_trades),
+                             id={"type": "history-section-body", "section": sect},
+                             className="history-section-body perf-trades-body",
+                             style={"display": "none"}),
+                    colSpan=len(SCOREBOARD_COLUMNS) + 1,
+                ),
+                className="perf-trades-row",
+            ))
     return rows
 
 
-def scoreboard_table(groups: list[dict], group_key: str,
-                     first_label: str) -> html.Div:
+def scoreboard_table(groups: list[dict], group_key: str, first_label: str,
+                     trades_by_symbol: dict | None = None) -> html.Div:
     """A complete scorecard table, header included."""
     return html.Div(
         html.Table(
             [scoreboard_header(first_label),
-             html.Tbody(scoreboard_rows(groups, group_key))],
+             html.Tbody(scoreboard_rows(groups, group_key, trades_by_symbol))],
             className="history-data-table",
         ),
         className="history-table-wrap",
@@ -170,6 +245,9 @@ def scorecard(preds: list[dict]) -> html.Div:
     # looked like today was missing when all of it was present.
     dates = sorted(p.get("target_date") or p.get("prediction_date", "")
                    for p in evaluated)
+    trades_by_symbol: dict = {}
+    for p in evaluated:
+        trades_by_symbol.setdefault(p.get("symbol", "?"), []).append(p)
     summary = html.Div(
         f"{len(evaluated)} scored predictions · "
         f"{len({p.get('symbol') for p in evaluated})} symbols · "
@@ -201,12 +279,42 @@ def scorecard(preds: list[dict]) -> html.Div:
                          "model_name", "Model"),
         html.Div("By symbol", className="scoreboard-subtitle"),
         scoreboard_table(aggregate_predictions(evaluated, "symbol"),
-                         "symbol", "Symbol"),
+                         "symbol", "Symbol",
+                         trades_by_symbol=trades_by_symbol),
     ])
 
 
+def model_filter_row(history_data, model="all") -> html.Div:
+    """The model dropdown, seeded from its store rather than written back.
+
+    Lives outside #archive-body for the same reason the filter bar does: a
+    rebuilt dropdown re-fires its value Input, which writes the store, which
+    would rebuild whatever contains it — a render loop.
+    """
+    preds = (history_data or {}).get("predictions", [])
+    names = sorted({p.get("model_name") for p in preds if p.get("model_name")})
+    if model not in ("all", None) and model not in names:
+        # Keep a selection with no rows visible, so it can be changed away.
+        names.append(model)
+    return html.Div(
+        [
+            html.Span("Model:", className="history-date-label"),
+            dcc.Dropdown(
+                id="history-model-dropdown",
+                options=[{"label": "All models", "value": "all"}]
+                + [{"label": MODEL_DISPLAY.get(n, n), "value": n} for n in names],
+                value=model or "all",
+                clearable=False,
+                searchable=False,
+                className="history-model-dropdown",
+            ),
+        ],
+        className="history-filter-row perf-model-row",
+    )
+
+
 def layout(history_data=None, filter_symbols=None, filter_date_range="all",
-           specific_date=None, outcome="all") -> html.Div:
+           specific_date=None, outcome="all", model="all") -> html.Div:
     """Scorecard on top, the per-call log beneath it.
 
     One surface on purpose. The aggregate used to be a modal and the log a
@@ -219,11 +327,16 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
     """
     return html.Div(
         [
+            html.Div(
+                create_data_actions(include_refresh=False),
+                className="perf-action-bar",
+            ),
             build_history_filter_bar(history_data, filter_symbols,
                                      filter_date_range, specific_date),
+            model_filter_row(history_data, model),
             html.Div(
                 body(history_data, filter_symbols, filter_date_range,
-                     specific_date, outcome),
+                     specific_date, outcome, model),
                 id="archive-body",
             ),
         ],
@@ -232,11 +345,11 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
 
 
 def body(history_data=None, filter_symbols=None, filter_date_range="all",
-         specific_date=None, outcome="all") -> list:
+         specific_date=None, outcome="all", model="all") -> list:
     history_data = history_data or {}
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
-    preds = buckets["predictions"]
+    preds = _by_model(buckets["predictions"], model)
 
     # The scorecard always describes the full scope; only the log narrows.
     # Filtering the aggregates too would make "wrong" show a 0% hit rate,
@@ -255,6 +368,15 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
         html.Div(subtitle, className="scoreboard-subtitle") if log else None,
         log,
     ]
+
+
+def _by_model(preds: list[dict], model: str) -> list[dict]:
+    """Narrow to one model. Unlike the outcome slice, this filters the
+    scorecard too: "how is Kronos doing?" is a question about the aggregates,
+    not just the log."""
+    if not model or model == "all":
+        return preds
+    return [p for p in preds if p.get("model_name") == model]
 
 
 def _by_outcome(preds: list[dict], outcome: str) -> list[dict]:

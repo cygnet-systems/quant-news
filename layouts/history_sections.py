@@ -163,6 +163,16 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
 
     active_day = current_session()
 
+    # Predictions are only ever made for a market session, so a weekend or
+    # holiday can only ever filter to nothing. Grey them out instead of
+    # letting the user pick a date that returns an empty list.
+    try:
+        from utils.trading_calendar import non_trading_days
+        closed_days = [d.isoformat()
+                       for d in non_trading_days("2020-01-01", active_day)]
+    except Exception:
+        closed_days = []
+
     rows.append(
         html.Div(
             [
@@ -173,6 +183,8 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
                             id="history-date-picker",
                             date=specific_date,
                             initial_visible_month=active_day.isoformat(),
+                            max_date_allowed=active_day.isoformat(),
+                            disabled_days=closed_days,
                             display_format="YYYY-MM-DD",
                             placeholder=active_day.isoformat(),
                             className="history-date-picker",

@@ -48,6 +48,35 @@ def json_report_to_markdown(data: dict) -> str:
             if info.get("risk_factors"):
                 lines.append(f"### Risk Factors\n{info['risk_factors']}\n")
 
+            pos = info.get("positioning") or {}
+            quality = info.get("quality") or {}
+            if pos.get("pc_volume") is not None or quality.get("total_checks"):
+                lines.append("### Positioning & Quality")
+                if pos.get("pc_volume") is not None:
+                    pcoi = (f"{pos['pc_oi']:.2f}"
+                            if pos.get("pc_oi") is not None else "n/a")
+                    lines.append(
+                        f"**Options flow** (chain as of {pos.get('as_of', '?')}): "
+                        f"P/C volume {pos['pc_volume']:.2f} "
+                        f"({pos.get('put_volume', 0):,} puts / "
+                        f"{pos.get('call_volume', 0):,} calls), "
+                        f"P/C open interest {pcoi} — {pos.get('read', '')}\n")
+                if quality.get("total_checks"):
+                    flag = str(quality.get("flag", "")).replace("_", " ").upper()
+                    lines.append(
+                        f"**Quality screen (Bad Apples)** as of "
+                        f"{quality.get('as_of', '?')}: {flag} — "
+                        f"{quality['total_fails']}/{quality['total_checks']} "
+                        f"checks failed")
+                    for f in (quality.get("failed_checks") or [])[:8]:
+                        note = f" ({f['note']})" if f.get("note") else ""
+                        lines.append(f"- {f['check']}: {f['value']}{note}")
+                    for h in (quality.get("red_flags") or [])[:6]:
+                        when = f" ({h['date']})" if h.get("date") else ""
+                        lines.append(f"- red flag [{h['category']}]: "
+                                     f"{h['headline']}{when}")
+                    lines.append("")
+
             thesis = info.get("company_thesis") or {}
             if thesis:
                 lines.append("### Company Thesis")

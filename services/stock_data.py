@@ -5,6 +5,7 @@ and basic metrics from Yahoo Finance.
 """
 
 import atexit
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -13,6 +14,8 @@ import pandas as pd
 import yfinance as yf
 
 from config import APP
+
+logger = logging.getLogger(__name__)
 
 # Ticker cache with TTL to avoid creating multiple Ticker objects
 _ticker_cache: dict[str, tuple[yf.Ticker, datetime]] = {}
@@ -173,7 +176,10 @@ def get_company_profile(symbol: str, max_chars: int = 900) -> str:
         if summary:
             parts.append(summary)
         return "\n".join(parts)
-    except Exception:
+    except Exception as e:
+        # Feeds the research prompt; an empty profile silently narrows the
+        # model's context, so make the reason visible in the log.
+        logger.warning("company profile unavailable for %s: %s", symbol, e)
         return ""
 
 
