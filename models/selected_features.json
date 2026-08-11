@@ -1,10 +1,12 @@
 {
-  "version": 2,
-  "derived_from": "TradingAgents V6 SHAP analysis (n=28, AMBA)",
+  "version": 3,
+  "derived_from": "TradingAgents V6 SHAP analysis (n=28, AMBA) + 2026-08-11 regime/evidence additions",
   "n_original": 20,
-  "n_selected": 18,
+  "n_selected": 21,
   "removed": ["sent_neg_pct", "sent_neutral_pct"],
   "removal_reason": "DeBERTa-derived; DeBERTa excluded from V6.1 pipeline",
+  "added_2026_08_11": ["news_present", "atr_percentile", "dist_52wk_high_pct"],
+  "added_reason": "R2000 diversity test: failures cluster in high-vol names and no-news regimes; the model could not see either",
   "features": [
     "spy_gap",
     "vs_spy_excess_5d",
@@ -23,6 +25,9 @@
     "av_n_tech_articles",
     "av_topic_ipo_avg",
     "spy_ind_close_50_sma_delta5",
-    "global_topic_energy_transportation_avg"
+    "global_topic_energy_transportation_avg",
+    "news_present",
+    "atr_percentile",
+    "dist_52wk_high_pct"
   ]
 }

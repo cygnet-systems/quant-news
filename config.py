@@ -414,6 +414,11 @@ class ModelConfig:
     ENSEMBLE_XGBOOST_WEIGHT: float = 1.3
     ENSEMBLE_TRADING_AGENTS_WEIGHT: float = 0.8
 
+    # Research/report model (first-pass per-symbol research). Single source
+    # of truth — the CLI and the UI both resolve None to this, so changing
+    # it here changes scheduled runs without touching the job rows.
+    REPORT_MODEL: str = os.getenv("REPORT_MODEL", "gpt-5.6-luna")
+
     # Recommendations engine (second-pass synthesis model)
     # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic (says which
     # side to trust and why, two-sided levels); this is ONE call per run

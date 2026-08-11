@@ -32,7 +32,11 @@ logger = logging.getLogger(__name__)
 # v4 (2026-08-06): DB-cached articles expose topics under "topics_json", not
 # "topics" -- every av_*/global_* feature trained as constant 0.0 on cache
 # hits. Both spellings now read; all news-trained models must be refit.
-FEATURE_VERSION: int = 4
+# v5 (2026-08-11): +news_present (blind-vs-quiet disambiguation),
+# +atr_percentile, +dist_52wk_high_pct (regime features — R2000 test showed
+# failures cluster in high-vol names and the model could not see volatility
+# regime at all). 18 -> 21 features; cached models retrain on version bump.
+FEATURE_VERSION: int = 5
 
 INDICATOR_SENTINEL_COLUMN: str = "SMA_50"
 
@@ -157,6 +161,13 @@ class LiveFeatureBuilder:
             self._global_topic_features(global_news or [], prefix="global_")
         )
 
+        # Regime / evidence features (v3 additions).
+        # news_present separates "quiet week" (topic features 0.0 WITH
+        # articles seen) from "blind" (topic features 0.0 with NO articles) —
+        # without it those opposite situations are the same input.
+        features["news_present"] = 1.0 if av_news else 0.0
+        features.update(self._regime_features(ticker_df))
+
         # Ensure all 18 features are present. Missing NEWS/topic features
         # fill with 0.0 -- "no articles" is a real zero. Missing PRICE
         # features fill with NaN: XGBoost/LightGBM handle NaN natively,
@@ -172,6 +183,35 @@ class LiveFeatureBuilder:
                 result[feat] = np.nan
 
         return result
+
+    def _regime_features(self, df: pd.DataFrame) -> dict[str, float]:
+        """Volatility-regime and trend-position features (v3).
+
+        atr_percentile: today's ATR within its own trailing year — whipsaw
+        risk is the documented failure mode, and absolute ATR is not
+        comparable across names the way its own percentile is.
+        dist_52wk_high_pct: percent below the trailing-252-session high —
+        separates "extended near highs" from "washed out", which momentum
+        features alone conflate.
+        """
+        features: dict[str, float] = {
+            "atr_percentile": np.nan,
+            "dist_52wk_high_pct": np.nan,
+        }
+        if "ATR" in df.columns:
+            atr = df["ATR"].dropna()
+            if len(atr) >= 60:
+                window = atr.tail(252)
+                current = float(window.iloc[-1])
+                features["atr_percentile"] = float(
+                    (window <= current).mean() * 100)
+        if "Close" in df.columns and len(df) >= 60:
+            closes = df["Close"].tail(252)
+            high = float(closes.max())
+            if high > 0:
+                features["dist_52wk_high_pct"] = (
+                    (float(closes.iloc[-1]) / high - 1) * 100)
+        return features
 
     def _gap_features(
         self, df: pd.DataFrame, prefix: str

@@ -52,7 +52,13 @@ ALL_MODELS: tuple[str, ...] = (
 # layoffs/legal/guidance/short-seller/dilution) as an 18th check.
 # 2026-08-08.3 — quality screen grows to 20 checks (short interest, analyst
 # revision momentum); evidence-set selection stamped per prediction.
-PIPELINE_EPOCH = "2026-08-08.3"
+# 2026-08-11.1 — feature set v5 (news_present, atr_percentile,
+# dist_52wk_high_pct; ATR-scaled training labels); ensemble votes run through
+# calibrated confidence + rolling-performance decay; synthesis emits scored
+# p_correct instead of conviction labels; peer blocks add relative valuation;
+# options positioning carries day-over-day flow; SPY regime stamped on every
+# prediction; report figures audited against their prompt.
+PIPELINE_EPOCH = "2026-08-11.1"
 
 # Conviction labels map to nominal confidences for display only — backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -114,6 +120,40 @@ def merge_research_into_analysis(
     return {**ai_analysis, "by_symbol": by_sym}, True
 
 
+def _positioning_delta(sym: str, as_of: str, today: dict) -> dict | None:
+    """Day-over-day put/call OI shift from the warmer's previous-session
+    snapshot. None when yesterday wasn't warmed — the delta earns its place
+    once the system runs daily, and is honestly absent until then."""
+    try:
+        from services import terminal_cache
+        from utils.trading_calendar import get_previous_trading_day
+
+        prev_session = get_previous_trading_day(as_of).isoformat()
+        prev = terminal_cache.get_putcall_summary(sym, prev_session)
+        if not prev:
+            return None
+
+        def _ratio(snapshot: dict) -> float | None:
+            call_oi = sum(e.get("call_oi") or 0 for e in snapshot.get("expiries", []))
+            put_oi = sum(e.get("put_oi") or 0 for e in snapshot.get("expiries", []))
+            return (put_oi / call_oi) if call_oi else None
+
+        prev_ratio = _ratio(prev)
+        today_ratio = (today.get("put_call_oi_ratio")
+                       or _ratio(today) if isinstance(today, dict) else None)
+        if prev_ratio is None or today_ratio is None:
+            return None
+        return {
+            "prev_session": prev_session,
+            "put_call_oi_prev": round(prev_ratio, 3),
+            "put_call_oi_now": round(float(today_ratio), 3),
+            "shift": round(float(today_ratio) - prev_ratio, 3),
+        }
+    except Exception as e:
+        logger.debug(f"{sym}: positioning delta skipped: {e}")
+        return None
+
+
 def attach_positioning_quality(
     ai_analysis: dict | None,
     symbols: list | None,
@@ -140,6 +180,14 @@ def attach_positioning_quality(
             except Exception as e:
                 logger.warning(f"{sym}: options positioning failed: {e}")
                 entry["positioning"] = None
+        if "options" in evidence and entry.get("positioning") \
+                and "positioning_delta" not in entry:
+            # Flow over time, not just a snapshot: compare against the
+            # previous session's WARMED summary only (cache read, no
+            # network) — a live re-fetch labeled "yesterday" would be
+            # current-chain data wearing a costume.
+            entry["positioning_delta"] = _positioning_delta(
+                sym, as_of, entry["positioning"])
         # Recompute when absent OR when the stored dict predates the news
         # red-flag scan — a cached report must not freeze an older screen.
         stale_quality = (isinstance(entry.get("quality"), dict)
@@ -238,11 +286,30 @@ def run_predictions(
     is_backtest = target_date < date_cls.today()
 
     spy_df = None
+    spy_regime = None
     try:
         spy_df = fetch_ohlcv("SPY", period="2y")
         spy_df = spy_df[spy_df.index <= str(cutoff_date)]
     except Exception as e:
         logger.warning(f"SPY fetch failed: {e}")
+
+    # Stamp the market regime each prediction was made under, so performance
+    # can later be sliced by regime instead of reconstructed archaeologically.
+    if spy_df is not None and len(spy_df) >= 200:
+        try:
+            close = float(spy_df["Close"].iloc[-1])
+            sma50 = float(spy_df["Close"].rolling(50).mean().iloc[-1])
+            sma200 = float(spy_df["Close"].rolling(200).mean().iloc[-1])
+            ret20 = spy_df["Close"].pct_change().tail(20)
+            vol20 = float(ret20.std() * (252 ** 0.5) * 100)
+            spy_regime = {
+                "state": ("BULL" if close > sma50 and close > sma200
+                          else "BEAR" if close < sma50 and close < sma200
+                          else "MIXED"),
+                "spy_vol20_ann_pct": round(vol20, 1),
+            }
+        except Exception as e:
+            logger.debug(f"regime stamp skipped: {e}")
 
     needs_historical = bool(selected & {"xgboost_shap", "lightgbm"})
     training_news_failures: list[str] = []
@@ -346,6 +413,8 @@ def run_predictions(
                     entry["details"]["evidence"] = evidence_set
                     entry["details"].setdefault("news_count", len(sym_news))
                     entry["details"].setdefault("news_status", sym_status)
+                    if spy_regime:
+                        entry["details"]["regime"] = spy_regime
 
         decisions = {m: r.get("decision") for m, r in results[symbol].items()
                      if isinstance(r, dict) and not r.get("error")}
@@ -742,23 +811,38 @@ def run_recommendations(
                 f"{sym}: synthesis action {rec.get('action')!r} is not "
                 f"BUY/SELL/HOLD — dropping this symbol's recommendation")
             continue
-        conviction = str(rec.get("conviction", "")).upper()
-        if conviction not in _CONVICTION_CONF:
-            # An off-menu label ("MODERATE", null) used to store a NULL
-            # confidence with no trace. Treat it as LOW and say so.
-            logger.warning(f"{sym}: synthesis conviction {conviction!r} not in "
-                           f"{sorted(_CONVICTION_CONF)} — treating as LOW")
+        # p_correct (scored probability) replaced the HIGH/MEDIUM/LOW
+        # conviction labels — measured over 4 weeks, the labels carried no
+        # calibration signal (HIGH hit 60%, MEDIUM 64%). A probability can be
+        # scored against outcomes and calibrated; a mood cannot. The label
+        # path stays as fallback for a model that ignores the new schema.
+        p_correct = rec.get("p_correct")
+        try:
+            p_correct = float(p_correct) if p_correct is not None else None
+            if p_correct is not None and not 0.4 <= p_correct <= 0.95:
+                logger.warning(f"{sym}: synthesis p_correct {p_correct} out of "
+                               f"range — clamping")
+                p_correct = min(0.95, max(0.4, p_correct))
+        except (TypeError, ValueError):
+            p_correct = None
+        if p_correct is None:
+            conviction = str(rec.get("conviction", "")).upper()
+            if conviction not in _CONVICTION_CONF:
+                logger.warning(f"{sym}: synthesis gave neither p_correct nor a "
+                               f"known conviction ({conviction!r}) — treating "
+                               f"as LOW")
+            p_correct = _CONVICTION_CONF.get(conviction, _CONVICTION_CONF["LOW"])
         try:
             cache.store_prediction(
                 sym, "recommendation_synthesis",
                 {
                     "decision": action,
-                    "confidence": _CONVICTION_CONF.get(
-                        conviction, _CONVICTION_CONF["LOW"]),
+                    "confidence": p_correct,
                     "up_probability": None,
                     "details": {
                         "synthesis_model": result.get("model_used"),
                         "basis": result.get("basis"),
+                        "p_correct": rec.get("p_correct"),
                         "conviction": rec.get("conviction"),
                         "key_level": rec.get("key_level"),
                         "change_trigger": rec.get("change_trigger"),
@@ -801,7 +885,7 @@ def run_full_analysis(
     symbols: list[str],
     target: Optional[str] = None,
     lookback_days: int = 7,
-    report_model: str = "gpt-5.6-luna",
+    report_model: Optional[str] = None,
     recs_model: Optional[str] = None,
     include_thesis: bool = True,
     models: Optional[set[str]] = None,
@@ -824,6 +908,7 @@ def run_full_analysis(
     from services.news_window import fetch_overnight_news, fetch_point_in_time_news
     from utils.trading_calendar import resolve_target_and_cutoff
 
+    report_model = report_model or MODEL.REPORT_MODEL
     recs_model = recs_model or MODEL.RECOMMENDATIONS_MODEL
     news_filter = (news_filter or MODEL.NEWS_FILTER_MODE).lower()
     target_date, cutoff_date = resolve_target_and_cutoff(target)
@@ -1096,6 +1181,14 @@ def evaluate_pending() -> int:
 
     count = get_cache().evaluate_predictions()
     prog.emit("action", f"Scheduled evaluation: {count} predictions scored")
+
+    if count:
+        # New outcomes change what every confidence has historically meant.
+        try:
+            from services.calibration_service import invalidate
+            invalidate()
+        except Exception:
+            pass
 
     try:
         from services.evaluation_service import get_evaluation_service

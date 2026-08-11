@@ -121,19 +121,49 @@ def resolution_state(pred: dict) -> str:
     return "pending"
 
 
+def _cost_bps(prev_close) -> float:
+    """Round-trip friction estimate in basis points, by price bucket.
+
+    Price is the proxy we have on every prediction row; it correlates well
+    enough with spread for an honesty adjustment (this is a haircut, not a
+    microstructure model): sub-$5 names trade wide, $100+ names trade tight.
+    """
+    try:
+        price = float(prev_close)
+    except (TypeError, ValueError):
+        return 20.0
+    if price < 5:
+        return 40.0
+    if price < 20:
+        return 25.0
+    if price < 100:
+        return 15.0
+    return 8.0
+
+
 def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
     """Group evaluated predictions by model or symbol into summary stats.
 
     Hit rate counts BUY/SELL only. HOLD takes no position, scores "correct" by
     default against the no-trade band, and would otherwise inflate the rate
     into meaninglessness -- so holds are reported as their own count instead.
+
+    Beyond the raw aggregates, each group carries the three honesty stats the
+    profit question actually turns on:
+      * hit_se — binomial standard error of the hit rate; a 60% on 11 trades
+        is a coin flip wearing a costume, and the SE is what says so.
+      * net_pnl — pnl minus a per-trade friction haircut (see _cost_bps),
+        because gross P&L on small caps flatters every edge.
+      * concentration — the largest single symbol's share of gross |P&L|;
+        an "edge" that is one ticker is a position, not a strategy.
     """
     groups: dict[str, dict] = {}
     for p in preds:
         g = groups.setdefault(
             p.get(group_key, "?"),
             {"scored": 0, "hits": 0, "trades": 0, "trade_hits": 0,
-             "holds": 0, "pnl": 0.0, "conf": []},
+             "holds": 0, "pnl": 0.0, "conf": [], "cost": 0.0,
+             "pnl_by_symbol": {}},
         )
         is_trade = (p.get("decision") or "HOLD").upper() != "HOLD"
         state = resolution_state(p)
@@ -151,6 +181,12 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
             g["holds"] += 1
         if p.get("pnl_dollars") is not None:
             g["pnl"] += p["pnl_dollars"]
+            sym = p.get("symbol", "?")
+            g["pnl_by_symbol"][sym] = (g["pnl_by_symbol"].get(sym, 0.0)
+                                       + p["pnl_dollars"])
+            if is_trade:
+                # $1,000 notional per trade x round-trip bps.
+                g["cost"] += 1000.0 * _cost_bps(p.get("previous_close")) / 10000.0
         if p.get("confidence") is not None:
             g["conf"].append(p["confidence"])
 
@@ -158,6 +194,12 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
     for name in sorted(groups):
         g = groups[name]
         trades = g["trades"]
+        hit_rate = (g["trade_hits"] / trades) if trades else None
+        hit_se = ((hit_rate * (1 - hit_rate) / trades) ** 0.5
+                  if hit_rate is not None and trades >= 2 else None)
+        gross_abs = sum(abs(v) for v in g["pnl_by_symbol"].values())
+        concentration = (max(abs(v) for v in g["pnl_by_symbol"].values())
+                         / gross_abs if gross_abs > 0 else None)
         out.append({
             "name": name,
             "scored": g["scored"],
@@ -166,7 +208,13 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
             "trade_hits": g["trade_hits"],
             "holds": g["holds"],
             "pnl": g["pnl"],
-            "hit_rate": (g["trade_hits"] / trades) if trades else None,
+            "net_pnl": g["pnl"] - g["cost"],
+            "est_costs": g["cost"],
+            "hit_rate": hit_rate,
+            "hit_se": hit_se,
+            "significant": (hit_rate is not None and hit_se is not None
+                            and hit_se > 0 and abs(hit_rate - 0.5) > 2 * hit_se),
+            "concentration": concentration,
             "pnl_per_trade": (g["pnl"] / trades) if trades else None,
             "avg_confidence": (sum(g["conf"]) / len(g["conf"])) if g["conf"] else None,
         })

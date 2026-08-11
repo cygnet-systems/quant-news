@@ -114,6 +114,16 @@ JOB_TYPES: dict[str, JobType] = {
         default_hour=18,
         default_minute=0,
     ),
+    "replay": JobType(
+        kind="replay",
+        label="Ensemble replay",
+        description="Re-score the four ensemble methods over every stored "
+                    "member vote and report which would have done best",
+        verb="replay",
+        needs_symbols=False,
+        default_hour=19,
+        default_minute=0,
+    ),
 }
 
 

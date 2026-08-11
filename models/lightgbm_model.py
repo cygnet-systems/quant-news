@@ -217,6 +217,10 @@ class LightGBMModel(BaseModel):
         labels: list[int] = []
         skipped = 0
 
+        # ATR-scaled ambiguity band — see xgboost_model._train_from_history
+        # for the rationale; the two trainers must label identically.
+        atr_col = ticker_full["ATR"] if "ATR" in ticker_full.columns else None
+
         min_window = 60
         for t in range(min_window, len(ticker_full) - 1):
             close_today = float(ticker_full["Close"].iloc[t])
@@ -227,7 +231,13 @@ class LightGBMModel(BaseModel):
 
             pct = (close_tomorrow - close_today) / close_today
 
-            if threshold > 0.0 and abs(pct) < threshold:
+            day_threshold = threshold
+            if atr_col is not None:
+                atr_val = atr_col.iloc[t]
+                if pd.notna(atr_val) and close_today > 0:
+                    day_threshold = max(
+                        threshold, 0.15 * float(atr_val) / close_today)
+            if day_threshold > 0.0 and abs(pct) < day_threshold:
                 skipped += 1
                 continue
 

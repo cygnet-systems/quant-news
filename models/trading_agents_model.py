@@ -184,6 +184,7 @@ class TradingAgentsModel(BaseModel):
                 "triggers": result.get("triggers", {}),
                 "structured": result.get("structured", {}),
                 "provenance": result.get("provenance", {}),
+                "figure_check": result.get("figure_check"),
                 "news_count": result.get("news_count", 0),
                 "sector_etf": result.get("sector_etf", ""),
                 "used_news": use_news,

@@ -28,13 +28,30 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     if not pred:
         return html.Span("no call", className="home-chip home-chip-none")
     decision = (pred.get("decision") or "HOLD").upper()
-    conf = pred.get("confidence")
+    raw_conf = pred.get("confidence")
     label = decision if compact else f"{decision}"
-    # Every call states its provenance: made from data through the
-    # prediction date, for the target session's close.
-    title = decision + (f" at {conf:.0%} confidence" if conf is not None else "")
+
+    # Raw model confidence is anti-calibrated on this platform and is never
+    # shown. The badge is the CALIBRATED value — what this raw confidence has
+    # historically meant for this model — or nothing when the model lacks
+    # enough evaluated history to earn a number.
+    cal = None
+    try:
+        from services.calibration_service import calibrate
+        cal = calibrate(pred.get("model_name", ""), raw_conf)
+    except Exception:
+        cal = None
+
     made = pred.get("prediction_date")
     target = pred.get("target_date")
+    title = decision
+    if cal is not None:
+        title += (f" — calls like this one have been right {cal:.0%} of the "
+                  f"time (calibrated from evaluated history; model claimed "
+                  f"{raw_conf:.0%})")
+    elif raw_conf is not None:
+        title += (f" — model claims {raw_conf:.0%}, but has too little "
+                  f"evaluated history to calibrate; treat as unsized")
     if made:
         title += f" — made with data through {made}"
     if target:
@@ -42,8 +59,8 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     return html.Span(
         [
             html.Span(label, className="home-chip-decision"),
-            html.Span(f"{conf:.0%}", className="home-chip-conf num")
-            if conf is not None else "",
+            html.Span(f"{cal:.0%}", className="home-chip-conf num")
+            if cal is not None else "",
         ],
         className=f"home-chip home-chip-{DECISION_CLASS.get(decision, 'neutral')}",
         title=title,

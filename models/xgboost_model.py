@@ -237,6 +237,13 @@ class XGBoostModel(BaseModel):
         labels: list[int] = []
         skipped = 0
 
+        # Volatility-scaled ambiguity: a fixed percent threshold makes a
+        # 70%-vol name and a utility the same class problem — noise days on
+        # the volatile name pass as signal, real moves on the quiet name get
+        # skipped. Scale the band by each day's own ATR so "ambiguous" means
+        # the same thing everywhere: a move small relative to typical range.
+        atr_col = ticker_full["ATR"] if "ATR" in ticker_full.columns else None
+
         # Walk-forward: need at least 60 bars of history for indicators
         min_window = 60
         for t in range(min_window, len(ticker_full) - 1):
@@ -249,8 +256,16 @@ class XGBoostModel(BaseModel):
 
             pct = (close_tomorrow - close_today) / close_today
 
-            # Ambiguity filter
-            if threshold > 0.0 and abs(pct) < threshold:
+            # Ambiguity filter: ATR-scaled when ATR is available, the fixed
+            # config threshold as the floor either way.
+            day_threshold = threshold
+            if atr_col is not None:
+                atr_val = atr_col.iloc[t]
+                if pd.notna(atr_val) and close_today > 0:
+                    # A move under ~15% of typical daily range is noise.
+                    day_threshold = max(
+                        threshold, 0.15 * float(atr_val) / close_today)
+            if day_threshold > 0.0 and abs(pct) < day_threshold:
                 skipped += 1
                 continue
 

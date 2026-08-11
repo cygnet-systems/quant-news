@@ -1031,6 +1031,7 @@ YOUR ROLE:
 - Synthesize both inputs into specific, actionable recommendations per symbol
 - When the AI report and model predictions DISAGREE, this is the most valuable signal — explain WHY they disagree and which to trust in this context
 - Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa) — they are context that shades conviction, never a standalone reason to flip a direction
+- "p_correct" is a probability, not a mood: your estimate that the ACTION direction is right for the next session's close, on the 0.50-0.75 scale where 0.50 means "no edge over a coin flip". You will be scored against realized outcomes — a persistent gap between your stated p_correct and your hit rate is a defect. State 0.50-0.55 freely; earn anything above 0.65.
 - Explain which models are most relevant for each symbol's situation
 - Provide an overall portfolio-level summary
 - Be direct and specific. No hedging.
@@ -1047,7 +1048,7 @@ Respond with ONLY valid JSON matching this schema:
   "by_symbol": {{
     "<SYMBOL>": {{
       "action": "BUY|SELL|HOLD",
-      "conviction": "HIGH|MEDIUM|LOW",
+      "p_correct": 0.55,
       "reasoning": "2-3 sentences explaining the recommendation, referencing specific data",
       "key_level": "The single price level that matters most for this call (from the data, e.g. 'support $59.35')",
       "change_trigger": "One concrete condition that would flip this action",
@@ -1111,6 +1112,17 @@ Respond with ONLY valid JSON matching this schema:
                     if pos.get("pc_oi") is not None else
                     f"Options positioning (as of {pos.get('as_of', 'n/a')}): "
                     f"P/C volume {pos['pc_volume']:.2f} — {pos.get('read', '')}")
+            delta = ctx_entry.get("positioning_delta") or {}
+            if delta.get("shift") is not None:
+                direction = ("toward puts" if delta["shift"] > 0
+                             else "toward calls" if delta["shift"] < 0
+                             else "unchanged")
+                lines.append(
+                    f"Options flow (day-over-day): P/C open-interest "
+                    f"{delta['put_call_oi_prev']:.2f} → "
+                    f"{delta['put_call_oi_now']:.2f} "
+                    f"({delta['shift']:+.2f}, {direction}) since "
+                    f"{delta['prev_session']}")
             quality = ctx_entry.get("quality") or {}
             if quality.get("total_checks"):
                 failed = ", ".join(f["check"] for f in

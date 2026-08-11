@@ -27,20 +27,25 @@ SCOREBOARD_TIPS = {
     "Trades": "BUY/SELL calls that took a position. HOLD days take no "
               "position and are counted separately as 'held'.",
     "Hit Rate": "Share of BUY/SELL calls where the next close moved the way "
-                "the model predicted. HOLD days are excluded, since they "
-                "cannot be right or wrong.",
-    "Avg Conf": "The model's own average stated confidence. Compare it with "
-                "Hit Rate: a model claiming 70% should be right ~70% of the "
-                "time, and a large gap means it is miscalibrated.",
-    "P&L": "Total dollars across all trades. Each takes a fixed $1,000 "
-           "notional position, entered at the close and exited at the next "
-           "close. Gross, before commission, spread and slippage.",
-    "$/Trade": "P&L divided by Trades: the average edge per position. This "
-               "is the number to judge, since a large P&L over many trades "
-               "can still be a per-trade edge of roughly zero.",
+                "the model predicted, with its ± standard error. Bold means "
+                "statistically distinguishable from a coin flip (2 SE); "
+                "anything else is noise at this sample size, however good "
+                "it looks.",
+    "Calibration": "Claimed vs delivered: the model's average stated "
+                   "confidence against its actual hit rate. Red means it "
+                   "claims at least 15 points more than it delivers — its "
+                   "confidence cannot be used for sizing.",
+    "P&L": "Total dollars across all trades at $1,000 notional each, gross "
+           "(before friction).",
+    "Net P&L": "P&L minus an estimated round-trip friction haircut per trade "
+               "(8-40 bps by price bucket: cheaper stocks trade wider). The "
+               "number a real account would keep.",
+    "$/Trade": "Gross P&L divided by Trades: the average edge per position. "
+               "Judge this together with Net P&L — many small wins can "
+               "vanish into friction.",
 }
 
-SCOREBOARD_COLUMNS = ["Trades", "Hit Rate", "Avg Conf", "P&L", "$/Trade"]
+SCOREBOARD_COLUMNS = ["Trades", "Hit Rate", "Calibration", "P&L", "Net P&L", "$/Trade"]
 
 
 def sb_th(label: str) -> html.Th:
@@ -108,14 +113,61 @@ def scoreboard_rows(groups: list[dict], group_key: str,
     rows = []
     for g in groups:
         trades, pnl, holds = g["trades"], g["pnl"], g["holds"]
-        hit_rate = f"{g['hit_rate']:.0%}" if g["hit_rate"] is not None else "n/a"
-        avg_conf = (f"{g['avg_confidence']:.0%}"
-                    if g["avg_confidence"] is not None else "n/a")
         per_trade = (f"${g['pnl_per_trade']:+.2f}"
                      if g["pnl_per_trade"] is not None else "n/a")
         pnl_cls = "positive" if pnl > 0 else "negative" if pnl < 0 else ""
         display = (MODEL_DISPLAY.get(g["name"], g["name"])
                    if group_key == "model_name" else g["name"])
+
+        # Hit rate with its standard error; bold only when the rate is
+        # 2 SE away from a coin flip. Everything else is presented as the
+        # noise it statistically is.
+        if g["hit_rate"] is not None:
+            se = g.get("hit_se")
+            hit_txt = (f"{g['hit_rate']:.0%} ±{se:.0%}" if se is not None
+                       else f"{g['hit_rate']:.0%}")
+            hit_cell = (html.Strong(hit_txt, title="Distinguishable from a "
+                                    "coin flip at 2 standard errors")
+                        if g.get("significant") else
+                        html.Span(hit_txt, className="scoreboard-muted",
+                                  title="Within 2 SE of 50% — statistically "
+                                        "indistinguishable from chance at "
+                                        "this sample size"))
+        else:
+            hit_cell = html.Span("n/a")
+
+        # Calibration: claimed → delivered, red when the gap is a lie.
+        if g["avg_confidence"] is not None and g["hit_rate"] is not None:
+            gap = g["avg_confidence"] - g["hit_rate"]
+            cal_cls = "negative" if gap > 0.15 else ""
+            cal_cell = html.Span(
+                f"{g['avg_confidence']:.0%}→{g['hit_rate']:.0%}",
+                className=f"num {cal_cls}",
+                title=f"Claims {g['avg_confidence']:.0%} on average, delivers "
+                      f"{g['hit_rate']:.0%}"
+                      + (" — overconfident by more than 15 points; its stated"
+                         " confidence cannot size positions" if gap > 0.15
+                         else ""),
+            )
+        else:
+            cal_cell = html.Span("n/a")
+
+        net = g.get("net_pnl")
+        net_cls = ("positive" if net and net > 0
+                   else "negative" if net and net < 0 else "")
+        net_cell = (html.Span(f"${net:+.2f}", className=f"num {net_cls}",
+                              title=f"Gross ${pnl:+.2f} minus "
+                                    f"~${g.get('est_costs', 0):.2f} estimated "
+                                    f"friction")
+                    if net is not None else html.Span("n/a"))
+
+        conc = g.get("concentration")
+        conc_flag = (html.Span(
+            f" ⚠ {conc:.0%} one name",
+            className="scoreboard-muted",
+            title="This share of gross P&L comes from a single symbol — "
+                  "an edge that is one ticker is a position, not a strategy",
+        ) if conc is not None and conc > 0.4 and trades >= 10 else "")
         # A symbol row is a question — "what did we actually call on this
         # name, and when was it right?" — so make it the way to ask it.
         sym_trades = (trades_by_symbol or {}).get(g["name"]) \
@@ -153,12 +205,13 @@ def scoreboard_rows(groups: list[dict], group_key: str,
             ]), title=f"{trades} BUY/SELL positions taken, "
                       f"{holds} HOLD days took no position "
                       f"({g['scored']} predictions scored in total)"),
-            html.Td(hit_rate, className="num",
-                    title=f"{g['trade_hits']} of {trades} BUY/SELL calls "
-                          f"went the predicted way (HOLDs excluded)"),
-            html.Td(avg_conf, className="num"),
-            html.Td(html.Span(f"${pnl:+.2f}", className=f"num {pnl_cls}"),
-                    title=f"{trades} trades x $1,000 notional"),
+            html.Td(hit_cell, className="num"),
+            html.Td(cal_cell, className="num"),
+            html.Td(html.Span([
+                html.Span(f"${pnl:+.2f}", className=f"num {pnl_cls}"),
+                conc_flag,
+            ]), title=f"{trades} trades x $1,000 notional, gross"),
+            html.Td(net_cell),
             html.Td(html.Span(per_trade, className=f"num {pnl_cls}")),
         ]))
         if sym_trades:

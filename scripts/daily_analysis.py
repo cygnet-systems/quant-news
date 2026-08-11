@@ -53,14 +53,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=["analyze", "evaluate", "cost", "notify-test"])
+                        choices=["analyze", "evaluate", "replay", "cost",
+                                 "notify-test"])
     parser.add_argument("--symbols", help="Comma-separated (default: watchlist)")
     parser.add_argument("--target", help="Target session YYYY-MM-DD "
                                          "(default: next unresolved session)")
     parser.add_argument("--lookback", type=int, default=7,
                         help="News window in days (default: 7)")
-    parser.add_argument("--report-model", default="gpt-5.6-luna",
-                        help="Research/report model (default: gpt-5.6-luna)")
+    parser.add_argument("--report-model", default=None,
+                        help="Research/report model "
+                             "(default: config REPORT_MODEL)")
     parser.add_argument("--recs-model", default=None,
                         help="Synthesis model (default: config RECOMMENDATIONS_MODEL)")
     parser.add_argument("--news-filter", default=None,
@@ -115,6 +117,27 @@ def main() -> int:
         # backlog is the "evaluated: 0 looked normal" failure shape — exit 2
         # so the scheduler records it as partial and mails accordingly.
         return 2 if backlog["pending_mature"] else 0
+
+    if args.command == "replay":
+        # Reuses the standalone replay script's engine so the scheduled run
+        # and a hand run can never disagree about the methodology.
+        from scripts.replay_ensemble_methods import (
+            hold_bands, load_cohorts, replay,
+        )
+        cohorts = load_cohorts(args.target)
+        if not cohorts:
+            summary = {"replayed": 0, "note": "no member votes stored yet"}
+        else:
+            outcome = replay(cohorts, hold_bands(cohorts),
+                             min_agree=2)
+            best = max(outcome.items(),
+                       key=lambda kv: kv[1].get("net_pnl",
+                                                kv[1].get("pnl", 0)))
+            summary = {"replayed": sum(len(v) for v in cohorts.values()),
+                       "methods": outcome, "best_method": best[0]}
+        print(json.dumps(summary, indent=None if args.json else 2,
+                         default=str))
+        return 0
 
     if args.command == "notify-test":
         from services import notify_service

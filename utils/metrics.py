@@ -286,7 +286,48 @@ def compute_peer_relative_strength(
         elif abs(own_mo - avg) <= 5:
             lines.append("NOTE: moves roughly with peers — sector-wide repricing more likely "
                          "than company-specific mispricing. 'Cheap' may be correct.")
+
+        # Peer-relative valuation: "6x forward earnings" is only cheap if the
+        # peer set doesn't also trade at 6x. Current multiples are a mild
+        # anachronism for backtests (they move slowly enough to be usable
+        # context); flagged as approximate so the model treats them that way.
+        val_lines = _peer_valuation_lines(symbol, peers)
+        if val_lines:
+            lines.append("Valuation vs peers (current multiples, approximate):")
+            lines.extend(val_lines)
         return "\n".join(lines)
     except Exception as e:
         logger.warning(f"Peer RS computation failed for {symbol}: {e}")
         return ""
+
+
+def _peer_valuation_lines(symbol: str, peers: list[str]) -> list[str]:
+    """Forward P/E of the symbol against its peer set, from cached info."""
+    try:
+        from services.stock_data import get_stock_info
+
+        def _fpe(sym: str):
+            try:
+                info = get_stock_info(sym) or {}
+                v = info.get("forwardPE") or info.get("forward_pe")
+                return float(v) if v and 0 < float(v) < 500 else None
+            except Exception:
+                return None
+
+        own = _fpe(symbol)
+        if own is None:
+            return []
+        peer_fpes = [(p, _fpe(p)) for p in peers]
+        known = [v for _, v in peer_fpes if v is not None]
+        if len(known) < 2:
+            return []
+        med = sorted(known)[len(known) // 2]
+        lines = [f"  {symbol}: {own:.1f}x fwd P/E | peer median: {med:.1f}x | "
+                 + ("discount" if own < med else "premium")
+                 + f" {abs(own / med - 1):.0%}"]
+        lines.append("  " + ", ".join(
+            f"{p} {v:.1f}x" if v is not None else f"{p} n/a"
+            for p, v in peer_fpes))
+        return lines
+    except Exception:
+        return []

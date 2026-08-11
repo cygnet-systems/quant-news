@@ -863,6 +863,33 @@ class SingleAgentResearch:
             f" where missing.*"
         )
 
+        # Deterministic figure audit: every number the report cites should
+        # exist in the prompt it was generated from. The prompt IS the source
+        # of record here — auditing against it needs no extra fetch and can't
+        # drift from what the model actually saw. High unmatched ratios mean
+        # invention; a few stragglers are usually the model's own arithmetic.
+        figure_check = None
+        try:
+            from utils.figure_check import check_figures
+            fc = check_figures(raw_text, prompt)
+            figure_check = {
+                "checked": fc.checked,
+                "unmatched": fc.unmatched[:12],
+                "grounded_ratio": round(fc.grounded_ratio, 3),
+            }
+            if fc.checked >= 10 and fc.grounded_ratio < 0.8:
+                logger.warning(
+                    f"{symbol}: report cites {len(fc.unmatched)} of "
+                    f"{fc.checked} figures with no source in its prompt: "
+                    f"{fc.unmatched[:6]}")
+                from services import progress_service as _prog
+                _prog.emit("error",
+                           f"{symbol}: {len(fc.unmatched)}/{fc.checked} report "
+                           f"figures lack a source in the data shown to the "
+                           f"model — treat unverified numbers as suspect")
+        except Exception as e:
+            logger.debug(f"figure check skipped: {e}")
+
         return {
             "decision": decision,
             "confidence": confidence,
@@ -871,6 +898,7 @@ class SingleAgentResearch:
             "triggers": triggers,
             "structured": structured,
             "provenance": provenance,
+            "figure_check": figure_check,
             "news_count": len(news_articles),
             "sector_etf": sector_etf,
             "input_tokens": usage_total["input_tokens"],

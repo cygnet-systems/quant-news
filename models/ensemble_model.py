@@ -130,6 +130,22 @@ class EnsembleModel(BaseModel):
 
         # The vote weight decides the DIRECTION only, per `method`. It
         # deliberately does not decide the confidence — see below.
+        #
+        # Direction weights run through two evaluated-history corrections:
+        #   * calibrate() — what this member's raw confidence has historically
+        #     meant (isotonic fit). Raw confidences are anti-calibrated here,
+        #     and `confidence_weighted` on raw numbers rewards overconfidence.
+        #     Members without enough history get shrunk halfway toward 0.5.
+        #   * rolling_hit_rate() — decays chronically-wrong members instead of
+        #     letting config weights carry them at full strength; clamped to
+        #     [0.5x, 1.5x] so one hot or cold month cannot zero a member out.
+        # The probability aggregation below stays config-weight-only: that
+        # formula is Brier-validated as-is and is not re-weighted lightly.
+        try:
+            from services.calibration_service import calibrate, rolling_hit_rate
+        except Exception:
+            calibrate = rolling_hit_rate = None  # type: ignore
+
         weighted_score = 0.0
         total_weight = 0.0
         prob_sum = 0.0
@@ -138,6 +154,7 @@ class EnsembleModel(BaseModel):
         sell_votes = 0
         votes = {}
         weights_used = {}
+        perf_factors = {}
 
         for model_name, result in valid.items():
             decision = result.get("decision", "HOLD")
@@ -146,27 +163,38 @@ class EnsembleModel(BaseModel):
             model_conf = float(model_conf) if model_conf is not None else 0.5
             direction = _DIRECTION_MAP.get(decision, 0.0)
 
+            cal_conf = calibrate(model_name, model_conf) if calibrate else None
+            if cal_conf is None:
+                cal_conf = 0.5 + (model_conf - 0.5) * 0.5
+
+            perf = rolling_hit_rate(model_name) if rolling_hit_rate else None
+            perf_factor = (min(1.5, max(0.5, perf / 0.5))
+                           if perf is not None else 1.0)
+            perf_factors[model_name] = round(perf_factor, 2)
+
             if method == "confidence_weighted":
-                effective = weight * model_conf
+                effective = weight * cal_conf * perf_factor
             elif method == "agreement":
                 effective = 1.0
-            else:  # majority, prob_mean — config weight only
-                effective = weight
+            else:  # majority, prob_mean — config weight x performance decay
+                effective = weight * perf_factor
             weighted_score += effective * direction
             total_weight += effective
             if direction > 0:
                 buy_votes += 1
             elif direction < 0:
                 sell_votes += 1
-            votes[model_name] = f"{decision} ({model_conf:.0%})"
+            votes[model_name] = (f"{decision} (cal {cal_conf:.0%}"
+                                 + (f", 30d {perf:.0%}" if perf is not None else "")
+                                 + ")")
             weights_used[model_name] = round(effective, 3)
 
             # Members' own probabilities, weighted by config weight only.
             member_p = result.get("up_probability")
             if member_p is None:
-                # No probability published: fall back to the member's stated
-                # confidence pushed to the side it actually voted.
-                member_p = 0.5 + direction * (model_conf / 2.0)
+                # No probability published: fall back to the member's
+                # calibrated confidence pushed to the side it actually voted.
+                member_p = 0.5 + direction * (cal_conf / 2.0)
             prob_sum += weight * float(member_p)
             prob_weight += weight
 
@@ -224,6 +252,7 @@ class EnsembleModel(BaseModel):
             "method": method,
             "votes": votes,
             "weights_used": weights_used,
+            "perf_factors": perf_factors,
             "weighted_score": round(weighted_score, 3),
             "normalized_score": round(normalized, 3),
             "direction_agreement": round(abs(normalized), 3),
