@@ -606,7 +606,15 @@ def run_job(job_id: str, trigger: str = "schedule",
                     # A back-dated run must not stamp today as done — that
                     # would make catch-up skip the day's own window.
                     if status == "success" and not (overrides or {}).get("target"):
-                        job_row.last_success_date = started.date().isoformat()
+                        # The date must be taken in the JOB's timezone, not
+                        # the container's. On a UTC host, a 20:00-ET run is
+                        # already "tomorrow" in UTC — stamping that date made
+                        # the watchdog (which asks about today in job tz)
+                        # mail a false "overdue" minutes after a success.
+                        import pytz
+                        local = started.astimezone(
+                            pytz.timezone(job["timezone"]))
+                        job_row.last_success_date = local.date().isoformat()
         finally:
             lock.release()
 
