@@ -317,6 +317,23 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 logger.debug(f"SPY regime block failed: {e}")
 
+            # SEC filings (8-K catalyst flags + Form 4 insider transactions)
+            # and the whole-market finviz snapshot context. Both come from
+            # the Terminal's nightly collectors and are point-in-time by
+            # their own stamps; both degrade to absence, never to staleness.
+            try:
+                from services.terminal_data import (
+                    filings_block, market_context_block,
+                )
+                block = filings_block(symbol, as_of)
+                if block:
+                    extra_blocks.append(block)
+                block = market_context_block(symbol, as_of)
+                if block:
+                    extra_blocks.append(block)
+            except Exception as e:
+                logger.debug(f"terminal data blocks failed: {e}")
+
             # Options positioning (point-in-time chain) and the Bad Apples
             # quality screen. Both blocks state their own interpretation
             # limits — positioning context and risk framing, not timing.

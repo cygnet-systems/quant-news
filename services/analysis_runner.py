@@ -58,7 +58,10 @@ ALL_MODELS: tuple[str, ...] = (
 # p_correct instead of conviction labels; peer blocks add relative valuation;
 # options positioning carries day-over-day flow; SPY regime stamped on every
 # prediction; report figures audited against their prompt.
-PIPELINE_EPOCH = "2026-08-11.1"
+# 2026-08-11.2 — research prompts gain SEC filings (8-K events + Form 4
+# insider transactions) and finviz market-context blocks, from the
+# Terminal's nightly collectors (point-in-time by filing/snapshot stamps).
+PIPELINE_EPOCH = "2026-08-11.2"
 
 # Conviction labels map to nominal confidences for display only — backtests
 # showed they carry no calibration signal, so the label stays in details.
