@@ -1065,6 +1065,20 @@ def run_full_analysis(
 
     recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
 
+    # Synthesis rows are written AFTER persist_predictions' auto-evaluate, so
+    # on a backtest they used to stay "pending" until the next scheduled
+    # evaluation — every other model's row scored, the synthesis row didn't
+    # (bitten twice: the stuck 08-06 PANW row, then all 5 in the random-5
+    # QA run). Idempotent, so re-evaluating here is cheap.
+    if recommendations:
+        try:
+            from services.cache_service import get_cache
+            late = get_cache().evaluate_predictions()
+            if late:
+                logger.info(f"Post-synthesis evaluation: {late} rows scored")
+        except Exception as e:
+            logger.warning(f"post-synthesis evaluation failed: {e}")
+
     # The archived JSON is the only durable copy of the portfolio-level report
     # — predictions and recommendations have their own tables, this does not.
     # It used to fail silently at INFO, so an object-storage outage cost every

@@ -12,8 +12,10 @@ can never see the future. Strictly read-only and never raises — a missing
 table or dead connection degrades to an empty block and the run proceeds
 without the evidence (the block's absence is itself visible in the prompt).
 
-Connection: TERMINAL_CACHE_DATABASE_URL — the same env the warmed-cache
-bridge uses, since the tables live in the same database.
+Connection: TERMINAL_HISTORY_DATABASE_URL — the Terminal's historical-data
+Postgres (a different database from its warm-cache/Redis tier, hence a
+different env var than terminal_cache's). Falls back to
+TERMINAL_CACHE_DATABASE_URL for single-database dev setups.
 """
 
 import logging
@@ -35,9 +37,11 @@ def _get_engine():
         if _engine is None:
             try:
                 from sqlalchemy import create_engine
-                url = os.environ.get(
-                    "TERMINAL_CACHE_DATABASE_URL",
-                    "postgresql+psycopg2://cygnet:dev@localhost:5432/cygnet_dev")
+                url = (os.environ.get("TERMINAL_HISTORY_DATABASE_URL")
+                       or os.environ.get(
+                           "TERMINAL_CACHE_DATABASE_URL",
+                           "postgresql+psycopg2://cygnet:dev@localhost:5432/"
+                           "cygnet_dev"))
                 _engine = create_engine(url, pool_pre_ping=True,
                                         pool_size=2, max_overflow=2)
             except Exception as e:
@@ -142,7 +146,7 @@ def market_context_block(symbol: str, as_of: str) -> str:
         SELECT count(*),
                avg(CASE WHEN (payload->>'Change') LIKE '-%' THEN 0.0 ELSE 1.0 END),
                percentile_cont(0.5) WITHIN GROUP
-                   (ORDER BY NULLIF(replace(payload->>'Rel Volume', ',', ''), '')::float)
+                   (ORDER BY NULLIF(replace(payload->>'Relative Volume', ',', ''), '')::float)
         FROM finviz_snapshots WHERE snapshot_date = :d
     """, {"d": snap_date})
 
@@ -161,12 +165,13 @@ def market_context_block(symbol: str, as_of: str) -> str:
     if own:
         p, sector, industry = own[0][0] or {}, own[0][1], own[0][2]
         bits = []
-        for label, keys in (("RSI", ("RSI", "RSI (14)")),
-                            ("rel volume", ("Rel Volume",)),
-                            ("perf week", ("Perf Week",)),
-                            ("perf month", ("Perf Month",)),
-                            ("short float %", ("Short Float", "Float Short")),
-                            ("inst own %", ("Inst Own",))):
+        for label, keys in (
+                ("RSI", ("Relative Strength Index (14)", "RSI", "RSI (14)")),
+                ("rel volume", ("Relative Volume", "Rel Volume")),
+                ("perf week %", ("Performance (Week)", "Perf Week")),
+                ("perf month %", ("Performance (Month)", "Perf Month")),
+                ("short float %", ("Short Float", "Float Short")),
+                ("inst own %", ("Institutional Ownership", "Inst Own"))):
             v = _pct(p, *keys)
             if v is not None:
                 bits.append(f"{label} {v:g}")
