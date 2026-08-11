@@ -4008,16 +4008,28 @@ def run_ensemble_effective(ens_on, run_checks, members, method, min_agree):
     # Both live on the Schedule page, so neither exists on other routes.
     Input("scheduler-refresh", "n_intervals", allow_optional=True),
     Input("scheduler-action-status", "data", allow_optional=True),
+    State("sched-new-name", "value", allow_optional=True),
+    State("sched-new-symbols", "value", allow_optional=True),
 )
-def render_scheduler_panel(_n, _action):
+def render_scheduler_panel(_n, _action, draft_name, draft_symbols):
     """Redraw the schedule panel from the database.
 
     Reads on a timer rather than caching in a Store: the job state is written
     by the scheduler thread (and possibly by another instance), so the browser
     is never the source of truth for it.
+
+    The timer must not clobber a form someone is filling in: a re-render
+    resets every input, so half-typed jobs used to vanish on the next tick.
+    Draft content in the create form defers the redraw; an explicit action
+    (create/save/delete, via scheduler-action-status) always redraws.
     """
     from layouts.scheduler_components import build_scheduler_panel
     from services import scheduler_service
+
+    timer_fired = (ctx.triggered_id == "scheduler-refresh")
+    if timer_fired and ((draft_name or "").strip()
+                        or (draft_symbols or "").strip()):
+        raise PreventUpdate
 
     try:
         return build_scheduler_panel(
