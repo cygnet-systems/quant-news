@@ -93,6 +93,11 @@ class JobType:
     needs_symbols: bool = False
     default_hour: int = 7
     default_minute: int = 0
+    # Tunable knobs, rendered by the schedule UI as labeled inputs and stored
+    # in params_json: (param_key, label, default, help). Declarative so a new
+    # knob is one tuple here — not a form change, a callback change and a
+    # command-builder change.
+    params_spec: tuple = ()
 
 
 JOB_TYPES: dict[str, JobType] = {
@@ -124,6 +129,26 @@ JOB_TYPES: dict[str, JobType] = {
         default_hour=19,
         default_minute=0,
     ),
+    "alpha_lab": JobType(
+        kind="alpha_lab",
+        label="Alpha Lab",
+        description="Re-run the standing edge hypotheses (rank spread, event "
+                    "drift, calibration gate) against all accumulated "
+                    "outcomes and flag any that cross the pre-registered "
+                    "significance bar",
+        verb="alpha-lab",
+        needs_symbols=False,
+        default_hour=20,
+        default_minute=0,
+        params_spec=(
+            ("event_move", "Event move %", 5.0,
+             "One-day move that counts as an event for the drift test"),
+            ("gate_p", "Gate probability", 0.55,
+             "Calibrated-probability threshold for the trade-gate test"),
+            ("top_frac", "Basket divisor", 6.0,
+             "Rank basket size = symbols / this (6 = top/bottom sixth)"),
+        ),
+    ),
 }
 
 
@@ -132,7 +157,11 @@ def list_job_types() -> list[dict]:
     return [
         {"kind": t.kind, "label": t.label, "description": t.description,
          "needs_symbols": t.needs_symbols,
-         "default_hour": t.default_hour, "default_minute": t.default_minute}
+         "default_hour": t.default_hour, "default_minute": t.default_minute,
+         "params_spec": [
+             {"key": k, "label": lbl, "default": dflt, "help": hlp}
+             for k, lbl, dflt, hlp in t.params_spec
+         ]}
         for t in JOB_TYPES.values()
     ]
 
@@ -454,6 +483,14 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
 
     cmd = [sys.executable, CLI, job_type.verb, "--json"]
     if not job_type.needs_symbols:
+        # Symbol-less operations still take tuning params.
+        if job["kind"] == "alpha_lab":
+            if params.get("event_move"):
+                cmd += ["--event-move", str(params["event_move"])]
+            if params.get("gate_p"):
+                cmd += ["--gate-p", str(params["gate_p"])]
+            if params.get("top_frac"):
+                cmd += ["--top-frac", str(params["top_frac"])]
         return cmd
 
     if job.get("symbols_csv"):
@@ -621,6 +658,8 @@ def _notify(job: dict, status: str, summary: dict, log: str, started: datetime,
             )
         elif job["kind"] == "evaluation":
             notify_service.notify_evaluation()
+        elif job["kind"] == "alpha_lab":
+            notify_service.notify_alpha_lab(summary)
     except Exception as e:
         logger.warning(f"notification for {job['id']} failed: {e}")
 

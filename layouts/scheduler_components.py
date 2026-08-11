@@ -394,6 +394,44 @@ def _create_form(job_types: list[dict]) -> html.Div:
                         ],
                         className="scheduler-row",
                     ),
+                    # Tunable knobs per operation type, from its declarative
+                    # params_spec. Every knob for every type is rendered once
+                    # (hidden ids can't be read by the create callback in Dash
+                    # 4); the container for a type shows only while that type
+                    # is selected, so the visible form stays minimal.
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            dbc.Label(spec["label"],
+                                                      className="scheduler-label"),
+                                            dbc.Input(
+                                                id={"type": "sched-new-param",
+                                                    "kind": t["kind"],
+                                                    "key": spec["key"]},
+                                                type="number",
+                                                value=spec["default"],
+                                                size="sm",
+                                                className="scheduler-time-input",
+                                            ),
+                                            html.Small(spec["help"],
+                                                       className="scheduler-hint"),
+                                        ],
+                                        className="scheduler-field",
+                                    )
+                                    for spec in t["params_spec"]
+                                ],
+                                id={"type": "sched-new-params-group",
+                                    "kind": t["kind"]},
+                                className="scheduler-row scheduler-params-row",
+                                style={"display": "none"},
+                            )
+                            for t in job_types if t.get("params_spec")
+                        ],
+                        id="sched-new-params",
+                    ),
                     html.Div(
                         [
                             dbc.Label("Symbols", className="scheduler-label"),

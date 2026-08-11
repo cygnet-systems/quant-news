@@ -419,6 +419,14 @@ class ModelConfig:
     # it here changes scheduled runs without touching the job rows.
     REPORT_MODEL: str = os.getenv("REPORT_MODEL", "gpt-5.6-luna")
 
+    # When the news SOURCE fails (not a quiet week — an outage/rate-limit),
+    # news-dependent models abstain (HOLD, zero confidence) instead of
+    # calling direction blind. A blind call scored as a real one poisons
+    # calibration and the scoreboard alike.
+    ABSTAIN_ON_NEWS_UNAVAILABLE: bool = os.getenv(
+        "ABSTAIN_ON_NEWS_UNAVAILABLE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
     # Recommendations engine (second-pass synthesis model)
     # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic (says which
     # side to trust and why, two-sided levels); this is ONE call per run

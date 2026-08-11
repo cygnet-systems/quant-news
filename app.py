@@ -4085,6 +4085,18 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
 
 
 @callback(
+    Output({"type": "sched-new-params-group", "kind": ALL}, "style"),
+    Input("sched-new-kind", "value", allow_optional=True),
+    State({"type": "sched-new-params-group", "kind": ALL}, "id"),
+    prevent_initial_call=True,
+)
+def show_kind_params(kind, group_ids):
+    """Reveal only the selected operation's tuning knobs."""
+    return [{"display": "flex" if g.get("kind") == kind else "none"}
+            for g in (group_ids or [])]
+
+
+@callback(
     Output("scheduler-action-status", "data", allow_duplicate=True),
     Output("sched-create-feedback", "children"),
     Input("sched-create", "n_clicks"),
@@ -4096,13 +4108,17 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
     State("sched-new-tz", "value"),
     State("sched-new-symbols", "value"),
     State("sched-new-visibility", "value"),
+    State({"type": "sched-new-param", "kind": ALL, "key": ALL}, "value"),
+    State({"type": "sched-new-param", "kind": ALL, "key": ALL}, "id"),
     prevent_initial_call=True,
 )
 def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols,
-                         visibility):
+                         visibility, param_values, param_ids):
     """Add a job of any registered operation type."""
     if not n_clicks:
         raise PreventUpdate
+    # (param_values/param_ids are the per-kind tuning inputs; filtered to the
+    # selected kind below, so knobs for unselected operations are ignored.)
 
     from services import scheduler_service
 
@@ -4123,10 +4139,16 @@ def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols,
         return dash.no_update, html.Span("This operation needs at least one symbol",
                                          className="scheduler-feedback-error")
 
+    # Per-kind tuning knobs: only the selected kind's inputs apply.
+    params = {"only_trading_days": True}
+    for pid, val in zip(param_ids or [], param_values or []):
+        if pid.get("kind") == kind and val is not None:
+            params[pid["key"]] = val
+
     job_id = scheduler_service.create_job(
         kind=kind, description=(name or "").strip(), hour=hour, minute=minute,
         days_of_week=days, timezone=tz, symbols_csv=cleaned or None,
-        params={"only_trading_days": True},
+        params=params,
         is_public=visibility != "private",
     )
     if not job_id:

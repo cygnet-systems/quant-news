@@ -426,6 +426,51 @@ def notify_job_failure(job_id: str, detail: str) -> bool:
     return _send(f"❌ quant-news: {job_id} failed", _wrap("Job failed", job_id, body))
 
 
+def notify_alpha_lab(results: dict) -> bool:
+    """Alpha Lab digest: one line per standing hypothesis, loud only when
+    something crosses the pre-registered bar. A quiet week mails a quiet
+    email — the absence of edge is a result, not a failure."""
+    tests = results.get("tests") or []
+    passing = results.get("passing") or []
+
+    rows = []
+    for t in tests:
+        name = t.get("hypothesis", "?")
+        sig = t.get("significant")
+        stat = {
+            "cross_sectional": (f"spread {t.get('mean_spread_pct')}%/day, "
+                                f"t={t.get('t_spread')}"),
+            "event_drift": (f"5d {t.get('drift_5d_pct')}% / 10d "
+                            f"{t.get('drift_10d_pct')}%, "
+                            f"t={t.get('t_5d')}/{t.get('t_10d')}"),
+            "calibration_gate": (f"gated {t.get('hit_gated')} vs ungated "
+                                 f"{t.get('hit_ungated')} "
+                                 f"({t.get('edge_pp')}pp)"),
+        }.get(name, "")
+        color = "#2e7d32" if sig else "#777"
+        verdict = "SIGNIFICANT" if sig else "not significant"
+        rows.append(
+            f"<tr><td style='padding:4px 12px 4px 0'><b>{name}</b></td>"
+            f"<td style='padding:4px 12px 4px 0'>{stat}</td>"
+            f"<td style='padding:4px 0;color:{color}'>{verdict} "
+            f"<span style='color:#999'>({t.get('power', '')})</span></td></tr>")
+
+    headline = (f"{len(passing)} hypothesis(es) crossed the bar: "
+                f"{', '.join(passing)} — review before acting"
+                if passing else
+                "No standing hypothesis is significant yet — power is "
+                "accruing with every scheduled day")
+    body = (f"<p>{headline}</p>"
+            f"<table style='border-collapse:collapse'>{''.join(rows)}</table>"
+            f"<p style='color:#999;font-size:12px'>Criteria are "
+            f"pre-registered in services/alpha_lab.py; n grows daily via the "
+            f"schedule. {results.get('n_evaluated_predictions', '?')} "
+            f"evaluated predictions in the pool.</p>")
+    subject = ("Alpha Lab: " + (f"{len(passing)} SIGNIFICANT" if passing
+                                else "no edge yet"))
+    return _send(subject, _wrap("Alpha Lab", results.get("as_of", ""), body))
+
+
 def notify_overdue(job_ids: list[str]) -> bool:
     names = ", ".join(job_ids)
     body = (f'<p>These jobs have no successful run today and their scheduled '

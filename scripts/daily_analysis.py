@@ -53,8 +53,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=["analyze", "evaluate", "replay", "cost",
-                                 "notify-test"])
+                        choices=["analyze", "evaluate", "replay", "alpha-lab",
+                                 "cost", "notify-test"])
+    parser.add_argument("--event-move", type=float, default=5.0,
+                        help="alpha-lab: one-day move (%%) that defines an "
+                             "event (default 5)")
+    parser.add_argument("--gate-p", type=float, default=0.55,
+                        help="alpha-lab: calibrated-probability trade gate "
+                             "(default 0.55)")
+    parser.add_argument("--top-frac", type=float, default=6.0,
+                        help="alpha-lab: rank basket = n_symbols/this "
+                             "(default 6 -> top/bottom sixth)")
     parser.add_argument("--symbols", help="Comma-separated (default: watchlist)")
     parser.add_argument("--target", help="Target session YYYY-MM-DD "
                                          "(default: next unresolved session)")
@@ -117,6 +126,15 @@ def main() -> int:
         # backlog is the "evaluated: 0 looked normal" failure shape — exit 2
         # so the scheduler records it as partial and mails accordingly.
         return 2 if backlog["pending_mature"] else 0
+
+    if args.command == "alpha-lab":
+        from services.alpha_lab import run_all
+        results = run_all(move_pct=args.event_move, gate=args.gate_p,
+                          top_frac=args.top_frac)
+        print(json.dumps(results, indent=None if args.json else 2,
+                         default=str))
+        # Exit 0 either way — "no edge found" is a successful experiment.
+        return 0
 
     if args.command == "replay":
         # Reuses the standalone replay script's engine so the scheduled run

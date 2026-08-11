@@ -404,6 +404,27 @@ def run_predictions(
         sym_status = (news_status_by_symbol or {}).get(
             symbol, "ok" if sym_news else "empty")
 
+        # A news-dependent model that could not read the news must not call a
+        # direction — the call would be scored as if informed, poisoning both
+        # the scoreboard and calibration. Quiet weeks ("empty") do not
+        # abstain; only source failure does.
+        from config import MODEL as _MODEL
+        if (_MODEL.ABSTAIN_ON_NEWS_UNAVAILABLE
+                and sym_status == "unavailable"):
+            for news_model in ("deberta_sentiment",):
+                entry = results[symbol].get(news_model)
+                if (isinstance(entry, dict) and not entry.get("error")
+                        and entry.get("decision") != "HOLD"):
+                    prog.emit("models",
+                              f"{symbol}: {news_model} abstained — news "
+                              f"source unavailable, blind {entry['decision']} "
+                              f"withheld")
+                    entry.update(decision="HOLD", confidence=0.0,
+                                 up_probability=0.5)
+                    entry.setdefault("details", {})
+                    if isinstance(entry["details"], dict):
+                        entry["details"]["abstained"] = "news_unavailable"
+
         for entry in results[symbol].values():
             if isinstance(entry, dict) and not entry.get("error"):
                 entry["news_status"] = sym_status
