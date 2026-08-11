@@ -418,9 +418,121 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
 
     return [
         scorecard(preds),
+        alpha_lab_section(),
         html.Div(subtitle, className="scoreboard-subtitle") if log else None,
         log,
     ]
+
+
+_LAB_STATUS = {
+    "significant": ("SIGNIFICANT", "positive",
+                    "Crossed the pre-registered bar — review before acting"),
+    "settled_null": ("SETTLED — NO EFFECT", "neutral",
+                     "Reached full statistical power with no effect; this "
+                     "question is closed unless the regime changes"),
+    "accruing": ("ACCRUING", "muted",
+                 "Not significant yet; every scheduled day adds power"),
+}
+
+
+def _latest_lab_snapshot() -> dict | None:
+    """Newest Alpha Lab result from the report archive, or None."""
+    import json
+
+    try:
+        from services.cache_service import get_cache
+        cache = get_cache()
+        rows = [r for r in cache.list_report_catalog(limit=200)
+                if r.get("report_type") == "alpha_lab"]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: (r.get("trade_date") or "",
+                                 r.get("created_at") or ""), reverse=True)
+        content = cache.get_report_content(rows[0]["storage_key"])
+        return json.loads(content) if content else None
+    except Exception:
+        return None
+
+
+def alpha_lab_section() -> html.Div:
+    """The standing edge-hypothesis scoreboard, self-explanatory.
+
+    Every hypothesis card carries its plain-language description, the exact
+    method/formula, and a worked example — the reader should never need the
+    source to understand what a verdict means. Explanations come from
+    services.alpha_lab.HYPOTHESIS_INFO so this page, the email digest and the
+    test itself can never drift apart.
+    """
+    from services.alpha_lab import HYPOTHESIS_INFO
+
+    snap = _latest_lab_snapshot()
+    tests = {t.get("hypothesis"): t for t in (snap or {}).get("tests", [])}
+
+    cards = []
+    for key, info in HYPOTHESIS_INFO.items():
+        t = tests.get(key) or {}
+        status = t.get("status") or ("accruing" if t else "no_run")
+        label, cls, status_help = _LAB_STATUS.get(
+            status, ("NOT RUN YET", "muted",
+                     "First run lands on the next scheduled Alpha Lab day"))
+
+        stat_line = ""
+        if t:
+            stat_line = {
+                "cross_sectional": (
+                    f"L/S spread {t.get('mean_spread_pct')}%/day "
+                    f"(t={t.get('t_spread')}) · rank-IC {t.get('mean_ic')} · "
+                    f"{t.get('power', '')}"),
+                "event_drift": (
+                    f"signed drift 5d {t.get('drift_5d_pct')}% / 10d "
+                    f"{t.get('drift_10d_pct')}% "
+                    f"(t={t.get('t_5d')}/{t.get('t_10d')}) · "
+                    f"{t.get('power', '')}"),
+                "calibration_gate": (
+                    f"gated hit {t.get('hit_gated')} vs ungated "
+                    f"{t.get('hit_ungated')} ({t.get('edge_pp')}pp) · "
+                    f"{t.get('power', '')}"),
+            }.get(key, "")
+
+        cards.append(html.Div([
+            html.Div([
+                html.Span(info["title"], className="lab-card-title"),
+                html.Span(label, className=f"lab-status lab-status-{cls}",
+                          title=status_help),
+            ], className="lab-card-head"),
+            html.P(info["what"], className="lab-card-what"),
+            html.Div(stat_line, className="lab-card-stat num") if stat_line
+            else None,
+            html.Details([
+                html.Summary("Method & worked example",
+                             className="lab-card-more"),
+                html.Div([
+                    html.Div("Method", className="lab-card-subhead"),
+                    html.Pre(info["method"], className="lab-card-method"),
+                    html.Div("Worked example", className="lab-card-subhead"),
+                    html.P(info["example"], className="lab-card-example"),
+                    html.Div([
+                        html.Span("If it passes: ",
+                                  className="lab-card-subhead-inline"),
+                        info["if_significant"],
+                    ], className="lab-card-example"),
+                ], className="lab-card-detail"),
+            ]),
+        ], className="lab-card"))
+
+    as_of = (snap or {}).get("as_of", "")
+    return html.Div([
+        html.Div([
+            html.Span("Alpha Lab", className="scoreboard-subtitle"),
+            html.Span(
+                "Standing edge hypotheses, re-tested Mon/Wed/Fri against all "
+                "accumulated outcomes. Pass criteria are pre-registered and "
+                "never move with the results"
+                + (f" · last run {as_of[:16]}" if as_of else " · no run yet"),
+                className="lab-section-note"),
+        ], className="lab-section-head"),
+        html.Div(cards, className="lab-cards"),
+    ], className="lab-section")
 
 
 def _by_model(preds: list[dict], model: str) -> list[dict]:

@@ -186,6 +186,96 @@ def test_calibration_gate(preds: pd.DataFrame, gate: float = 0.55) -> dict:
     }
 
 
+# Human-readable identity of each hypothesis — the email and the UI both
+# render from this, so the explanation cannot drift between surfaces.
+HYPOTHESIS_INFO = {
+    "cross_sectional": {
+        "title": "Cross-sectional ranking",
+        "what": "Each day, rank every watchlist name by the models' combined "
+                "score and go long the top basket / short the bottom basket. "
+                "Tests whether the models can ORDER names by attractiveness "
+                "even if they can't call direction outright.",
+        "if_significant": "A market-neutral long/short portfolio built from "
+                          "the daily scores would be worth trading.",
+        "method": "score(s) = mean over models of P(up) for symbol s.\n"
+                  "spread(d) = mean next-day return of top-k names "
+                  "− mean of bottom-k  (k = n/6, min 2)\n"
+                  "IC(d) = Spearman rank correlation(scores, next-day "
+                  "returns)\n"
+                  "Verdict: t = mean(spread) / (sd(spread)/√days). "
+                  "PASS iff |t| ≥ 2 AND days ≥ 40.",
+        "example": "Aug 10, 20 names: top-3 by score (PANW 0.61, MPWR 0.58, "
+                   "HWM 0.57) average +0.9% the next day; bottom-3 (LUV "
+                   "0.38, VZ 0.41, DOC 0.43) average −0.4%. That day's "
+                   "spread = +1.3%. One good day means nothing — the test "
+                   "needs the AVERAGE daily spread to be ≥2 standard errors "
+                   "above zero across 40+ days before it passes.",
+    },
+    "event_drift": {
+        "title": "Event drift (5-10 day)",
+        "what": "After a one-day move of 5%+, does the stock keep drifting "
+                "the same way over the next 5-10 sessions? (The classic "
+                "post-event-drift anomaly, tested on our own universe.)",
+        "if_significant": "Predictions should switch from daily calls to "
+                          "event-triggered multi-day calls.",
+        "method": "Event: |1-day return| ≥ 5%.\n"
+                  "Signed drift(h) = sign(event move) × (close[t+h]/close[t] "
+                  "− 1),  h ∈ {5, 10} sessions\n"
+                  "(positive = continuation, negative = reversal)\n"
+                  "Verdict: one-sample t-test of signed drift vs 0. "
+                  "PASS iff |t| ≥ 2 AND events ≥ 300.",
+        "example": "WGO drops −8% on a Tuesday. If it slides another −2% "
+                   "over the next 5 sessions, that event's signed drift is "
+                   "+2% (the move CONTINUED). If it bounces +3%, signed "
+                   "drift is −3% (it REVERSED). Averaged over 748 such "
+                   "events in our universe the drift is ≈0%: big moves "
+                   "neither continue nor reverse reliably — so neither side "
+                   "is tradable.",
+    },
+    "calibration_gate": {
+        "title": "Calibration gate",
+        "what": "Trade only when a model's CALIBRATED probability (what its "
+                "confidence has historically meant) clears a threshold. "
+                "Tests whether being selective beats taking every call.",
+        "if_significant": "The pipeline should suppress low-calibrated-"
+                          "probability calls instead of publishing them all.",
+        "method": "Per model, walk-forward: fit isotonic regression "
+                  "(raw confidence → realized hit rate) on the first 60% of "
+                  "its evaluated calls; apply to the last 40%.\n"
+                  "Keep only calls with calibrated p ≥ 0.55.\n"
+                  "Verdict: hit(gated) − hit(all) ≥ +3pp AND gated trades "
+                  "≥ 100.",
+        "example": "XGBoost claims 87% on a call, but historically its "
+                   "'87%' calls hit only ~54% → calibrated p = 0.54 → "
+                   "gated OUT. Kronos claims 65% and its '65%' calls hit "
+                   "58% → calibrated p = 0.58 → trades. The gate passes "
+                   "only if the kept subset beats take-everything by 3+ "
+                   "points over 100+ trades — so far it has not.",
+    },
+}
+
+
+def _status(t: dict) -> str:
+    """significant | settled_null | accruing.
+
+    A test at full pre-registered power whose statistic is still nowhere
+    (|t| < 1) is SETTLED, not 'still trying' — pretending otherwise turns the
+    digest into three eternal maybes.
+    """
+    if t.get("significant"):
+        return "significant"
+    try:
+        have, need = t.get("power", "0/1").split("/")
+        full_power = float(have.split()[0]) >= float(need.split()[0])
+    except (ValueError, AttributeError):
+        full_power = False
+    stats = [abs(t.get(k) or 0) for k in ("t_spread", "t_5d", "t_10d")
+             if t.get(k) is not None]
+    quiet = (max(stats) < 1.0) if stats else (
+        t.get("edge_pp") is not None and t["edge_pp"] < 0)
+    return "settled_null" if full_power and quiet else "accruing"
+
+
 def run_all(move_pct: float = 5.0, gate: float = 0.55,
             top_frac: float = 6.0) -> dict:
     """Run every standing hypothesis test and persist the snapshot."""
@@ -201,6 +291,9 @@ def run_all(move_pct: float = 5.0, gate: float = 0.55,
             test_calibration_gate(preds, gate=gate),
         ],
     }
+    for t in results["tests"]:
+        t["status"] = _status(t)
+        t["info"] = HYPOTHESIS_INFO.get(t["hypothesis"], {})
     passing = [t["hypothesis"] for t in results["tests"] if t["significant"]]
     results["passing"] = passing
 

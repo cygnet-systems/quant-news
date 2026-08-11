@@ -427,45 +427,62 @@ def notify_job_failure(job_id: str, detail: str) -> bool:
 
 
 def notify_alpha_lab(results: dict) -> bool:
-    """Alpha Lab digest: one line per standing hypothesis, loud only when
-    something crosses the pre-registered bar. A quiet week mails a quiet
-    email — the absence of edge is a result, not a failure."""
+    """Alpha Lab digest: one card per standing hypothesis — what it tests,
+    what a pass would mean, where it stands. Loud only when something crosses
+    the pre-registered bar; a settled-dead hypothesis says so instead of
+    reading as an eternal maybe."""
     tests = results.get("tests") or []
     passing = results.get("passing") or []
 
-    rows = []
+    STATUS_STYLE = {
+        "significant": ("#2e7d32", "SIGNIFICANT — review before acting"),
+        "settled_null": ("#8a6d3b", "SETTLED — no effect at full power"),
+        "accruing": ("#777", "not significant yet — power accruing"),
+    }
+
+    cards = []
     for t in tests:
         name = t.get("hypothesis", "?")
-        sig = t.get("significant")
+        info = t.get("info") or {}
         stat = {
-            "cross_sectional": (f"spread {t.get('mean_spread_pct')}%/day, "
-                                f"t={t.get('t_spread')}"),
-            "event_drift": (f"5d {t.get('drift_5d_pct')}% / 10d "
-                            f"{t.get('drift_10d_pct')}%, "
-                            f"t={t.get('t_5d')}/{t.get('t_10d')}"),
-            "calibration_gate": (f"gated {t.get('hit_gated')} vs ungated "
+            "cross_sectional": (f"L/S spread {t.get('mean_spread_pct')}%/day "
+                                f"(t={t.get('t_spread')}), mean rank-IC "
+                                f"{t.get('mean_ic')}"),
+            "event_drift": (f"signed drift 5d {t.get('drift_5d_pct')}% / "
+                            f"10d {t.get('drift_10d_pct')}% "
+                            f"(t={t.get('t_5d')}/{t.get('t_10d')})"),
+            "calibration_gate": (f"gated hit {t.get('hit_gated')} vs ungated "
                                  f"{t.get('hit_ungated')} "
-                                 f"({t.get('edge_pp')}pp)"),
+                                 f"({t.get('edge_pp')}pp edge)"),
         }.get(name, "")
-        color = "#2e7d32" if sig else "#777"
-        verdict = "SIGNIFICANT" if sig else "not significant"
-        rows.append(
-            f"<tr><td style='padding:4px 12px 4px 0'><b>{name}</b></td>"
-            f"<td style='padding:4px 12px 4px 0'>{stat}</td>"
-            f"<td style='padding:4px 0;color:{color}'>{verdict} "
-            f"<span style='color:#999'>({t.get('power', '')})</span></td></tr>")
+        color, verdict = STATUS_STYLE.get(t.get("status", "accruing"),
+                                          STATUS_STYLE["accruing"])
+        cards.append(
+            f"<div style='margin:0 0 14px 0;padding:10px 12px;"
+            f"border-left:3px solid {color};background:#fafafa'>"
+            f"<div style='font-size:14px'><b>{info.get('title', name)}</b> "
+            f"&nbsp;<span style='color:{color}'>{verdict}</span> "
+            f"<span style='color:#999'>({t.get('power', '')})</span></div>"
+            f"<div style='color:#555;font-size:13px;margin:6px 0 0 0'>"
+            f"{info.get('what', '')}</div>"
+            f"<div style='color:#555;font-size:13px;margin:4px 0 0 0'>"
+            f"<i>If it passes:</i> {info.get('if_significant', '')}</div>"
+            f"<div style='font-size:13px;margin:6px 0 0 0'>"
+            f"<b>Latest:</b> {stat}</div>"
+            f"</div>")
 
-    headline = (f"{len(passing)} hypothesis(es) crossed the bar: "
-                f"{', '.join(passing)} — review before acting"
+    headline = (f"{len(passing)} hypothesis(es) crossed the pre-registered "
+                f"bar: {', '.join(passing)} — review before acting"
                 if passing else
-                "No standing hypothesis is significant yet — power is "
-                "accruing with every scheduled day")
-    body = (f"<p>{headline}</p>"
-            f"<table style='border-collapse:collapse'>{''.join(rows)}</table>"
-            f"<p style='color:#999;font-size:12px'>Criteria are "
-            f"pre-registered in services/alpha_lab.py; n grows daily via the "
-            f"schedule. {results.get('n_evaluated_predictions', '?')} "
-            f"evaluated predictions in the pool.</p>")
+                "No standing hypothesis is significant. Settled entries are "
+                "closed questions; accruing entries gain power every "
+                "scheduled day.")
+    body = (f"<p>{headline}</p>{''.join(cards)}"
+            f"<p style='color:#999;font-size:12px'>Pass criteria are "
+            f"pre-registered in services/alpha_lab.py and do not move with "
+            f"the results. Pool: "
+            f"{results.get('n_evaluated_predictions', '?')} evaluated "
+            f"predictions. Full history on the Performance page.</p>")
     subject = ("Alpha Lab: " + (f"{len(passing)} SIGNIFICANT" if passing
                                 else "no edge yet"))
     return _send(subject, _wrap("Alpha Lab", results.get("as_of", ""), body))
