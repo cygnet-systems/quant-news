@@ -12,7 +12,7 @@ can never see the future. Strictly read-only and never raises — a missing
 table or dead connection degrades to an empty block and the run proceeds
 without the evidence (the block's absence is itself visible in the prompt).
 
-Connection: TERMINAL_HISTORY_DATABASE_URL — the Terminal's historical-data
+Connection: HISTORICAL_DATABASE_URL — the Terminal's historical-data
 Postgres (a different database from its warm-cache/Redis tier, hence a
 different env var than terminal_cache's). Falls back to
 TERMINAL_CACHE_DATABASE_URL for single-database dev setups.
@@ -37,7 +37,8 @@ def _get_engine():
         if _engine is None:
             try:
                 from sqlalchemy import create_engine
-                url = (os.environ.get("TERMINAL_HISTORY_DATABASE_URL")
+                url = (os.environ.get("HISTORICAL_DATABASE_URL")
+                       or os.environ.get("TERMINAL_HISTORY_DATABASE_URL")
                        or os.environ.get(
                            "TERMINAL_CACHE_DATABASE_URL",
                            "postgresql+psycopg2://cygnet:dev@localhost:5432/"
