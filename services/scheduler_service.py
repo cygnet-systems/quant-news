@@ -529,6 +529,7 @@ def run_job(job_id: str, trigger: str = "schedule",
             return {"status": "error", "detail": f"unknown job {job_id}"}
         job = {"id": row.id, "kind": row.kind, "symbols_csv": row.symbols_csv,
                "params": row.params_json or {}, "enabled": row.enabled,
+               "timezone": row.timezone,
                "owner_uid": row.owner_uid, "is_public": bool(row.is_public)}
 
     if not job["enabled"] and trigger == "schedule":
@@ -611,9 +612,19 @@ def run_job(job_id: str, trigger: str = "schedule",
                         # already "tomorrow" in UTC — stamping that date made
                         # the watchdog (which asks about today in job tz)
                         # mail a false "overdue" minutes after a success.
+                        # This stamp shares a transaction with the run row's
+                        # own finalize: an exception here rolls back BOTH,
+                        # leaving the run "running" forever and the day
+                        # unstamped — which is how a missing job key turned
+                        # one good 07:00 run into 28 phantom catch-up reruns
+                        # (2026-08-11). The date is best-effort; the row
+                        # bookkeeping is not allowed to die for it.
                         import pytz
-                        local = started.astimezone(
-                            pytz.timezone(job["timezone"]))
+                        try:
+                            local = started.astimezone(
+                                pytz.timezone(job.get("timezone") or "UTC"))
+                        except Exception:
+                            local = started
                         job_row.last_success_date = local.date().isoformat()
         finally:
             lock.release()
