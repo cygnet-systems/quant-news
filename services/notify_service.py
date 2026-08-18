@@ -41,6 +41,22 @@ _REQUIRED = (
 
 _ACTION_COLOR = {"BUY": "#00C805", "SELL": "#FF5000", "HOLD": "#A0A0A0"}
 
+# Matrix column order + short labels for the evaluation mail. Names not
+# listed here still get a column (label = raw name), appended at the end.
+_MODEL_ORDER = [
+    "kronos_mini", "xgboost_shap", "lightgbm", "deberta_sentiment",
+    "trading_agents", "ensemble", "recommendation_synthesis",
+]
+_MODEL_LABEL = {
+    "kronos_mini": "Kronos",
+    "xgboost_shap": "XGBoost",
+    "lightgbm": "LightGBM",
+    "deberta_sentiment": "DeBERTa",
+    "trading_agents": "Agent",
+    "ensemble": "Ensemble",
+    "recommendation_synthesis": "Synthesis",
+}
+
 
 def _config() -> Optional[dict]:
     cfg = {k: os.environ.get(k) for k in _REQUIRED}
@@ -226,31 +242,33 @@ def notify_analysis(summary: dict, cost: float | None = None,
     ))
 
 
+def _fmt_pnl(pnl: float) -> str:
+    return f"{'+' if pnl > 0 else ''}${pnl:,.2f}" if pnl >= 0 else f"-${-pnl:,.2f}"
+
+
+def _pnl_color(pnl: float) -> str:
+    return "#00A004" if pnl > 0 else "#D93900" if pnl < 0 else "#666"
+
+
 def notify_evaluation(trade_date: str | None = None) -> bool:
-    """The evening mail: how the calls actually landed."""
+    """The evening mail: how the calls actually landed.
+
+    Two views of the same scored rows: a per-model scoreboard (who was right,
+    at what cost), then a symbol × model matrix so a single glance answers
+    "what did each model say about NVDA and what did that call make or lose".
+    """
     from db.session import get_session
     from sqlalchemy import text
 
     target = trade_date or date.today().isoformat()
     try:
         with get_session() as session:
-            per_model = session.execute(text("""
-                select model_name,
-                       count(*) filter (where decision <> 'HOLD') as active,
-                       count(*) filter (where decision <> 'HOLD' and was_correct) as hits,
-                       round(sum(pnl_dollars)::numeric, 2) as pnl
-                from model_predictions
-                where target_date = :d and was_correct is not null
-                group by 1 order by 1
-            """), {"d": target}).mappings().all()
-
-            synthesis = session.execute(text("""
-                select symbol, decision, was_correct,
+            scored = session.execute(text("""
+                select symbol, model_name, decision, was_correct,
                        round(pnl_dollars::numeric, 2) as pnl
                 from model_predictions
-                where target_date = :d and model_name = 'recommendation_synthesis'
-                  and was_correct is not null
-                order by symbol
+                where target_date = :d and was_correct is not null
+                order by symbol, model_name
             """), {"d": target}).mappings().all()
     except Exception as e:
         logger.warning(f"evaluation notification query failed: {e}")
@@ -266,7 +284,7 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
     except Exception as e:
         logger.warning(f"evaluation backlog query failed: {e}")
 
-    if not per_model:
+    if not scored:
         pending = backlog.get("pending_mature", 0)
         if pending:
             by_date = ", ".join(f"{d}: {n}" for d, n in
@@ -288,52 +306,97 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
                   "when the vendor has not published the session's close "
                   "yet.</p>"))
 
-    model_rows = ""
-    for r in per_model:
-        acc = (r["hits"] / r["active"] * 100) if r["active"] else None
-        pnl = float(r["pnl"] or 0)
-        pnl_color = "#00A004" if pnl > 0 else "#D93900" if pnl < 0 else "#666"
-        model_rows += (
-            f'<tr><td style="{_TD}">{r["model_name"]}</td>'
-            f'<td style="{_TD}">{r["active"]}</td>'
-            f'<td style="{_TD}">{f"{acc:.0f}%" if acc is not None else "—"}</td>'
-            f'<td style="{_TD};color:{pnl_color}">${pnl:,.2f}</td></tr>'
-        )
+    # Pivot the scored rows: cells[symbol][model] plus per-model aggregates.
+    models_seen = sorted({r["model_name"] for r in scored})
+    model_cols = ([m for m in _MODEL_ORDER if m in models_seen]
+                  + [m for m in models_seen if m not in _MODEL_ORDER])
+    cells: dict[str, dict[str, dict]] = {}
+    agg = {m: {"active": 0, "hits": 0, "pnl": 0.0} for m in model_cols}
+    for r in scored:
+        cells.setdefault(r["symbol"], {})[r["model_name"]] = r
+        a = agg[r["model_name"]]
+        a["pnl"] += float(r["pnl"] or 0)
+        if r["decision"] != "HOLD":
+            a["active"] += 1
+            a["hits"] += 1 if r["was_correct"] else 0
 
-    miss_rows = ""
-    for r in synthesis:
-        mark = "✓" if r["was_correct"] else "✗"
-        color = "#00A004" if r["was_correct"] else "#D93900"
-        miss_rows += (
-            f'<tr><td style="{_TD};font-weight:600">{r["symbol"]}</td>'
-            f'<td style="{_TD}">{r["decision"]}</td>'
-            f'<td style="{_TD};color:{color}">{mark}</td>'
-            f'<td style="{_TD}">${float(r["pnl"] or 0):,.2f}</td></tr>'
-        )
-
-    total_active = sum(r["active"] for r in per_model)
-    total_hits = sum(r["hits"] for r in per_model)
-    total_pnl = sum(float(r["pnl"] or 0) for r in per_model)
+    total_active = sum(a["active"] for a in agg.values())
+    total_hits = sum(a["hits"] for a in agg.values())
+    total_pnl = sum(a["pnl"] for a in agg.values())
     overall = (total_hits / total_active * 100) if total_active else 0
+
+    # Scoreboard: one row per model, with a totals row.
+    model_rows = ""
+    for m in model_cols:
+        a = agg[m]
+        acc = (a["hits"] / a["active"] * 100) if a["active"] else None
+        model_rows += (
+            f'<tr><td style="{_TD}">{_MODEL_LABEL.get(m, m)}</td>'
+            f'<td style="{_TD}">{a["active"]}</td>'
+            f'<td style="{_TD}">{f"{acc:.0f}%" if acc is not None else "—"}</td>'
+            f'<td style="{_TD};color:{_pnl_color(a["pnl"])}">{_fmt_pnl(a["pnl"])}</td></tr>'
+        )
+    model_rows += (
+        f'<tr><td style="{_TD};font-weight:600">Total</td>'
+        f'<td style="{_TD};font-weight:600">{total_active}</td>'
+        f'<td style="{_TD};font-weight:600">{overall:.0f}%</td>'
+        f'<td style="{_TD};font-weight:600;color:{_pnl_color(total_pnl)}">'
+        f'{_fmt_pnl(total_pnl)}</td></tr>'
+    )
+
+    # Matrix: symbol rows × model columns; each cell = call, hit/miss, P&L.
+    _MTD = "padding:5px 8px;border-bottom:1px solid #eee;font-size:12px;white-space:nowrap"
+
+    def _cell(r) -> str:
+        if r is None:
+            return f'<td style="{_MTD};color:#ccc">—</td>'
+        pnl = float(r["pnl"] or 0)
+        if r["decision"] == "HOLD":
+            return (f'<td style="{_MTD};color:#A0A0A0">HOLD'
+                    + (f'<br>{_fmt_pnl(pnl)}' if pnl else '') + '</td>')
+        mark = "✓" if r["was_correct"] else "✗"
+        mark_color = "#00A004" if r["was_correct"] else "#D93900"
+        return (
+            f'<td style="{_MTD}">'
+            f'<span style="color:{_ACTION_COLOR[r["decision"]]};font-weight:600">'
+            f'{r["decision"]}</span> '
+            f'<span style="color:{mark_color};font-weight:600">{mark}</span><br>'
+            f'<span style="color:{_pnl_color(pnl)}">{_fmt_pnl(pnl)}</span></td>'
+        )
+
+    matrix_head = (f'<tr><th style="{_TH}">Symbol</th>'
+                   + "".join(f'<th style="{_TH}">{_MODEL_LABEL.get(m, m)}</th>'
+                             for m in model_cols)
+                   + f'<th style="{_TH}">Total</th></tr>')
+    matrix_rows = ""
+    for sym in sorted(cells):
+        row_pnl = sum(float((cells[sym].get(m) or {}).get("pnl") or 0)
+                      for m in model_cols)
+        matrix_rows += (
+            f'<tr><td style="{_MTD};font-weight:600">{sym}</td>'
+            + "".join(_cell(cells[sym].get(m)) for m in model_cols)
+            + f'<td style="{_MTD};font-weight:600;color:{_pnl_color(row_pnl)}">'
+              f'{_fmt_pnl(row_pnl)}</td></tr>'
+        )
+    matrix_rows += (
+        f'<tr><td style="{_MTD};font-weight:600">Total</td>'
+        + "".join(
+            f'<td style="{_MTD};font-weight:600;color:{_pnl_color(agg[m]["pnl"])}">'
+            f'{_fmt_pnl(agg[m]["pnl"])}</td>' for m in model_cols)
+        + f'<td style="{_MTD};font-weight:600;color:{_pnl_color(total_pnl)}">'
+          f'{_fmt_pnl(total_pnl)}</td></tr>'
+    )
 
     body = (
         f'<table style="border-collapse:collapse;min-width:380px">'
         f'<tr><th style="{_TH}">Model</th><th style="{_TH}">Active</th>'
         f'<th style="{_TH}">Hit rate</th><th style="{_TH}">P&amp;L</th></tr>'
         f'{model_rows}</table>'
-    )
-    if miss_rows:
-        body += (
-            f'<h3 style="font-size:14px;margin:20px 0 6px">Synthesis calls</h3>'
-            f'<table style="border-collapse:collapse;min-width:320px">'
-            f'<tr><th style="{_TH}">Symbol</th><th style="{_TH}">Call</th>'
-            f'<th style="{_TH}">Right?</th><th style="{_TH}">P&amp;L</th></tr>'
-            f'{miss_rows}</table>'
-        )
-    body += (
+        f'<h3 style="font-size:14px;margin:20px 0 6px">Calls by symbol</h3>'
+        f'<table style="border-collapse:collapse">{matrix_head}{matrix_rows}</table>'
         f'<p style="color:#666;font-size:13px;margin-top:14px">'
         f'{total_hits}/{total_active} directional calls correct ({overall:.0f}%) · '
-        f'${total_pnl:,.2f} gross, before costs.<br>'
+        f'{_fmt_pnl(total_pnl)} gross, before costs.<br>'
         f'A single day is far too small a sample to read as skill.</p>'
     )
     if backlog.get("pending_mature"):
@@ -345,7 +408,7 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
             f'unscored ({by_date}) — the evaluator is skipping them.</p>'
         )
     return _send(
-        f"Results {target} — {overall:.0f}% on {total_active} calls, ${total_pnl:,.2f}",
+        f"Results {target} — {overall:.0f}% on {total_active} calls, {_fmt_pnl(total_pnl)}",
         _wrap("Results", f"Target session {target}", body),
     )
 
