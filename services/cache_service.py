@@ -9,6 +9,7 @@ Migrated from DuckDB — same public API, Postgres backend.
 import hashlib
 import json
 import logging
+import math
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,20 @@ def _sanitize_json(obj):
     if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
         return None
     return obj
+
+
+def _usable_price(v) -> bool:
+    """A price a row can be scored against: present, finite, positive.
+
+    NaN slips past every ``<= 0`` / ``is None`` guard (in Python NaN fails all
+    comparisons; in Postgres NaN sorts ABOVE infinity, so ``close > 0`` is
+    true for it). One pre-market vendor fetch on 2026-08-18 wrote NaN closes
+    into stock_prices, which store_prediction copied into previous_close for
+    an entire day's predictions and the evaluator then crashed serializing
+    NaN into JSONB — killing the whole run's transaction.
+    """
+    return v is not None and not isinstance(v, str) \
+        and math.isfinite(v) and v > 0
 
 
 def _parse_topics(topics_json) -> list:
@@ -375,6 +390,22 @@ class CacheService:
                 cache_df[col] = 0.0 if col != "date" else None
         cache_df = cache_df[required_cols]
 
+        # A bar with no real close is a bar that never happened. Pre-market
+        # fetches can return today's (or even yesterday's) row with NaN OHLC;
+        # the delete-then-insert below would REPLACE a good stored close with
+        # that NaN, which then poisons previous_close on every prediction
+        # stored that morning (2026-08-18: all 139 rows, evaluation crashed).
+        finite_close = pd.to_numeric(cache_df["close"], errors="coerce")
+        bad = ~(finite_close.notna() & (finite_close > 0)
+                & (finite_close != float("inf")))
+        if bad.any():
+            logger.warning(
+                f"Dropping {int(bad.sum())} bar(s) with unusable close for "
+                f"{symbol}: {[str(d)[:10] for d in cache_df.loc[bad, 'date'].tolist()]}")
+            cache_df = cache_df[~bad]
+            if cache_df.empty:
+                return
+
         now = datetime.now(timezone.utc)
 
         with get_session() as session:
@@ -622,12 +653,19 @@ class CacheService:
         ).hexdigest()
 
         with get_session() as session:
-            prev_close_row = session.execute(
+            # Most recent USABLE close, not merely the most recent row: a
+            # partial pre-market bar can sit at the top with a NaN close, and
+            # storing that as previous_close makes the row unscorable (and
+            # once crashed the evaluator wholesale). Scan a few and take the
+            # first real one; NULL when none is — the evaluator skips NULLs.
+            recent_closes = session.execute(
                 select(StockPrice.close)
                 .where(StockPrice.symbol == symbol, StockPrice.date <= str(pred_date))
                 .order_by(StockPrice.date.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+                .limit(5)
+            ).scalars().all()
+            prev_close_row = next(
+                (c for c in recent_closes if _usable_price(c)), None)
 
             session.merge(ModelPrediction(
                 id=pred_id,
@@ -774,11 +812,11 @@ class CacheService:
                     )
                 ).scalar_one_or_none()
 
-                if actual_row is None:
+                if not _usable_price(actual_row):
                     skipped_no_price.append(
                         f"{pred.symbol}@{str(pred.target_date)[:10]}")
                     continue
-                if pred.previous_close is None or pred.previous_close <= 0:
+                if not _usable_price(pred.previous_close):
                     skipped_no_prev += 1
                     continue
 
@@ -801,10 +839,10 @@ class CacheService:
                     # The band drifts as history accrues; without recording
                     # what this row was judged against, the verdict can never
                     # be audited or reproduced.
-                    pred.details_json = {
+                    pred.details_json = _sanitize_json({
                         **(pred.details_json or {}),
                         "hold_eval": {"band": band, "move": move},
-                    }
+                    })
 
                 pnl = compute_pnl(pred.decision, pred.previous_close, actual_close)
 
@@ -888,7 +926,7 @@ class CacheService:
                 moves = [
                     abs(closes[i] - closes[i - 1]) / closes[i - 1]
                     for i in range(1, len(closes))
-                    if closes[i - 1]
+                    if _usable_price(closes[i - 1]) and _usable_price(closes[i])
                 ]
                 if moves:
                     moves.sort()
@@ -929,15 +967,16 @@ class CacheService:
             ).scalars().all()
 
             for pred in rows:
-                if not pred.previous_close or pred.previous_close <= 0:
+                if not _usable_price(pred.previous_close) \
+                        or not _usable_price(pred.actual_close):
                     continue
                 move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
                 band = self._hold_band(session, pred.symbol, bands, pred.target_date)
                 pred.was_correct = move <= band
-                pred.details_json = {
+                pred.details_json = _sanitize_json({
                     **(pred.details_json or {}),
                     "hold_eval": {"band": band, "move": move},
-                }
+                })
                 if pred.pnl_dollars is None:
                     pred.pnl_dollars = 0.0
                 pred.evaluated_at = datetime.now(timezone.utc)
@@ -967,15 +1006,16 @@ class CacheService:
                 )
             ).scalars().all()
             for pred in rows:
-                if not pred.previous_close or pred.previous_close <= 0:
+                if not _usable_price(pred.previous_close) \
+                        or not _usable_price(pred.actual_close):
                     continue
                 move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
                 band = self._hold_band(session, pred.symbol, bands, pred.target_date)
                 pred.was_correct = move <= band
-                pred.details_json = {
+                pred.details_json = _sanitize_json({
                     **(pred.details_json or {}),
                     "hold_eval": {"band": band, "move": move},
-                }
+                })
                 pred.evaluated_at = datetime.now(timezone.utc)
                 updated += 1
 
