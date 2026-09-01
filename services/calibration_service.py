@@ -166,6 +166,98 @@ def rolling_hit_rate(model_name: str, days: int = 30) -> Optional[float]:
     return result
 
 
+# A report may not quote a hit rate off fewer evaluated calls than this. The
+# floor is deliberately lower than MIN_SAMPLES (which gates a whole isotonic
+# fit) but high enough that the number is not one week of luck.
+MIN_STATEABLE_SAMPLES = 20
+
+
+def evaluated_hit_rate(
+    model_name: Optional[str] = None,
+    days: int = 90,
+    as_of: Optional[str] = None,
+) -> dict:
+    """Evaluated directional hit rate on active (non-HOLD) calls.
+
+    ``model_name`` None means every model — the platform-wide number. ``as_of``
+    bounds the window's upper edge so a historical/backtest run cannot quote a
+    rate measured on sessions it has not reached yet; None means "through the
+    latest evaluated row".
+
+    Returns ``{"n", "hit_rate", "days", "through", "model"}`` with ``hit_rate``
+    None whenever ``n`` is below :data:`MIN_STATEABLE_SAMPLES` — callers must
+    then say so rather than print an unearned number.
+    """
+    from db.session import get_session
+    from sqlalchemy import text
+
+    # The upper bound is on target_date, not prediction_date: an outcome is not
+    # knowable until the session it predicted has closed, so a run dated `as_of`
+    # may only count calls that had already resolved by then.
+    # CAST(...) rather than the ::date shorthand: SQLAlchemy's text() bind
+    # scanner refuses to bind ":upper" when another colon follows it, so
+    # ":upper::date" reaches Postgres as a literal and fails to parse.
+    upper = "CAST(:upper AS date)" if as_of is not None else "CURRENT_DATE"
+    sql = f"""
+        SELECT count(*),
+               avg(CASE WHEN was_correct THEN 1.0 ELSE 0.0 END),
+               max(target_date)
+        FROM model_predictions
+        WHERE was_correct IS NOT NULL
+          AND decision != 'HOLD'
+          AND prediction_date >= ({upper} - make_interval(days => :days))
+          AND target_date <= {upper}
+    """
+    params: dict = {"days": days}
+    if as_of is not None:
+        params["upper"] = as_of
+    if model_name:
+        sql += " AND model_name = :model"
+        params["model"] = model_name
+
+    with get_session() as session:
+        n, rate, through = session.execute(text(sql), params).fetchone()
+
+    n = int(n or 0)
+    return {
+        "model": model_name or "all models",
+        "days": days,
+        "n": n,
+        "hit_rate": (round(float(rate), 3)
+                     if n >= MIN_STATEABLE_SAMPLES and rate is not None else None),
+        "through": str(through) if through else None,
+    }
+
+
+def track_record_sentence(
+    model_name: Optional[str] = None,
+    days: int = 90,
+    as_of: Optional[str] = None,
+) -> str:
+    """One literal sentence a report may quote verbatim about its own accuracy.
+
+    This is the only place the wording lives, so a reader-facing surface and a
+    prompt cannot drift apart, and the LLM never has to phrase (or invent) it.
+    """
+    try:
+        stats = evaluated_hit_rate(model_name, days=days, as_of=as_of)
+    except Exception as e:  # a DB hiccup must not take a report down
+        logger.warning(f"track record lookup failed: {e}")
+        return ("Unavailable for this run — the evaluated history could not "
+                "be read, so no hit rate is stated.")
+
+    label = model_name or "all models on this platform"
+    if stats["hit_rate"] is None:
+        return (f"Not enough evaluated history to state a hit rate "
+                f"({stats['n']} scored non-HOLD call"
+                f"{'' if stats['n'] == 1 else 's'} for {label} in the last "
+                f"{days} days; {MIN_STATEABLE_SAMPLES} is the minimum). Treat "
+                f"the conviction below as an unproven estimate.")
+    return (f"{stats['hit_rate']:.0%} of scored non-HOLD calls for "
+            f"{label} were directionally correct over the last {days} days "
+            f"(n={stats['n']}, through {stats['through']}). Coin-flip is 50%.")
+
+
 def calibration_table() -> dict[str, dict]:
     """Snapshot for the scoreboard: per model, sample size, base rate, and
     the fitted mapping at a few reference raw confidences."""

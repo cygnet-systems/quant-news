@@ -61,7 +61,11 @@ ALL_MODELS: tuple[str, ...] = (
 # 2026-08-11.2 — research prompts gain SEC filings (8-K events + Form 4
 # insider transactions) and finviz market-context blocks, from the
 # Terminal's nightly collectors (point-in-time by filing/snapshot stamps).
-PIPELINE_EPOCH = "2026-08-11.2"
+# 2026-08-23.1 — research prompts gain the measured-accuracy block and the
+# prior-stance continuity block, news items carry their source, and the report
+# sections are reordered to lead with the symbol's own evidence. A prediction
+# written before this was made from materially different inputs.
+PIPELINE_EPOCH = "2026-08-23.1"
 
 # Conviction labels map to nominal confidences for display only — backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -78,7 +82,7 @@ def merge_research_into_analysis(
     trading_agents signal into an AI-analysis dict.
 
     Full Analysis produces its research text through the prediction pipeline
-    only; consumers that read ai_analysis["by_symbol"] (Luna, XLSX export,
+    only; consumers that read ai_analysis["by_symbol"] (the synthesis step,
     PDF report) get the same report the user sees on screen. Entries that
     already carry text analysis are untouched. Returns (dict, changed).
     """
@@ -96,7 +100,13 @@ def merge_research_into_analysis(
         st = det.get("structured") or {}
         entry["research"] = {
             "decision": sig.get("decision"),
+            # Two different numbers travel together from here on: the
+            # track-record weight the model layer computed (0.5 = no record
+            # yet) and the report's own stated conviction. Downstream surfaces
+            # kept conflating them because only one was ever carried.
             "confidence": sig.get("confidence"),
+            "stated_conviction": det.get("stated_conviction"),
+            "confidence_type": det.get("confidence_type"),
             "raw_response": det["raw_response"],
             "triggers": det.get("triggers") or {},
             "structured": st,
@@ -107,6 +117,7 @@ def merge_research_into_analysis(
             entry["recommendation"] = (st.get("stance")
                                        or _STANCE.get(sig.get("decision"), "NEUTRAL"))
             entry["confidence"] = sig.get("confidence")
+            entry["stated_conviction"] = det.get("stated_conviction")
             entry["stance_source"] = "research_verdict"
             if st.get("sentiment_alignment"):
                 entry["sentiment_explanation"] = st["sentiment_alignment"]
@@ -203,6 +214,37 @@ def attach_positioning_quality(
                 logger.warning(f"{sym}: quality screen failed: {e}")
                 entry["quality"] = entry.get("quality") or None
         by_sym[sym] = entry
+
+    if symbols:
+        try:
+            from services import progress_service as prog
+
+            def _sym_summary(entry: dict) -> dict:
+                pos = entry.get("positioning") or {}
+                quality = entry.get("quality") or {}
+                return {
+                    "options": ("ok" if pos.get("pc_volume") is not None
+                                else "missing"),
+                    "pc_volume": pos.get("pc_volume"),
+                    "pc_oi": pos.get("pc_oi"),
+                    "quality": ((str(quality.get("flag") or "")).upper()
+                                or "missing"),
+                    "quality_fails": quality.get("total_fails"),
+                }
+
+            prog.emit("action",
+                      f"Evidence attached ({', '.join(sorted(evidence)) or 'none'}) "
+                      f"for {len(symbols)} symbols",
+                      payload={
+                          "event": "enrichment",
+                          "as_of": as_of,
+                          "evidence": sorted(evidence),
+                          "by_symbol": {s: _sym_summary(by_sym.get(s) or {})
+                                        for s in symbols},
+                      })
+        except Exception as e:
+            logger.debug(f"enrichment emit skipped: {e}")
+
     return {**ai_analysis, "by_symbol": by_sym}
 
 
@@ -222,6 +264,7 @@ def load_market_data(
     Postgres on the way through, which is also what lets the 6pm evaluation
     find closes to score against.
     """
+    from services import progress_service as prog
     from services.analytics import (
         add_indicators_to_df, calculate_performance_metrics, get_latest_signals,
     )
@@ -229,6 +272,7 @@ def load_market_data(
 
     cache = get_cache()
     data: dict[str, dict] = {}
+    bars_by_symbol: dict[str, dict] = {}
     for symbol in symbols:
         try:
             df, metadata = cache.get_stock_prices(
@@ -242,8 +286,23 @@ def load_market_data(
                 "from_cache": metadata.get("from_cache", False),
                 "api_error": metadata.get("api_error"),
             }
+            bars_by_symbol[symbol] = {
+                "bars": len(df),
+                "start": str(df.index.min())[:10] if len(df) else None,
+                "end": str(df.index.max())[:10] if len(df) else None,
+                "source": ("cache" if metadata.get("from_cache") else "fetch"),
+            }
         except Exception as e:
             logger.warning(f"{symbol}: price fetch failed: {e}")
+            bars_by_symbol[symbol] = {"bars": 0, "error": str(e)[:120]}
+    prog.emit("action", f"Market data loaded: {len(data)}/{len(bars_by_symbol)} "
+                        f"symbols ({period})",
+              payload={
+                  "event": "data_load",
+                  "period": period,
+                  "force_refresh": force_refresh,
+                  "by_symbol": bars_by_symbol,
+              })
     return data
 
 
@@ -321,6 +380,12 @@ def run_predictions(
         try:
             from config import MODEL
             from services.news_service import fetch_historical_av_news
+            # This is the run's longest silent phase on a cold cache — say so
+            # before it starts instead of letting the feed go dark.
+            prog.emit("news", f"Fetching historical news for training (up to "
+                              f"{len(symbols)} symbols × "
+                              f"{MODEL.NEWS_LOOKBACK_MONTHS} months — can take "
+                              f"minutes on first run)…")
             historical_global_news = fetch_historical_av_news(
                 "", months=MODEL.NEWS_LOOKBACK_MONTHS)
         except Exception as e:
@@ -367,7 +432,19 @@ def run_predictions(
             if reused:
                 results[symbol] = reused
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
-                                    f"predictions for {cutoff_date} (unchanged data)")
+                                    f"predictions for {cutoff_date} (unchanged data)",
+                          payload={
+                              "event": "cache",
+                              "kind": "predictions",
+                              "outcome": "hit",
+                              "symbol": symbol,
+                              "models": sorted(reused),
+                              "summary": {
+                                  "cutoff": str(cutoff_date),
+                                  "news_count": len(sym_news),
+                                  "pipeline_epoch": PIPELINE_EPOCH,
+                              },
+                          })
                 continue
 
         historical_av_news: dict = {}
@@ -386,7 +463,8 @@ def run_predictions(
                             f"({mode}, as-of {cutoff_date})")
         # The only LLM call under here is the research report, so its spend
         # lands against this symbol.
-        with usage.track("research", symbol=symbol, trade_date=str(cutoff_date)):
+        with usage.track("research", symbol=symbol, trade_date=str(cutoff_date),
+                         section=f"research:{symbol}"):
             results[symbol] = service.predict_symbol_no_store(
                 symbol, df, spy_df=spy_df,
                 news=sym_news,
@@ -545,9 +623,9 @@ def _reusable_predictions(
         return None
 
     # Only the models this run asked for. The stored set for a date also holds
-    # `recommendation_synthesis` — Luna's OWN output, persisted as a
+    # `recommendation_synthesis` — the synthesis step's OWN output, persisted as a
     # prediction so it gets scored. Handing that back as a model signal would
-    # feed Luna its own previous verdict as independent evidence.
+    # feed the synthesis step its own previous verdict as independent evidence.
     wanted = selected | {"ensemble"}
     return {name: {k: v for k, v in entry.items() if k != "previous_close"}
             for name, entry in stored.items() if name in wanted}
@@ -695,15 +773,27 @@ def build_ai_report(
                                   evidence=evidence)
     try:
         from services import persistence_service as ps
-        cached = ps.get_cached_report(None, as_of, "ai_report",
-                                      ps.compute_data_hash(cache_key))
+        cache_hash = ps.compute_data_hash(cache_key)
+        cache_payload = {
+            "event": "cache",
+            "kind": "ai_report",
+            "input_data_hash": cache_hash,
+            "summary": _report_key_summary(news_by_symbol, symbols, cache_key),
+        }
+        cached = ps.get_cached_report(None, as_of, "ai_report", cache_hash)
         if cached:
-            prog.emit("ai", "AI report cache hit — regeneration skipped")
+            prog.emit("ai", "AI report cache hit — regeneration skipped",
+                      payload={**cache_payload, "outcome": "hit"})
             restored = json.loads(cached)
             restored["from_cache"] = True
             restored["recs_request"] = "news+signals"
             restored["recs_model"] = recs_model
             return restored
+        # A miss on inputs that look unchanged is a diagnosable event now:
+        # the payload records the hash and what fed it, so a cross-restart
+        # miss can be compared against the hit that should have happened.
+        prog.emit("ai", "AI report cache miss — generating fresh",
+                  payload={**cache_payload, "outcome": "miss"})
     except Exception as e:
         logger.debug(f"AI report cache check failed: {e}")
 
@@ -712,7 +802,8 @@ def build_ai_report(
                         f"across {len(symbols)} symbols ({report_model})…")
         provider = "openai" if report_model.startswith("gpt-") else "anthropic"
         try:
-            with usage.track("ai_report", trade_date=as_of):
+            with usage.track("ai_report", trade_date=as_of,
+                             section="ai_report:overall"):
                 result["overall"] = get_llm().summarize_news_structured(
                     all_articles, symbols,
                     stock_data=enriched,
@@ -753,8 +844,35 @@ def _report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
     }
 
 
+def _report_key_summary(news_by_symbol: dict, symbols: list[str],
+                        cache_key: dict) -> dict:
+    """A compact fingerprint of what fed the report cache hash.
+
+    Instrumentation only — the hash itself is untouched. The news window is
+    the volatile input (a late-indexed article shifts the hash), so the
+    per-symbol counts and the newest article timestamp are what make a
+    cross-restart miss diagnosable.
+    """
+    newest = None
+    for arts in (news_by_symbol or {}).values():
+        for a in arts or []:
+            ts = a.get("published_at")
+            if ts and (newest is None or ts > newest):
+                newest = ts
+    return {
+        "symbols": sorted(symbols),
+        "articles": sum(len(v or []) for v in (news_by_symbol or {}).values()),
+        "articles_by_symbol": {s: len(v or [])
+                               for s, v in (news_by_symbol or {}).items()},
+        "newest_article": newest,
+        **{k: cache_key.get(k) for k in
+           ("as_of", "model", "lookback", "thesis", "research", "recs",
+            "evidence", "schema")},
+    }
+
+
 # ---------------------------------------------------------------------------
-# Stage 4 — recommendation synthesis (Luna)
+# Stage 4 — recommendation synthesis
 # ---------------------------------------------------------------------------
 
 def run_recommendations(
@@ -799,20 +917,36 @@ def run_recommendations(
             "model_signals": valid_signals,
             "symbols": sorted(symbols),
         })
+        rec_cache_payload = {
+            "event": "cache",
+            "kind": "recommendation",
+            "input_data_hash": rec_data_hash,
+            "summary": {
+                "trade_date": trade_date,
+                "symbols": sorted(symbols),
+                "signal_models": sorted({m for v in valid_signals.values()
+                                         for m in v if not m.startswith("_")}),
+                "report_generated_at": ai_analysis.get("generated_at"),
+            },
+        }
         cached = ps.get_cached_recommendation(trade_date, rec_data_hash)
         if cached:
             # Identical evidence in, identical synthesis out — re-asking is
             # the single most expensive call in the run.
-            prog.emit("luna", "Recommendation cache hit — synthesis skipped")
+            prog.emit("luna", "Recommendation cache hit — synthesis skipped",
+                      payload={**rec_cache_payload, "outcome": "hit"})
             cached["from_cache"] = True
             return cached
+        prog.emit("luna", "Recommendation cache miss — synthesizing fresh",
+                  payload={**rec_cache_payload, "outcome": "miss"})
     except Exception as e:
         logger.debug(f"Recommendation cache check failed: {e}")
 
     prog.emit("luna", f"Synthesis ({ai_analysis.get('recs_model')}) over "
                       f"{len(symbols)} symbols…")
     synthesis_started = time.time()
-    with usage.track("recommendations", trade_date=trade_date):
+    with usage.track("recommendations", trade_date=trade_date,
+                     section="recommendations"):
         result = get_llm().generate_recommendations(
             ai_analysis, valid_signals, symbols,
             basis=basis,
@@ -896,7 +1030,7 @@ def run_recommendations(
             logger.warning(f"Failed to persist recommendation: {e}")
 
     actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
-    prog.emit("luna", "Luna finished — " + (", ".join(
+    prog.emit("luna", "Synthesis finished — " + (", ".join(
         f"{s}={a}" for s, a in actions.items()) or "done"))
     return result
 
@@ -993,7 +1127,22 @@ def run_full_analysis(
     window_desc = ("overnight close→open" if news_filter == "overnight"
                    else f"{lookback_days}d lookback")
     prog.emit("news", f"News window ({window_desc}) ending {as_of}: "
-                      f"{sum(len(v) for v in news_by_symbol.values())} articles")
+                      f"{sum(len(v) for v in news_by_symbol.values())} articles",
+              payload={
+                  "event": "news_window",
+                  "filter": news_filter,
+                  "lookback_days": lookback_days,
+                  "as_of": as_of,
+                  "target_date": target_date.isoformat(),
+                  "articles": sum(len(v) for v in news_by_symbol.values()),
+                  "articles_by_symbol": {s: len(v)
+                                         for s, v in news_by_symbol.items()},
+                  "source_status": {
+                      s: ("unavailable" if s in news_unavailable
+                          else "empty" if s in news_empty else "ok")
+                      for s in priced
+                  },
+              })
 
     # "The source was down" and "the week was quiet" produce the same empty
     # list but mean opposite things, so they are reported separately. Without

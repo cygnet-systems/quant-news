@@ -233,11 +233,6 @@ body {
     color: var(--text-primary);
 }
 
-.topbar-subtitle {
-    font-size: 11px;
-    color: var(--text-muted);
-}
-
 .topbar-actions {
     display: flex;
     align-items: center;
@@ -2595,9 +2590,11 @@ body {
 }
 
 .ta-card-conf {
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
+    margin-left: auto;
+    white-space: nowrap;
 }
 
 .ta-card-meta-row {
@@ -3111,9 +3108,12 @@ body {
     margin-left: auto;
     padding: 2px 10px;
     border-radius: 999px;
-    font-size: 0.78rem;
+    /* Carries three labelled parts now (decision, conviction, track-record
+       weight) rather than a bare percentage — smaller, and allowed to wrap. */
+    font-size: 0.72rem;
     font-weight: 700;
     background: var(--bg-tertiary, #242424);
+    text-align: right;
 }
 
 .research-verdict-badge.positive { color: var(--positive, #00C805); }
@@ -4256,6 +4256,26 @@ body {
     font-size: var(--text-xs);
     color: var(--text-muted);
     margin-top: 4px;
+}
+
+/* Pre-flight strip at the top of the run dialog: missing keys and the
+   duration estimate, both visible before the run is started. */
+.run-preflight:empty { display: none; }
+
+.run-preflight-warn {
+    font-size: var(--text-xs);
+    color: var(--negative);
+    background: rgba(220, 53, 69, 0.08);
+    border: 1px solid rgba(220, 53, 69, 0.35);
+    border-radius: var(--radius-sm);
+    padding: var(--space-2) var(--space-3);
+    margin-bottom: var(--space-2);
+}
+
+.run-preflight-estimate {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    margin-bottom: var(--space-3);
 }
 
 .run-scope-radio {

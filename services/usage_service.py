@@ -32,11 +32,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class UsageContext:
-    """What the LLM call underneath this context is for."""
+    """What the LLM call underneath this context is for.
+
+    ``section`` narrows ``stage`` to the report section served (e.g.
+    "research:BE", "ai_report:overall", "recommendations"). It rides the
+    same ContextVar; only the trace table stores it — llm_usage is keyed by
+    stage alone and stays unchanged.
+    """
 
     stage: str = "unknown"
     symbol: Optional[str] = None
     trade_date: Optional[str] = None
+    section: Optional[str] = None
 
 
 _context: ContextVar[UsageContext] = ContextVar(
@@ -45,10 +52,11 @@ _context: ContextVar[UsageContext] = ContextVar(
 
 
 @contextmanager
-def track(stage: str, symbol: str | None = None, trade_date: str | None = None):
+def track(stage: str, symbol: str | None = None, trade_date: str | None = None,
+          section: str | None = None):
     """Label every LLM call made inside this block."""
     token = _context.set(UsageContext(stage=stage, symbol=symbol,
-                                      trade_date=trade_date))
+                                      trade_date=trade_date, section=section))
     try:
         yield
     finally:
@@ -80,8 +88,12 @@ def record(
     duration_ms: int | None = None,
     ok: bool = True,
     error: str | None = None,
-) -> None:
-    """Write one usage row. Never raises — telemetry must not break a run."""
+) -> int | None:
+    """Write one usage row. Never raises — telemetry must not break a run.
+
+    Returns the new row's id (so the trace row for the same physical call
+    can link to its cost record), or None when the write was skipped.
+    """
     try:
         from db.models import LLMUsage
         from db.session import get_session
@@ -100,7 +112,7 @@ def record(
         run_id = prog.current_run_id()
 
         with get_session() as session:
-            session.add(LLMUsage(
+            row = LLMUsage(
                 run_id=run_id,
                 stage=ctx.stage,
                 symbol=ctx.symbol,
@@ -116,9 +128,13 @@ def record(
                 ok=ok,
                 error=(error or None) and str(error)[:500],
                 owner_uid=owner_uid,
-            ))
+            )
+            session.add(row)
+            session.flush()
+            return row.id
     except Exception as e:
         logger.debug(f"usage telemetry write failed: {e}")
+        return None
 
 
 def _current_uid() -> str | None:

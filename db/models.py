@@ -126,6 +126,7 @@ class RecommendationRun(Base):
     provider_used: Mapped[str] = mapped_column(String(32), nullable=False)
     result_json: Mapped[dict | None] = mapped_column(JSONB)
 
+    run_id: Mapped[str | None] = mapped_column(String(36))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -139,6 +140,7 @@ class RecommendationRun(Base):
         ),
         Index("ix_recommendation_lookup", "trade_date"),
         Index("ix_recommendation_owner", "owner_uid"),
+        Index("ix_recommendation_run", "run_id"),
     )
 
 
@@ -284,6 +286,10 @@ class ModelPrediction(Base):
     # Cache invalidation
     input_data_hash: Mapped[str | None] = mapped_column(String(64))
 
+    # The pipeline run that produced this row (activity_log/llm_usage share
+    # the id). NULL for rows written before runs were stamped.
+    run_id: Mapped[str | None] = mapped_column(String(36))
+
     # Timing
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
@@ -302,6 +308,7 @@ class ModelPrediction(Base):
         Index("ix_model_pred_owner", "owner_uid"),
         Index("ix_model_pred_news_status", "news_status", "prediction_date"),
         Index("ix_model_pred_ens_method", "ensemble_method", "prediction_date"),
+        Index("ix_model_pred_run", "run_id"),
     )
 
 
@@ -399,6 +406,7 @@ class TradingAgentReport(Base):
     model_name: Mapped[str | None] = mapped_column(String(64))
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
+    run_id: Mapped[str | None] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -408,6 +416,7 @@ class TradingAgentReport(Base):
     __table_args__ = (
         Index("ix_trading_agent_report_lookup", "symbol", "trade_date"),
         Index("ix_trading_agent_report_owner", "owner_uid"),
+        Index("ix_trading_agent_report_run", "run_id"),
     )
 
 
@@ -430,6 +439,9 @@ class ActivityLog(Base):
     run_title: Mapped[str | None] = mapped_column(Text)
     stage: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    # Structured facts behind the message (counts, windows, hashes) for the
+    # Trace view. Lives ONLY here — the diskcache feed events stay small.
+    payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -561,6 +573,61 @@ class LLMUsage(Base):
         Index("ix_llm_usage_time", "created_at"),
         Index("ix_llm_usage_stage", "stage", "created_at"),
         Index("ix_llm_usage_run", "run_id"),
+    )
+
+
+class LLMTrace(Base):
+    """Full request/response capture for one PHYSICAL LLM API call.
+
+    One row per attempt that reached a provider — retries and failover
+    attempts each get their own row with a shared context and an incremented
+    ``attempt``. Captured BEFORE any parsing, so an unparseable or truncated
+    response is preserved exactly as the provider sent it.
+
+    Division of labour with ``llm_usage``: that table remains the SOLE
+    token/cost record; this one holds the bodies (system prompt, prompt, raw
+    response) and the request parameters actually sent. ``usage_id`` links
+    the paired llm_usage row when the call also produced one.
+
+    ``section`` narrows ``stage`` to the report section the call served
+    (e.g. "research:BE", "ai_report:overall", "recommendations").
+    """
+
+    __tablename__ = "llm_traces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    usage_id: Mapped[int | None] = mapped_column(Integer)
+    run_id: Mapped[str | None] = mapped_column(String(36))
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    section: Mapped[str | None] = mapped_column(String(64))
+    symbol: Mapped[str | None] = mapped_column(String(16))
+    trade_date: Mapped[date | None] = mapped_column(Date)
+
+    provider: Mapped[str | None] = mapped_column(String(32))
+    model: Mapped[str | None] = mapped_column(String(64))
+
+    system_prompt: Mapped[str | None] = mapped_column(Text)
+    prompt: Mapped[str | None] = mapped_column(Text)
+    response: Mapped[str | None] = mapped_column(Text)
+    # The request parameters actually sent (temperature, max_tokens,
+    # reasoning effort, thinking config, …) minus the bodies above.
+    params_json: Mapped[dict | None] = mapped_column(JSONB)
+
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    error: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+    __table_args__ = (
+        Index("ix_llm_traces_run", "run_id"),
+        Index("ix_llm_traces_time", "created_at"),
+        Index("ix_llm_traces_owner", "owner_uid"),
     )
 
 

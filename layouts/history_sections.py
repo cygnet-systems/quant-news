@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
+from layouts.formatters import confidence_tooltip, conviction_label, weight_label
+
 
 def filter_items(items, filter_symbols, filter_date_range, specific_date=None, sym_key="symbol", date_key="trade_date"):
     """Filter a list of dicts by symbol set and date range or specific date."""
@@ -337,7 +339,8 @@ def empty_history_message(has_filters: bool, noun: str = "data") -> html.Div:
     # The Reports page has its own generate affordance; everywhere else the
     # run lives behind the toolbar's Run analysis button.
     action = ('use "New report" above to generate one'
-              if noun == "reports" else "run Full Analysis to generate data")
+              if noun == "reports"
+              else 'use "Run analysis" in the toolbar to generate data')
     return html.Div(
         [
             html.I(className="bi bi-clock-history",
@@ -365,8 +368,14 @@ def _ta_report_card(report):
     input_tokens = report.get("input_tokens", 0)
     output_tokens = report.get("output_tokens", 0)
 
-    conf_pct = int((confidence or 0) * 100)
     dec_cls = "positive" if decision == "BUY" else "negative" if decision == "SELL" else "neutral"
+
+    # The bare percentage here was the reliability weight, which readers took
+    # for the report's own confidence. Name it, and show the report's stated
+    # conviction beside it so the two are never confused again.
+    from models.single_agent import extract_confidence
+    stated = (extract_confidence(report["report_text"])
+              if report.get("report_text") else None)
 
     return html.Div(
         [
@@ -374,10 +383,13 @@ def _ta_report_card(report):
                 [
                     html.Span(symbol, className="ta-card-symbol"),
                     html.Span(decision, className=f"history-decision {dec_cls}"),
-                    html.Span(f"{conf_pct}%", className="ta-card-conf"),
+                    html.Span(weight_label(confidence), className="ta-card-conf",
+                              title=confidence_tooltip()),
                 ],
                 className="ta-card-header",
             ),
+            html.Div(conviction_label(stated), className="ta-card-meta",
+                     title=confidence_tooltip()),
             html.Div(
                 [
                     html.Span(trade_date, className="ta-card-date"),
@@ -465,6 +477,13 @@ def build_ta_reports_section(ta_reports):
     )
 
 
+_REPORT_TYPE_LABELS = {
+    "ai_report": "AI report",
+    "trading_agents": "Research report",
+    "recommendations": "Recommendations",
+}
+
+
 def build_saved_reports_section(reports):
     """Stored PDF/JSON/MD report artifacts."""
     if not reports:
@@ -472,7 +491,11 @@ def build_saved_reports_section(reports):
     report_rows = []
     for r in reports:
         sym = r.get("symbol") or "Portfolio"
-        rtype = r.get("report_type", "").replace("_", " ").title()
+        # .title() alone turned "ai_report" into "Ai Report". Known types get
+        # a written label; anything else still falls back to title-casing.
+        raw_type = r.get("report_type", "") or ""
+        rtype = _REPORT_TYPE_LABELS.get(
+            raw_type, raw_type.replace("_", " ").title())
         fmt = (r.get("file_format") or "").upper()
         # JSON-stored AI reports are converted to Markdown on download
         # (serve_saved_report) — label the button by what the user GETS.
@@ -748,13 +771,16 @@ def build_activity_section(activity_scope="all", stages=None, symbol=None,
         for run_idx, run in enumerate(activity_runs):
             lines = [
                 html.Div([
-                    html.Span(e["ts"], className="progress-ts"),
+                    html.Span(_prog.event_clock(e), className="progress-ts",
+                              title=_prog.DISPLAY_TZ_LABEL),
                     html.Span(e["message"], className="progress-msg"),
                 ], className="progress-line"
                    + (" progress-line-error" if e["stage"] == "error" else ""))
                 for e in run["events"]
             ]
-            started = run["started"].strftime("%Y-%m-%d %H:%M")
+            # get_activity_runs already hands these over in the display zone.
+            started = (f"{run['started'].strftime('%Y-%m-%d %H:%M')} "
+                       f"{_prog.DISPLAY_TZ_LABEL}")
             err = (f" · {run['errors']} error{'s' if run['errors'] != 1 else ''}"
                    if run["errors"] else "")
             # Whose run it was only matters when more than one person's rows

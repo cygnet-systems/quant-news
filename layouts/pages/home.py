@@ -346,9 +346,10 @@ def cohort_table(cohort: dict, active_symbol: str | None = None,
         [html.Th("Symbol"), html.Th("Prev close")]
         + [html.Th(MODEL_DISPLAY.get(m, m), title=m) for m in models]
         + [html.Th("Synthesis",
-                   title="Luna's verdict over the models, stored as a "
-                         "prediction so it is scored the same way. It is a "
-                         "synthesis of the others, not a peer model."),
+                   title="The synthesis model's verdict over the models, "
+                         "stored as a prediction so it is scored the same "
+                         "way. It is a synthesis of the others, not a peer "
+                         "model."),
            html.Th("Outcome")]
     ))
 
@@ -840,19 +841,33 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
     )
 
     if not has_cohort:
+        # The board's callback targets must exist even before the first run:
+        # render_home_panes outputs to these ids whenever it fires, and a
+        # missing Output id is a browser-console error in Dash 4. The empty
+        # state lives inside home-cohort-table so a completed run replaces it
+        # with the board in place.
         right = html.Div(
-            html.Div(
-                [
-                    html.Div("No predictions yet", className="empty-state-title"),
+            [
+                html.Div(id="home-board-title"),
+                html.Div(id="home-meta-wrap"),
+                html.Div(
                     html.Div(
-                        "Add symbols on the left, then use Run analysis in "
-                        "the toolbar. Once a run completes, this page shows "
-                        "what it predicted and how those calls resolved.",
-                        className="empty-state-note",
+                        [
+                            html.Div("No predictions yet",
+                                     className="empty-state-title"),
+                            html.Div(
+                                "Add symbols on the left, then use Run "
+                                "analysis in the toolbar. Once a run "
+                                "completes, this page shows what it "
+                                "predicted and how those calls resolved.",
+                                className="empty-state-note",
+                            ),
+                        ],
+                        className="empty-state",
                     ),
-                ],
-                className="empty-state",
-            ),
+                    id="home-cohort-table",
+                ),
+            ],
             className="home-right",
         )
         return html.Div([left, right], className="page page-home home-split")

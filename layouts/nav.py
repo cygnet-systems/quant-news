@@ -23,6 +23,7 @@ NAV_SECTIONS = [
     ("/reports", "Reports", "bi-journal-text"),
     ("/schedule", "Schedule", "bi-alarm"),
     ("/activity", "Activity", "bi-activity"),
+    ("/trace", "Trace", "bi-diagram-3"),
 ]
 
 SECTION_TITLES = {path: label for path, label, _ in NAV_SECTIONS}
@@ -100,18 +101,32 @@ def create_topbar() -> html.Div:
             html.Div(
                 [
                     html.H1(id="topbar-title", className="topbar-title"),
-                    html.Div(id="topbar-subtitle", className="topbar-subtitle"),
                 ],
                 className="topbar-heading",
             ),
 
             html.Div(
-                dbc.Button(
-                    [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
-                    id="run-analysis-btn",
-                    color="success",
-                    size="sm",
-                ),
+                [
+                    # Background prediction running indicator. It lives in the
+                    # always-mounted topbar (not a page) because the running=
+                    # spec on generate_model_signals targets it, and the badge
+                    # must be visible whatever route the run was started from.
+                    html.Span(
+                        [
+                            html.I(className="bi bi-gear-fill spinning-icon"),
+                            " Predicting...",
+                        ],
+                        id="prediction-running-indicator",
+                        className="prediction-running-badge",
+                        style={"display": "none"},
+                    ),
+                    dbc.Button(
+                        [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
+                        id="run-analysis-btn",
+                        color="success",
+                        size="sm",
+                    ),
+                ],
                 className="topbar-actions",
             ),
         ]

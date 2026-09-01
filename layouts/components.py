@@ -443,12 +443,13 @@ def create_recommendation_banner(
     Returns:
         Styled recommendation banner component.
     """
-    # Handle loading state — prompt user to run AI Report
+    # Handle loading state — point at the toolbar's run dialog
     if recommendation == "LOADING":
         return html.Div(
             [
-                html.Div("Awaiting Analysis", className="recommendation-label"),
-                html.Div('Run "AI Report" to analyze', className="recommendation-meta"),
+                html.Div("Awaiting analysis", className="recommendation-label"),
+                html.Div('Use "Run analysis" in the toolbar',
+                         className="recommendation-meta"),
             ],
             className="recommendation-banner loading",
         )

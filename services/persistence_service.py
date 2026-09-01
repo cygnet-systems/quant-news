@@ -353,6 +353,11 @@ def store_recommendation(
     duration_ms: int | None = None,
 ) -> None:
     """Store a recommendation result."""
+    try:
+        from services import progress_service as prog
+        run_id = prog.current_run_id()
+    except Exception:
+        run_id = None
     with get_session() as session:
         session.merge(RecommendationRun(
             trade_date=trade_date,
@@ -361,6 +366,7 @@ def store_recommendation(
             model_used=model_used,
             provider_used=provider_used,
             result_json=result,
+            run_id=run_id,
             duration_ms=duration_ms,
             owner_uid=_current_uid(),
             is_public=_default_public(),

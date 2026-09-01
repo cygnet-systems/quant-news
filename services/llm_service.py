@@ -40,7 +40,7 @@ def _first_text(response) -> Optional[str]:
 
 
 def _record_usage(usage_out: Optional[dict], response, provider: str,
-                  model: str, duration_ms: Optional[int] = None) -> None:
+                  model: str, duration_ms: Optional[int] = None) -> Optional[int]:
     """Normalise a response's token counts, then fan them out two ways.
 
     1. ``usage_out``, when a caller passed one — an out-parameter rather than a
@@ -55,6 +55,9 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
     reports prompt_tokens/completion_tokens. Both are normalised here so
     callers never branch on provider. Never raises — telemetry must not be
     able to fail a generation that already succeeded.
+
+    Returns the llm_usage row id (or None) so the trace row for the same
+    physical call can link to its cost record.
     """
     in_tok = out_tok = 0
     try:
@@ -80,11 +83,32 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
         logger.debug("usage capture failed: %s", e)
 
     from services import usage_service
-    usage_service.record(
+    return usage_service.record(
         model=model, provider=provider,
         input_tokens=in_tok, output_tokens=out_tok,
         duration_ms=duration_ms,
     )
+
+
+def _trace_params(api_kwargs: dict) -> dict:
+    """The request parameters as sent, minus the bodies (those get their own
+    Text columns) and minus the model (its own column too)."""
+    return {k: v for k, v in api_kwargs.items()
+            if k not in ("messages", "system", "model")}
+
+
+def _calibrated(model_name: str, raw_confidence) -> Optional[float]:
+    """What this model's raw confidence has historically resolved to, or None.
+
+    The synthesis prompt shows this beside the raw score so the strategist can
+    see that a 92% from a gradient-boosted model is not a 92% chance of being
+    right. None (too little evaluated history) is stated as such, never filled.
+    """
+    try:
+        from services.calibration_service import calibrate
+        return calibrate(model_name, float(raw_confidence))
+    except Exception:
+        return None
 
 
 # Default model per provider — single source of truth for the three copies of
@@ -299,6 +323,42 @@ class LLMService:
         def _elapsed_ms() -> int:
             return int((_time.time() - _call_t0) * 1000)
 
+        # Trace bookkeeping: one llm_traces row per PHYSICAL API call,
+        # retries and failover attempts included. `last_call` describes the
+        # attempt in flight; `open` distinguishes "raised before its trace was
+        # written" (the outer except records it) from "already traced".
+        attempt_n = 0
+        last_call: dict = {}
+
+        def _begin_attempt(provider_: str, model_: str, api_kwargs: dict) -> None:
+            nonlocal attempt_n
+            attempt_n += 1
+            last_call.update(provider=provider_, model=model_,
+                             params=_trace_params(api_kwargs),
+                             t0=_time.time(), open=True)
+
+        def _trace(response_text: Optional[str], *, ok: bool = True,
+                   error: Optional[str] = None,
+                   usage_id: Optional[int] = None) -> None:
+            """Record the in-flight attempt. Captured before any parsing, so
+            a truncated/unparseable response is preserved verbatim. Never
+            breaks the call path — record_llm_call swallows its own errors."""
+            last_call["open"] = False
+            try:
+                from services.trace_service import record_llm_call
+                record_llm_call(
+                    provider=last_call.get("provider"),
+                    model=last_call.get("model"),
+                    system_prompt=system_prompt, prompt=prompt,
+                    response=response_text, params=last_call.get("params"),
+                    attempt=attempt_n, ok=ok, error=error,
+                    duration_ms=int((_time.time()
+                                     - last_call.get("t0", _call_t0)) * 1000),
+                    usage_id=usage_id,
+                )
+            except Exception as trace_err:  # pragma: no cover - best-effort
+                logger.debug("llm trace failed: %s", trace_err)
+
         try:
             if use_provider == "anthropic":
                 api_kwargs = {
@@ -329,6 +389,7 @@ class LLMService:
                             "type": "enabled", "budget_tokens": max_tokens * 2,
                         }
 
+                _begin_attempt("anthropic", use_model, api_kwargs)
                 response = use_client.messages.create(**api_kwargs)
                 if getattr(response, "stop_reason", None) == "max_tokens":
                     # Truncation was previously silent; on report prompts the
@@ -337,9 +398,11 @@ class LLMService:
                         f"LLM response truncated at max_tokens={max_tokens} "
                         f"(model={use_model}) — output is incomplete"
                     )
-                _record_usage(usage_out, response, "anthropic", use_model,
-                              duration_ms=_elapsed_ms())
-                return _first_text(response)
+                usage_id = _record_usage(usage_out, response, "anthropic",
+                                         use_model, duration_ms=_elapsed_ms())
+                text = _first_text(response)
+                _trace(text, usage_id=usage_id)
+                return text
 
             # OpenAI-compatible path (LM Studio, OpenAI)
             messages = []
@@ -369,6 +432,7 @@ class LLMService:
 
             # Transient errors (401 permission flaps, 429, 5xx) shouldn't kill
             # a whole pipeline — retry once with a short backoff.
+            _begin_attempt(use_provider, use_model, api_kwargs)
             try:
                 response = use_client.chat.completions.create(**api_kwargs)
             except Exception as api_err:
@@ -377,8 +441,10 @@ class LLMService:
                                                    "insufficient permissions", "overloaded"))
                 if not transient:
                     raise
+                _trace(None, ok=False, error=msg)
                 logger.warning(f"Transient OpenAI error, retrying in 3s: {msg[:120]}")
                 _time.sleep(3)
+                _begin_attempt(use_provider, use_model, api_kwargs)
                 response = use_client.chat.completions.create(**api_kwargs)
 
             content = response.choices[0].message.content
@@ -391,17 +457,27 @@ class LLMService:
                     f"Reasoning model returned empty content (finish_reason={finish}) — "
                     f"retrying with low effort"
                 )
+                # The empty answer is itself evidence — keep its row.
+                _trace(content, error=f"empty content (finish_reason={finish})")
                 api_kwargs["reasoning_effort"] = "low"
                 api_kwargs["max_completion_tokens"] = max(max_tokens * 4, 20000)
+                _begin_attempt(use_provider, use_model, api_kwargs)
                 response = use_client.chat.completions.create(**api_kwargs)
                 content = response.choices[0].message.content
 
-            _record_usage(usage_out, response, use_provider, use_model,
-                          duration_ms=_elapsed_ms())
+            usage_id = _record_usage(usage_out, response, use_provider,
+                                     use_model, duration_ms=_elapsed_ms())
+            _trace(content, usage_id=usage_id)
             return content
 
         except Exception as e:
             logger.warning(f"LLM generation error ({use_provider}): {e}")
+
+            # The attempt that raised has not been traced yet (the success
+            # paths close their own) — record it before anything else so
+            # failover attempts stack on top with incremented numbers.
+            if last_call.get("open"):
+                _trace(None, ok=False, error=str(e))
 
             # Auto-failover only when using default provider (not overrides).
             # Work entirely in locals; publish the new active pair only after
@@ -412,14 +488,22 @@ class LLMService:
                 if API.ANTHROPIC_API_KEY:
                     try:
                         fo_client, _ = self._get_client_for_provider("anthropic")
+                        fo_kwargs = {"model": _DEFAULT_MODELS["anthropic"],
+                                     "max_tokens": max_tokens,
+                                     "temperature": temperature}
+                        _begin_attempt("anthropic", _DEFAULT_MODELS["anthropic"],
+                                       fo_kwargs)
                         result = self._generate_anthropic(
                             fo_client, prompt, system_prompt, max_tokens, temperature,
                             usage_out=usage_out,
                         )
                         self._active = (fo_client, "anthropic")
                         logger.info("Failover to Anthropic succeeded, keeping provider")
+                        _trace(result)
                         return result
                     except Exception as e2:
+                        if last_call.get("open"):
+                            _trace(None, ok=False, error=str(e2))
                         logger.warning(f"Anthropic failover failed: {e2}")
 
                 if API.OPENAI_API_KEY:
@@ -429,18 +513,25 @@ class LLMService:
                         if system_prompt:
                             messages.append({"role": "system", "content": system_prompt})
                         messages.append({"role": "user", "content": prompt})
-                        response = fo_client.chat.completions.create(
-                            model=_DEFAULT_MODELS["openai"],
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                        )
+                        fo_kwargs = {
+                            "model": _DEFAULT_MODELS["openai"],
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        }
+                        _begin_attempt("openai", _DEFAULT_MODELS["openai"],
+                                       fo_kwargs)
+                        response = fo_client.chat.completions.create(**fo_kwargs)
                         self._active = (fo_client, "openai")
                         logger.info("Failover to OpenAI succeeded, keeping provider")
-                        _record_usage(usage_out, response, "openai",
-                                      _DEFAULT_MODELS["openai"])
-                        return response.choices[0].message.content
+                        usage_id = _record_usage(usage_out, response, "openai",
+                                                 _DEFAULT_MODELS["openai"])
+                        content = response.choices[0].message.content
+                        _trace(content, usage_id=usage_id)
+                        return content
                     except Exception as e3:
+                        if last_call.get("open"):
+                            _trace(None, ok=False, error=str(e3))
                         logger.warning(f"OpenAI failover failed: {e3}")
 
             # A failed call still consumed wall-clock and, on a mid-stream
@@ -1027,6 +1118,18 @@ Provide a 3-4 sentence analysis covering:
 AVAILABLE MODELS:
 {model_desc_block}
 
+WHAT THE NUMBERS IN THE INPUT MEAN (read this before interpreting any of them):
+- "conviction" is the research report's OWN stated probability that its direction is right. It is a judgement the report made about itself. It has never been scored, so it carries no information about how often that report is actually correct.
+- "track-record weight" is NOT a model saying how sure it is. It is the model's measured directional hit rate on resolved past calls, used as a weight. A value of exactly 0.50 shown as "no track record yet" means the model has not accumulated enough scored calls to earn a weight — it is a placeholder for missing evidence, NOT a claim of 50/50 conviction, and NOT the report "mirroring" anything. Never reason from a 0.50 weight as if the report expressed a neutral view.
+- "up" is the model's probability that the next close is higher. Where it sits at 0.50 alongside a stated direction, the model has declared a direction without an earned edge.
+- A "MEASURED ACCURACY" line inside a research report quotes the platform's evaluated hit rate with a sample size. It is the only number here that has been checked against outcomes. Where it says no rate can be stated, the sample was too thin — do not fill one in.
+- If a field is "n/a", it was not reported. Say so; do not substitute 50%.
+
+WHAT THIS PLATFORM HAS ACTUALLY MEASURED (use these findings, do not contradict them):
+- Model agreement is not evidence of a better call. Measured on this platform's own resolved predictions, days on which the models agreed performed WORSE than days they split — the models are correlated momentum readers, so consensus mostly means they all read the same trend, not that the trend is more likely to continue. Never describe unanimity or a 5-model consensus as "highest-conviction" or as a reason to size up. Where they agree, look for the input they are all leaning on and ask whether it is one signal counted several times.
+- Stated confidence on this platform has historically been anti-calibrated: higher stated numbers have not produced higher hit rates. Weight evidence, not stated certainty.
+- Directional hit rates across models sit close to 50% over large samples. Treat any thesis that implies a large, reliable edge as suspect.
+
 YOUR ROLE:
 - Synthesize both inputs into specific, actionable recommendations per symbol
 - When the AI report and model predictions DISAGREE, this is the most valuable signal — explain WHY they disagree and which to trust in this context
@@ -1082,8 +1185,22 @@ Respond with ONLY valid JSON matching this schema:
                 lines.append("Research report (verdict + key sections):")
                 lines.append("  " + digest.replace("\n", "\n  "))
             if sym_report:
-                lines.append(f"AI Report: {sym_report.get('recommendation', 'N/A')} "
-                             f"(confidence: {sym_report.get('confidence', 'N/A')})")
+                # Two distinct numbers, spelled out. The unlabeled
+                # "(confidence: 0.5)" this used to print was read by the
+                # synthesis model as the report expressing a neutral view,
+                # when it is actually the "no track record yet" placeholder.
+                weight = sym_report.get("confidence")
+                conviction = sym_report.get("stated_conviction")
+                weight_str = (
+                    f"{weight:.0%}" + (" — no track record yet, placeholder"
+                                       if float(weight) == 0.5 else "")
+                    if isinstance(weight, (int, float)) else "n/a")
+                conv_str = (f"{conviction:.2f}"
+                            if isinstance(conviction, (int, float)) else "n/a")
+                lines.append(
+                    f"AI Report: {sym_report.get('recommendation', 'N/A')} "
+                    f"(report's own conviction: {conv_str}; "
+                    f"measured track-record weight: {weight_str})")
                 lines.append(f"  Sentiment: {sym_report.get('market_sentiment', 'N/A')}")
                 kd = sym_report.get("key_developments", "")
                 if kd:
@@ -1150,9 +1267,29 @@ Respond with ONLY valid JSON matching this schema:
                     # Say "n/a" instead of inventing a 50%.
                     confidence = result.get("confidence")
                     up_prob = result.get("up_probability")
+                    # Name which KIND of number this is. The research arm
+                    # publishes a measured track-record weight (0.5 = none
+                    # earned yet); every other model publishes its own raw,
+                    # uncalibrated score. Printing both as "conf:" is what led
+                    # the synthesis to read a 0.5 placeholder as a stated view.
+                    if model_name == "trading_agents":
+                        conf_label = "measured track-record weight"
+                        placeholder = (confidence is not None
+                                       and float(confidence) == 0.5)
+                    else:
+                        conf_label = "raw model score, uncalibrated"
+                        placeholder = False
                     conf_str = f"{confidence:.0%}" if confidence is not None else "n/a"
+                    if placeholder:
+                        conf_str += " — no track record yet, placeholder"
+                    elif confidence is not None:
+                        cal = _calibrated(model_name, confidence)
+                        conf_str += (f" (calls at this score have resolved "
+                                     f"{cal:.0%} correct)" if cal is not None
+                                     else " (no calibration history yet)")
                     up_str = f"{up_prob:.0%}" if up_prob is not None else "n/a"
-                    lines.append(f"  {display}: {decision} (conf: {conf_str}, up: {up_str})")
+                    lines.append(f"  {display}: {decision} "
+                                 f"({conf_label}: {conf_str}, up: {up_str})")
                     triggers = (result.get("details") or {}).get("triggers") or {}
                     if triggers.get("reassess_to_buy"):
                         lines.append(f"    TA reassess-to-BUY trigger: {triggers['reassess_to_buy'][:150]}")

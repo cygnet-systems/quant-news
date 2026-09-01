@@ -134,6 +134,145 @@ RUN_SCOPES = [
      "Report, then all models, then the synthesis recommendation."),
 ]
 
+# Wall-clock components for the pre-flight estimate, in seconds. These are the
+# numbers already recorded elsewhere in the codebase rather than guesses: a
+# research call is ~35s (app.py's fan-out comment) and RUN_MODELS advertises
+# ~60s for TradingAgents end to end; the synthesis is one call over the whole
+# batch and the run dialog already warns it "may take a minute". Everything
+# here is presented to the user as approximate.
+RESEARCH_SECONDS = 35
+RESEARCH_CONCURRENCY = 8      # app.py caps the async fan-out at 8 workers
+SYNTHESIS_SECONDS = 15        # one call for the batch, not per symbol
+NEWS_FETCH_SECONDS = 3        # per symbol, Alpha Vantage is rate-limited
+ML_MODEL_SECONDS = 4          # per symbol per numerical model
+
+_LLM_MODELS = {"trading_agents"}
+_NEWS_MODELS = {"deberta_sentiment", "xgboost_shap", "lightgbm"}
+
+
+def _provider_for(model_id: str) -> str:
+    return "openai" if (model_id or "").startswith("gpt-") else "anthropic"
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"~{int(round(seconds / 5.0)) * 5}s"
+    minutes = seconds / 60.0
+    return f"~{minutes:.0f} min" if minutes >= 2 else "~1-2 min"
+
+
+def estimate_run_seconds(scope: str, n_symbols: int, models: list,
+                         recs_on: bool) -> float:
+    """Rough wall-clock for the selected scope. Deliberately coarse."""
+    n = max(1, int(n_symbols or 0))
+    models = list(models or [])
+    total = 0.0
+    does_report = scope in ("report", "full")
+    does_models = scope in ("models", "full")
+
+    if does_report or (does_models and any(m in _NEWS_MODELS for m in models)):
+        total += n * NEWS_FETCH_SECONDS
+    if does_report:
+        # Research fans out concurrently, capped at RESEARCH_CONCURRENCY.
+        batches = -(-n // RESEARCH_CONCURRENCY)
+        total += batches * RESEARCH_SECONDS
+    if does_models:
+        ml = [m for m in models if m not in _LLM_MODELS]
+        total += n * len(ml) * ML_MODEL_SECONDS
+        if "trading_agents" in models and not does_report:
+            # In the models-only path the research call runs inside the
+            # prediction subprocess, one symbol at a time.
+            total += n * RESEARCH_SECONDS
+    if recs_on and scope == "full":
+        total += SYNTHESIS_SECONDS
+    return total
+
+
+def run_preflight_children(scope: str, symbols: list, models: list,
+                           report_model: str, recs_basis: str,
+                           recs_model: str) -> list:
+    """Warnings about missing keys plus a duration estimate for this run.
+
+    A run with no usable API key used to look identical to a healthy one until
+    it failed several stages in, and nothing anywhere said how long to wait.
+    """
+    import os
+
+    from config import API
+
+    def _key(name: str) -> bool:
+        return bool(getattr(API, name, "") or os.getenv(name, ""))
+
+    models = list(models or [])
+    n = len(symbols or [])
+    does_report = scope in ("report", "full")
+    does_models = scope in ("models", "full")
+    recs_on = scope == "full" and (recs_basis or "auto") != "off"
+
+    # Which LLM providers this run will actually call, and for what.
+    needs: dict[str, list[str]] = {}
+    if does_report:
+        needs.setdefault(_provider_for(report_model), []).append(
+            "the research report")
+    if does_models and "trading_agents" in models:
+        needs.setdefault(_provider_for(report_model), []).append(
+            "the TradingAgents model")
+    if recs_on:
+        needs.setdefault(_provider_for(recs_model), []).append(
+            "the recommendation synthesis")
+
+    warnings = []
+    env_for = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+    for provider, uses in needs.items():
+        env = env_for[provider]
+        if not _key(env):
+            warnings.append(
+                f"{env} is not set — {', '.join(sorted(set(uses)))} will fail.")
+
+    news_needed = does_report or (does_models
+                                  and any(m in _NEWS_MODELS for m in models))
+    if news_needed and not _key("ALPHA_VANTAGE_API_KEY"):
+        display = {mid: label for mid, label, _ in RUN_MODELS}
+        which = ["the report's news window"] if does_report else []
+        which += [display.get(m, m) for m in models if m in _NEWS_MODELS]
+        warnings.append(
+            "ALPHA_VANTAGE_API_KEY is not set — no articles will be fetched, so "
+            + ", ".join(which) + " will run on empty news.")
+
+    if n == 0:
+        # estimate_run_seconds floors at one symbol so a fixed cost is never
+        # divided away; printing that as "~70s for 0 symbols" advertised work
+        # for a run that cannot start.
+        estimate = html.Div(
+            [
+                html.I(className="bi bi-clock me-1"),
+                html.Span("No symbols selected — nothing will run. Add at "
+                          "least one above for a duration estimate."),
+            ],
+            className="run-preflight-estimate",
+        )
+    else:
+        seconds = estimate_run_seconds(scope, n, models, recs_on)
+        estimate = html.Div(
+            [
+                html.I(className="bi bi-clock me-1"),
+                html.Span(f"Estimated {_fmt_duration(seconds)} for {n} symbol"
+                          f"{'' if n == 1 else 's'} — approximate, and slower "
+                          f"when a provider is rate-limiting."),
+            ],
+            className="run-preflight-estimate",
+        )
+    if not warnings:
+        return [estimate]
+    return [
+        html.Div(
+            [html.I(className="bi bi-exclamation-triangle-fill me-2")]
+            + [html.Div(w) for w in warnings],
+            className="run-preflight-warn",
+        ),
+        estimate,
+    ]
+
 # (value, label, what-it-does hint). The hints are honest about what the
 # platform's own evals found — the selector is only useful if it tells you
 # when each method actually differs.
@@ -529,6 +668,11 @@ def create_run_modal() -> dbc.Modal:
                 close_button=True,
             ),
             dbc.ModalBody([
+                # Pre-flight: what this run needs that is not configured, and
+                # roughly how long it will take. Both were previously only
+                # discoverable by starting the run and watching it fail.
+                html.Div(id="run-preflight", className="run-preflight"),
+
                 # --- Symbols ---
                 # The set a run acts on used to be an invisible rule (always
                 # the watchlist). It is now the dialog's first question, preset
@@ -673,6 +817,10 @@ def create_run_modal() -> dbc.Modal:
                 ),
             ]),
             dbc.ModalFooter([
+                # Inline validation (e.g. an empty symbol set) — me-auto keeps
+                # it left of the buttons in the footer's flex row.
+                html.Div(id="run-validation-msg",
+                         className="run-validation-msg text-danger me-auto"),
                 dbc.Button("Cancel", id="run-cancel-btn", color="secondary",
                            className="me-2"),
                 dbc.Button([html.I(className="bi bi-play-fill me-1"), "Run"],

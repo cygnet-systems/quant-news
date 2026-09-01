@@ -21,7 +21,10 @@ import diskcache
 import pandas as pd
 import plotly.graph_objects as go
 import dash_bootstrap_components as dbc
-from dash import Input, Output, State, callback, ctx, html, ALL, MATCH, dcc
+from dash import (
+    Input, Output, State, callback, clientside_callback, ctx, html, ALL,
+    MATCH, dcc,
+)
 from dash import DiskcacheManager
 from dash.exceptions import PreventUpdate
 
@@ -76,6 +79,7 @@ from layouts.pages import home as home_page
 from layouts.pages import performance as performance_page
 from layouts.pages import reports as reports_page
 from layouts.pages import schedule as schedule_page
+from layouts.pages import trace as trace_page
 from layouts.pages.analyze import (
     build_overall_tab_content,
     build_tab_content,
@@ -534,6 +538,8 @@ def _build_route(path, history_data, filter_symbols, filter_range,
             filter_symbols, filter_range, filter_specific)
     if path == "/schedule":
         return schedule_page.layout()
+    if path == "/trace":
+        return trace_page.layout()
     if path == "/activity":
         from services import watchlist_service
         return activity_page.layout(
@@ -621,6 +627,10 @@ def _fill_run_inputs(symbols, stock_data, news_data=None):
                     "signals": get_latest_signals(df),
                     "period": "1y",
                     "from_cache": meta.get("from_cache", False),
+                    # Origin stamp for the run-level data_load event: entries
+                    # without one came from the browser session store.
+                    "source": ("cache" if meta.get("from_cache")
+                               else "fetch"),
                 }
             except Exception as e:
                 logger.warning("Run input: price fetch failed for %s: %s",
@@ -691,10 +701,13 @@ def _home_symbol_reports(symbol: str | None) -> list[dict]:
     if not symbol:
         return []
     try:
-        from models.single_agent import strip_epilogue
+        from models.single_agent import render_report_markdown
         reports = get_cache().get_trading_agent_reports(symbol, limit=5)
         for r in reports:
-            r["report_text"] = strip_epilogue(r.get("report_text") or "")
+            # Epilogue stripped AND the verdict fields turned into list items,
+            # so the Home reading pane gets the same discrete labelled lines
+            # the modal and the PDF do.
+            r["report_text"] = render_report_markdown(r.get("report_text") or "")
         return reports
     except Exception as e:
         logger.warning("Could not read %s reports for Home: %s", symbol, e)
@@ -729,7 +742,8 @@ def _home_reports_by_symbol() -> dict:
 
 HOME_ROLLING_DAYS = 30
 
-_ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule", "/activity"]
+_ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule",
+           "/activity", "/trace"]
 
 
 @callback(
@@ -999,16 +1013,22 @@ def set_home_cutoff(value, current):
     # but the Outputs exist on one route.
     Input("selected-symbols", "data"),
     Input("home-cutoff-date", "data"),
+    # A completed run must land here without a manual reload: predictions
+    # arrive via the store status, report-only runs via the analysis store
+    # (their research reports feed the right-hand reader).
+    Input("prediction-store-status", "data"),
+    Input("ai-analysis-store", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
-def render_home_panes(active_symbol, search, watchlist, cutoff, pathname):
+def render_home_panes(active_symbol, search, watchlist, cutoff,
+                      _pred_status, _ai_analysis, pathname):
     """Re-render the symbol rail, the board, and its date header together.
 
     One callback for all four so the row highlight, the board, and the
     "predicting X, data through Y" line can never disagree about which
-    symbol or cutoff is active. Only fires from Home's own controls, so the
-    Outputs are always mounted (see render_archive_body for the pattern).
+    symbol or cutoff is active. The pathname guard PreventUpdates off Home,
+    where these Outputs are not mounted (see render_archive_body).
     """
     path = (pathname or "/").rstrip("/") or "/"
     if path != "/":
@@ -1820,12 +1840,51 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
         prog.start_run(f"Full Analysis — {len(symbols or [])} symbols, "
                        f"target {target_str} (data through {as_of_str})"
                        + (" (backtest)" if is_backtest else ""))
+    else:
+        # A report-only run is a run too: without its own boundary the panel
+        # keeps the previous run's green check through the whole generation
+        # and polls at the idle rate.
+        prog.start_run(f"Report — {len(symbols or [])} symbols, "
+                       f"target {target_str} (data through {as_of_str})"
+                       + (" (backtest)" if is_backtest else ""))
     prog.emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
     prog.emit("action", f"Options: model={report_model}, window={window_desc}, "
                         f"type={'thesis' if include_thesis_flag else 'standard'}, "
                         f"research={'pipeline' if is_full else 'on'}, "
                         f"recs={recs_mode} ({recs_model_val}), "
                         f"target {target_str}, data through {as_of_str}")
+
+    # One data_load event covering EVERY symbol's price input for this run,
+    # whatever its origin — the browser session store (the normal case, which
+    # previously produced no data_load at all) or the server gap-fill above.
+    # In-memory parse of frames the report reads anyway; nothing is refetched.
+    price_inputs: dict[str, dict] = {}
+    for sym in (symbols or []):
+        entry = (stock_data or {}).get(sym) or {}
+        if not entry.get("prices"):
+            price_inputs[sym] = {"bars": 0, "error": "no price data"}
+            continue
+        try:
+            _pf = pd.read_json(StringIO(entry["prices"]))
+            if "Date" in _pf.columns:
+                _pf = _pf.set_index("Date")
+            _pf.index = pd.to_datetime(_pf.index)
+            _pf = _pf[_pf.index <= as_of_str]
+            price_inputs[sym] = {
+                "bars": len(_pf),
+                "start": str(_pf.index.min())[:10] if len(_pf) else None,
+                "end": str(_pf.index.max())[:10] if len(_pf) else None,
+                "source": entry.get("source") or "session-store",
+            }
+        except Exception as e:
+            price_inputs[sym] = {"bars": 0, "error": str(e)[:120]}
+    # No `period`: the store's label is the UI display window, not the data
+    # window — per-symbol start/end record what was actually consumed.
+    prog.emit("action",
+              f"Price inputs resolved: "
+              f"{sum(1 for v in price_inputs.values() if v.get('bars'))}"
+              f"/{len(symbols or [])} symbols (data through {as_of_str})",
+              payload={"event": "data_load", "by_symbol": price_inputs})
 
     articles_by_symbol = news_data.get("articles_by_symbol", {})
 
@@ -1877,41 +1936,85 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
                 articles_by_symbol.get(sym, []), as_of_str, lookback_days=lookback_days)
     articles_by_symbol = windowed
     total_articles = sum(len(a) for a in articles_by_symbol.values())
+    news_window_payload = {
+        "event": "news_window",
+        "filter": "overnight" if overnight_news else "lookback",
+        "lookback_days": lookback_days,
+        "as_of": as_of_str,
+        "target_date": target_str,
+        "articles": total_articles,
+        "articles_by_symbol": {s: len(a)
+                               for s, a in articles_by_symbol.items()},
+        "source_status": {s: ("ok" if a else "empty")
+                          for s, a in articles_by_symbol.items()},
+    }
     if overnight_news:
         prog.emit("news", f"Overnight window {as_of_str} {_M.NEWS_OVERNIGHT_START_ET} ET "
                           f"→ {target_str} {_M.NEWS_OVERNIGHT_END_ET} ET "
                           f"(relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE}): "
-                          f"{total_articles} articles fetched (point-in-time)")
+                          f"{total_articles} articles fetched (point-in-time)",
+                  payload={**news_window_payload,
+                           "relevance_threshold": _M.NEWS_OVERNIGHT_RELEVANCE})
     else:
         prog.emit("news", f"News window {lookback_days}d ending {as_of_str} "
                           f"(target {target_str} minus 1 trading day): "
-                          f"{total_articles} articles fetched (point-in-time)")
+                          f"{total_articles} articles fetched (point-in-time)",
+                  payload=news_window_payload)
+
+    # One key dict for both the cache check here and the store at the end —
+    # and the trace payload records its hash plus a compact summary of what
+    # fed it, so a cross-restart cache miss stops being undiagnosable.
+    report_cache_key = {
+        "news": articles_by_symbol,
+        "symbols": sorted(symbols or []),
+        "as_of": as_of_str,
+        # v5-flowq: per-symbol options positioning + quality screen
+        # ride the payload (and the research/portfolio prompts).
+        # Model, window and analysis type key the cache — switching
+        # model must not serve the other model's cached report.
+        "schema": "v5-flowq",
+        "model": report_model,
+        "lookback": "overnight" if overnight_news else lookback_days,
+        "thesis": include_thesis_flag,
+        "research": include_research,
+        "recs": recs_mode,
+        "evidence": evidence_sel,
+    }
 
     # Check persistent cache (Postgres + S3) before running LLM
     if _s3_available and ctx.triggered_id != "ai-retry-btn":
         try:
             from services import persistence_service as ps
-            data_hash = ps.compute_data_hash({
-                "news": articles_by_symbol,
-                "symbols": sorted(symbols or []),
-                "as_of": as_of_str,
-                # v5-flowq: per-symbol options positioning + quality screen
-                # ride the payload (and the research/portfolio prompts).
-                # Model, window and analysis type key the cache — switching
-                # model must not serve the other model's cached report.
-                "schema": "v5-flowq",
-                "model": report_model,
-                "lookback": "overnight" if overnight_news else lookback_days,
-                "thesis": include_thesis_flag,
-                "research": include_research,
-                "recs": recs_mode,
-                "evidence": evidence_sel,
-            })
+            from services.analysis_runner import (
+                _report_key_summary as report_key_summary,
+            )
+            data_hash = ps.compute_data_hash(report_cache_key)
+            report_cache_payload = {
+                "event": "cache",
+                "kind": "ai_report",
+                "input_data_hash": data_hash,
+                "summary": report_key_summary(articles_by_symbol,
+                                              sorted(symbols or []),
+                                              report_cache_key),
+            }
             cached = ps.get_cached_report(None, as_of_str, "ai_report", data_hash)
+            if not cached:
+                prog.emit("ai", "AI report cache miss — generating fresh",
+                          payload={**report_cache_payload, "outcome": "miss"})
             if cached:
                 logger.info("AI report cache hit (Postgres/S3)")
+                prog.emit("ai", "AI report cache hit — regeneration skipped",
+                          payload={**report_cache_payload, "outcome": "hit"})
                 cached_result = json.loads(cached)
                 cached_result["from_cache"] = True
+                # Re-stamp for THIS click — the stored copy carries the
+                # correlation keys of the run that originally produced it.
+                cached_result["run_seq"] = n_clicks
+                cached_result["scope"] = scope
+                if not is_full and recs_mode == "off":
+                    # Nothing left to run for this scope: close the run.
+                    prog.finish_run(f"Report complete ({len(symbols or [])} "
+                                    "symbols, from cache)")
                 return cached_result
         except Exception as e:
             logger.debug(f"AI report cache check failed: {e}")
@@ -1924,12 +2027,22 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
         "by_symbol": {},
         "as_of": as_of_str,
         "generated_at": datetime.now().isoformat(),
+        # Correlation keys: run_seq ties this payload to the confirm click
+        # that produced it (the model-signals _meta carries the same value),
+        # and scope lets the synthesis callback tell a report-only payload
+        # from a full-pipeline one even if a stale requested flag lingers.
+        "run_seq": n_clicks,
+        "scope": scope,
     }
 
     # Per-symbol context: fundamentals, validated metric blocks, events, peers
     enriched_stock_data = {}
     extra_blocks_by_symbol = {}
     for symbol in (symbols or []):
+        # One line per symbol: this loop is network-bound (profile, events,
+        # peers, options, quality) and used to run in total silence.
+        prog.emit("ai", f"{symbol}: gathering fundamentals, options, "
+                        f"quality screens…")
         sym_data = stock_data.get(symbol, {})
         enriched = {
             "metrics": sym_data.get("metrics", {}),
@@ -2038,6 +2151,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
     # ~35s each, so give them their own worker slots).
     def _run_research(sym: str):
         from models.trading_agents_model import TradingAgentsModel
+        from services import usage_service as _usage
         entry = (stock_data or {}).get(sym) or {}
         df = None
         if entry.get("prices"):
@@ -2057,8 +2171,14 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
                                 f"({age}d before {as_of_str}) — refetching fresh")
                 df = None
         model_obj = TradingAgentsModel()
-        res = model_obj.predict(sym, df, as_of=as_of_str, model=report_model,
-                                include_thesis=include_thesis_flag)
+        # Runs in a worker thread via asyncio.to_thread (context copies in),
+        # but the label is set here so the trace/spend attribution never
+        # depends on what the event-loop context happened to hold.
+        with _usage.track("research", symbol=sym, trade_date=as_of_str,
+                          section=f"research:{sym}"):
+            res = model_obj.predict(sym, df, as_of=as_of_str,
+                                    model=report_model,
+                                    include_thesis=include_thesis_flag)
         return res
 
     # Async fan-out: each task holds a worker thread only while its blocking
@@ -2086,7 +2206,12 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
             raw = details.get("raw_response", "")
             result.setdefault("research_by_symbol", {})[symbol] = {
                 "decision": r.decision,
+                # Both numbers, kept apart: `confidence` is the measured
+                # track-record weight, `stated_conviction` is what the report
+                # itself claimed. The UI labels each; it cannot if only one
+                # travels.
                 "confidence": r.confidence,
+                "stated_conviction": details.get("stated_conviction"),
                 "raw_response": raw,
                 "triggers": details.get("triggers") or {},
                 "structured": details.get("structured") or {},
@@ -2150,8 +2275,15 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
         overall_metrics = "\n\n".join(
             b["metrics"] for b in extra_blocks_by_symbol.values() if b.get("metrics")
         )
+
+        def _run_overall(*args, **kw):
+            from services import usage_service as _usage
+            with _usage.track("ai_report", trade_date=as_of_str,
+                              section="ai_report:overall"):
+                return llm.summarize_news_structured(*args, **kw)
+
         aio_tasks.append(_run_task(
-            "overall", None, llm.summarize_news_structured, overall_articles, symbols or [],
+            "overall", None, _run_overall, overall_articles, symbols or [],
             stock_data=enriched_stock_data,
             as_of_date=as_of_str,
             extra_blocks={"metrics": overall_metrics} if overall_metrics else None,
@@ -2207,8 +2339,18 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
         result["failed"] = True
         prog.emit("error", "AI Report produced no analysis")
     else:
-        prog.emit("ai", f"AI Report complete ({len(result['by_symbol'])} symbols) — "
-                        "model predictions next")
+        # Count what the report covered. Full scope defers the per-symbol
+        # research to the model stage, so by_symbol is legitimately empty
+        # there — fall back to the run's symbol list rather than saying "0".
+        n_covered = len(result["by_symbol"]) or len(symbols or [])
+        if is_full:
+            prog.emit("ai", f"AI Report complete ({n_covered} symbols) — "
+                            "model predictions next")
+        elif recs_mode != "off":
+            prog.emit("ai", f"AI Report complete ({n_covered} symbols) — "
+                            "synthesizing recommendations next")
+        else:
+            prog.emit("ai", f"AI Report complete ({n_covered} symbols)")
 
     # Per-symbol options positioning + quality screen ride the payload so the
     # synthesis prompt and every renderer read one source. After the failed
@@ -2224,22 +2366,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
     if _s3_available and not result.get("failed"):
         try:
             from services import persistence_service as ps
-            data_hash = ps.compute_data_hash({
-                "news": articles_by_symbol,
-                "symbols": sorted(symbols or []),
-                "as_of": as_of_str,
-                # v5-flowq: per-symbol options positioning + quality screen
-                # ride the payload (and the research/portfolio prompts).
-                # Model, window and analysis type key the cache — switching
-                # model must not serve the other model's cached report.
-                "schema": "v5-flowq",
-                "model": report_model,
-                "lookback": "overnight" if overnight_news else lookback_days,
-                "thesis": include_thesis_flag,
-                "research": include_research,
-                "recs": recs_mode,
-                "evidence": evidence_sel,
-            })
+            data_hash = ps.compute_data_hash(report_cache_key)
             ps.store_report(
                 symbol=None,
                 trade_date=as_of_str,
@@ -2250,6 +2377,17 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
             )
         except Exception as e:
             logger.warning(f"Failed to persist AI report to S3: {e}")
+
+    # Report-only runs end here unless recommendations still have to run
+    # (the synthesis callback closes those). Full runs are closed by the
+    # persist/synthesis stages once the models land.
+    if not is_full:
+        if result.get("failed"):
+            prog.finish_run("Report failed — no analysis produced")
+        elif recs_mode == "off":
+            prog.finish_run(f"Report complete "
+                            f"({len(result['by_symbol']) or len(symbols or [])}"
+                            " symbols)")
 
     return result
 
@@ -2775,82 +2913,138 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
     if not n_clicks or not symbols:
         raise PreventUpdate
 
-    # Symbols outside the browser stores (cohort- or custom-scoped runs)
-    # fetch their own OHLCV and news here, in the background subprocess.
-    stock_data, news_data = _fill_run_inputs(symbols, stock_data,
-                                             news_data or {})
-
     # The model checkboxes are now honoured on every scope. Full pipeline used
     # to overwrite them with [True] * 5, so the boxes you unticked ran anyway.
     is_full_analysis = scope == "full"
-    research_kwargs = {}
-    if is_full_analysis:
-        # The research report (trading_agents) honours the report model/depth
-        # choices; `research_model` is a distinct kwarg so no other model can
-        # mistake it for its own.
-        research_kwargs = {
-            "research_model": research_model or None,
-            "include_thesis": (research_depth or "thesis") != "standard",
-            # Modal checklist; None only before the modal has rendered once.
-            "evidence": sorted(run_evidence) if run_evidence is not None
-                        else ["options", "quality"],
-        }
-    else:
-        # Models-only owns the feed; the full pipeline started it already.
-        from services import progress_service as _prog
-        _prog.start_run(f"Predictions — {len(symbols or [])} symbols")
+    from services import progress_service as _prog
 
-    import os
-    os.environ["_DASH_BG_SUBPROCESS"] = "1"
+    def _abort_run(exc: Exception) -> dict:
+        """Close the run as a failure and hand downstream a marked payload.
 
-    from datetime import date as date_cls
+        logger.exception, not error: this body runs in the background
+        subprocess, where an escaped exception is swallowed into Dash's job
+        error — the browser sees a bare HTTP 500 and the server log NOTHING.
+        The traceback must be written here or it exists nowhere.
 
-    # The picker holds the TARGET session — the close being predicted. Models
-    # are truncated to `predict_date`, the previous trading day, so a Monday
-    # target trains and scores on nothing after the preceding Friday.
-    from utils.trading_calendar import resolve_target_and_cutoff
-    target_date, predict_date = resolve_target_and_cutoff(
-        predict_date_str[:10] if predict_date_str else None
-    )
+        A marked payload, not {}: downstream must be able to tell "the run
+        failed" from "no predictions". The empty dict cleared the running
+        badge as if successful and left the panel spinning forever.
+        """
+        logger.exception("Model signal generation error")
+        _prog.emit("error", f"Model run failed: {str(exc)[:200]}")
+        _prog.finish_run(("Full Analysis" if is_full_analysis
+                          else "Predictions")
+                         + f" failed — {str(exc)[:120]}")
+        return {"_run_failed": str(exc), "_meta": {"run_seq": n_clicks}}
 
-    is_backtest = target_date < date_cls.today()
+    # Everything after the guards runs under a catch-all. A one-line bug
+    # before the old try boundary shipped as "every run dies at +1s with a
+    # bare HTTP 500 and a forever-running badge" — nothing here may execute
+    # unprotected.
+    try:
+        if not is_full_analysis:
+            # Models-only owns the feed; the full pipeline started it
+            # already. Started BEFORE the input fill so the first emits below
+            # group under this run, not the previous one.
+            _prog.start_run(f"Predictions — {len(symbols or [])} symbols")
 
-    _ALL_MODEL_IDS = [
-        "kronos_mini", "xgboost_shap", "lightgbm",
-        "deberta_sentiment", "trading_agents",
-    ]
-    selected_models = set()
-    for model_id, checked in zip(_ALL_MODEL_IDS, model_checks or []):
-        if checked:
-            selected_models.add(model_id)
+        # First line before any heavy work: the subprocess spends its first
+        # seconds on imports and input fetches with nothing on the panel.
+        # (emit itself touches only diskcache + Postgres — no torch.)
+        # The pid rides along and is recorded beside the run key, so the
+        # server's watchdog can tell "worker died" from "worker still
+        # grinding" — this process has been observed dying without a
+        # traceback (torch/MPS native teardown), which previously left the
+        # run spinning forever.
+        _prog.emit("models", "Preparing model engine (first run loads model "
+                             "weights)…",
+                   payload={"event": "run_process", "pid": os.getpid()})
+        _prog.record_run_pid()
 
-    # Build the ensemble config from the dialog's own controls: they are what
-    # the user sees at click time, whereas the store State could still be one
-    # sync callback behind the last edit. The store keeps the same values for
-    # the drawer and live recompute.
-    from config import MODEL as _MODEL
-    if ens_members is not None:
-        weights = {}
-        for model_id, w in zip(_ALL_MODEL_IDS, ens_weights or []):
-            try:
-                weights[model_id] = round(float(w), 1)
-            except (TypeError, ValueError):
-                weights[model_id] = 1.0
+        # Symbols outside the browser stores (cohort- or custom-scoped runs)
+        # fetch their own OHLCV and news here, in the background subprocess.
         try:
-            min_agree_val = int(ens_min_agree)
-        except (TypeError, ValueError):
-            min_agree_val = _MODEL.ENSEMBLE_MIN_AGREE
-        ensemble_config = {
-            "enabled_models": [m for m, on in zip(_ALL_MODEL_IDS, ens_members)
-                               if on],
-            "weights": weights,
-            "method": ens_method or _MODEL.ENSEMBLE_DEFAULT_METHOD,
-            "min_agree": min_agree_val,
-        }
+            stock_data, news_data = _fill_run_inputs(symbols, stock_data,
+                                                     news_data or {})
+        except Exception as e:
+            logger.exception("Run input fetch failed")
+            _prog.emit("error", f"Run input fetch failed: {str(e)[:200]}")
+            _prog.finish_run(f"Run failed — could not fetch input data "
+                             f"({str(e)[:120]})")
+            return {"_run_failed": str(e), "_meta": {"run_seq": n_clicks}}
+
+        research_kwargs = {}
+        if is_full_analysis:
+            # The research report (trading_agents) honours the report
+            # model/depth choices; `research_model` is a distinct kwarg so no
+            # other model can mistake it for its own.
+            research_kwargs = {
+                "research_model": research_model or None,
+                "include_thesis": (research_depth or "thesis") != "standard",
+                # Modal checklist; None only before the modal rendered once.
+                "evidence": sorted(run_evidence) if run_evidence is not None
+                            else ["options", "quality"],
+            }
+
+        # Module-level os — a function-local `import os` here once shadowed
+        # the name for the WHOLE body, so the pid emit above raised
+        # UnboundLocalError on every run. Never re-import module-level names
+        # inside this function.
+        os.environ["_DASH_BG_SUBPROCESS"] = "1"
+
+        from datetime import date as date_cls
+
+        # The picker holds the TARGET session — the close being predicted.
+        # Models are truncated to `predict_date`, the previous trading day,
+        # so a Monday target trains and scores on nothing after the
+        # preceding Friday.
+        from utils.trading_calendar import resolve_target_and_cutoff
+        target_date, predict_date = resolve_target_and_cutoff(
+            predict_date_str[:10] if predict_date_str else None
+        )
+
+        is_backtest = target_date < date_cls.today()
+
+        _ALL_MODEL_IDS = [
+            "kronos_mini", "xgboost_shap", "lightgbm",
+            "deberta_sentiment", "trading_agents",
+        ]
+        selected_models = set()
+        for model_id, checked in zip(_ALL_MODEL_IDS, model_checks or []):
+            if checked:
+                selected_models.add(model_id)
+
+        # Build the ensemble config from the dialog's own controls: they are
+        # what the user sees at click time, whereas the store State could
+        # still be one sync callback behind the last edit. The store keeps
+        # the same values for the drawer and live recompute.
+        from config import MODEL as _MODEL
+        if ens_members is not None:
+            weights = {}
+            for model_id, w in zip(_ALL_MODEL_IDS, ens_weights or []):
+                try:
+                    weights[model_id] = round(float(w), 1)
+                except (TypeError, ValueError):
+                    weights[model_id] = 1.0
+            try:
+                min_agree_val = int(ens_min_agree)
+            except (TypeError, ValueError):
+                min_agree_val = _MODEL.ENSEMBLE_MIN_AGREE
+            ensemble_config = {
+                "enabled_models": [m for m, on
+                                   in zip(_ALL_MODEL_IDS, ens_members) if on],
+                "weights": weights,
+                "method": ens_method or _MODEL.ENSEMBLE_DEFAULT_METHOD,
+                "min_agree": min_agree_val,
+            }
+    except Exception as e:
+        return _abort_run(e)
 
     try:
         from services.prediction_service import get_prediction_service
         from services.stock_data import fetch_stock_data as fetch_ohlcv
+
+        from services import progress_service as _prog
 
         service = get_prediction_service()
         results = {}
@@ -2872,6 +3066,12 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
                 from services.news_service import fetch_historical_av_news
                 from config import MODEL
                 logger.info("Fetching historical global news for training")
+                # Longest silent phase on a cold cache — announce its scope
+                # instead of letting the feed go dark for minutes.
+                _prog.emit("news", f"Fetching historical news for training "
+                                   f"(up to {len(symbols)} symbols × "
+                                   f"{MODEL.NEWS_LOOKBACK_MONTHS} months — can "
+                                   f"take minutes on first run)…")
                 historical_global_news = fetch_historical_av_news(
                     "", months=MODEL.NEWS_LOOKBACK_MONTHS,
                 )
@@ -2883,17 +3083,39 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
             except Exception as e:
                 logger.warning(f"Historical global news fetch failed: {e}")
 
+        # Resolve every symbol's frame BEFORE the model loop, so the run's
+        # price inputs land as ONE data_load event whatever their origin —
+        # the browser session store (the normal warm-watchlist case, which
+        # previously produced no data_load at all), the server gap-fill, or
+        # a fetch. The model loop then consumes these frames; nothing is
+        # parsed twice.
+        from services import usage_service as _usage
+        frames: dict[str, pd.DataFrame] = {}
+        price_inputs: dict[str, dict] = {}
         for symbol in symbols:
             sym_data = stock_data.get(symbol, {})
             prices_json = sym_data.get("prices")
             if not prices_json:
+                # Named, not just logged — "Stored 0 predictions" must never
+                # be the only clue a symbol had no data.
+                _prog.emit("error", f"{symbol}: skipped — no price data "
+                                    "available")
+                price_inputs[symbol] = {"bars": 0, "error": "no price data"}
                 continue
 
             try:
                 df = pd.read_json(StringIO(prices_json))
                 if df.empty:
+                    _prog.emit("error", f"{symbol}: skipped — no price data "
+                                        "available")
+                    price_inputs[symbol] = {"bars": 0,
+                                            "error": "no price data"}
                     continue
             except Exception:
+                _prog.emit("error", f"{symbol}: skipped — price data "
+                                    "unreadable")
+                price_inputs[symbol] = {"bars": 0,
+                                        "error": "price data unreadable"}
                 continue
 
             # Truncate OHLCV to the cutoff on EVERY run, not just backtests.
@@ -2901,14 +3123,40 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
             # bar is today's partial intraday print.
             if "Date" in df.columns:
                 df = df[df["Date"] <= str(predict_date)]
+                dates = pd.to_datetime(df["Date"]) if len(df) else None
             else:
                 df = df[df.index <= str(predict_date)]
+                dates = df.index if len(df) else None
             if df.empty:
                 logger.warning(
                     f"{symbol}: no data available as of {predict_date}"
                 )
+                _prog.emit("error", f"{symbol}: skipped — no price data "
+                                    f"as of {predict_date}")
+                price_inputs[symbol] = {
+                    "bars": 0, "error": f"no data as of {predict_date}"}
                 continue
 
+            frames[symbol] = df
+            price_inputs[symbol] = {
+                "bars": len(df),
+                "start": str(dates.min())[:10],
+                "end": str(dates.max())[:10],
+                # Entries the gap-fill created carry their own source stamp;
+                # everything else arrived through the browser session store.
+                "source": sym_data.get("source") or "session-store",
+            }
+
+        # No `period` here on purpose: the store's period label is the UI
+        # DISPLAY window (a "1D" chart still ships months of daily bars), so
+        # recording it would mislabel the data. start/end per symbol are the
+        # truth about what was consumed.
+        _prog.emit("action",
+                   f"Price inputs resolved: {len(frames)}/{len(symbols)} "
+                   f"symbols (cutoff {predict_date})",
+                   payload={"event": "data_load", "by_symbol": price_inputs})
+
+        for symbol, df in frames.items():
             sym_news = []
             if news_data and news_data.get("articles_by_symbol"):
                 sym_news = news_data["articles_by_symbol"].get(symbol) or []
@@ -2945,23 +3193,29 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
                 f"{symbol}: running {selected_models} ({mode}, "
                 f"date={predict_date})"
             )
-            from services import progress_service as _prog
             _prog.emit("models", f"{symbol}: running {len(selected_models)} models "
                                  f"({mode}, as-of {predict_date})")
 
-            new_results = service.predict_symbol_no_store(
-                symbol, df, spy_df=spy_df,
-                news=sym_news,
-                ensemble_config=ensemble_config,
-                models_to_run=selected_models,
-                run_ensemble=bool(run_ensemble),
-                historical_av_news=historical_av_news,
-                historical_global_news=historical_global_news,
-                # Always the cutoff, live or backtest — downstream slicing has
-                # to stop at the previous trading day either way.
-                as_of=str(predict_date),
-                **research_kwargs,
-            )
+            # The only LLM call under here is the research report — label it
+            # so its trace/spend land against this symbol (this runs in the
+            # background subprocess, so the context must be set HERE, not in
+            # the server process; mirrors analysis_runner.run_predictions).
+            with _usage.track("research", symbol=symbol,
+                              trade_date=str(predict_date),
+                              section=f"research:{symbol}"):
+                new_results = service.predict_symbol_no_store(
+                    symbol, df, spy_df=spy_df,
+                    news=sym_news,
+                    ensemble_config=ensemble_config,
+                    models_to_run=selected_models,
+                    run_ensemble=bool(run_ensemble),
+                    historical_av_news=historical_av_news,
+                    historical_global_news=historical_global_news,
+                    # Always the cutoff, live or backtest — downstream slicing
+                    # has to stop at the previous trading day either way.
+                    as_of=str(predict_date),
+                    **research_kwargs,
+                )
 
             results[symbol] = new_results
             decisions = {m: r.get("decision") for m, r in new_results.items()
@@ -2969,28 +3223,49 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
             _prog.emit("models", f"{symbol}: " + ", ".join(
                 f"{m}={d}" for m, d in decisions.items()))
 
+            # One summary line per symbol when anything failed or was
+            # skipped — the decisions line above only lists the survivors.
+            # Abstentions (a deliberate no-call, e.g. DeBERTa with no
+            # relevant news) are not failures and stay out of it.
+            failed = {
+                m: (r.get("error") or "")
+                for m, r in new_results.items()
+                if isinstance(r, dict) and r.get("error")
+                and not (r.get("details") or {}).get("abstained")
+            }
+            if failed:
+                ran = len(new_results) - len(failed)
+                _prog.emit("error",
+                           f"{symbol}: {ran} of {len(new_results)} models "
+                           "ran — " + ", ".join(
+                               f"{m} failed ({err[:60]})"
+                               for m, err in failed.items()))
+
         # Attach metadata so persist_predictions knows the date, and so the
         # report can state the target session rather than infer one.
         results["_meta"] = {
             "predict_date": predict_date.isoformat(),   # data cutoff
             "target_date": target_date.isoformat(),     # session being predicted
             "is_backtest": is_backtest,
+            # Ties this store to the confirm click that produced it, so the
+            # synthesis stage can pair it with the same click's AI report.
+            "run_seq": n_clicks,
         }
 
         return results
 
     except Exception as e:
-        logger.error(f"Model signal generation error: {e}")
-        return {}
+        return _abort_run(e)
 
 
 @callback(
     Output("prediction-store-status", "data"),
     Input("model-signals-store", "data"),
     State("full-analysis-requested", "data"),
+    State("ai-analysis-store", "data"),
     prevent_initial_call=True,
 )
-def persist_predictions(signals, fa_requested):
+def persist_predictions(signals, fa_requested, ai_analysis):
     """Persist model predictions to Postgres in the server process.
 
     This callback receives the serializable dict from model-signals-store
@@ -3000,6 +3275,17 @@ def persist_predictions(signals, fa_requested):
     """
     if not signals:
         raise PreventUpdate
+    # The worker's output is in hand — its pid no longer stands for the
+    # run's health, alive or not (the watchdog must not flag a subprocess
+    # that exited after delivering).
+    from services import progress_service as _prog_pid
+    _prog_pid.clear_run_pid()
+    if signals.get("_run_failed"):
+        # The background handler already emitted the failure and finished
+        # the run — pass a failed status through so the pages listening on
+        # this store still refresh, instead of pretending "Stored 0".
+        return {"failed": signals["_run_failed"], "count": 0,
+                "stored_at": str(datetime.now())}
 
     meta = signals.pop("_meta", {})
     predict_date_str = meta.get("predict_date")
@@ -3050,8 +3336,14 @@ def persist_predictions(signals, fa_requested):
         invalidate_memo()
         if not fa_requested:
             prog.finish_run(f"Predictions complete — {stored} stored")
+        elif ((ai_analysis or {}).get("failed")
+              and (ai_analysis or {}).get("run_seq") == meta.get("run_seq")):
+            # This run's report already failed: no synthesis is coming, so
+            # don't announce a handoff that never happens. The synthesis
+            # callback sees the same store pair and closes the run.
+            pass
         else:
-            prog.emit("luna", "Handing off to recommendation synthesis (Luna)…")
+            prog.emit("luna", "Handing off to recommendation synthesis…")
 
         return {
             "stored_at": str(datetime.now()),
@@ -3063,7 +3355,16 @@ def persist_predictions(signals, fa_requested):
 
     except Exception as e:
         logger.error(f"Prediction persistence error: {e}")
-        return {"error": str(e)}
+        from services import progress_service as prog
+        prog.emit("error", f"Prediction storage failed: {str(e)[:200]}")
+        if not fa_requested:
+            prog.finish_run("Predictions finished with errors — storage "
+                            "failed")
+        else:
+            # The signals are still in the store, so synthesis can proceed
+            # and owns the finish; only the persisted rows are missing.
+            prog.emit("luna", "Handing off to recommendation synthesis…")
+        return {"error": str(e), "stored_at": str(datetime.now())}
 
 
 # =============================================================================
@@ -3133,8 +3434,14 @@ def evaluate_predictions_now(n_clicks):
     Input("prediction-store-status", "data"),
     Input("download-report", "data"),
     Input("history-eval-status", "data"),
+    # A report-only run never touches prediction-store-status, so reload
+    # when the report itself lands and when a recommendation run persists —
+    # otherwise a fresh report only appears after re-navigating.
+    Input("ai-analysis-store", "data"),
+    Input("recommendations-store", "data"),
 )
-def load_report_history(symbols, _prediction_status, _download_done, _eval_status):
+def load_report_history(symbols, _prediction_status, _download_done,
+                        _eval_status, _ai_analysis, _recommendations):
     """Load all historical data: reports, predictions, recommendations, TradingAgents."""
     return fetch_report_history(symbols)
 
@@ -3235,10 +3542,14 @@ _PROGRESS_POLL_IDLE_MS = 10_000
     Output("progress-count", "children"),
     Output("progress-header-icon", "children"),
     Output("progress-interval", "interval"),
+    Output("progress-snap-store", "data"),
+    Output("progress-fp-store", "data"),
     Input("progress-interval", "n_intervals"),
     State("progress-interval", "interval"),
+    State("progress-snap-store", "data"),
+    State("progress-fp-store", "data"),
 )
-def render_progress_panel(_n, _current_interval):
+def render_progress_panel(_n, _current_interval, last_snap, last_fp):
     """Live activity feed for pipeline runs.
 
     Streams events emitted by every stage (including the background model
@@ -3247,15 +3558,44 @@ def render_progress_panel(_n, _current_interval):
     """
     from services import progress_service as prog
 
+    # Watchdog first: a run whose worker process died (observed: torch/MPS
+    # native crash with no traceback) or that stopped emitting must become a
+    # visible failure on this very tick, not an eternal spinner. Cheap when
+    # idle (one diskcache read); emits + closes the run at most once.
+    prog.watchdog_check()
+
     feed = prog.get_feed()
     events = feed.get("events") or []
-    poll = (_PROGRESS_POLL_ACTIVE_MS if feed.get("active")
+    active = bool(feed.get("active"))
+    poll = (_PROGRESS_POLL_ACTIVE_MS if active
             else _PROGRESS_POLL_IDLE_MS)
     # Writing interval on every tick restarts the timer and costs a DOM update
     # for no change; only send it when the rate actually changes.
     poll_out = poll if poll != _current_interval else dash.no_update
+    # Newest run boundary. Written only when a NEW run appears, so the
+    # clientside snap-to-newest fires once per run — a scroll offset parked
+    # on the previous run's lines otherwise hides the new run entirely.
+    snap = next((e.get("t") for e in reversed(events)
+                 if e.get("stage") == "run"), None)
+    snap_out = snap if (snap is not None and snap != last_snap) \
+        else dash.no_update
     if not events:
-        return dash.no_update, dash.no_update, dash.no_update, poll_out
+        return (dash.no_update, dash.no_update, dash.no_update, poll_out,
+                dash.no_update, dash.no_update)
+
+    # What this tick would render: the visible window's newest edge and
+    # size, the run boundary, and the active flag (drives the header icon).
+    # If none of it moved, rewrite nothing — rebuilding the ~45 row nodes
+    # every tick destroyed and recreated them all, which reset the feed's
+    # scroll position on every poll, idle included. Count + newest
+    # timestamp + boundary also cover the feed being swapped underneath us
+    # (cold-start rehydrate, another publisher process).
+    newest = events[-1]
+    fp = [len(events), newest.get("t"), newest.get("stage"),
+          newest.get("message"), snap, active]
+    if fp == last_fp:
+        return (dash.no_update, dash.no_update, dash.no_update, poll_out,
+                snap_out, dash.no_update)
 
     # No auto-hide: the panel is an audit log now, so it stays up until the
     # user closes it. (It previously vanished 5 minutes after a run finished.)
@@ -3265,20 +3605,59 @@ def render_progress_panel(_n, _current_interval):
         icon = _STAGE_ICONS.get(stage, "bi-dot")
         cls = "progress-line-error" if stage == "error" else (
             "progress-line-done" if stage == "done" else "")
+        # Rendered from the event's epoch, not its pre-formatted string: rows
+        # written by an older process carried a naive local clock while rows
+        # restored from Postgres carried UTC, so the same panel showed both.
         rows.append(html.Div(
             [
-                html.Span(e.get("ts", ""), className="progress-ts"),
+                html.Span(prog.event_clock(e), className="progress-ts",
+                          title=f"{prog.DISPLAY_TZ_LABEL} "
+                                f"({prog.DISPLAY_TZ.key})"),
                 html.I(className=f"bi {icon} progress-icon progress-icon-{stage}"),
                 html.Span(e.get("message", ""), className="progress-msg"),
             ],
             className=f"progress-line {cls}",
         ))
+    # No `key` props: dash-renderer keys child wrappers by tree path, not by
+    # the component's key, so re-rendered rows are recreated wholesale
+    # whatever we stamp on them. assets/feed_scroll_anchor.js preserves the
+    # reading position across those rewrites instead.
 
     header_icon = (html.Div(className="progress-spinner")
-                   if feed.get("active")
+                   if active
                    else html.I(className="bi bi-check-circle-fill progress-header-done"))
 
-    return rows, f"{len(events)} events", header_icon, poll_out
+    return (rows, f"{len(events)} events", header_icon, poll_out, snap_out,
+            fp)
+
+
+# Scroll the feed to the newest lines when a new run starts. Clientside:
+# scroll offsets are a DOM concern no server response can touch. Two gates:
+# the server writes the token only when a new run boundary appears, and the
+# browser remembers the last token it acted on — so even a rewrite of the
+# same token can never re-snap, and the inert sink output means nothing can
+# clear the store and re-arm the loop (outputting the store's own
+# clear_data did exactly that: token wiped → every tick saw "new" → the
+# user's scroll-away was reverted on each poll).
+clientside_callback(
+    """
+    function(token) {
+        var ns = window._quantnewsSnap = window._quantnewsSnap || {};
+        if (token == null || token === ns.last) {
+            return "";
+        }
+        ns.last = token;
+        var feed = document.getElementById("progress-feed-scroll");
+        if (feed && feed.lastElementChild) {
+            feed.lastElementChild.scrollIntoView({block: "nearest"});
+        }
+        return "";
+    }
+    """,
+    Output("progress-snap-sink", "children"),
+    Input("progress-snap-store", "data"),
+    prevent_initial_call=True,
+)
 
 
 @callback(
@@ -3343,6 +3722,101 @@ def apply_progress_panel_state(state):
         "bi bi-plus-lg" if mode == "minimised" else "bi bi-dash-lg",
         closed,
     )
+
+
+# =============================================================================
+# TRACE PAGE
+# =============================================================================
+
+
+@callback(
+    Output("trace-data-wrap", "children"),
+    Output("trace-models-wrap", "children"),
+    Output("trace-llm-wrap", "children"),
+    Output("trace-interval", "interval"),
+    Output("trace-run-select", "options"),
+    Output("trace-watermark-store", "data"),
+    # Page-local components: the callback only dispatches on /trace.
+    Input("trace-interval", "n_intervals", allow_optional=True),
+    Input("trace-run-select", "value", allow_optional=True),
+    State("trace-watermark-store", "data", allow_optional=True),
+    prevent_initial_call=True,
+)
+def render_trace_view(_n, run_id, wm):
+    """Keep the Trace page current for the selected run.
+
+    Incremental on purpose: each tick asks only for the run's newest row ids
+    (indexed max() per table) and rewrites a section ONLY when its watermark
+    moved — the Data/Models groups follow activity_log, the LLM group follows
+    llm_traces, so streaming events cannot wipe an expanded prompt body.
+    Poll rate mirrors the progress panel: fast while the selected run is the
+    live one, idle for historical runs.
+    """
+    from services import progress_service as prog
+    from services import trace_service
+
+    wm = dict(wm or {})
+    marks = (trace_service.run_watermarks(run_id) if run_id
+             else {"events": 0, "traces": 0})
+
+    selection_changed = (ctx.triggered_id == "trace-run-select"
+                         or wm.get("run_id") != run_id)
+    events_moved = selection_changed or marks["events"] != wm.get("events")
+    traces_moved = selection_changed or marks["traces"] != wm.get("traces")
+
+    feed = prog.get_feed()
+    active = bool(feed.get("active"))
+    live_run = prog.current_run_id()
+    poll = (trace_page.POLL_ACTIVE_MS if active and run_id == live_run
+            else trace_page.POLL_IDLE_MS)
+    poll_out = poll if poll != wm.get("poll") else dash.no_update
+
+    # Refresh the selector's OPTIONS (never its value — an explicitly picked
+    # historical run stays picked) when the run list actually changed: a new
+    # run boundary landed, or the live flag flipped (a listed run's status
+    # label just changed). Both probes are cheap; the 50-run listing query
+    # runs only on those transitions.
+    known = wm.get("runs") or []
+    run_marker = trace_service.latest_run_marker()
+    options_out = dash.no_update
+    if (not known or run_marker != wm.get("run_marker")
+            or active != wm.get("active")):
+        runs = trace_page.list_trace_runs()
+        options_out = trace_page.run_options(runs)
+        known = [r["run_id"] for r in runs]
+
+    if not (events_moved or traces_moved) and poll_out is dash.no_update \
+            and options_out is dash.no_update:
+        raise PreventUpdate
+
+    return (
+        trace_page.build_data_section(run_id) if events_moved else dash.no_update,
+        trace_page.build_models_section(run_id) if events_moved else dash.no_update,
+        trace_page.build_llm_section(run_id) if traces_moved else dash.no_update,
+        poll_out,
+        options_out,
+        {"run_id": run_id, "events": marks["events"], "traces": marks["traces"],
+         "poll": poll, "active": active, "run_marker": run_marker,
+         "runs": known},
+    )
+
+
+@callback(
+    Output({"type": "trace-llm-body", "id": MATCH}, "children"),
+    Output({"type": "trace-llm-body", "id": MATCH}, "style"),
+    Input({"type": "trace-llm-expand", "id": MATCH}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def toggle_trace_llm_body(n_clicks):
+    """Fetch one call's prompt/response bodies on expand (and only then) —
+    the list query never selects the Text columns."""
+    if not n_clicks:
+        raise PreventUpdate
+    if n_clicks % 2 == 0:
+        return dash.no_update, {"display": "none"}
+    from services import trace_service
+    bodies = trace_service.get_llm_call_bodies(ctx.triggered_id["id"])
+    return trace_page.render_llm_bodies(bodies), {"display": "block"}
 
 
 # =============================================================================
@@ -3572,18 +4046,25 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
         logger.info("No research report body for %s", triggered)
         raise PreventUpdate
 
-    from models.single_agent import strip_epilogue
+    from models.single_agent import extract_confidence, render_report_markdown
+    from layouts.formatters import conviction_label, weight_label
 
-    conf_pct = int((report.get("confidence") or 0) * 100)
-    title = (f"{report.get('symbol', '?')} — {report.get('decision', '?')} "
-             f"({conf_pct}%) — {report.get('trade_date', '')}")
+    # The bare "(50%)" this used to print was the reliability weight, sitting
+    # unlabeled beside the report body's own conviction line. Both numbers are
+    # named now so a reader can tell which is which.
+    stated = extract_confidence(report.get("report_text") or "")
+    title = (f"{report.get('symbol', '?')} — {report.get('decision', '?')} · "
+             f"{conviction_label(stated)} · {weight_label(report.get('confidence'))}"
+             f" — {report.get('trade_date', '')}")
     from services import progress_service as prog
     prog.emit("action", f"Report viewed: {report.get('symbol', '?')} "
                         f"{report.get('trade_date', '')}")
     body = [
         html.Div(
             [
-                html.Span(f"Generated: {report.get('created_at', '')}",
+                # Was raw UTC with microseconds ("…14:37:42.473370+00:00"),
+                # which also showed tomorrow's date all evening.
+                html.Span(f"Generated: {prog.format_stamp(report.get('created_at'))}",
                           className="ta-accordion-meta"),
                 html.Span(f" | model: {report.get('model_name', '?')}",
                           className="ta-accordion-meta"),
@@ -3591,9 +4072,11 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
             style={"marginBottom": "8px"},
         ),
         dcc.Markdown(
-            # Machine-read epilogue is stripped for reading; the report keeps
-            # its own "Compiled by … Sources: …" footer for transparency.
-            strip_epilogue(report.get("report_text", "")),
+            # Machine-read epilogue is stripped for reading, and the verdict's
+            # field lines become list items so they render as discrete labelled
+            # lines instead of one folded paragraph. The report keeps its own
+            # "Compiled by … Sources: …" footer for transparency.
+            render_report_markdown(report.get("report_text", "")),
             className="ta-report-body",
             style={"fontSize": "0.85rem", "lineHeight": "1.6"},
         ),
@@ -3804,6 +4287,9 @@ def recompute_ensemble(ensemble_config, signals):
     updated = dict(signals)
 
     for symbol, model_results in updated.items():
+        # _meta / a failure marker are not per-symbol result dicts
+        if not isinstance(model_results, dict):
+            continue
         # Collect individual (non-ensemble) results
         other_results = {
             k: v for k, v in model_results.items() if k != "ensemble"
@@ -4303,8 +4789,14 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
     Async: fires on modal open, so the live vendor fetch runs in a worker
     thread instead of freezing the UI thread pool."""
     symbols = (run_symbols or {}).get("symbols") or []
-    if not is_open or not symbols:
+    if not is_open:
         raise PreventUpdate
+    if not symbols:
+        # Removing the last chip must clear the counts too — PreventUpdate
+        # here left the previous symbol's table on screen.
+        return html.Div("No symbols in this run — add one to preview "
+                        "article availability.",
+                        className="run-symbols-empty")
 
     from config import MODEL as _M
     from utils.trading_calendar import resolve_target_and_cutoff
@@ -4486,6 +4978,19 @@ def _run_source_options(watchlist, cohort_syms):
     Output("run-symbols-store", "data"),
     Output("run-symbols-source", "options"),
     Output("run-symbols-source", "value"),
+    Output("run-validation-msg", "children"),
+    Output("progress-panel-state", "data", allow_duplicate=True),
+    Output("run-started-toast", "is_open"),
+    Output("run-started-toast", "children"),
+    # Snap the panel's poll to the fast rate on confirm — waiting for a slow
+    # idle tick to notice the active flag cost ~an idle interval before the
+    # first run events rendered.
+    Output("progress-interval", "interval", allow_duplicate=True),
+    # The picker's default/max/holidays are baked into the layout at process
+    # start; a long-lived server would otherwise pin the dialog to launch day.
+    Output("run-date-picker", "date"),
+    Output("run-date-picker", "max_date_allowed"),
+    Output("run-date-picker", "disabled_days"),
     Input("run-analysis-btn", "n_clicks"),
     Input("reports-new-btn", "n_clicks", allow_optional=True),
     Input({"type": "new-report-btn", "symbol": ALL}, "n_clicks"),
@@ -4495,11 +5000,14 @@ def _run_source_options(watchlist, cohort_syms):
     State("selected-symbols", "data"),
     State("news-data-store", "data"),
     State("run-modal", "is_open"),
+    State("run-symbols-store", "data"),
+    State("run-scope", "value"),
+    State("progress-panel-state", "data"),
     prevent_initial_call=True,
 )
 def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                      confirm_clicks, stock_data, watchlist,
-                     news_data, is_open):
+                     news_data, is_open, run_store, run_scope, panel_state):
     """Open or close the single run dialog, preset by where it was opened.
 
     Two kinds of opener, deliberately: the toolbar button (the ONE global
@@ -4508,12 +5016,48 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     Reports page's New Report (scope=report, watchlist) and any per-symbol
     New-report button (scope=report, just that symbol). The old Home header
     duplicate, which carried no context at all, is gone.
+
+    Confirm also owns the immediate acknowledgement: force-open the activity
+    panel (a user who once closed it otherwise gets zero feedback) and toast
+    where the results will land. An empty symbol set keeps the dialog open
+    with an inline message instead of silently no-opping — every downstream
+    stage guards on the list being non-empty.
     """
     triggered = ctx.triggered_id
     no_sym_update = (dash.no_update,) * 3
+    # panel state + toast open/children + poll rate
+    no_feedback = (dash.no_update,) * 4
+    # date-picker date + max_date_allowed + disabled_days
+    no_picker = (dash.no_update,) * 3
 
-    if triggered in ("run-cancel-btn", "run-confirm-btn"):
-        return (False, dash.no_update, dash.no_update) + no_sym_update
+    if triggered == "run-cancel-btn":
+        return (False, dash.no_update, dash.no_update) + no_sym_update \
+            + ("",) + no_feedback + no_picker
+
+    if triggered == "run-confirm-btn":
+        symbols = (run_store or {}).get("symbols") or []
+        if not symbols:
+            return (dash.no_update,) * 6 \
+                + ("Add at least one symbol to run.",) + no_feedback \
+                + no_picker
+        panel = dict(panel_state or {})
+        panel.setdefault("mode", "normal")
+        panel["closed"] = False
+        # Mark the feed active NOW: the stage that calls start_run is a
+        # separate callback, and the fast tick below must not see an idle
+        # feed and drop straight back to the slow rate.
+        from services import progress_service as prog
+        prog.mark_run_pending()
+        scope = run_scope or "full"
+        toast_msg = {
+            "models": "Run started — predictions will appear on Home "
+                      "and Analyze.",
+            "report": "Report started — it will appear under Reports.",
+        }.get(scope, "Run started — predictions will appear on Home and "
+                     "Analyze, the report under Reports.")
+        return (False, dash.no_update, dash.no_update) + no_sym_update \
+            + ("", panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS) \
+            + no_picker
 
     is_context_btn = (isinstance(triggered, dict)
                       and triggered.get("type") == "new-report-btn")
@@ -4558,6 +5102,16 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         "watchlist": watchlist,
         "cohort": cohort_syms,
     }
+    picker = no_picker
+    try:
+        from utils.trading_calendar import (get_default_target_day,
+                                            non_trading_days)
+        target = get_default_target_day()
+        picker = (target.isoformat(), target.isoformat(),
+                  [d.isoformat()
+                   for d in non_trading_days("2020-01-01", target)])
+    except Exception as e:
+        logger.warning("Run dialog: could not refresh target session: %s", e)
     return (
         True,
         _run_data_summary(run_symbols, stock_data, news_data),
@@ -4565,7 +5119,8 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         store,
         _run_source_options(watchlist, cohort_syms),
         source,
-    )
+        "",
+    ) + no_feedback + picker
 
 
 @callback(
@@ -4718,14 +5273,60 @@ def apply_run_scope(scope):
 
 
 @callback(
+    Output("run-preflight", "children"),
+    Input("run-modal", "is_open"),
+    Input("run-scope", "value"),
+    Input("run-symbols-store", "data"),
+    Input({"type": "run-model-check", "model": ALL}, "value"),
+    Input("run-model", "value"),
+    Input("run-recs", "value"),
+    Input("run-recs-model", "value"),
+)
+def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
+                  recs_basis, recs_model):
+    """Name what this run needs and cannot reach, before it is started.
+
+    A missing API key used to surface only as a stage failure minutes in, and
+    the dialog gave no idea how long a run would take.
+    """
+    from layouts.modals import run_preflight_children
+
+    if not is_open:
+        return dash.no_update
+    # Read the ids alongside the values instead of zipping against a
+    # hand-maintained order — a pattern-matching Input's ordering is Dash's to
+    # decide, and a silent mis-zip here would name the wrong models.
+    checks = next((entry for entry in ctx.inputs_list
+                   if isinstance(entry, list) and entry
+                   and entry[0].get("id", {}).get("type") == "run-model-check"),
+                  [])
+    selected = [c["id"]["model"] for c in checks if c.get("value")]
+    return run_preflight_children(
+        scope or "full",
+        (run_symbols or {}).get("symbols") or [],
+        selected,
+        report_model or "",
+        recs_basis or "auto",
+        recs_model or "",
+    )
+
+
+@callback(
     Output("full-analysis-requested", "data"),
     Input("run-confirm-btn", "n_clicks"),
     State("run-scope", "value"),
+    State("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-def set_full_analysis_flag(n_clicks, scope):
-    """Arm the synthesis stage, but only for a full-pipeline run."""
-    if n_clicks and (scope or "full") == "full":
+def set_full_analysis_flag(n_clicks, scope, run_symbols):
+    """Arm the synthesis stage, but only for a full-pipeline run.
+
+    An empty symbol set never arms: the run dialog rejects it inline and no
+    stage will fire, so an armed flag would just lie in wait for the next
+    unrelated store update.
+    """
+    if n_clicks and (scope or "full") == "full" \
+            and ((run_symbols or {}).get("symbols") or []):
         return True
     raise PreventUpdate
 
@@ -4739,6 +5340,9 @@ from services.analysis_runner import (  # noqa: E402
 
 @callback(
     Output("recommendations-store", "data"),
+    # Every terminal branch also disarms the flag — a stale armed flag made
+    # the NEXT run's stores look like a full run still in flight.
+    Output("full-analysis-requested", "data", allow_duplicate=True),
     Input("ai-analysis-store", "data"),
     Input("model-signals-store", "data"),
     State("full-analysis-requested", "data"),
@@ -4753,6 +5357,14 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     that asked for recommendations (recs_request on the store, carrying the
     evidence basis: research+signals / news+signals / signals).
 
+    A full run synthesizes exactly once, from BOTH of that click's stores:
+    the report lands first, and synthesizing from it alone ran Luna without
+    any model signals — and "finished" the run while the models were still
+    working. run_seq (stamped on the report and the signals _meta by the
+    same confirm click) pairs the two. Report-only payloads proceed without
+    waiting, but only on the report's own landing — a later models-only
+    run's signals must never resurrect a stale report's recs_request.
+
     Async: the ~1-minute Luna synthesis and the Postgres persist loop run in
     worker threads instead of pinning a callback slot.
     """
@@ -4760,34 +5372,73 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     if not requested and not basis:
         raise PreventUpdate
 
-    if not ai_analysis or ai_analysis.get("failed"):
-        raise PreventUpdate
-    basis = basis or "news+signals"  # Full Analysis default
-    symbols = (run_symbols or {}).get("symbols") or []
+    from services import progress_service as prog
 
-    valid_signals = {
-        k: v for k, v in (model_signals or {}).items()
-        if k != "_meta" and isinstance(v, dict)
-    }
-    if not valid_signals:
-        if basis == "signals":
-            # Predictions-only synthesis with no predictions is a no-op —
-            # say so instead of silently doing nothing.
-            from services import progress_service as _prog
-            _prog.emit("error", "Recommendations (predictions only) skipped — "
-                                "no model predictions in this session. Run Predict first.")
+    # A report-scope payload never gets model signals, so a lingering
+    # requested flag must not make it wait for them.
+    is_full_run = bool(requested) and (ai_analysis or {}).get("scope") != "report"
+    if is_full_run:
+        sig_meta = (model_signals or {}).get("_meta") or {}
+        run_seq = (ai_analysis or {}).get("run_seq")
+        if run_seq is None or run_seq != sig_meta.get("run_seq"):
             raise PreventUpdate
-        # Text-based bases can proceed without signals; Luna sees the gap.
-        valid_signals = {}
+        if (model_signals or {}).get("_run_failed"):
+            # The model stage crashed; its handler already closed the run.
+            return {"error": "Model run failed — recommendations skipped",
+                    "generated_at": datetime.now().isoformat()}, False
+    elif ctx.triggered_id != "ai-analysis-store":
+        # No full run armed for this click, so only the report's OWN landing
+        # may synthesize. Fresh signals from a models-only run must not be
+        # glued to whatever stale report (and its recs_request) still sits
+        # in the session store — that ran Luna right after a models-only
+        # "Predictions complete". No finish needed: persist_predictions
+        # already closed that run.
+        raise PreventUpdate
+
+    if not ai_analysis:
+        raise PreventUpdate
+    if ai_analysis.get("failed"):
+        if is_full_run:
+            # The report is a synthesis input; without it this run cannot
+            # produce recommendations. Close the run honestly.
+            prog.finish_run("Full Analysis finished with errors — report "
+                            "failed")
+            return {"error": "AI report failed — recommendations skipped",
+                    "generated_at": datetime.now().isoformat()}, False
+        # Report-only failures are closed by the report callback itself.
+        raise PreventUpdate
 
     # Recommendations explicitly turned off for this run: the Full Analysis
     # flow still sets the requested flag, so honor the store's opt-out marker
     # (and close the progress run once predictions have landed).
     if ai_analysis.get("recs_off"):
-        if requested and valid_signals:
-            from services import progress_service as _prog
-            _prog.finish_run("Full Analysis complete (recommendations off)")
+        if is_full_run:
+            prog.finish_run("Full Analysis complete (recommendations off)")
+            return dash.no_update, False
         raise PreventUpdate
+
+    basis = basis or "news+signals"  # Full Analysis default
+    symbols = (run_symbols or {}).get("symbols") or []
+
+    valid_signals = {
+        k: v for k, v in (model_signals or {}).items()
+        if k not in ("_meta", "_run_failed") and isinstance(v, dict)
+    }
+    if not valid_signals:
+        if basis == "signals":
+            # Predictions-only synthesis with no predictions is a no-op —
+            # say so instead of silently doing nothing.
+            prog.emit("error", "Recommendations (predictions only) skipped — "
+                               "no model predictions in this session. Run Predict first.")
+            if is_full_run:
+                prog.finish_run("Full Analysis finished with errors — "
+                                "no model predictions")
+                return dash.no_update, False
+            prog.finish_run("Report complete — recommendations skipped "
+                            "(no predictions this session)")
+            raise PreventUpdate
+        # Text-based bases can proceed without signals; Luna sees the gap.
+        valid_signals = {}
 
     # As-of date travels with the AI report (set by the Full Analysis picker)
     trade_date = (ai_analysis.get("as_of") or datetime.now().strftime("%Y-%m-%d"))[:10]
@@ -4797,17 +5448,49 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     if _s3_available:
         try:
             from services import persistence_service as ps
+            # Hash only the stable report content. The payload also carries
+            # per-click correlation keys (run_seq — re-stamped even on a
+            # cache-served report — and scope), the from_cache marker and a
+            # generation timestamp; feeding those in meant an identical
+            # repeat run could never hit the stored recommendation.
+            _volatile = ("run_seq", "scope", "from_cache", "generated_at")
             rec_data_hash = ps.compute_data_hash({
-                "ai_analysis": ai_analysis,
+                "ai_analysis": {k: v for k, v in ai_analysis.items()
+                                if k not in _volatile},
                 "model_signals": valid_signals,
                 "symbols": sorted(symbols or []),
             })
+            rec_cache_payload = {
+                "event": "cache",
+                "kind": "recommendation",
+                "input_data_hash": rec_data_hash,
+                "summary": {
+                    "trade_date": trade_date,
+                    "symbols": sorted(symbols or []),
+                    "signal_models": sorted({m for v in valid_signals.values()
+                                             for m in v
+                                             if not m.startswith("_")}),
+                    "report_generated_at": ai_analysis.get("generated_at"),
+                    "report_from_cache": bool(ai_analysis.get("from_cache")),
+                },
+            }
             cached = await asyncio.to_thread(
                 ps.get_cached_recommendation, trade_date, rec_data_hash)
             if cached:
                 logger.info("Recommendation cache hit (Postgres)")
                 cached["from_cache"] = True
-                return cached
+                # A cache-served run is still a completed run — without the
+                # finish the panel spinner spun forever on a success.
+                prog.emit("luna", "Recommendation cache hit — synthesis "
+                                  "skipped",
+                          payload={**rec_cache_payload, "outcome": "hit"})
+                prog.finish_run(
+                    "Full Analysis complete (recommendations from cache)"
+                    if is_full_run
+                    else "Report complete (recommendations from cache)")
+                return cached, False
+            prog.emit("luna", "Recommendation cache miss — synthesizing fresh",
+                      payload={**rec_cache_payload, "outcome": "miss"})
         except Exception as e:
             logger.debug(f"Recommendation cache check failed: {e}")
 
@@ -4822,25 +5505,32 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
             basis = "research+signals"
 
     logger.info("Both stores ready — generating recommendations")
-    from services import progress_service as prog
     from config import MODEL as _MODEL_CFG
-    prog.emit("luna", f"Luna ({_MODEL_CFG.RECOMMENDATIONS_MODEL}) synthesizing "
+    prog.emit("luna", f"Synthesis ({_MODEL_CFG.RECOMMENDATIONS_MODEL}) over "
                       f"{len(symbols or [])} symbols — reasoning may take a minute…")
     llm = get_llm()
-    _luna_t0 = time.time()
-    result = await asyncio.to_thread(
-        llm.generate_recommendations, ai_analysis, model_signals, symbols or [],
-        basis=basis,
-        model_override=ai_analysis.get("recs_model"))
-    _luna_elapsed = time.time() - _luna_t0
+    _synthesis_t0 = time.time()
+
+    def _synthesize():
+        from services import usage_service as _usage
+        with _usage.track("recommendations", trade_date=trade_date,
+                          section="recommendations"):
+            return llm.generate_recommendations(
+                ai_analysis, model_signals, symbols or [],
+                basis=basis,
+                model_override=ai_analysis.get("recs_model"))
+
+    result = await asyncio.to_thread(_synthesize)
+    _synthesis_elapsed = time.time() - _synthesis_t0
 
     if result:
         result["generated_at"] = datetime.now().isoformat()
         result["as_of"] = trade_date
         actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
-        prog.emit("luna", f"Luna finished in {_luna_elapsed:.0f}s — "
+        prog.emit("luna", f"Synthesis finished in {_synthesis_elapsed:.0f}s — "
                           + (", ".join(f"{s}={a}" for s, a in actions.items()) or "done"))
-        prog.finish_run("Full Analysis complete")
+        prog.finish_run("Full Analysis complete" if is_full_run
+                        else "Report complete")
 
         # Score the synthesis like any model: persist each per-symbol action
         # as a prediction under "recommendation_synthesis" so the existing
@@ -4897,12 +5587,13 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
 
         await asyncio.to_thread(_persist_all)
 
-        return result
+        return result, False
 
-    prog.emit("error", "Luna returned empty response — synthesis failed")
-    prog.finish_run("Full Analysis finished with errors")
+    prog.emit("error", "Synthesis model returned empty response — synthesis failed")
+    prog.finish_run(("Full Analysis" if is_full_run else "Report")
+                    + " finished with errors")
     return {"error": "Recommendations model unavailable or returned empty response",
-            "generated_at": datetime.now().isoformat()}
+            "generated_at": datetime.now().isoformat()}, False
 
 
 @callback(

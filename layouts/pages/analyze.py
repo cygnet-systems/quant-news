@@ -18,6 +18,9 @@ from layouts.components import (
     create_sentiment_breakdown,
     create_top_headlines,
 )
+from layouts.formatters import (
+    confidence_tooltip, conviction_label, weight_label,
+)
 from layouts.signal_components import create_signal_cards
 from layouts.strategy_components import create_strategy_section
 
@@ -117,7 +120,7 @@ def create_ai_loading_indicator() -> html.Div:
                 [
                     html.I(className="bi bi-file-text", style={"fontSize": "1.2rem", "color": "#17a2b8"}),
                     html.Span(
-                        'Run "AI Report" from the toolbar to generate insights',
+                        'Use "Run analysis" in the toolbar to generate insights',
                         className="loading-inline-text",
                         style={"color": "var(--text-secondary)"},
                     ),
@@ -868,8 +871,12 @@ def build_tab_content(
             article_count=len(articles),
             date_range=get_date_range(articles),
         )
-    elif articles:
-        # Show loading state while waiting for AI analysis
+    elif articles and not ai_failed:
+        # Awaiting-analysis banner. It already names the toolbar action, so the
+        # separate loading indicator below is suppressed for this state — the
+        # two together printed the same guidance sentence twice. A FAILED
+        # analysis is not "awaiting" anything, so the banner sits out and the
+        # failure indicator speaks alone.
         rec_banner = create_recommendation_banner(recommendation="LOADING")
     else:
         rec_banner = None
@@ -879,14 +886,19 @@ def build_tab_content(
 
     # -- Research Report — the verdict-first deep dive (either source) --
     if research.get("raw_response"):
-        from models.single_agent import strip_epilogue
+        from models.single_agent import extract_confidence, render_report_markdown
         r_dec = research.get("decision", "HOLD")
         r_cls = ("positive" if r_dec == "BUY"
                  else "negative" if r_dec == "SELL" else "neutral")
-        body = strip_epilogue(research["raw_response"])
+        # Verdict fields become list items here too — a single newline between
+        # them folds into one paragraph in every markdown renderer.
+        body = render_report_markdown(research["raw_response"])
+        r_stated = research.get("stated_conviction")
+        if r_stated is None:
+            r_stated = extract_confidence(research["raw_response"])
         # New reports end with their own "Compiled by …" sources footer; only
         # older persisted reports need the model named in the footnote.
-        footnote = "Saved to History → TradingAgents Reports (PDF available there)."
+        footnote = "Saved to Reports → Research Reports (PDF available there)."
         if "Compiled by" not in body and research.get("model"):
             footnote = (f"Model: {research['model']}. " + footnote)
         children.append(html.Div(
@@ -895,9 +907,14 @@ def build_tab_content(
                     [
                         html.I(className="bi bi-journal-richtext me-2"),
                         html.Span("Research Report", className="section-title mb-0"),
+                        # Both numbers, both named. The bare percentage that
+                        # used to sit here was the track-record weight and read
+                        # as the report's own confidence.
                         html.Span(
-                            f"{r_dec} · {research.get('confidence', 0):.0%}",
+                            f"{r_dec} · {conviction_label(r_stated)} · "
+                            f"{weight_label(research.get('confidence'))}",
                             className=f"research-verdict-badge {r_cls}",
+                            title=confidence_tooltip(),
                         ),
                     ],
                     className="research-report-header",
@@ -974,11 +991,11 @@ def build_tab_content(
                 className="research-report-footnote",
                 style={"marginTop": "-4px", "marginBottom": "8px"},
             ))
-    elif articles and not analysis:
-        if ai_failed:
-            children.append(create_ai_failure_indicator())
-        else:
-            children.append(create_ai_loading_indicator())
+    elif articles and not analysis and ai_failed:
+        # Only the failure case adds anything here: the awaiting-analysis case
+        # is already covered by the banner above, and running both repeated the
+        # same "Use Run analysis in the toolbar" sentence on the page.
+        children.append(create_ai_failure_indicator())
 
     # -- Watch Items / Company Thesis — from either tier (shallow JSON or the
     # research epilogue); rendered identically so there is ONE report style.
@@ -1261,16 +1278,8 @@ def create_context_panel() -> html.Div:
                 [
                     html.H2("Analysis", className="panel-main-title"),
                     html.Span(id="llm-status", className="llm-status-badge"),
-                    # Background prediction running indicator
-                    html.Span(
-                        [
-                            html.I(className="bi bi-gear-fill spinning-icon"),
-                            " Predicting...",
-                        ],
-                        id="prediction-running-indicator",
-                        className="prediction-running-badge",
-                        style={"display": "none"},
-                    ),
+                    # The "Predicting..." badge moved to the global topbar
+                    # (layouts/nav.py) so every route shows a running job.
                     # Hidden — keeps download_report_pdf callback wired
                     html.Button(id="download-report-btn", style={"display": "none"}),
                 ],

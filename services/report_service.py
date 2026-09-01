@@ -80,9 +80,12 @@ def _render_markdown_report(text: str) -> str:
     """
     import re
     import markdown as md
-    from models.single_agent import strip_epilogue
+    from models.single_agent import render_report_markdown
 
-    body = strip_epilogue(text or "")
+    # render_report_markdown, not strip_epilogue: it also turns the verdict's
+    # field lines into list items, which is what stops the whole verdict block
+    # collapsing into a single run-on paragraph here.
+    body = render_report_markdown(text or "")
     body = re.sub(
         r"(?m)^(?![ \t]*[-*+][ \t])(.*\S.*)\n([ \t]*[-*+][ \t])",
         r"\1\n\n\2",
@@ -226,7 +229,18 @@ def generate_ta_report_pdf(
     body_html = _render_markdown_report(report_text)
 
     epilogue_html = ""
-    ep_bits = []
+    # The two numbers lead the At a Glance panel, each named. A reader who
+    # opens only this panel must not have to guess which percentage is which.
+    ep_bits = [
+        "<p><strong>Conviction (this report's own):</strong> "
+        + (f"{stated:.2f}" if stated is not None else "not stated")
+        + " &nbsp;&nbsp; <strong>Track-record weight (measured):</strong> "
+        + ("unrated — not enough resolved calls yet"
+           if confidence in (None, 0.5) else f"{conf_pct}%")
+        + "</p><p class='meta'>Conviction is the report's own estimate and has "
+          "never been scored; the track-record weight is this model's measured "
+          "hit rate on resolved calls.</p>"
+    ]
     stance = structured.get("stance")
     if stance:
         ep_bits.append(f"<p><strong>Stance:</strong> {_esc(stance)}</p>")
@@ -272,8 +286,8 @@ def generate_ta_report_pdf(
     <h1>{symbol} TradingAgents Report</h1>
     <div class="subtitle">
         <strong>Decision:</strong> {decision}
-        {f'&nbsp;&nbsp;<strong>Stated conviction:</strong> {stated_pct}%' if stated_pct is not None else ''}
-        &nbsp;&nbsp;<strong>Reliability weight:</strong> {conf_pct}%{' (neutral — no track record yet)' if confidence == 0.5 else ''}
+        {f'&nbsp;&nbsp;<strong>Conviction (report&#39;s own):</strong> {stated_pct}%' if stated_pct is not None else ''}
+        &nbsp;&nbsp;<strong>Track-record weight (measured):</strong> {'unrated' if confidence in (None, 0.5) else f'{conf_pct}%'}
         &nbsp;&nbsp;<strong>Trade Date:</strong> {trade_date}
         {model_line}
     </div>

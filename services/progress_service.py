@@ -13,16 +13,41 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import diskcache
 
 logger = logging.getLogger(__name__)
+
+# One display zone for every activity timestamp. The feed used to mix two:
+# emit() formatted naive local wall-clock in whichever process was running,
+# while hydrate_from_db()/get_activity_runs() formatted the tz-aware UTC value
+# straight out of Postgres — so restored rows rendered ~4 hours off next to
+# live ones. Everything is stored UTC-aware and rendered here, in the market
+# zone this app already uses everywhere else (news_window, cache_service,
+# scheduler job defaults all spell it "US/Eastern").
+DISPLAY_TZ = ZoneInfo("US/Eastern")
+DISPLAY_TZ_LABEL = "ET"
 
 _CACHE_DIR = "cache/progress"
 _EVENTS_KEY = "events"
 _ACTIVE_KEY = "active"
 _RUN_ID_KEY = "run_id"
 _RUN_TITLE_KEY = "run_title"
+# Watchdog state: the OS pid executing the run's heavy stage (recorded by the
+# prediction subprocess, cleared when its results reach the server), when that
+# pid was first seen dead, and which run was already aborted (once-only guard).
+_RUN_PID_KEY = "run_pid"
+_PID_DEAD_SINCE_KEY = "run_pid_dead_since"
+_ABORTED_RUN_KEY = "run_aborted"
+
+# A recorded worker pid must stay dead this long before the run is declared
+# aborted — on a healthy run there is a window of a few seconds between the
+# subprocess exiting and persist_predictions (server-side) clearing the pid.
+WATCHDOG_PID_GRACE_S = 30
+# Fallback for runs with no recorded worker (report-only runs execute in the
+# server process): an active feed with no event this long is a stall.
+WATCHDOG_STALL_S = 15 * 60
 # In-memory window the panel renders. The full history lives in the
 # activity_log table; this is just how much we keep hot for polling.
 _MAX_EVENTS = 500
@@ -100,12 +125,22 @@ def current_run_id() -> str:
     return _run_identity()[0]
 
 
-def _write_audit(stage: str, message: str) -> None:
+def _write_audit(stage: str, message: str, payload: dict | None = None) -> None:
     """Append to the durable audit trail. Best-effort: the DB being down must
     never break a pipeline, and the diskcache feed still drives the panel."""
     try:
+        import json
+
         from db.models import ActivityLog
         from db.session import get_session
+
+        # JSON-clean the payload up front (dates, numpy scalars): losing a
+        # payload to a stray type must not lose the whole audit row.
+        if payload is not None:
+            try:
+                payload = json.loads(json.dumps(payload, default=str))
+            except (TypeError, ValueError):
+                payload = {"unserializable": str(payload)[:500]}
 
         run_id, run_title = _run_identity()
         with get_session() as session:
@@ -115,9 +150,26 @@ def _write_audit(stage: str, message: str) -> None:
                 run_title=run_title,
                 stage=stage,
                 message=message[:4000],
+                payload=payload,
             ))
     except Exception as e:
         logger.debug(f"activity_log write skipped: {e}")
+
+
+def mark_run_pending() -> None:
+    """Flip the feed active the moment a run is confirmed.
+
+    Confirming a run and the stage that calls start_run() are separate
+    callbacks (the model stage even lives in a spawned subprocess), so on a
+    cold idle panel the poller's next tick would still see active=False and
+    stay at the idle rate — the first events then took an idle interval to
+    appear. Publisher-only, like the rest of the live feed.
+    """
+    try:
+        if _enabled():
+            _get_cache().set(_ACTIVE_KEY, True)
+    except Exception as e:
+        logger.debug(f"progress mark_run_pending failed: {e}")
 
 
 def start_run(title: str) -> None:
@@ -139,11 +191,125 @@ def start_run(title: str) -> None:
             c.set(_RUN_ID_KEY, run_id)
             c.set(_RUN_TITLE_KEY, title)
             c.set(_ACTIVE_KEY, True)
+            # A previous run's worker pid must never be read as this run's.
+            c.set(_RUN_PID_KEY, None)
+            c.set(_PID_DEAD_SINCE_KEY, None)
         else:
             _local_run["id"], _local_run["title"] = run_id, title
         emit("run", title)
     except Exception as e:
         logger.debug(f"progress start_run failed: {e}")
+
+
+def record_run_pid() -> None:
+    """Publisher-only: remember which OS process executes the run's heavy
+    stage. The prediction subprocess calls this as its first act; the server
+    clears it (clear_run_pid) once that stage's results have arrived, so a
+    recorded-but-dead pid means the run lost its worker."""
+    try:
+        if _enabled():
+            c = _get_cache()
+            c.set(_RUN_PID_KEY, os.getpid())
+            c.set(_PID_DEAD_SINCE_KEY, None)
+    except Exception as e:
+        logger.debug(f"progress record_run_pid failed: {e}")
+
+
+def clear_run_pid() -> None:
+    """The recorded worker's output has been received (or the run is over) —
+    its pid no longer stands for the run's health."""
+    try:
+        if _enabled():
+            c = _get_cache()
+            c.set(_RUN_PID_KEY, None)
+            c.set(_PID_DEAD_SINCE_KEY, None)
+    except Exception as e:
+        logger.debug(f"progress clear_run_pid failed: {e}")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while the process exists and is not a zombie (a died spawn child
+    can linger as a zombie until its parent reaps it — that is dead)."""
+    try:
+        import psutil
+        p = psutil.Process(int(pid))
+        return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+    except Exception:
+        return False
+
+
+def watchdog_check() -> bool:
+    """Close a run whose worker died (or that stopped emitting) as a failure.
+
+    Called from the server's progress poll. Two detections, exactly once per
+    run (the aborted-run mark guards re-emission):
+
+    * A recorded worker pid that has stayed dead past WATCHDOG_PID_GRACE_S —
+      the grace covers the healthy seconds between the subprocess exiting
+      and persist_predictions clearing the pid.
+    * No recorded pid (report-only runs execute in the server process): no
+      feed event for WATCHDOG_STALL_S while the run claims to be active.
+
+    Returns True when it aborted a run on this call.
+    """
+    try:
+        if not _enabled():
+            return False
+        c = _get_cache()
+        if not c.get(_ACTIVE_KEY):
+            return False
+        run_id = c.get(_RUN_ID_KEY)
+        if not run_id or c.get(_ABORTED_RUN_KEY) == run_id:
+            return False
+
+        now = time.time()
+        pid = c.get(_RUN_PID_KEY)
+        if pid:
+            if _pid_alive(pid):
+                if c.get(_PID_DEAD_SINCE_KEY):
+                    c.set(_PID_DEAD_SINCE_KEY, None)
+                return False
+            dead_since = c.get(_PID_DEAD_SINCE_KEY)
+            if not dead_since:
+                c.set(_PID_DEAD_SINCE_KEY, now)
+                return False
+            if now - dead_since < WATCHDOG_PID_GRACE_S:
+                return False
+            message = ("Run aborted — the prediction process died "
+                       "unexpectedly (no results were stored)")
+            finish = "Run failed — prediction process died"
+        else:
+            events = c.get(_EVENTS_KEY) or []
+            if not events:
+                return False
+            # The run must actually be OPEN in the feed. active=True over a
+            # feed whose newest boundary is a completion is mark_run_pending
+            # arming the panel for a run whose start_run hasn't landed yet —
+            # aborting there would stamp a spurious failure on the PREVIOUS
+            # run during the subprocess spawn window.
+            for e in reversed(events):
+                if e.get("stage") == "done":
+                    return False
+                if e.get("stage") == "run":
+                    break
+            last_t = events[-1].get("t")
+            if not last_t or now - last_t < WATCHDOG_STALL_S:
+                return False
+            message = (f"Run aborted — no activity for "
+                       f"{int(WATCHDOG_STALL_S // 60)} minutes (stalled)")
+            finish = "Run failed — stalled with no activity"
+
+        # Mark BEFORE emitting: the abort's own events must not retrigger it.
+        c.set(_ABORTED_RUN_KEY, run_id)
+        # The abort otherwise lives only in the feed and activity_log; a
+        # post-mortem from the server log alone would show nothing at all.
+        logger.warning(f"Watchdog aborted run {run_id}: {message}")
+        emit("error", message)
+        finish_run(finish)
+        return True
+    except Exception as e:
+        logger.debug(f"progress watchdog check failed: {e}")
+        return False
 
 
 def get_activity_runs(limit_runs: int = 50, scope: str = "all",
@@ -226,19 +392,24 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all",
 
         by_run: dict[tuple[str, str], dict] = {}
         for r in rows:
+            # started/ended are handed to the page already in DISPLAY_TZ, so a
+            # renderer calling .strftime() on them cannot reintroduce the UTC
+            # skew this feed used to show.
+            stamp = to_display_tz(r.created_at)
             run = by_run.setdefault((r.user_id, r.run_id), {
                 "run_id": r.run_id,
                 "user_id": r.user_id,
                 "title": r.run_title or "Activity",
-                "started": r.created_at,
-                "ended": r.created_at,
+                "started": stamp,
+                "ended": stamp,
                 "events": [],
                 "errors": 0,
             })
-            run["ended"] = r.created_at
+            run["ended"] = stamp
             run["errors"] += 1 if r.stage == "error" else 0
             run["events"].append({
-                "ts": r.created_at.strftime("%H:%M:%S"),
+                "ts": format_clock(r.created_at),
+                "t": stamp.timestamp(),
                 "stage": r.stage,
                 "message": r.message,
             })
@@ -252,6 +423,64 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all",
     except Exception as e:
         logger.debug(f"activity_log run query skipped: {e}")
         return []
+
+
+def to_display_tz(value: "datetime | float | str | None") -> "datetime | None":
+    """Normalize an epoch, ISO string or datetime to a DISPLAY_TZ datetime.
+
+    A naive value is *assumed UTC* — the same rule services/news_window.py
+    documents, and correct for every naive value this app persists (Postgres
+    timestamptz round-trips aware; the few naive ones came from
+    ``datetime.utcnow()``-shaped code). Strings are accepted because several
+    cache accessors hand timestamps to the UI already str()-ed.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(DISPLAY_TZ)
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(DISPLAY_TZ)
+
+
+def format_stamp(value: "datetime | float | str | None",
+                 with_seconds: bool = False) -> str:
+    """"YYYY-MM-DD HH:MM ET" — for absolute timestamps shown to a reader.
+
+    Raw UTC was leaking into two surfaces with no marker at all, and late
+    evening ET rendered under tomorrow's DATE. Microseconds are always dropped:
+    nothing a reader does with a stamp needs them.
+    """
+    dt = to_display_tz(value)
+    if dt is None:
+        return ""
+    fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
+    return f"{dt.strftime(fmt)} {DISPLAY_TZ_LABEL}"
+
+
+def format_clock(value: "datetime | float | None") -> str:
+    """HH:MM:SS in DISPLAY_TZ, or "" — the feed's one timestamp formatter."""
+    dt = to_display_tz(value)
+    return dt.strftime("%H:%M:%S") if dt else ""
+
+
+def event_clock(event: dict) -> str:
+    """Render one feed event's time.
+
+    Prefers the epoch ``t`` every writer stores, so events already sitting in
+    the diskcache feed from an older process — whose pre-formatted ``ts``
+    string may be in either zone — still render in DISPLAY_TZ. Falls back to
+    the stored string only when there is no epoch to work from.
+    """
+    t = event.get("t")
+    if isinstance(t, (int, float)):
+        return format_clock(t)
+    return str(event.get("ts") or "")
 
 
 def hydrate_from_db(limit: int = _MAX_EVENTS) -> int:
@@ -280,8 +509,8 @@ def hydrate_from_db(limit: int = _MAX_EVENTS) -> int:
             ).scalars().all()
 
         events = [{
-            "ts": r.created_at.strftime("%H:%M:%S"),
-            "t": r.created_at.timestamp(),
+            "ts": format_clock(r.created_at),
+            "t": to_display_tz(r.created_at).timestamp(),
             "stage": r.stage,
             "message": r.message,
         } for r in reversed(rows)]
@@ -295,13 +524,18 @@ def hydrate_from_db(limit: int = _MAX_EVENTS) -> int:
         return 0
 
 
-def emit(stage: str, message: str) -> None:
+def emit(stage: str, message: str, payload: dict | None = None) -> None:
     """Append an event. Never raises — progress must not break the pipeline.
 
     The two sinks are gated separately. The diskcache feed is the live UI
     panel and stays publisher-only, so headless tools never interleave with a
     browser run; the durable audit trail always records, so a seed or backfill
     run outside the web process still shows up in the Activity Log.
+
+    ``payload`` is optional structured data behind the message (counts,
+    windows, hashes) for the Trace page. It goes to Postgres ONLY — the
+    diskcache feed is read whole on every panel tick under a transact lock,
+    so feed events must stay small; they carry at most a has_payload flag.
     """
     if _enabled():
         try:
@@ -312,17 +546,24 @@ def emit(stage: str, message: str) -> None:
             # concurrently.
             with c.transact():
                 events = c.get(_EVENTS_KEY) or []
-                events.append({
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                    "t": time.time(),
+                now = datetime.now(timezone.utc)
+                event = {
+                    # Both fields are UTC-derived: "t" is the epoch every
+                    # renderer prefers, "ts" is the same instant already
+                    # rendered in DISPLAY_TZ for anything reading it raw.
+                    "ts": format_clock(now),
+                    "t": now.timestamp(),
                     "stage": stage,
                     "message": message,
-                })
+                }
+                if payload is not None:
+                    event["has_payload"] = True
+                events.append(event)
                 c.set(_EVENTS_KEY, events[-_MAX_EVENTS:])
         except Exception as e:
             logger.debug(f"progress emit failed: {e}")
 
-    _write_audit(stage, message)
+    _write_audit(stage, message, payload)
 
 
 def finish_run(message: str = "Pipeline complete") -> None:
@@ -330,7 +571,11 @@ def finish_run(message: str = "Pipeline complete") -> None:
     try:
         emit("done", message)
         if _enabled():
-            _get_cache().set(_ACTIVE_KEY, False)
+            c = _get_cache()
+            c.set(_ACTIVE_KEY, False)
+            # Terminal state: the worker pid (if any) no longer matters.
+            c.set(_RUN_PID_KEY, None)
+            c.set(_PID_DEAD_SINCE_KEY, None)
     except Exception as e:
         logger.debug(f"progress finish_run failed: {e}")
 

@@ -85,8 +85,8 @@ def build_xlsx(
                 row["AI Confidence"] = ana.get("confidence")
             rec = ((recommendations or {}).get("by_symbol") or {}).get(sym) or {}
             if rec:
-                row["Luna Action"] = rec.get("action")
-                row["Luna Conviction"] = rec.get("conviction")
+                row["Synthesis Action"] = rec.get("action")
+                row["Synthesis Conviction"] = rec.get("conviction")
             summary_rows.append(row)
         if summary_rows:
             df = pd.DataFrame(summary_rows)
@@ -172,7 +172,7 @@ def build_xlsx(
             df.to_excel(writer, sheet_name="AI Analysis", index=False)
             _autosize(writer, "AI Analysis", df)
 
-        # --- Luna recommendations ---
+        # --- recommendation synthesis ---
         rec_rows = []
         for sym, rec in ((recommendations or {}).get("by_symbol") or {}).items():
             if not isinstance(rec, dict):

@@ -85,7 +85,14 @@ def trade_detail_table(trades: list[dict]) -> html.Table:
             html.Td(MODEL_DISPLAY.get(p.get("model_name", ""),
                                       p.get("model_name", ""))),
             html.Td(html.Span(decision, className=f"history-decision {dec_cls}")),
-            html.Td(f"{int(conf * 100)}%" if conf else "—", className="num"),
+            # The research arm stores a measured track-record weight here
+            # (0.5 = none earned yet); every other model stores its own raw
+            # score. An unlabeled "50%" read as a stated conviction.
+            html.Td(
+                ("unrated" if (p.get("model_name") == "trading_agents"
+                               and conf is not None and float(conf) == 0.5)
+                 else f"{int(conf * 100)}%" if conf else "—"),
+                className="num"),
             html.Td(html.Span(result, className=result_cls)),
             html.Td(html.Span(f"${pnl:+.2f}" if pnl is not None else "—",
                               className=f"num {pnl_cls}")),
@@ -96,8 +103,16 @@ def trade_detail_table(trades: list[dict]) -> html.Table:
     ordered.sort(key=lambda p: p.get("target_date")
                  or p.get("prediction_date") or "", reverse=True)
     return html.Table([
-        html.Thead(html.Tr([html.Th(h) for h in
-                            ["Date", "Model", "Signal", "Conf", "Result", "P&L"]])),
+        html.Thead(html.Tr([
+            html.Th("Date"), html.Th("Model"), html.Th("Signal"),
+            html.Th("Score",
+                    title="The model's own stored score — a measured "
+                          "track-record weight for TradingAgents (unrated "
+                          "until it has enough resolved calls), a raw "
+                          "uncalibrated probability for the others. Not the "
+                          "report's stated conviction."),
+            html.Th("Result"), html.Th("P&L"),
+        ])),
         html.Tbody([_row(p) for p in ordered]),
     ], className="history-data-table history-pred-table")
 

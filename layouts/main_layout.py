@@ -134,13 +134,30 @@ def create_layout() -> html.Div:
             dcc.Interval(id="progress-interval", interval=1500, disabled=False),
             dcc.Store(id="progress-panel-state", storage_type="local",
                       data={"mode": "normal", "closed": False}),
+            # Timestamp of the newest run boundary. Written only when a new
+            # run appears in the feed, so the clientside snap-to-newest fires
+            # once per run and never fights mid-run scrolling.
+            dcc.Store(id="progress-snap-store"),
+            # Inert target for the snap clientside callback. Its output must
+            # never touch the snap store itself: writing the store's
+            # clear_data wiped the token, so every tick saw "new" and
+            # re-snapped the scroll in a loop.
+            html.Div(id="progress-snap-sink", style={"display": "none"}),
+            # Fingerprint of the panel's last render (visible window +
+            # active flag). The panel rewrites its children only when this
+            # changes: rebuilding the ~45 row nodes on every tick destroyed
+            # the DOM nodes and reset the feed's scroll position each poll.
+            dcc.Store(id="progress-fp-store"),
             html.Div(
                 html.Div(
                     [
                         html.Div(
                             [
                                 html.Div(id="progress-header-icon"),
-                                html.Span("Pipeline Activity", className="progress-title"),
+                                html.Span("Pipeline Activity",
+                                          className="progress-title",
+                                          title="Timestamps are US/Eastern"),
+                                html.Span("ET", className="progress-count"),
                                 html.Span(id="progress-count", className="progress-count"),
                                 html.Div(
                                     [
@@ -189,13 +206,13 @@ def create_layout() -> html.Div:
             dcc.Store(id="recommendations-store", data={}),
             dcc.Store(id="full-analysis-requested", data=False),
 
-            # AI Report raw-data modal + download (the JSON is machine food —
-            # Luna and the renderers eat it — but it should still be
-            # inspectable and exportable on demand)
+            # Raw-data modal + download for the news analysis (the JSON is
+            # machine food — the synthesis step and the renderers eat it — but
+            # it should still be inspectable and exportable on demand)
             dcc.Download(id="download-ai-json"),
             dbc.Modal(
                 [
-                    dbc.ModalHeader(dbc.ModalTitle("AI Report — raw data"), close_button=True),
+                    dbc.ModalHeader(dbc.ModalTitle("Analysis — raw data"), close_button=True),
                     dbc.ModalBody(html.Pre(id="ai-json-body", className="ai-json-body")),
                     dbc.ModalFooter(
                         dbc.Button([html.I(className="bi bi-download me-1"), "Download .json"],
@@ -292,6 +309,22 @@ def create_layout() -> html.Div:
                 "",
                 id="history-eval-toast",
                 header="Prediction Evaluation",
+                icon="success",
+                is_open=False,
+                dismissable=True,
+                duration=6000,
+                style={
+                    "position": "fixed",
+                    "top": 16,
+                    "right": 16,
+                    "zIndex": 9999,
+                    "width": 340,
+                },
+            ),
+            dbc.Toast(
+                "",
+                id="run-started-toast",
+                header="Run started",
                 icon="success",
                 is_open=False,
                 dismissable=True,

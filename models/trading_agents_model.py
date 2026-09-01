@@ -120,12 +120,19 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 logger.debug("reflection context failed: %s", e)
 
+        # The one accuracy sentence the report is required to quote verbatim.
+        # Measured here (not phrased by the LLM) so a reader sees the platform's
+        # own evaluated hit rate next to the model's self-assessed conviction,
+        # and so a thin sample produces "not enough history" instead of a number.
+        track_record = self._track_record_line(as_of)
+
         agent = get_research_agent(model=model_name, backend=kwargs.get("backend"))
         result = agent.analyze(
             symbol,
             as_of,
             ohlcv_df=ohlcv_df,
             news=news,
+            track_record=track_record,
             # Per-block cap: one oversized block (usually news-heavy metrics)
             # must not push the later blocks (peers, SPY regime) past the
             # whole-string budget — that's how peers silently vanished.
@@ -195,6 +202,37 @@ class TradingAgentsModel(BaseModel):
                 "served_by_model": result.get("served_by_model", ""),
             },
         )
+
+    @staticmethod
+    def _track_record_line(as_of: str) -> str:
+        """The accuracy sentence for this run, or an explicit "can't say".
+
+        Prefers this model's own evaluated history and falls back to the
+        platform-wide number when the research arm alone is too thin — a
+        reader is better served by "all models, n=140" than by silence. Both
+        are bounded to `as_of` so a historical run cannot quote a rate
+        measured on sessions it has not reached.
+        """
+        try:
+            from services import calibration_service as cal
+            own = cal.evaluated_hit_rate("trading_agents", days=90, as_of=as_of)
+            if own["hit_rate"] is not None:
+                return cal.track_record_sentence("trading_agents", days=90,
+                                                 as_of=as_of)
+            everything = cal.evaluated_hit_rate(None, days=90, as_of=as_of)
+            if everything["hit_rate"] is not None:
+                return (f"This research model has only {own['n']} "
+                        f"scored non-HOLD calls in the last 90 days — too few to "
+                        f"quote. Across all models on this platform the figure is "
+                        f"{everything['hit_rate']:.0%} directionally correct "
+                        f"(n={everything['n']}, through {everything['through']}). "
+                        f"Coin-flip is 50%.")
+            # Neither is quotable — the "not enough history" wording lives in
+            # calibration_service so every surface says it the same way.
+            return cal.track_record_sentence("trading_agents", days=90, as_of=as_of)
+        except Exception as e:
+            logger.debug(f"track record lookup failed: {e}")
+            return ""
 
     @staticmethod
     def _grounded_confidence(

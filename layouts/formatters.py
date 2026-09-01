@@ -11,6 +11,43 @@ MODEL_DISPLAY = {
 }
 
 
+# Two unrelated numbers used to sit unlabeled inches apart on the same report:
+# a modal titled "MRAM — SELL (50%)" beside body text reading "CONFIDENCE:
+# 0.68". The 50% is the model's measured directional hit rate (0.5 = it has
+# not earned one yet — NOT the model saying it is 50% sure); the 0.68 is the
+# report's own stated conviction. Every surface that shows either one goes
+# through these so the wording can never drift apart again.
+
+def weight_label(confidence) -> str:
+    """Reader-facing label for the stored reliability weight."""
+    if confidence is None:
+        return "track-record weight — unrated"
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return "track-record weight — unrated"
+    if value == 0.5:
+        return "track-record weight — unrated"
+    return f"track-record weight {value:.0%}"
+
+
+def conviction_label(stated) -> str:
+    """Reader-facing label for the report's own stated conviction."""
+    if stated is None:
+        return "conviction — not stated"
+    try:
+        return f"conviction {float(stated):.2f}"
+    except (TypeError, ValueError):
+        return "conviction — not stated"
+
+
+def confidence_tooltip() -> str:
+    """One sentence explaining the pair, for `title=` attributes."""
+    return ("Track-record weight is this model's measured hit rate on resolved "
+            "calls (unrated until it has enough of them); conviction is what "
+            "the report itself claimed, which has never been scored.")
+
+
 def json_report_to_markdown(data: dict) -> str:
     """Convert an AI report JSON dict into a readable Markdown document."""
     lines = []

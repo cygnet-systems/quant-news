@@ -44,6 +44,8 @@ class ResearchAgent(Protocol):
         extra_context: str = "",
         use_news: bool = True,
         include_thesis: bool = False,
+        track_record: Optional[str] = None,
+        use_continuity: bool = True,
     ) -> dict[str, Any]:
         ...
 
@@ -91,6 +93,9 @@ class TradingAgentsAdapter:
         news: Optional[list] = None,
         extra_context: str = "",
         use_news: bool = True,
+        include_thesis: bool = False,
+        track_record: Optional[str] = None,
+        use_continuity: bool = True,
     ) -> dict[str, Any]:
         # When adopting a release, map onto its PUBLIC API here, e.g.:
         #   from tradingagents.graph.trading_graph import TradingAgentsGraph

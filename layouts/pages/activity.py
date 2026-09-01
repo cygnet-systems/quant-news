@@ -9,6 +9,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from layouts.history_sections import build_activity_section
+from services import progress_service as _prog
 
 # The vocabulary emit() actually uses. Filtering by stage is the difference
 # between "what did the system do" and "show me only the failures".
@@ -29,7 +30,10 @@ def _search_history_rows(searches: list[dict]) -> html.Div:
         )
     rows = []
     for s in searches:
-        last = (s.get("last_used_at") or "")[:16].replace("T", " ")
+        # last_used_at is a UTC isoformat string. Slicing it to 16 chars
+        # printed raw UTC with no zone marker, so a late-evening ET search
+        # showed under TOMORROW's date — a wrong day, not just a wrong hour.
+        last = _prog.format_stamp(s.get("last_used_at"))
         rows.append(html.Tr([
             html.Td(html.Button(
                 ", ".join(s["symbols"]),
@@ -46,7 +50,9 @@ def _search_history_rows(searches: list[dict]) -> html.Div:
             [
                 html.Thead(html.Tr([
                     html.Th("Symbols"), html.Th("Count"),
-                    html.Th("Times used"), html.Th("Last used"),
+                    html.Th("Times used"),
+                    html.Th("Last used", title=f"Times are "
+                                               f"{_prog.DISPLAY_TZ.key}"),
                 ])),
                 html.Tbody(rows),
             ],

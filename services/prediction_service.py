@@ -94,6 +94,34 @@ class PredictionService:
             f"ready: {self._registry.list_ready_models()}"
         )
 
+    @staticmethod
+    def _input_summary(ohlcv_df: pd.DataFrame, kwargs: dict) -> dict:
+        """What the model was fed, in numbers — the Trace page's Models rows.
+
+        Compact by construction: counts and flags only, never frames or
+        article bodies (the payload rides the activity_log, not the feed)."""
+        last_bar = None
+        try:
+            if "Date" in getattr(ohlcv_df, "columns", []):
+                last_bar = str(pd.to_datetime(ohlcv_df["Date"]).max().date())
+            elif len(ohlcv_df):
+                last_bar = str(pd.to_datetime(ohlcv_df.index.max()).date())
+        except Exception:
+            pass
+        summary = {
+            "bars": len(ohlcv_df) if ohlcv_df is not None else 0,
+            "last_bar": last_bar,
+            "news": len(kwargs.get("news") or []),
+            "as_of": kwargs.get("as_of"),
+            "has_spy": kwargs.get("spy_df") is not None,
+            "has_sector": kwargs.get("sector_df") is not None,
+            "historical_news_days": len(kwargs.get("historical_av_news") or {}),
+        }
+        for flag in ("research_model", "include_thesis", "evidence"):
+            if kwargs.get(flag) is not None:
+                summary[flag] = kwargs[flag]
+        return summary
+
     def _run_single_model(
         self,
         model_name: str,
@@ -106,7 +134,10 @@ class PredictionService:
         Every model in every phase funnels through here, so this is also where
         per-model progress is emitted -- the panel would otherwise show one
         line per symbol covering ~60s of work with no indication of which
-        model is running or what it decided.
+        model is running or what it decided. Each execution also emits a
+        structured ``model_run`` payload (input summary, outcome, elapsed ms)
+        and stamps ``duration_ms`` on the result dict so persistence can
+        store it.
         """
         from services import progress_service as prog
 
@@ -122,20 +153,53 @@ class PredictionService:
                 error=f"{model_name} not ready",
             ).to_dict()
 
+        input_summary = self._input_summary(ohlcv_df, kwargs)
+
+        def _record(result_dict: dict, elapsed_ms: int) -> dict:
+            result_dict["duration_ms"] = elapsed_ms
+            return {
+                "event": "model_run",
+                "symbol": symbol,
+                "model": model_name,
+                "decision": result_dict.get("decision"),
+                "confidence": result_dict.get("confidence"),
+                "up_probability": result_dict.get("up_probability"),
+                "duration_ms": elapsed_ms,
+                "error": result_dict.get("error"),
+                "abstained": bool((result_dict.get("details") or {})
+                                  .get("abstained")),
+                "input": input_summary,
+            }
+
         prog.emit("model", f"{symbol} · {model_name} running…")
         t0 = time.time()
         try:
             result = model.predict(symbol, ohlcv_df, **kwargs)
+            elapsed_ms = int((time.time() - t0) * 1000)
+            result_dict = result.to_dict()
+            payload = _record(result_dict, elapsed_ms)
+            if result.error:
+                # Models catch their own crashes and hand back an
+                # error-carrying HOLD — report the failure (or a deliberate
+                # abstention), never a "→ HOLD (0%)" that reads like a call.
+                if (result.details or {}).get("abstained"):
+                    prog.emit("model", f"{symbol} · {model_name} abstained: "
+                                       f"{result.error[:120]}", payload=payload)
+                else:
+                    prog.emit("error", f"{symbol} · {model_name} failed: "
+                                       f"{result.error[:120]}", payload=payload)
+                return model_name, result_dict
             prog.emit(
                 "model",
                 f"{symbol} · {model_name} → {result.decision} "
-                f"({result.confidence:.0%}) in {time.time() - t0:.1f}s",
+                f"({result.confidence:.0%}) in {elapsed_ms / 1000:.1f}s",
+                payload=payload,
             )
-            return model_name, result.to_dict()
+            return model_name, result_dict
         except Exception as e:
+            elapsed_ms = int((time.time() - t0) * 1000)
             logger.error(f"{model_name} failed for {symbol}: {e}")
-            prog.emit("error", f"{symbol} · {model_name} failed: {str(e)[:120]}")
-            return model_name, PredictionResult(
+            result_dict = PredictionResult(
                 model_name=model_name,
                 decision="HOLD",
                 confidence=0.0,
@@ -143,6 +207,9 @@ class PredictionService:
                 details={},
                 error=str(e),
             ).to_dict()
+            prog.emit("error", f"{symbol} · {model_name} failed: {str(e)[:120]}",
+                      payload=_record(result_dict, elapsed_ms))
+            return model_name, result_dict
 
     def predict_symbol_no_store(
         self,

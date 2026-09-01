@@ -137,6 +137,16 @@ def _visible(model_cls):
     return cond
 
 
+def _current_run_id():
+    """The pipeline run this write belongs to ("adhoc" outside a run —
+    same grouping the activity log and llm_usage use)."""
+    try:
+        from services import progress_service as prog
+        return prog.current_run_id()
+    except Exception:
+        return None
+
+
 class CacheService:
     """Postgres-backed caching service for stock data.
 
@@ -688,6 +698,10 @@ class CacheService:
                              or details.get("news_status")),
                 ensemble_method=details.get("method"),
                 input_data_hash=data_hash,
+                # The run that produced this row, and how long the model took
+                # — what lets the Trace page join a run to its predictions.
+                run_id=_current_run_id(),
+                duration_ms=result.get("duration_ms"),
                 created_at=datetime.now(timezone.utc),
                 # Re-storing a prediction id invalidates any prior evaluation:
                 # merge() used to keep old actual_close/was_correct/pnl from a
@@ -1072,6 +1086,7 @@ class CacheService:
                 model_name=model_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                run_id=_current_run_id(),
                 owner_uid=_current_uid(),
                 is_public=_default_public(),
             ))
@@ -1098,6 +1113,57 @@ class CacheService:
                 }
                 for r in rows
             ]
+
+    def get_prior_trading_agent_report(
+        self, symbol: str, as_of: str,
+        generated_before: "datetime | None" = None,
+        exclude_id: str | None = None,
+    ) -> dict | None:
+        """The stance a reader last saw for ``symbol``, or None.
+
+        Two separate bounds, because trade_date alone cannot do both jobs:
+
+        * ``trade_date <= as_of`` is the lookahead guard. A report for a LATER
+          session is never visible, so a walk-forward run can only ever see
+          stances for sessions that had already happened.
+        * ``created_at < generated_before`` is the self-exclusion guard, and it
+          is what makes a same-cutoff re-run work. Every report this app writes
+          carries trade_date = the run's DATA CUTOFF, and the run dialog caps
+          the target at the next session — so re-running a name today produces
+          a report with the identical trade_date as this morning's. A strict
+          ``<`` on trade_date silently hid the predecessor in exactly the case
+          a reader is checking continuity. Ordering by (trade_date, created_at)
+          descending then picks the genuinely most recent earlier stance.
+
+        ``exclude_id`` drops one specific row (a regeneration replacing a
+        known report) without relying on clock resolution.
+        """
+        from db.models import TradingAgentReport
+        with get_session() as session:
+            q = (
+                select(TradingAgentReport)
+                .where(TradingAgentReport.symbol == symbol.upper())
+                .where(TradingAgentReport.trade_date <= as_of)
+                .where(_visible(TradingAgentReport))
+            )
+            if generated_before is not None:
+                q = q.where(TradingAgentReport.created_at < generated_before)
+            if exclude_id:
+                q = q.where(TradingAgentReport.id != exclude_id)
+            r = session.execute(
+                q.order_by(TradingAgentReport.trade_date.desc(),
+                           TradingAgentReport.created_at.desc())
+                .limit(1)
+            ).scalars().first()
+            if r is None:
+                return None
+            return {
+                "id": r.id, "symbol": r.symbol,
+                "trade_date": str(r.trade_date),
+                "decision": r.decision, "confidence": r.confidence,
+                "report_text": r.report_text, "model_name": r.model_name,
+                "created_at": str(r.created_at),
+            }
 
     def latest_reports_by_symbol(self, symbols: list[str] | None = None) -> dict[str, dict]:
         """Newest research report per symbol, without the report body.
