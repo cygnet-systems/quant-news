@@ -188,6 +188,23 @@ class TestActiveRuns:
         rs.set_status(done, "done")
         assert [r["run_id"] for r in rs.active_runs()] == [a, b]
 
+    def test_scheduled_runs_never_lock_but_stay_on_the_pill(self, db):
+        # The daily job's row is owner None; if it counted as the lock,
+        # every anonymous session would be refused for the whole run.
+        sched = rs.create_run("scheduled", ["AAPL"], None, job_run_id=1)
+        mine = rs.create_run("scheduled", ["AAPL"], "u1", job_run_id=2)
+        assert rs.active_run_for(None) is None
+        assert rs.active_run_for("u1") is None
+        assert [r["run_id"] for r in rs.active_runs()] == [sched, mine]
+        manual = rs.create_run("manual", ["MSFT"], None)
+        assert rs.active_run_for(None)["run_id"] == manual
+
+    def test_visibility_is_recorded(self, db):
+        private = rs.create_run("scheduled", ["AAPL"], "u1", is_public=False)
+        default = rs.create_run("manual", ["AAPL"], "u1")
+        assert rs.get_run(private)["is_public"] is False
+        assert rs.get_run(default)["is_public"] is True
+
 
 class TestListRuns:
     def test_newest_first_with_filters(self, db):
@@ -219,13 +236,45 @@ class TestOrphans:
     """An active row nobody is working on is the owner's lock; the reaper
     must fail exactly those and leave live runs alone."""
 
-    def test_live_unlinked_run_is_never_an_orphan(self, db):
+    def test_live_unlinked_running_run_is_never_an_orphan(self, db):
         run_id = rs.create_run("manual", ["NVDA"], "u1")
+        rs.update_progress(run_id, "models", done=1, total=3)
         _age(run_id, 10 * 3600)
         run = rs.get_run(run_id)
         assert rs.orphan_reason(run, live=[run_id], max_age_s=60) is None
         assert rs.reap_orphans(live=[run_id], max_age_s=60) == []
-        assert rs.get_run(run_id)["status"] == "queued"
+        assert rs.get_run(run_id)["status"] == "running"
+
+    def test_live_queued_run_ages_out_on_the_stall_window(self, db, monkeypatch):
+        # Armed by the confirm (so the feed lists it) but no stage ever
+        # reported: nothing on the feed side can age it, so the row's own
+        # clock decides, on the feed's stall window, live list or not.
+        from datetime import timedelta
+        run_id = rs.create_run("manual", ["NVDA"], "u1")
+        run = rs.get_run(run_id)
+        t0 = rs._now()
+        stall = 15 * 60
+        assert rs._orphan_reason(run, [run_id], None, {},
+                                 t0 + timedelta(seconds=stall - 1),
+                                 queued_stall_s=stall) is None
+        reason = rs._orphan_reason(run, [run_id], None, {},
+                                   t0 + timedelta(seconds=stall + 1),
+                                   queued_stall_s=stall)
+        assert reason and "no stage started" in reason and "15-minute" in reason
+        # None disables it; -1 reads the feed's constant.
+        assert rs._orphan_reason(run, [run_id], None, {},
+                                 t0 + timedelta(days=1), queued_stall_s=None) is None
+        monkeypatch.setattr("services.progress_service.WATCHDOG_STALL_S", 30)
+        assert rs._orphan_reason(run, [run_id], None, {},
+                                 t0 + timedelta(seconds=31)) is not None
+
+        _age(run_id, 3600)
+        assert rs.reap_orphans(live=[run_id], max_age_s=None,
+                               queued_stall_s=None) == []
+        reaped = rs.reap_orphans(live=[run_id], max_age_s=None)
+        assert [r["run_id"] for r in reaped] == [run_id]
+        assert rs.get_run(run_id)["status"] == "failed"
+        assert rs.active_run_for("u1") is None
 
     def test_absent_run_is_an_orphan_only_past_the_age(self, db):
         young = rs.create_run("manual", ["NVDA"], "u1")

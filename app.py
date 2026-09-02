@@ -1801,14 +1801,30 @@ def _run_owner_uid():
 def _dispatch_run_id(run_store, dispatched) -> str:
     """The run a stage callback fires for; PreventUpdate when there is none.
 
-    The stages trigger on run-store rather than on the confirm click: the
-    click's own callbacks all fire at once, before the dispatcher could have
-    written the id. A store value the stages already handled (run-dispatched
-    carries the last one) or a run no longer in flight (a session store
-    restoring on reload) is not a new confirm.
+    The stages trigger on run-dispatch (a memory store the dispatcher
+    writes on confirm) rather than on the confirm click: the click's own
+    callbacks all fire at once, before the dispatcher could have written
+    the id. A value the stages already handled (run-dispatched carries the
+    last one) or a run no longer in flight is not a new confirm. A dict
+    with no run_id is a dispatcher bug, not an idle store, and is said so
+    on the feed; only None is silent.
     """
+    if run_store is None:
+        raise PreventUpdate
     run_id = (run_store or {}).get("run_id")
-    if not run_id or run_id == (dispatched or {}).get("run_id"):
+    if not run_id:
+        logger.warning("run dispatch ignored: store carries no run_id (%r)",
+                       run_store)
+        try:
+            from services import progress_service as prog
+            # Ad-hoc bucket, not the newest run in flight: that could be
+            # another user's feed.
+            prog.emit("error", "Run not started: the dispatcher wrote a run "
+                      "with no id; confirm again", run_id=prog.ADHOC_RUN_ID)
+        except Exception as e:
+            logger.debug("run dispatch feed line failed: %s", e)
+        raise PreventUpdate
+    if run_id == (dispatched or {}).get("run_id"):
         raise PreventUpdate
     try:
         from services import run_service
@@ -1819,6 +1835,33 @@ def _dispatch_run_id(run_store, dispatched) -> str:
     if row is not None and not row["active"]:
         raise PreventUpdate
     return run_id
+
+
+def _active_run_refusal():
+    """The validation line for a run this owner may not start because a
+    manual run of theirs is in flight, or None when the lock is free.
+
+    A row whose process is provably gone (nothing has reported on it past
+    the run ceiling) is failed here rather than refusing this owner
+    forever. Scheduled runs never lock: they belong to the scheduler, not
+    to whoever is signed in (an anonymous session would otherwise be
+    refused for the whole daily job), and the topbar pill is where they
+    show. Raises when the row cannot be read; the caller words that.
+    """
+    from services import progress_service as prog
+    from services import run_service
+
+    active = run_service.active_run_for(_run_owner_uid())
+    if active is not None and prog.fail_orphan(active):
+        active = None
+    if active is None:
+        return None
+    return [
+        "You have a run in progress. Cancel it to start another. ",
+        dbc.Button("Cancel run", id="run-cancel-active-btn",
+                   size="sm", outline=True, color="danger",
+                   className="ms-2"),
+    ]
 
 
 def _close_run(run_id, message: str, status: str = "done", error=None) -> None:
@@ -1841,14 +1884,14 @@ def _close_run(run_id, message: str, status: str = "done", error=None) -> None:
 
 @callback(
     Output("run-dispatched", "data"),
-    Input("run-store", "data"),
+    Input("run-dispatch", "data"),
     State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
 def mark_run_dispatched(run_store, dispatched):
     """Remember which run the stages were handed. Fires in the same batch as
-    the stages, so they still see the previous value; the next emission of
-    the same id (a reload restoring the session store) sees this one."""
+    the stages, so they still see the previous value; a second emission of
+    the same id sees this one."""
     run_id = (run_store or {}).get("run_id")
     if not run_id or run_id == (dispatched or {}).get("run_id"):
         raise PreventUpdate
@@ -1857,8 +1900,7 @@ def mark_run_dispatched(run_store, dispatched):
 
 @callback(
     Output("ai-analysis-store", "data"),
-    Input("run-store", "data"),
-    Input("ai-retry-btn", "n_clicks"),
+    Input("run-dispatch", "data"),
     State("run-scope", "value"),
     State("run-symbols-store", "data"),
     State("stock-data-store", "data"),
@@ -1874,7 +1916,7 @@ def mark_run_dispatched(run_store, dispatched):
     State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(run_store, retry_clicks, scope,
+async def generate_ai_analysis(run_store, scope,
                                run_symbols, stock_data, run_date, lookback,
                                max_articles_val, model, depth, recs,
                                recs_model, run_evidence, run_tools,
@@ -1894,18 +1936,14 @@ async def generate_ai_analysis(run_store, retry_clicks, scope,
     from functools import partial
 
     # The dispatcher's snapshot of scope and symbols wins over the dialog
-    # controls, which the user may have touched since confirming.
+    # controls, which the user may have touched since confirming. (A retry
+    # arrives here the same way: retry_run writes a fresh run to the same
+    # store, marked retry_of.)
     scope = (run_store or {}).get("scope") or scope or "full"
-    if ctx.triggered_id == "run-store":
-        run_id = _dispatch_run_id(run_store, dispatched)
-        # A models-only run has no report to build.
-        if scope == "models":
-            raise PreventUpdate
-    else:
-        # Retry re-runs the report under the run the dialog last started.
-        if not retry_clicks:
-            raise PreventUpdate
-        run_id = (run_store or {}).get("run_id")
+    run_id = _dispatch_run_id(run_store, dispatched)
+    # A models-only run has no report to build.
+    if scope == "models":
+        raise PreventUpdate
     # The run's symbol set comes from the dialog (watchlist / last cohort /
     # custom), not from the watchlist directly. The report does its own
     # point-in-time fetch per symbol; the browser's news store plays no part.
@@ -2086,8 +2124,9 @@ async def generate_ai_analysis(run_store, retry_clicks, scope,
         include_research=include_research, recs_mode=recs_mode,
         tools=tools_sel)
 
-    # Check persistent cache (Postgres + S3) before running LLM
-    if _s3_available and ctx.triggered_id != "ai-retry-btn":
+    # Check persistent cache (Postgres + S3) before running LLM. A retry
+    # exists because the cached (or failed) answer was not good enough.
+    if _s3_available and not (run_store or {}).get("retry_of"):
         try:
             from services import persistence_service as ps
             from services.analysis_runner import (
@@ -3023,7 +3062,7 @@ def update_period(clicks, current_period):
 
 @callback(
     Output("model-signals-store", "data"),
-    Input("run-store", "data"),
+    Input("run-dispatch", "data"),
     State("run-scope", "value"),
     State("stock-data-store", "data"),
     State("run-symbols-store", "data"),
@@ -3062,8 +3101,8 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
     as of that day. The selected date is stored in metadata for
     correct persistence.
 
-    The run id arrives as an argument (run-store is an Input, so its value
-    is serialised into this subprocess) and is asserted before any work:
+    The run id arrives as an argument (run-dispatch is an Input, so its
+    value is serialised into this subprocess) and is asserted before any work:
     the row it names is what the persisted predictions, the feed and the
     cancel path key on, so a stage without one must not run at all.
     """
@@ -3139,6 +3178,11 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
                         "weights)…",
               payload={"event": "run_process", "pid": os.getpid()})
         _prog.record_run_pid(run_id)
+        # Flip the row from queued to running now, not after the input
+        # fill and the model loads: a row still queued past the stall
+        # window is reaped as a run whose stage never started.
+        _prog.emit_progress("models", state="running", done=0,
+                            total=len(symbols), run_id=run_id)
 
         # The dialog's news window and cap govern the models too, the
         # sentiment and research models used to read the browser's news
@@ -5275,9 +5319,11 @@ def _run_source_options(watchlist, cohort_syms):
     Output("run-date-picker", "date"),
     Output("run-date-picker", "max_date_allowed"),
     Output("run-date-picker", "disabled_days"),
-    # The run record: written once per accepted confirm, and the ONLY
-    # trigger of the stage callbacks (see _dispatch_run_id).
+    # The run record, written once per accepted confirm: run-store keeps
+    # it for the session (the panel pins to it), run-dispatch is the memory
+    # copy the stage callbacks trigger on (see _dispatch_run_id).
     Output("run-store", "data"),
+    Output("run-dispatch", "data"),
     Input("run-analysis-btn", "n_clicks"),
     Input("reports-new-btn", "n_clicks", allow_optional=True),
     Input({"type": "new-report-btn", "symbol": ALL}, "n_clicks"),
@@ -5325,8 +5371,9 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
 
     Confirm is the run dispatcher: one run per owner at a time (a second
     confirm is refused with a Cancel button while one is in flight), then
-    the analysis_runs row is created and its id written to run-store, which
-    is what starts the stages. It also owns the immediate acknowledgement:
+    the analysis_runs row is created and its id written to run-store and
+    run-dispatch, which is what starts the stages. It also owns the
+    immediate acknowledgement:
     force-open the activity panel (a user who once closed it otherwise gets
     zero feedback) and toast the symbols and the estimate. An empty symbol
     set keeps the dialog open with an inline message instead of silently
@@ -5338,7 +5385,8 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     no_feedback = (dash.no_update,) * 4
     # date-picker date + max_date_allowed + disabled_days
     no_picker = (dash.no_update,) * 3
-    no_run = (dash.no_update,)
+    # run-store + run-dispatch
+    no_run = (dash.no_update,) * 2
 
     if triggered == "run-cancel-btn":
         return (False, dash.no_update, dash.no_update) + no_sym_update \
@@ -5359,25 +5407,12 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
 
         owner_uid = _run_owner_uid()
         try:
-            active = run_service.active_run_for(owner_uid)
+            refusal = _active_run_refusal()
         except Exception as e:
             logger.warning("Run dialog: could not check for an active run: %s", e)
             return refuse(f"Could not check for a run in progress: {str(e)[:120]}")
-        # A row whose process is provably gone (the scheduler finalized its
-        # job, or nothing has reported on it past the run ceiling) is
-        # failed here rather than refusing this owner forever.
-        if active is not None and prog.fail_orphan(active):
-            active = None
-        if active is not None:
-            if active.get("kind") == "scheduled":
-                return refuse("A scheduled run is in progress. Wait for it "
-                              "to finish before starting another.")
-            return refuse([
-                "You have a run in progress. Cancel it to start another. ",
-                dbc.Button("Cancel run", id="run-cancel-active-btn",
-                           size="sm", outline=True, color="danger",
-                           className="ms-2"),
-            ])
+        if refusal is not None:
+            return refuse(refusal)
 
         # The dialog's values as the row's config, and the estimate the
         # toast quotes; the same inputs the preflight line reads.
@@ -5446,7 +5481,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         }
         return (False, dash.no_update, dash.no_update) + no_sym_update \
             + ("", panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS) \
-            + no_picker + (run_data,)
+            + no_picker + (run_data, run_data)
 
     is_context_btn = (isinstance(triggered, dict)
                       and triggered.get("type") == "new-report-btn")
@@ -5538,18 +5573,11 @@ def cancel_active_run(n_clicks):
     from services import progress_service as prog
     from services import run_service
 
+    # Manual runs only: a scheduled run belongs to the scheduler, never
+    # locks this owner, and cannot be cancelled from here.
     active = run_service.active_run_for(_run_owner_uid())
     if active is None:
         return "No run in progress. You can start one.", dash.no_update
-    if active.get("kind") == "scheduled":
-        # The scheduler owns a live scheduled run; only one whose process is
-        # provably gone (its job finalized, or past the ceiling with nothing
-        # reporting) may be cleared from the dialog.
-        if prog.fail_orphan(active):
-            return ("Stale scheduled run cleared. You can start another.",
-                    dash.no_update)
-        return ("A scheduled run is in progress; it cannot be cancelled "
-                "from here.", dash.no_update)
     run_id = active["run_id"]
     pid = prog.terminate_run_worker(run_id)
     run_service.cancel_run(run_id)
@@ -5558,6 +5586,72 @@ def cancel_active_run(n_clicks):
               run_id=run_id)
     prog.finish_run("Cancelled", run_id=run_id)
     return "Run cancelled. You can start another.", False
+
+
+@callback(
+    Output("run-store", "data", allow_duplicate=True),
+    Output("run-dispatch", "data", allow_duplicate=True),
+    Output("run-modal", "is_open", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Input("ai-retry-btn", "n_clicks"),
+    State("run-store", "data"),
+    prevent_initial_call=True,
+)
+def retry_run(n_clicks, run_store):
+    """Retry the run this session last started, as a new run.
+
+    The old retry re-ran the report stage under the previous run's id,
+    which walked past the per-owner lock and reopened a row that had
+    already closed. A retry is a confirm with the previous run's config:
+    it is refused while this owner has a run in flight (the dialog opens
+    to show why, with the Cancel button), otherwise a fresh manual row is
+    created from the previous row's config and handed to the same stores
+    the confirm writes, so the normal dispatch path runs. The dict is
+    marked retry_of so the report stage skips its persistent cache.
+    """
+    if not n_clicks:
+        raise PreventUpdate
+    prev_id = (run_store or {}).get("run_id")
+    if not prev_id:
+        raise PreventUpdate
+    from services import progress_service as prog
+    from services import run_service
+
+    def refuse(message):
+        return dash.no_update, dash.no_update, True, message
+
+    try:
+        refusal = _active_run_refusal()
+    except Exception as e:
+        logger.warning("Retry: could not check for an active run: %s", e)
+        return refuse(f"Could not check for a run in progress: {str(e)[:120]}")
+    if refusal is not None:
+        return refuse(refusal)
+    prev = run_service.get_run(prev_id)
+    if prev is None:
+        logger.warning("Retry: run %s has no row to retry from", prev_id[:8])
+        return refuse("The last run's record is gone. Start it again from here.")
+    owner_uid = _run_owner_uid()
+    try:
+        run_id = run_service.create_run(
+            kind="manual", symbols=prev["symbols"], owner_uid=owner_uid,
+            preset=prev["preset"], config=prev["config"],
+            prediction_date=prev["prediction_date"],
+            target_date=prev["target_date"], estimate_s=prev["estimate_s"])
+    except Exception as e:
+        logger.error("Retry: run row not created: %s", e)
+        return refuse(f"Could not record the run: {str(e)[:120]}")
+    prog.mark_run_pending(run_id)
+    run_data = {
+        "run_id": run_id,
+        "started": datetime.now().isoformat(),
+        "scope": prev["preset"] or (run_store or {}).get("scope") or "full",
+        "symbols": list(prev["symbols"]),
+        "owner_uid": owner_uid,
+        "kind": "manual",
+        "retry_of": prev_id,
+    }
+    return run_data, run_data, dash.no_update, ""
 
 
 @callback(
@@ -5752,7 +5846,7 @@ def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
 
 @callback(
     Output("full-analysis-requested", "data"),
-    Input("run-store", "data"),
+    Input("run-dispatch", "data"),
     State("run-scope", "value"),
     State("run-symbols-store", "data"),
     State("run-dispatched", "data"),

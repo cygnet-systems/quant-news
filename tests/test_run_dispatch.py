@@ -1,13 +1,16 @@
-"""The confirm dispatcher and the run-store handoff to the stage callbacks.
+"""The confirm dispatcher and the run-dispatch handoff to the stage callbacks.
 
-One run per owner: a confirm while this owner has a run in flight is
-refused with a Cancel button and creates nothing; otherwise the
-analysis_runs row is created, the feed armed, and the id written to
-run-store, which is the only thing that starts the stages. The stages
-read that store through _dispatch_run_id, which must ignore a store value
-they already handled (a session store restoring on reload) and a run that
-is no longer in flight. Cancel terminates the recorded worker and leaves a
-sticky cancelled row behind that a late stage close cannot overturn.
+One run per owner: a confirm while this owner has a manual run in flight
+is refused with a Cancel button and creates nothing (a scheduled run never
+locks); otherwise the analysis_runs row is created, the feed armed, and
+the run dict written to run-store (session, the panel pins to it) and
+run-dispatch (memory), the latter being the only thing that starts the
+stages: a session store re-emits on every mount, and stages hanging off
+it re-fired on every page load. The stages read the dict through
+_dispatch_run_id, which must ignore a value they already handled and a
+run that is no longer in flight. Retry is a confirm with the previous
+run's config. Cancel terminates the recorded worker and leaves a sticky
+cancelled row behind that a late stage close cannot overturn.
 
 Importing app registers every callback; the decorated functions are still
 plain callables, so the confirm branch runs here with a stubbed ctx and
@@ -105,6 +108,7 @@ def confirm(db, feed, monkeypatch):
 # Output positions of toggle_run_modal.
 IS_OPEN, VALIDATION, PANEL, TOAST_OPEN, TOAST_MSG, INTERVAL, RUN_STORE = \
     0, 6, 7, 8, 9, 10, 14
+RUN_DISPATCH = 15
 
 
 class TestConfirmDispatch:
@@ -119,6 +123,8 @@ class TestConfirmDispatch:
         assert run_data["symbols"] == ["nvda", "AMD"]
         assert run_data["owner_uid"] == "u1"
         assert run_data["kind"] == "manual"
+        # The same dict lands in both stores in the one callback.
+        assert out[RUN_DISPATCH] == run_data
 
         row = rs.get_run(run_id)
         assert row["status"] == "queued"
@@ -146,6 +152,7 @@ class TestConfirmDispatch:
 
         assert out[IS_OPEN] is dash.no_update
         assert out[RUN_STORE] is dash.no_update
+        assert out[RUN_DISPATCH] is dash.no_update
         assert out[TOAST_OPEN] is dash.no_update
         msg = out[VALIDATION]
         assert isinstance(msg, list)
@@ -164,15 +171,19 @@ class TestConfirmDispatch:
         assert out[IS_OPEN] is False
         assert len(rs.list_runs()) == 2
 
-    def test_scheduled_run_refuses_without_cancel_button(self, confirm):
-        rs.create_run("scheduled", ["AAPL"], "u1")
+    def test_scheduled_run_never_refuses(self, confirm, monkeypatch):
+        # The daily job's row has owner None: it must not lock every
+        # anonymous session for the length of the run. The pill shows it.
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: None)
+        sched = rs.create_run("scheduled", ["AAPL"], None)
 
         out = confirm(["NVDA"])
 
-        assert out[IS_OPEN] is dash.no_update
-        assert isinstance(out[VALIDATION], str)
-        assert "scheduled run" in out[VALIDATION]
-        assert len(rs.list_runs()) == 1
+        assert out[IS_OPEN] is False
+        new_id = out[RUN_STORE]["run_id"]
+        assert new_id != sched
+        assert rs.get_run(sched)["status"] == "queued"
+        assert {r["run_id"] for r in rs.active_runs()} == {sched, new_id}
 
     def test_empty_symbols_refused_before_any_lookup(self, confirm):
         out = confirm([])
@@ -210,6 +221,22 @@ class TestStageDispatchGuard:
             app_module._dispatch_run_id({}, None)
         with pytest.raises(PreventUpdate):
             app_module._dispatch_run_id({"run_id": run_id}, {"run_id": run_id})
+
+    def test_dict_without_an_id_is_reported_not_swallowed(self, db, feed, caplog):
+        # None is the idle store; a dict with no run_id is a dispatcher
+        # bug and must leave a trace on the feed and in the log.
+        with pytest.raises(PreventUpdate):
+            app_module._dispatch_run_id(None, None)
+        # Nothing in flight: the idle feed is the rolling log, where an
+        # unnamed line lands.
+        assert feed.get_feed()["events"] == []
+        with caplog.at_level("WARNING", logger=app_module.logger.name):
+            with pytest.raises(PreventUpdate):
+                app_module._dispatch_run_id({"scope": "full"}, None)
+        assert any("no run_id" in r.message for r in caplog.records)
+        events = feed.get_feed()["events"]
+        assert events and events[-1]["stage"] == "error"
+        assert "no id" in events[-1]["message"]
 
     def test_fresh_store_dispatches_until_the_run_closes(self, db):
         run_id = rs.create_run("manual", ["NVDA"], "u1")
@@ -301,26 +328,21 @@ class TestCloseAndCancel:
         with pytest.raises(PreventUpdate):
             app_module.cancel_active_run(None)
 
-    def test_cancel_refuses_scheduled(self, db, feed, monkeypatch):
+    def test_cancel_never_sees_a_scheduled_run(self, db, feed, monkeypatch):
+        # Scheduled runs are the scheduler's: not this owner's lock, not
+        # cancellable from the dialog, live or orphaned alike (the reaper
+        # closes the orphan; the dialog has nothing to clear).
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: None)
-        run_id = rs.create_run("scheduled", ["NVDA"], None)
+        live = rs.create_run("scheduled", ["NVDA"], None)
+        feed.start_run("sched", run_id=live, kind="scheduled")
+        dead = rs.create_run("scheduled", ["AMD"], None,
+                             job_run_id=_finished_job_run("error"))
         msg, flag = app_module.cancel_active_run(1)
-        assert "scheduled" in msg
+        assert "No run in progress" in msg
         assert flag is dash.no_update
-        assert rs.get_run(run_id)["status"] == "queued"
-
-    def test_cancel_clears_a_scheduled_run_whose_job_finalized(self, db, feed, monkeypatch):
-        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: None)
-        run_id = rs.create_run("scheduled", ["NVDA"], None,
-                               job_run_id=_finished_job_run("error"))
-        feed.start_run("sched", run_id=run_id, kind="scheduled")
-
-        msg, _flag = app_module.cancel_active_run(1)
-
-        assert "Stale scheduled run cleared" in msg
-        assert rs.get_run(run_id)["status"] == "failed"
-        assert run_id not in feed._active_runs()
-        assert rs.active_run_for(None) is None
+        assert rs.get_run(live)["status"] == "queued"
+        assert rs.get_run(dead)["status"] == "queued"
+        assert live in feed._active_runs()
 
 
 class TestSynthesisFlag:
@@ -398,14 +420,14 @@ class TestReportStageProgress:
         run_id = rs.create_run("manual", ["NVDA"], "u1", preset="report")
         feed.mark_run_pending(run_id)
         monkeypatch.setattr(app_module, "ctx",
-                            SimpleNamespace(triggered_id="run-store"))
+                            SimpleNamespace(triggered_id="run-dispatch"))
         store = {"run_id": run_id, "scope": "report", "symbols": ["NVDA"],
                  "owner_uid": "u1", "kind": "manual"}
 
         # No news window from the dialog: the stage refuses before any
         # fetch, and the refusal must reach the row as a failed report.
         out = asyncio.run(app_module.generate_ai_analysis(
-            store, None, "report", None, {"NVDA": {"prices": "{}"}},
+            store, "report", None, {"NVDA": {"prices": "{}"}},
             "2026-09-03", None, 25, None, None, None, None, None, None, None))
 
         assert out["failed"] is True and out["run_id"] == run_id
@@ -418,11 +440,15 @@ class TestReportStageProgress:
 class TestOrphanEscape:
     """A row whose process is provably gone must not lock its owner out."""
 
-    def test_confirm_proceeds_past_an_orphaned_scheduled_row(self, confirm, db, feed,
-                                                            monkeypatch):
-        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: None)
-        orphan = rs.create_run("scheduled", ["NVDA"], None,
-                               job_run_id=_finished_job_run("interrupted"))
+    def test_confirm_proceeds_past_an_orphaned_manual_row(self, confirm, db, feed):
+        # Past the ceiling with nothing reporting on it: failed on the
+        # spot rather than refusing this owner until someone edits the row.
+        from datetime import timedelta
+        from sqlalchemy import update
+        orphan = rs.create_run("manual", ["NVDA"], "u1")
+        with rs.get_session() as session:
+            session.execute(update(AnalysisRun).where(AnalysisRun.run_id == orphan)
+                            .values(started_at=rs._now() - timedelta(hours=3)))
 
         out = confirm(["AMD"], scope="models")
 
@@ -430,18 +456,24 @@ class TestOrphanEscape:
         assert rs.get_run(orphan)["status"] == "failed"
         new_id = out[RUN_STORE]["run_id"]
         assert new_id != orphan
-        assert rs.active_run_for(None)["run_id"] == new_id
+        assert rs.active_run_for("u1")["run_id"] == new_id
 
-    def test_confirm_still_refused_by_a_live_scheduled_row(self, confirm, db, feed,
-                                                          monkeypatch):
+    def test_confirm_ignores_scheduled_rows_live_or_dead(self, confirm, db, feed,
+                                                        monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: None)
         live = rs.create_run("scheduled", ["NVDA"], None,
                              job_run_id=_finished_job_run("running"))
         feed.start_run("sched", run_id=live, kind="scheduled")
+        dead = rs.create_run("scheduled", ["TSLA"], None,
+                             job_run_id=_finished_job_run("interrupted"))
+
         out = confirm(["AMD"], scope="models")
-        assert out[IS_OPEN] is dash.no_update
-        assert "scheduled run is in progress" in out[VALIDATION]
+
+        assert out[IS_OPEN] is False
         assert rs.get_run(live)["status"] == "queued"
+        # Not the dialog's job to reap: the watchdog and the scheduler do.
+        assert rs.get_run(dead)["status"] == "queued"
+        assert rs.active_run_for(None)["run_id"] == out[RUN_STORE]["run_id"]
 
     def test_startup_reap_unlocks_a_restarted_server(self, db, feed):
         run_id = rs.create_run("manual", ["NVDA"], "u1")
@@ -485,8 +517,78 @@ class TestPanelFollowsOwnRun:
         assert any(st["id"] == "run-store" for st in cb.get("state", []))
 
 
+class TestRetry:
+    """Retry is a confirm with the previous run's config: it goes through
+    the lock and creates a fresh row, never reopening the old one."""
+
+    @pytest.fixture
+    def prev(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        run_id = rs.create_run(
+            "manual", ["nvda", "AMD"], "u1", preset="report",
+            config={"scope": "report", "lookback": 14, "models": []},
+            prediction_date="2026-09-02", target_date="2026-09-03",
+            estimate_s=90)
+        rs.set_status(run_id, "failed", error="provider timeout")
+        return {"run_id": run_id, "scope": "report", "symbols": ["nvda", "AMD"],
+                "owner_uid": "u1", "kind": "manual"}
+
+    def test_nothing_to_retry(self, db, feed):
+        with pytest.raises(PreventUpdate):
+            app_module.retry_run(None, {"run_id": "r1"})
+        with pytest.raises(PreventUpdate):
+            app_module.retry_run(1, None)
+        with pytest.raises(PreventUpdate):
+            app_module.retry_run(1, {})
+        assert rs.list_runs() == []
+
+    def test_retry_is_a_fresh_run_through_both_stores(self, prev, feed):
+        store, dispatch, is_open, msg = app_module.retry_run(1, prev)
+
+        assert msg == "" and is_open is dash.no_update
+        assert store == dispatch
+        new_id = store["run_id"]
+        assert new_id != prev["run_id"]
+        assert store["retry_of"] == prev["run_id"]
+        assert store["scope"] == "report"
+        assert store["symbols"] == ["NVDA", "AMD"]
+        assert store["owner_uid"] == "u1" and store["kind"] == "manual"
+
+        row = rs.get_run(new_id)
+        old = rs.get_run(prev["run_id"])
+        assert row["status"] == "queued" and row["kind"] == "manual"
+        assert row["preset"] == old["preset"]
+        assert row["config"] == old["config"]
+        assert row["prediction_date"] == old["prediction_date"]
+        assert row["target_date"] == old["target_date"]
+        assert row["estimate_s"] == old["estimate_s"]
+        # The old row is untouched, and the new one is armed for dispatch.
+        assert old["status"] == "failed" and old["error"] == "provider timeout"
+        assert new_id in feed._active_runs()
+        assert app_module._dispatch_run_id(dispatch, None) == new_id
+
+    def test_retry_refused_while_a_run_is_in_flight(self, prev, feed):
+        active = rs.create_run("manual", ["TSLA"], "u1")
+
+        store, dispatch, is_open, msg = app_module.retry_run(1, prev)
+
+        assert store is dash.no_update and dispatch is dash.no_update
+        assert is_open is True
+        assert "run in progress" in msg[0]
+        assert msg[1].id == "run-cancel-active-btn"
+        assert [r["run_id"] for r in rs.list_runs()] == [active, prev["run_id"]]
+
+    def test_retry_without_a_row_says_so(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        store, dispatch, is_open, msg = app_module.retry_run(1, {"run_id": "gone"})
+        assert store is dash.no_update and is_open is True
+        assert "record is gone" in msg
+        assert rs.list_runs() == []
+
+
 class TestWiring:
-    """The confirm click has ONE listener; the stages hang off run-store."""
+    """The confirm click has ONE listener; the stages hang off run-dispatch
+    (memory), never run-store (session: it re-emits on every mount)."""
 
     def _inputs(self, cb):
         return {i["id"] for i in cb.get("inputs", []) if isinstance(i["id"], str)}
@@ -498,13 +600,33 @@ class TestWiring:
         assert len(listeners) == 1
         assert "run-modal.is_open" in listeners[0]
 
-    def test_stages_listen_on_run_store(self):
+    def test_stages_listen_on_run_dispatch(self):
         from dash._callback import GLOBAL_CALLBACK_MAP
         listeners = {k for k, v in GLOBAL_CALLBACK_MAP.items()
-                     if "run-store" in self._inputs(v)}
+                     if "run-dispatch" in self._inputs(v)}
         for wanted in ("ai-analysis-store.data", "model-signals-store.data",
                        "full-analysis-requested.data", "run-dispatched.data"):
             assert any(wanted in k for k in listeners), wanted
+
+    def test_run_store_alone_dispatches_nothing(self):
+        # A session store restoring on mount re-emits its value; if any
+        # callback took run-store as an Input, every page load in a tab
+        # that once confirmed a run would fire it (a worker fork for the
+        # model stage). It may only ever be read as State.
+        from dash._callback import GLOBAL_CALLBACK_MAP
+        assert [k for k, v in GLOBAL_CALLBACK_MAP.items()
+                if "run-store" in self._inputs(v)] == []
+        readers = {k for k, v in GLOBAL_CALLBACK_MAP.items()
+                   if any(st["id"] == "run-store" for st in v.get("state", []))}
+        assert any("progress-feed-scroll.children" in k for k in readers)
+
+    def test_retry_button_feeds_only_the_retry_dispatcher(self):
+        from dash._callback import GLOBAL_CALLBACK_MAP
+        listeners = [k for k, v in GLOBAL_CALLBACK_MAP.items()
+                     if "ai-retry-btn" in self._inputs(v)]
+        assert len(listeners) == 1
+        assert "run-store.data" in listeners[0]
+        assert "run-dispatch.data" in listeners[0]
 
     def test_toasts_and_run_stores_are_mounted(self):
         from layouts.main_layout import create_layout
@@ -521,5 +643,25 @@ class TestWiring:
             return acc
 
         mounted = ids(create_layout(), set())
-        assert {"run-store", "run-dispatched", "run-started-toast",
-                "history-eval-toast"} <= mounted
+        assert {"run-store", "run-dispatch", "run-dispatched",
+                "run-started-toast", "history-eval-toast"} <= mounted
+
+    def test_run_dispatch_is_a_memory_store(self):
+        from layouts.main_layout import create_layout
+
+        def find(node, wanted):
+            if getattr(node, "id", None) == wanted:
+                return node
+            ch = getattr(node, "children", None)
+            for c in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                if c is not None and hasattr(c, "id"):
+                    hit = find(c, wanted)
+                    if hit is not None:
+                        return hit
+            return None
+
+        layout = create_layout()
+        assert getattr(find(layout, "run-store"), "storage_type", None) == "session"
+        dispatch = find(layout, "run-dispatch")
+        assert dispatch is not None
+        assert getattr(dispatch, "storage_type", "memory") == "memory"

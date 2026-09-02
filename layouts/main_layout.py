@@ -38,15 +38,19 @@ def create_layout() -> html.Div:
             # purpose: a one-off run tweak should not survive a reload.
             dcc.Store(id="run-symbols-store", data={}),
             # The run the confirm dispatcher last created, shape {"run_id",
-            # "started", "scope", "symbols", "owner_uid", "kind"}. The stage
-            # callbacks trigger on it, not on the confirm click: the click's
-            # own callbacks all fire before any of them could have written
-            # the id. run-dispatched holds the last run_id the stages picked
-            # up, so a run-store that re-emits the same id (a session store
-            # restoring on reload) does not start the stages twice. It is
-            # declared first so it restores before run-store does.
-            dcc.Store(id="run-dispatched", data=None, storage_type="session"),
+            # "started", "scope", "symbols", "owner_uid", "kind"}. Session
+            # scoped so the panel can keep following the viewer's own run
+            # across a reload. Nothing dispatches on it: a session store
+            # re-emits its value on every mount, and the stages hanging off
+            # it re-fired (a worker fork, a DB read, the running spinner) on
+            # every page load in a tab that had ever confirmed a run.
             dcc.Store(id="run-store", data=None, storage_type="session"),
+            # The same dict, written in the same callback, in a memory
+            # store: it only ever changes on a confirm (or a retry), so the
+            # stage callbacks trigger on this one. run-dispatched holds the
+            # last run_id the stages picked up, the guard behind the guard.
+            dcc.Store(id="run-dispatch", data=None),
+            dcc.Store(id="run-dispatched", data=None, storage_type="session"),
             # Home prediction-board symbol narrow. Session-scoped on purpose:
             # "show me AAPL" answers a question you are asking now, not one
             # you want still applied tomorrow.

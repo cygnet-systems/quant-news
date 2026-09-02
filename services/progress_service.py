@@ -320,8 +320,11 @@ def mark_run_pending(run_id: str | None = None) -> None:
     appear. Publisher-only, like the rest of the live feed.
 
     With a ``run_id`` (the row the confirm dispatcher created) the run
-    joins the active list right away; without one only the legacy boolean
-    is armed, and start_run() brings the list in line.
+    joins the active list right away and its meta records when: a run
+    whose stages never start has no events for the watchdog to age, so
+    the stall window is measured from this moment instead. Without an id
+    only the legacy boolean is armed, and start_run() brings the list in
+    line.
     """
     try:
         if not _enabled():
@@ -331,6 +334,9 @@ def mark_run_pending(run_id: str | None = None) -> None:
             with c.transact():
                 _add_active(c, run_id)
                 c.set(_aborted_key(run_id), None)
+                meta = dict(c.get(_meta_key(run_id)) or {})
+                meta["pending"] = time.time()
+                c.set(_meta_key(run_id), meta, expire=_PER_RUN_TTL_S)
         else:
             c.set(_ACTIVE_KEY, True)
     except Exception as e:
@@ -360,10 +366,12 @@ def start_run(title: str, run_id: str | None = None,
             with c.transact():
                 _add_active(c, run_id)
                 c.set(_RUN_ID_KEY, run_id)
-                c.set(_meta_key(run_id), {
+                meta = dict(c.get(_meta_key(run_id)) or {})
+                meta.update({
                     "title": title, "kind": kind, "owner_uid": owner_uid,
                     "started": time.time(),
-                }, expire=_PER_RUN_TTL_S)
+                })
+                c.set(_meta_key(run_id), meta, expire=_PER_RUN_TTL_S)
                 # A previous run's worker pid must never be read as this
                 # run's, and an id reused after an abort starts clean.
                 c.set(_pid_key(run_id), None)
@@ -524,18 +532,29 @@ def _watchdog_one(c: diskcache.Cache, run_id: str, now: float) -> bool:
     else:
         events = c.get(_events_key(run_id)) or []
         if not events:
-            return False
-        # A feed whose newest line is a completion is a run that already
-        # closed; only its active-list entry is stale, and stamping a
-        # failure on it would be wrong.
-        if events[-1].get("stage") == "done":
-            return False
-        last_t = events[-1].get("t")
-        if not last_t or now - last_t < WATCHDOG_STALL_S:
-            return False
-        message = (f"Run aborted: no activity for "
-                   f"{int(WATCHDOG_STALL_S // 60)} minutes (stalled)")
-        finish = "Run failed: stalled with no activity"
+            # Armed by mark_run_pending and never started: the stall
+            # window runs from that moment, or the run holds its owner's
+            # lock forever. A run with neither events nor a pending mark
+            # is a legacy active entry nothing can date.
+            meta = c.get(_meta_key(run_id)) or {}
+            armed = meta.get("pending") or meta.get("started")
+            if not armed or now - armed < WATCHDOG_STALL_S:
+                return False
+            message = (f"Run aborted: no stage started within "
+                       f"{int(WATCHDOG_STALL_S // 60)} minutes of the confirm")
+            finish = "Run failed: no stage started"
+        else:
+            # A feed whose newest line is a completion is a run that
+            # already closed; only its active-list entry is stale, and
+            # stamping a failure on it would be wrong.
+            if events[-1].get("stage") == "done":
+                return False
+            last_t = events[-1].get("t")
+            if not last_t or now - last_t < WATCHDOG_STALL_S:
+                return False
+            message = (f"Run aborted: no activity for "
+                       f"{int(WATCHDOG_STALL_S // 60)} minutes (stalled)")
+            finish = "Run failed: stalled with no activity"
 
     # Mark BEFORE emitting: the abort's own events must not retrigger it.
     c.set(_aborted_key(run_id), True, expire=_PER_RUN_TTL_S)

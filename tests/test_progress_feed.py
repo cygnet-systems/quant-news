@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-from db.models import AnalysisRun, Base, JobRun
+from db.models import AnalysisRun, Base, JobRun, TradingAgentReport
 from services import progress_service as prog
 from services import run_service as rs
 
@@ -35,7 +35,8 @@ def db(monkeypatch):
     import db.session as dbs
 
     eng = create_engine("sqlite://")
-    Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__])
+    Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__,
+                                          TradingAgentReport.__table__])
     monkeypatch.setattr(dbs, "_engine", eng)
     monkeypatch.setattr(
         dbs, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
@@ -164,7 +165,10 @@ class TestRunContext:
     its own asyncio task; research code under it emits unnamed and stamps
     spend through current_run_id(). Both must follow the task's run."""
 
-    def test_concurrent_report_stages_keep_their_own_run(self, feed):
+    def test_concurrent_report_stages_keep_their_own_run(self, feed, db):
+        from sqlalchemy import select
+        from services.cache_service import get_cache
+
         async def stage(run_id):
             feed.start_run(f"Report {run_id}", run_id=run_id)
             # Let the other stage open its run before this one emits, so a
@@ -173,6 +177,13 @@ class TestRunContext:
             feed.emit("ta", f"research step from {run_id}")
             # The research model runs in a worker via to_thread.
             await asyncio.to_thread(feed.emit, "ta", f"thread step from {run_id}")
+            # The report it writes is stamped with the id it was handed
+            # (the stage passes run_id explicitly), and with the run's
+            # trade date as a string, the way the stage has it. (On the
+            # task's own thread: the in-memory SQLite engine is per-thread.)
+            get_cache().save_trading_agent_report(
+                f"SYM{run_id}", "2026-09-03", "BUY", 0.6, "text",
+                model_name="m", run_id=run_id)
             return feed.current_run_id()
 
         async def main():
@@ -183,6 +194,10 @@ class TestRunContext:
             "Report A", "research step from A", "thread step from A"]
         assert _messages(feed.get_feed("B")["events"]) == [
             "Report B", "research step from B", "thread step from B"]
+        with rs.get_session() as session:
+            rows = session.execute(select(TradingAgentReport)).scalars().all()
+        assert {r.symbol: r.run_id for r in rows} == {"SYMA": "A", "SYMB": "B"}
+        assert {str(r.trade_date) for r in rows} == {"2026-09-03"}
 
     def test_bare_thread_falls_back_to_the_process_run(self, feed):
         # An executor that did not copy the context (the runner's
@@ -231,6 +246,48 @@ class TestWatchdog:
         assert feed.get_feed("run-a")["events"][-1]["stage"] == "done"
         # Once only: the abort's own events must not retrigger it.
         assert feed.watchdog_check() is False
+
+    def test_armed_run_whose_stages_never_start_is_reaped(self, feed, db, monkeypatch):
+        # mark_run_pending puts the run in the active list with no events
+        # and no pid; before it recorded when, nothing could age it and
+        # the row held its owner's lock forever.
+        clock = {"now": 1_000.0}
+        monkeypatch.setattr(feed.time, "time", lambda: clock["now"])
+        run_id = rs.create_run("manual", ["NVDA"], "u1")
+        feed.mark_run_pending(run_id)
+        assert feed._get_cache().get(feed._meta_key(run_id))["pending"] == 1_000.0
+
+        assert feed.watchdog_check() is False
+        clock["now"] += feed.WATCHDOG_STALL_S - 1
+        assert feed.watchdog_check() is False
+        assert rs.get_run(run_id)["status"] == "queued"
+
+        clock["now"] += 2
+        assert feed.watchdog_check() is True
+        row = rs.get_run(run_id)
+        assert row["status"] == "failed"
+        assert "no stage started" in row["error"]
+        assert run_id not in feed._active_runs()
+        events = feed.get_feed(run_id)["events"]
+        assert events[-1]["stage"] == "done"
+        assert any("no stage started" in e["message"] for e in events)
+        assert rs.active_run_for("u1") is None
+        assert feed.watchdog_check() is False
+
+    def test_started_run_keeps_its_pending_mark_and_ages_on_events(self, feed, db,
+                                                                   monkeypatch):
+        clock = {"now": 1_000.0}
+        monkeypatch.setattr(feed.time, "time", lambda: clock["now"])
+        run_id = rs.create_run("manual", ["NVDA"], "u1")
+        feed.mark_run_pending(run_id)
+        clock["now"] += feed.WATCHDOG_STALL_S - 5
+        feed.start_run("late start", run_id=run_id)
+        meta = feed._get_cache().get(feed._meta_key(run_id))
+        assert meta["pending"] == 1_000.0 and meta["title"] == "late start"
+        # The stall window now runs from the newest event, not the confirm.
+        clock["now"] += 10
+        assert feed.watchdog_check() is False
+        assert rs.get_run(run_id)["status"] == "queued"
 
 
 def _job_run(status):

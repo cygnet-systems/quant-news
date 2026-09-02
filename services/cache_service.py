@@ -1092,6 +1092,10 @@ class CacheService:
         import uuid
         from db.models import TradingAgentReport
 
+        # Callers pass the ISO string the run works in; the column is a
+        # Date. psycopg2 coerces the string, SQLite (the tests) does not.
+        if isinstance(trade_date, str):
+            trade_date = date.fromisoformat(trade_date[:10])
         with get_session() as session:
             session.add(TradingAgentReport(
                 id=str(uuid.uuid4()),

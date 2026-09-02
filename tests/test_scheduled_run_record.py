@@ -133,6 +133,8 @@ def _only_run():
 def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatch):
     monkeypatch.setenv("QUANTNEWS_JOB_RUN_ID", "41")
     monkeypatch.setenv("QUANTNEWS_RUN_OWNER", "owner-1")
+    # A private job: the row must be as private as the rows it writes.
+    monkeypatch.setenv("QUANTNEWS_RUN_PUBLIC", "0")
 
     summary = ar.run_full_analysis(["NVDA", "AMD"], lookback_days=7,
                                    max_articles=50, recs_mode="auto")
@@ -141,6 +143,7 @@ def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatc
     assert run["kind"] == "scheduled"
     assert run["job_run_id"] == 41
     assert run["owner_uid"] == "owner-1"
+    assert run["is_public"] is False
     assert run["status"] == "done" and run["error"] is None
     assert run["symbols"] == ["NVDA", "AMD"]
     assert run["prediction_date"] == summary["as_of"]
@@ -161,10 +164,12 @@ def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatc
 def test_cli_run_without_a_job_has_no_link(db, feed, stages, monkeypatch):
     monkeypatch.delenv("QUANTNEWS_JOB_RUN_ID", raising=False)
     monkeypatch.delenv("QUANTNEWS_RUN_OWNER", raising=False)
+    monkeypatch.delenv("QUANTNEWS_RUN_PUBLIC", raising=False)
     ar.run_full_analysis(["AAPL"], lookback_days=3, max_articles=0,
                          recs_mode="off")
     run = _only_run()
     assert run["job_run_id"] is None and run["owner_uid"] is None
+    assert run["is_public"] is True
     assert run["status"] == "done"
     assert run["stages"]["synthesis"] == {"state": "skipped"}
 

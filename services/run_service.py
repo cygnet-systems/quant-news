@@ -100,8 +100,14 @@ def _to_dict(row) -> dict:
 
 def create_run(kind: str, symbols, owner_uid: str | None, preset: str | None = None,
                config: dict | None = None, prediction_date=None, target_date=None,
-               estimate_s: int | None = None, job_run_id: int | None = None) -> str:
-    """Insert a queued run and return its run_id (uuid4 string)."""
+               estimate_s: int | None = None, job_run_id: int | None = None,
+               is_public: bool = True) -> str:
+    """Insert a queued run and return its run_id (uuid4 string).
+
+    ``is_public`` should match what the run's predictions and reports are
+    stamped with (a private scheduled job writes private rows), so a run
+    page never lists a run whose artifacts its viewer cannot see.
+    """
     from db.models import AnalysisRun
 
     if kind not in KINDS:
@@ -125,6 +131,7 @@ def create_run(kind: str, symbols, owner_uid: str | None, preset: str | None = N
             estimate_s=int(estimate_s) if estimate_s is not None else None,
             started_at=_now(),
             job_run_id=job_run_id,
+            is_public=bool(is_public),
         ))
     logger.info("Run %s created: kind=%s owner=%s symbols=%s",
                 run_id[:8], kind, owner_uid, csv)
@@ -219,10 +226,15 @@ def get_run(run_id: str) -> dict | None:
 
 
 def active_run_for(owner_uid: str | None) -> dict | None:
-    """The newest queued/running run for this owner; the per-owner lock.
+    """The newest queued/running MANUAL run for this owner; the per-owner
+    lock behind the Run dialog's confirm.
 
     NULL owners compare as '' so anonymous sessions still lock against
-    each other, the same rule watchlist_service uses.
+    each other, the same rule watchlist_service uses. Scheduled runs are
+    left out: their owner is the job's (None for the public watchlist
+    job), so counting them would refuse every anonymous session for the
+    whole daily run. They stay in active_runs(), which is what the pill
+    reads.
     """
     from db.models import AnalysisRun
 
@@ -230,6 +242,7 @@ def active_run_for(owner_uid: str | None) -> dict | None:
         row = session.execute(
             select(AnalysisRun)
             .where(func.coalesce(AnalysisRun.owner_uid, "") == (owner_uid or ""),
+                   AnalysisRun.kind == "manual",
                    AnalysisRun.status.in_(ACTIVE_STATUSES))
             .order_by(AnalysisRun.started_at.desc())
             .limit(1)
@@ -280,6 +293,21 @@ def _run_ceiling_s() -> int:
     return JOB_TIMEOUT_SECONDS
 
 
+def _queued_stall_s() -> int:
+    """How long a queued run may sit before any stage reports on it: the
+    feed's own stall window, so both witnesses agree."""
+    from services.progress_service import WATCHDOG_STALL_S
+    return WATCHDOG_STALL_S
+
+
+def _age_s(run: dict, now: datetime) -> float:
+    started = run.get("started_at")
+    started_dt = datetime.fromisoformat(started) if started else None
+    if started_dt is not None and started_dt.tzinfo is None:
+        started_dt = started_dt.replace(tzinfo=timezone.utc)
+    return (now - started_dt).total_seconds() if started_dt else float("inf")
+
+
 def _job_run_statuses(session, job_run_ids) -> dict[int, str]:
     from db.models import JobRun
 
@@ -292,7 +320,7 @@ def _job_run_statuses(session, job_run_ids) -> dict[int, str]:
 
 
 def _orphan_reason(run: dict, live, max_age_s, job_statuses: dict,
-                   now: datetime) -> str | None:
+                   now: datetime, queued_stall_s=-1) -> str | None:
     """Why an active run is dead, or None while it may still be working.
 
     Three witnesses, in order of certainty. A run linked to a job_runs row
@@ -300,9 +328,13 @@ def _orphan_reason(run: dict, live, max_age_s, job_statuses: dict,
     never closed, ceiling kill, crash): the runner process is gone whatever
     the feed says. A run the progress feed lists as in flight is otherwise
     trusted, the feed's own watchdog handles stalls and dead worker pids
-    there. A run absent from the feed with no live process to vouch for it
-    is presumed dead once older than ``max_age_s`` (0: at once, the server
-    just restarted and nothing survives that; None: never by age).
+    there, with one exception: a run still QUEUED past ``queued_stall_s``
+    (the feed's stall window; None: never) was armed by the confirm and
+    then no stage ever reported, the feed has nothing to watch, so the
+    row is failed from here. A run absent from the feed with no live
+    process to vouch for it is presumed dead once older than ``max_age_s``
+    (0: at once, the server just restarted and nothing survives that;
+    None: never by age).
     """
     if run.get("status") not in ACTIVE_STATUSES:
         return None
@@ -313,14 +345,19 @@ def _orphan_reason(run: dict, live, max_age_s, job_statuses: dict,
             return (f"scheduler job run {job_run_id} finished ({job_status}) "
                     f"before the run closed")
     if run.get("run_id") in set(live or ()):
+        if run.get("status") != "queued" or queued_stall_s is None:
+            return None
+        if queued_stall_s == -1:
+            queued_stall_s = _queued_stall_s()
+        age_s = _age_s(run, now)
+        if age_s >= queued_stall_s:
+            return (f"no stage started on this run in "
+                    f"{int(age_s // 60)} minutes, past the "
+                    f"{int(queued_stall_s // 60)}-minute stall window")
         return None
     if max_age_s is None:
         return None
-    started = run.get("started_at")
-    started_dt = datetime.fromisoformat(started) if started else None
-    if started_dt is not None and started_dt.tzinfo is None:
-        started_dt = started_dt.replace(tzinfo=timezone.utc)
-    age_s = (now - started_dt).total_seconds() if started_dt else float("inf")
+    age_s = _age_s(run, now)
     if age_s >= max_age_s:
         if max_age_s <= 0:
             return "no process is reporting on this run"
@@ -330,22 +367,27 @@ def _orphan_reason(run: dict, live, max_age_s, job_statuses: dict,
     return None
 
 
-def orphan_reason(run: dict, live=(), max_age_s: float | None = -1) -> str | None:
+def orphan_reason(run: dict, live=(), max_age_s: float | None = -1,
+                  queued_stall_s: float | None = -1) -> str | None:
     """One run's verdict (see _orphan_reason); ``max_age_s`` defaults to the
-    scheduler's ceiling. ``live`` is the progress feed's active list."""
+    scheduler's ceiling and ``queued_stall_s`` to the feed's stall window.
+    ``live`` is the progress feed's active list."""
     if max_age_s == -1:
         max_age_s = _run_ceiling_s()
     with get_session() as session:
         statuses = _job_run_statuses(session, [run.get("job_run_id")])
-    return _orphan_reason(run, live, max_age_s, statuses, _now())
+    return _orphan_reason(run, live, max_age_s, statuses, _now(),
+                          queued_stall_s=queued_stall_s)
 
 
 def reap_orphans(live=(), max_age_s: float | None = -1,
-                 error: str | None = None) -> list[dict]:
+                 error: str | None = None,
+                 queued_stall_s: float | None = -1) -> list[dict]:
     """Fail every active run that is provably dead and return those runs.
 
-    ``live`` is the progress feed's active list; ``max_age_s`` as in
-    orphan_reason (default: the scheduler's ceiling; 0 on a server restart
+    ``live`` is the progress feed's active list; ``max_age_s`` and
+    ``queued_stall_s`` as in orphan_reason (defaults: the scheduler's
+    ceiling and the feed's stall window; max_age_s=0 on a server restart
     fails everything not live). ``error`` overrides the per-run reason.
     Sticky statuses make this safe to repeat: a run that closed itself in
     the meantime keeps its own outcome.
@@ -364,7 +406,8 @@ def reap_orphans(live=(), max_age_s: float | None = -1,
 
     reaped: list[dict] = []
     for run in runs:
-        reason = _orphan_reason(run, live, max_age_s, statuses, now)
+        reason = _orphan_reason(run, live, max_age_s, statuses, now,
+                                queued_stall_s=queued_stall_s)
         if reason is None:
             continue
         closed = set_status(run["run_id"], "failed", error=error or reason)
