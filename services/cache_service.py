@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1515,11 +1515,46 @@ class CacheService:
                         ticker_sentiment_score=article.get("ticker_sentiment_score"),
                         ticker_relevance_score=article.get("ticker_relevance_score"),
                         fetched_at=datetime.now(timezone.utc),
+                        published_at=article.get("published_at"),
                     ))
                     inserted += 1
                 except Exception:
                     pass
         return inserted
+
+    # ---- point-in-time news store: per-day vendor coverage -----------------
+
+    def news_coverage(self, symbol: str, start: "date", end: "date") -> dict:
+        """{day: fetched_at} for the (symbol, day) pairs already fetched."""
+        from db.models import NewsCoverage
+        with get_session() as session:
+            rows = session.execute(
+                select(NewsCoverage.day, NewsCoverage.fetched_at).where(
+                    NewsCoverage.symbol == symbol.upper(),
+                    NewsCoverage.day >= start, NewsCoverage.day <= end)
+            ).all()
+        return {d: t for d, t in rows}
+
+    def mark_news_coverage(self, symbol: str, days: list) -> None:
+        from db.models import NewsCoverage
+        now = datetime.now(timezone.utc)
+        with get_session() as session:
+            for d in days:
+                session.merge(NewsCoverage(symbol=symbol.upper(), day=d, fetched_at=now))
+
+    def prune_news(self, retention_days: int) -> int:
+        """Drop articles and coverage older than the retention window."""
+        from db.models import HistoricalNews, NewsCoverage
+        from sqlalchemy import delete
+        cutoff = date.today() - timedelta(days=retention_days)
+        with get_session() as session:
+            n = session.execute(
+                delete(HistoricalNews).where(HistoricalNews.published_date < cutoff)
+            ).rowcount or 0
+            session.execute(delete(NewsCoverage).where(NewsCoverage.day < cutoff))
+        if n:
+            logger.info(f"news store: pruned {n} articles older than {cutoff}")
+        return int(n)
 
     def get_historical_news(
         self, symbol: str, start_date: Optional[str] = None, end_date: Optional[str] = None,
@@ -1547,6 +1582,7 @@ class CacheService:
                     "ticker_sentiment_score": r.ticker_sentiment_score,
                     "ticker_relevance_score": r.ticker_relevance_score,
                     "fetched_at": r.fetched_at,
+                    "published_at": r.published_at,
                 }
                 for r in rows
             ]

@@ -546,6 +546,167 @@ class LLMService:
             )
             return None
 
+    def generate_with_web_search(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        *,
+        model: Optional[str] = None,
+        max_tokens: int = 6000,
+        max_searches: int = 8,
+        allowed_domains: Optional[list[str]] = None,
+        usage_out: Optional[dict] = None,
+        max_rounds: int = 4,
+    ) -> dict:
+        """One Anthropic call with the server-side web_search tool.
+
+        The model decides what to search; Anthropic runs the searches and
+        returns results and citations inside the same response. When the
+        server pauses a long tool loop (``stop_reason == "pause_turn"``) the
+        accumulated content is sent back and the turn continues, up to
+        ``max_rounds`` physical calls. Every physical call is recorded in
+        llm_usage and llm_traces like any other.
+
+        Returns {"text", "searches", "sources": [{url, title}], "stop_reason",
+        "model"}; raises on provider errors (the caller decides whether the
+        block is required, expected or optional). Anthropic only: the
+        browsing happens on the provider's side, so there is no
+        OpenAI-compatible route to fall back to.
+        """
+        client, use_provider = self._get_client_for_provider("anthropic")
+        if client is None:
+            raise RuntimeError("web research needs an Anthropic API key")
+        use_model = model or MODEL.INVESTIGATION_MODEL
+
+        tools = [{"type": "web_search_20260209", "name": "web_search",
+                  "max_uses": int(max_searches)}]
+        if allowed_domains:
+            tools[0]["allowed_domains"] = list(allowed_domains)
+
+        import time as _time
+        messages: list = [{"role": "user", "content": prompt}]
+        text_parts: list[str] = []
+        sources: dict[str, str] = {}
+        searches = 0
+        total_in = total_out = 0
+        stop_reason = None
+
+        for round_n in range(1, max_rounds + 1):
+            api_kwargs: dict = {
+                "model": use_model,
+                "max_tokens": max_tokens,
+                "messages": messages,
+                "tools": tools,
+            }
+            if system_prompt:
+                api_kwargs["system"] = system_prompt
+            if not _rejects_sampling_params(use_model):
+                api_kwargs["temperature"] = 0.2
+            t0 = _time.time()
+            try:
+                # Streamed, with its own timeout: a tool loop with several
+                # searches runs minutes, past the 180s the plain calls use,
+                # and a non-streaming request that long trips the SDK's
+                # HTTP timeout. The final message is assembled by the SDK.
+                with client.with_options(
+                        timeout=API.INVESTIGATION_TIMEOUT).messages.stream(
+                        **api_kwargs) as stream:
+                    response = stream.get_final_message()
+            except Exception as e:
+                try:
+                    from services.trace_service import record_llm_call
+                    record_llm_call(
+                        provider="anthropic", model=use_model,
+                        system_prompt=system_prompt, prompt=prompt,
+                        response=None, params=_trace_params(api_kwargs),
+                        attempt=round_n, ok=False, error=str(e),
+                        duration_ms=int((_time.time() - t0) * 1000))
+                except Exception:
+                    pass
+                raise
+
+            stop_reason = getattr(response, "stop_reason", None)
+            round_text: list[str] = []
+            for block in response.content:
+                btype = getattr(block, "type", "")
+                if btype == "text":
+                    round_text.append(block.text)
+                    for cit in (getattr(block, "citations", None) or []):
+                        url = getattr(cit, "url", None)
+                        if url:
+                            sources.setdefault(url, getattr(cit, "title", "") or "")
+                elif btype == "server_tool_use":
+                    # The dynamic-filtering search variant also runs code
+                    # execution server-side; only count the searches.
+                    if getattr(block, "name", "") == "web_search":
+                        searches += 1
+                elif btype == "web_search_tool_result":
+                    content = getattr(block, "content", None)
+                    # A list is results; an object is an error envelope.
+                    if isinstance(content, list):
+                        for r in content:
+                            url = getattr(r, "url", None)
+                            if url:
+                                sources.setdefault(
+                                    url, getattr(r, "title", "") or "")
+                    else:
+                        code = getattr(content, "error_code", None)
+                        if code:
+                            round_text.append(f"[web search error: {code}]")
+            text_parts.extend(round_text)
+
+            usage = getattr(response, "usage", None)
+            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+            total_in += in_tok
+            total_out += out_tok
+            duration_ms = int((_time.time() - t0) * 1000)
+            from services import usage_service
+            usage_id = usage_service.record(
+                model=use_model, provider="anthropic",
+                input_tokens=in_tok, output_tokens=out_tok,
+                duration_ms=duration_ms)
+            try:
+                from services.trace_service import record_llm_call
+                record_llm_call(
+                    provider="anthropic", model=use_model,
+                    system_prompt=system_prompt,
+                    prompt=prompt if round_n == 1 else
+                    f"[continuation round {round_n} after pause_turn]",
+                    response="\n".join(round_text) or None,
+                    params={**_trace_params(api_kwargs),
+                            "searches_so_far": searches,
+                            "stop_reason": stop_reason},
+                    attempt=round_n, ok=stop_reason != "refusal",
+                    error=(f"refusal: {getattr(getattr(response, 'stop_details', None), 'category', None)}"
+                           if stop_reason == "refusal" else None),
+                    duration_ms=duration_ms, usage_id=usage_id)
+            except Exception as trace_err:  # pragma: no cover
+                logger.debug("web-search trace failed: %s", trace_err)
+
+            if stop_reason == "pause_turn":
+                messages.append({"role": "assistant",
+                                 "content": response.content})
+                continue
+            break
+
+        if usage_out is not None:
+            usage_out.update({"input_tokens": total_in,
+                              "output_tokens": total_out,
+                              "model": use_model, "provider": "anthropic"})
+        if stop_reason == "refusal":
+            raise RuntimeError("web research call was refused by the provider")
+        if stop_reason == "max_tokens":
+            logger.warning(f"web research truncated at max_tokens={max_tokens} "
+                           f"(model={use_model})")
+        return {
+            "text": "\n".join(p for p in text_parts if p),
+            "searches": searches,
+            "sources": [{"url": u, "title": t} for u, t in sources.items()],
+            "stop_reason": stop_reason,
+            "model": use_model,
+        }
+
     def _generate_anthropic(
         self,
         client,
@@ -587,10 +748,12 @@ class LLMService:
         if not articles:
             return None
 
-        # Build context from articles
+        # Ten articles sampled across the window, not the newest ten.
+        from services.news_window import select_spread
         article_text = "\n".join([
-            f"- {a.get('title', '')}: {a.get('summary', '')[:200]}"
-            for a in articles[:10]  # Limit to 10 articles
+            f"- {str(a.get('published_at') or '')[:10]} {a.get('title', '')}: "
+            f"{(a.get('summary') or '')[:200]}"
+            for a in select_spread(articles, 10)
         ])
 
         system_prompt = """You are an objective financial news analyst. Synthesize news into a clear, actionable conclusion.
@@ -662,12 +825,32 @@ Respond using this EXACT markdown format:
         if not articles:
             return None
 
-        article_text = "\n".join([
-            f"- [{a.get('sentiment', 'unknown').upper()}] "
+        # Spread across symbols AND across the window. This used to be
+        # ``articles[:15]`` off a newest-first list — with a 20-symbol run
+        # that was fifteen headlines, mostly one symbol's, from the last day
+        # or two, whatever window the user had picked.
+        from config import MODEL as _M
+        from services.news_window import article_span, select_spread
+        budget = _M.NEWS_SYNTHESIS_ARTICLES
+        by_symbol: dict[str, list] = {}
+        for a in articles:
+            by_symbol.setdefault(a.get("symbol") or "?", []).append(a)
+        per_symbol = (max(1, budget // len(by_symbol)) if budget else 0)
+        shown: list = []
+        for sym in sorted(by_symbol):
+            shown.extend(select_spread(by_symbol[sym], per_symbol))
+        oldest, newest = article_span(shown)
+        article_text = (
+            f"({len(shown)} of {len(articles)} articles shown, sampled across "
+            f"each symbol's window {oldest} → {newest}; newest first per symbol)\n"
+        ) + "\n".join([
+            f"- {a.get('symbol') or '?'} "
+            f"{str(a.get('published_at') or '?')[:10]} "
+            f"[{(a.get('sentiment') or 'unknown').upper()}] "
             f"(relevance:{a.get('ticker_relevance_score', 'N/A')}, "
             f"score:{a.get('sentiment_score', 'N/A')}) "
-            f"{a.get('title', '')}: {a.get('summary', '')[:200]}"
-            for a in articles[:15]
+            f"{a.get('title', '')}: {(a.get('summary') or '')[:200]}"
+            for a in shown
         ])
 
         sentiment_counts = {"bullish": 0, "neutral": 0, "bearish": 0}
@@ -835,15 +1018,10 @@ Respond with this exact JSON structure (no markdown, no extra text):
 
         if response:
             try:
-                # Clean and parse JSON using regex for robustness
-                clean = response.strip()
-
-                # Use regex to extract JSON object from response
-                # This handles markdown code blocks and extra text
-                match = re.search(r'\{.*\}', clean, re.DOTALL)
-                if match:
-                    clean = match.group(0)
-
+                # String-aware balanced-brace scan (the greedy regex this
+                # replaced matched first-{ to LAST-} and "parsed" truncated
+                # responses into a json.loads failure).
+                clean = _extract_json_object(response) or response.strip()
                 result = json.loads(clean)
 
                 # Validate and normalize the result
@@ -929,8 +1107,10 @@ Respond with this exact JSON structure (no markdown, no extra text):
             sentiment = "NEUTRAL"
             confidence = 0.5
 
-        # Get top headlines for key developments
-        top_titles = [a.get("title", "") for a in articles[:3] if a.get("title")]
+        # Key developments sampled across the window, not the newest three.
+        from services.news_window import select_spread
+        top_titles = [a.get("title", "") for a in select_spread(articles, 3)
+                      if a.get("title")]
         key_dev = ". ".join(top_titles[:2]) if top_titles else "Recent news coverage on these stocks."
 
         return {
@@ -940,103 +1120,6 @@ Respond with this exact JSON structure (no markdown, no extra text):
             "market_sentiment": sentiment,
             "sentiment_explanation": f"Based on {total} articles: {sentiment_counts['bullish']} bullish, {sentiment_counts['neutral']} neutral, {sentiment_counts['bearish']} bearish.",
         }
-
-    def analyze_sentiment(
-        self,
-        text: str,
-    ) -> Optional[dict]:
-        """Analyze sentiment of text.
-
-        Args:
-            text: Text to analyze.
-
-        Returns:
-            Dictionary with sentiment analysis or None.
-        """
-        system_prompt = """You are a sentiment analysis expert for financial text.
-Analyze the sentiment and respond ONLY with a JSON object containing:
-- sentiment: "bullish", "bearish", or "neutral"
-- confidence: a number between 0 and 1
-- reasoning: a brief one-sentence explanation"""
-
-        prompt = f"""Analyze the sentiment of this financial text:
-
-"{text}"
-
-Respond with JSON only."""
-
-        response = self.generate(prompt, system_prompt, max_tokens=150, temperature=0.3)
-
-        if response:
-            try:
-                # Try to parse JSON from response
-                import json
-                # Handle potential markdown code blocks
-                clean_response = response.strip()
-                if clean_response.startswith("```"):
-                    clean_response = clean_response.split("```")[1]
-                    if clean_response.startswith("json"):
-                        clean_response = clean_response[4:]
-                return json.loads(clean_response)
-            except Exception:
-                return {"sentiment": "neutral", "confidence": 0.5, "raw": response}
-
-        return None
-
-    def generate_market_insight(
-        self,
-        symbol: str,
-        price_data: dict,
-        signals: dict,
-        news_sentiment: Optional[str] = None,
-    ) -> Optional[str]:
-        """Generate comprehensive market insight.
-
-        Args:
-            symbol: Stock symbol.
-            price_data: Dictionary with price metrics.
-            signals: Dictionary with technical signals.
-            news_sentiment: Optional news sentiment summary.
-
-        Returns:
-            AI-generated market insight or None.
-        """
-        system_prompt = """You are a professional market analyst.
-Provide clear, concise insights based on technical and fundamental data.
-Avoid making specific predictions or recommendations.
-Focus on factual observations and key levels to watch."""
-
-        # Build context
-        price_context = f"""
-Symbol: {symbol}
-Current Price: ${price_data.get('end_price', 'N/A')}
-1Y Return: {price_data.get('total_return', 'N/A')}%
-Volatility: {price_data.get('volatility', 'N/A')}%
-Max Drawdown: {price_data.get('max_drawdown', 'N/A')}%
-"""
-
-        signal_context = ""
-        if signals:
-            signal_lines = []
-            for key, val in signals.items():
-                if isinstance(val, dict):
-                    signal_lines.append(f"- {key}: {val.get('signal', str(val))}")
-            signal_context = "\nTechnical Signals:\n" + "\n".join(signal_lines)
-
-        news_context = ""
-        if news_sentiment:
-            news_context = f"\nNews Sentiment: {news_sentiment}"
-
-        prompt = f"""Based on the following data, provide a brief market insight for {symbol}:
-
-{price_context}{signal_context}{news_context}
-
-Provide a 3-4 sentence analysis covering:
-1. Current technical position
-2. Key levels to watch
-3. Notable observations"""
-
-        return self.generate(prompt, system_prompt, max_tokens=400)
 
     # Model description constant — extend when new models are added
     _MODEL_DESCRIPTIONS = {
@@ -1064,7 +1147,7 @@ Provide a 3-4 sentence analysis covering:
         verdict = parts[0].strip()
         remaining = budget - len(verdict)
 
-        priority = ("bull", "risk", "trade plan", "news", "technical")
+        priority = ("situation", "bull", "risk", "trade plan", "news", "technical")
 
         def rank(section: str) -> int:
             heading = section.split("\n", 1)[0].lower()
@@ -1134,6 +1217,8 @@ YOUR ROLE:
 - Synthesize both inputs into specific, actionable recommendations per symbol
 - When the AI report and model predictions DISAGREE, this is the most valuable signal — explain WHY they disagree and which to trust in this context
 - Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa) — they are context that shades conviction, never a standalone reason to flip a direction
+- Where a "Situation" line is present, the call is about that situation's resolution — a pending deal's completion odds and spread to the offer, a regulator's decision, an earnings print — not about trend. Models that only read price are less relevant there; say so in model_notes, and let key_level/change_trigger reference the offer price or the dated event rather than a moving average
+- Where a report says it was WRITTEN WITHOUT expected evidence, lower p_correct for that symbol and name the missing evidence in conflicts; do not treat the absence as neutral
 - "p_correct" is a probability, not a mood: your estimate that the ACTION direction is right for the next session's close, on the 0.50-0.75 scale where 0.50 means "no edge over a coin flip". You will be scored against realized outcomes — a persistent gap between your stated p_correct and your hit rate is a defect. State 0.50-0.55 freely; earn anything above 0.65.
 - Explain which models are most relevant for each symbol's situation
 - Provide an overall portfolio-level summary
@@ -1184,6 +1269,26 @@ Respond with ONLY valid JSON matching this schema:
                                                research_budget)
                 lines.append("Research report (verdict + key sections):")
                 lines.append("  " + digest.replace("\n", "\n  "))
+            inv = research.get("investigation") or {}
+            if inv.get("situation"):
+                deal = inv.get("deal") or {}
+                deal_str = ""
+                if deal.get("present"):
+                    offer = deal.get("offer_price")
+                    deal_str = (f"; deal: {deal.get('acquirer') or 'n/a'}"
+                                + (f" at ${float(offer):.2f}" if isinstance(offer, (int, float)) else "")
+                                + (f", gross spread {inv['spread_pct']:+.1f}%"
+                                   if inv.get("spread_pct") is not None else ""))
+                lines.append(
+                    f"Situation ({'web-researched' if inv.get('web') else 'classified from supplied evidence'}): "
+                    f"{inv['situation']} ({inv.get('situation_confidence', 'n/a')}) — "
+                    f"{str(inv.get('one_line') or '')[:220]}{deal_str}")
+            gaps = [g for g in ((research.get("evidence") or {}).get("gaps") or [])
+                    if g.get("severity") == "expected"]
+            if gaps:
+                lines.append("Research report WRITTEN WITHOUT expected evidence: "
+                             + "; ".join(f"{g.get('label')} ({g.get('reason')})"
+                                         for g in gaps))
             if sym_report:
                 # Two distinct numbers, spelled out. The unlabeled
                 # "(confidence: 0.5)" this used to print was read by the
@@ -1346,7 +1451,7 @@ Respond with ONLY valid JSON matching this schema:
             # truncated payload used to drop the whole day's synthesis on the
             # floor here). A completed AI report + prediction run shouldn't
             # be wasted, so re-ask once on the fallback model.
-            fallback = os.getenv("RECOMMENDATIONS_FALLBACK_MODEL", "claude-sonnet-4-6")
+            fallback = MODEL.RECOMMENDATIONS_FALLBACK_MODEL
             if fallback == primary_model:
                 fallback = ("claude-sonnet-4-6" if primary_model == "claude-sonnet-5"
                             else "claude-sonnet-5")

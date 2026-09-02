@@ -269,6 +269,11 @@ class ModelConfig:
     # scheduler job form and the CLI all expose this; the trace records
     # when it bites (fetched vs kept, effective span).
     NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "500"))
+    # The durable news store keeps every fetched article this long, then
+    # prunes. A daily 7/14/30-day run reads its window from the store and
+    # fetches only days it has not seen — the same articles are not paid for
+    # again every morning.
+    NEWS_RETENTION_DAYS: int = int(os.getenv("NEWS_RETENTION_DAYS", "90"))
     # How many of the window's articles a PROMPT actually reads. Sampled
     # spread across the window (services.news_window.select_spread), never
     # "the newest N" — that is what quietly turned a 30-day window into a

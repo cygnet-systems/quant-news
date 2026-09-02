@@ -32,8 +32,11 @@ from typing import Any, Optional
 import pandas as pd
 
 from config import MODEL
+from services.evidence_contract import EvidenceLedger
 from services.news_window import (
-    DEFAULT_NEWS_LOOKBACK_DAYS,
+    RunParameterMissing,
+    article_span,
+    select_spread,
     fetch_point_in_time_news,
     filter_articles_as_of,
 )
@@ -68,8 +71,12 @@ Every number you cite must be traceable to the data below:
   name. If it doesn't, name only the members it holds for, or quantify exactly
   ("3 of 4 peers") — never stretch "all" or "much" over a member the numbers
   don't support.
-- Use only the evidence in this prompt. You have no tools and cannot browse; if
-  something is missing, say so explicitly rather than filling it in.
+- Use only the evidence in this prompt. You cannot browse. The SITUATION &
+  INVESTIGATION block, when present, was gathered by a research stage WITH web
+  access before this prompt was built and carries its own sources — cite those
+  exactly as you cite news. If something is missing, say so explicitly rather
+  than filling it in. A block headed "Evidence NOT available" lists what this
+  run could not gather; never reason as if those inputs were neutral.
 - NEWS ATTRIBUTION: every claim you take from a news article must name the outlet
   and the publication date inline, e.g. "shares fell 18.9% (Reuters, 2026-08-14)".
   Each article below carries "src:" and a date — use those exact values. If you
@@ -115,6 +122,21 @@ Analyze ALL of the following data carefully before deciding.
 {sector_block}
 {extra_context}
 == HOW TO REASON (this is the order to think in, not the order to write in) ==
+
+**Step 0: Situation (read this first)** — {situation_line}
+The situation decides how every other block is read:
+- PENDING_ACQUISITION: the next 1-5 sessions are about deal-completion odds,
+  not trend. Anchor to the offer price and the computed spread; weigh the
+  regulatory milestones, the break risk and the decisive actors named in the
+  block. Moving averages are secondary here — never call a direction "because
+  price is below its SMAs" when the spread to a cash offer is the real question.
+  Triggers may be events (a regulator's order, a hearing, a vote) rather than
+  price levels; a price trigger must be stated relative to the offer price.
+- LEGAL_REGULATORY_OVERHANG, STRATEGIC_REVIEW, LEADERSHIP_CHANGE, DISTRESS,
+  PRODUCT_OR_CONTRACT: lead with the situation, its dated milestones and who
+  decides it; technicals describe how the tape is pricing it, not the thesis.
+- EARNINGS_EVENT: the event gate in Step 4 applies.
+- MOMENTUM_ONLY or no situation block: Steps 1-3 carry the call.
 
 **Step 1: Market Regime (Systematic Risk)** — from the SPY block:
 - SPY above 50 SMA AND 200 SMA with positive MACD = BULL (prior lean BUY)
@@ -199,33 +221,45 @@ Then the analysis, as sections in this order. Formatting rules:
   Rounding for readability is not estimating; the underlying digits must come
   from the data.
 
-1. Technicals ({ticker}) — cover price vs ALL THREE SMAs (20/50/200 — the
+1. Situation & Key Figures — what kind of situation {ticker} is in and the one
+   question that decides the next 1-5 sessions. From the SITUATION &
+   INVESTIGATION block: the deal or proceeding and its terms (offer price,
+   spread, consideration, approvals and their status), the dated milestones,
+   and the decisive actors with what the sourced record says about them —
+   every fact with its src and date. If the block says a finding is an
+   inference, say so. If no situation block was gathered, say exactly that in
+   one sentence and classify the situation yourself from the news block. For
+   MOMENTUM_ONLY, one short paragraph saying nothing situational is in play.
+2. Technicals ({ticker}) — cover price vs ALL THREE SMAs (20/50/200 — the
    200SMA anchors the long-term trend and must not be skipped), RSI, MACD,
-   volume, and volatility
-2. News & Catalysts — company-specific first, then sector, then macro. Every
+   volume, and volatility. In a PENDING_ACQUISITION, state every level relative
+   to the offer price as well.
+3. News & Catalysts — company-specific first, then sector, then macro. Every
    claim carries its outlet and date inline; is anything actually new?
-3. Fundamentals — valuation and quality, only as they bear on the 1-5 day window
-4. Peer Comparison — {ticker} vs the peer set in the data; company-specific move
+4. Fundamentals — valuation and quality, only as they bear on the 1-5 day window
+   (in a PENDING_ACQUISITION, only as they bear on completion or break value)
+5. Peer Comparison — {ticker} vs the peer set in the data; company-specific move
    or sector-wide repricing? (omit this section only if no peer block was provided)
-5. Business Context — what the company actually does, and which of tomorrow's
+6. Business Context — what the company actually does, and which of tomorrow's
    drivers (sector beta, own catalysts, liquidity) dominate for a name this size
-6. Market & Sector Backdrop — SPY regime and {sector_etf} versus SPY, in AT MOST
+7. Market & Sector Backdrop — SPY regime and {sector_etf} versus SPY, in AT MOST
    three sentences. This context is identical for every symbol analysed today, so
    it earns no more space than that; spend the words on what it changes for
    {ticker} specifically
-7. Bull vs Bear — the debate, not a summary. First "**Bull:**" with the 2-3
+8. Bull vs Bear — the debate, not a summary. First "**Bull:**" with the 2-3
    strongest arguments FOR upside, each anchored to a specific number or article
    in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
    same standard. Argue each side at full strength — do not soften the side you
    disagree with. The Read line states which side wins over 1-5 sessions and on
    what evidence the loser's case would take over.
-8. Risk — systematic / sector / idiosyncratic; name the single biggest risk to
-   THIS call and the falsification conditions that would flip it
-9. Trade Plan — stance; the key levels (support, resistance, SMAs) rounded as
-   described above and stamped "as of {date}"; invalidation (which close or level
-   kills the thesis); what to watch next session. If a prior stance is shown
-   above, this section must also say in one sentence what changed since it, or
-   that nothing did
+9. Risk — systematic / sector / idiosyncratic; name the single biggest risk to
+   THIS call and the falsification conditions that would flip it. Name any
+   evidence this run could not gather and what it would have changed.
+10. Trade Plan — stance; the key levels (support, resistance, SMAs) rounded as
+   described above and stamped "as of {date}"; invalidation (which close, level
+   or event kills the thesis); what to watch next session. If a prior stance is
+   shown above, this section must also say in one sentence what changed since
+   it, or that nothing did
 """
 
 
@@ -285,12 +319,6 @@ def _cached_frame(symbol: str, period: str = "2y") -> "pd.DataFrame":
         from services.stock_data import fetch_stock_data
         _FRAME_CACHE[key] = fetch_stock_data(symbol, period=period)
     return _FRAME_CACHE[key]
-
-
-def clear_caches() -> None:
-    """Drop the in-process frame/fundamentals caches (use between live runs)."""
-    _FRAME_CACHE.clear()
-    _FUND_CACHE.clear()
 
 
 def _smart_truncate(data: str, max_chars: int) -> str:
@@ -440,17 +468,26 @@ def _price_action_block(df: pd.DataFrame, n: int = 15) -> str:
     return "\n".join(lines)
 
 
-def _news_block(articles: list, n: int = 20) -> str:
+def _news_block(articles: list, n: Optional[int] = None) -> tuple[str, int, tuple]:
     """Point-in-time headlines, each carrying the outlet and date to cite.
 
     The prompt requires inline attribution on every news-derived claim, so the
     outlet has to be in the block the model reads — without ``src:`` here the
     only honest option left to the model is to drop the claim.
+
+    Shows up to ``n`` (config NEWS_PROMPT_ARTICLES) articles SPREAD across
+    the window, not the newest ``n``: newest-first truncation is how a
+    30-day window used to reach the model as its last three days.
     """
     if not articles:
-        return "No news in the point-in-time window."
-    lines = []
-    for a in articles[:n]:
+        return "No news in the point-in-time window.", 0, (None, None)
+    if n is None:
+        n = MODEL.NEWS_PROMPT_ARTICLES
+    shown = select_spread(articles, n)
+    oldest, newest = article_span(shown)
+    lines = [f"({len(shown)} of {len(articles)} articles in the window, "
+             f"sampled across {oldest} → {newest}, newest first)"]
+    for a in shown:
         if hasattr(a, "title"):
             title = a.title or ""
             summary = (a.summary or "")[:200]
@@ -471,7 +508,7 @@ def _news_block(articles: list, n: int = 20) -> str:
         # blank would have read as "no source needed".
         src = str(source).strip() if source else "unattributed"
         lines.append(f"- [{sent}] (src: {src} | {date} | rel:{relf}) {title}: {summary}")
-    return "\n".join(lines)
+    return "\n".join(lines), len(shown), (oldest, newest)
 
 
 def _dollars(v) -> str:
@@ -855,11 +892,13 @@ class SingleAgentResearch:
         ohlcv_df: Optional[pd.DataFrame] = None,
         news: Optional[list] = None,
         extra_context: str = "",
-        news_lookback_days: int = DEFAULT_NEWS_LOOKBACK_DAYS,
+        news_lookback_days: Optional[int] = None,
         use_news: bool = True,
         include_thesis: bool = False,
         track_record: Optional[str] = None,
         use_continuity: bool = True,
+        ledger: "Optional[EvidenceLedger]" = None,
+        situation: Optional[str] = None,
     ) -> dict[str, Any]:
         """Run the analysis for `symbol` as of `as_of` (YYYY-MM-DD).
 
@@ -877,6 +916,10 @@ class SingleAgentResearch:
         suppresses the prior-stance lookup for the same reason.
         """
         from services.stock_data import fetch_stock_data
+
+        # Every block records itself as present or as a gap; a required block
+        # that cannot be built raises here and the report is not written.
+        ledger = ledger or EvidenceLedger(symbol)
 
         # Stamped before anything is fetched: the continuity lookup uses it to
         # exclude reports written by this very run (a retry, or a concurrent
@@ -905,12 +948,15 @@ class SingleAgentResearch:
         proxy_level = sinfo["level"]
         try:
             spy_block = _technicals_block("SPY", _as_of_slice(_cached_frame("SPY"), as_of))
-        except Exception:
+            ledger.have("spy")
+        except Exception as e:
             spy_block = "SPY data unavailable."
+            ledger.missing("spy", f"SPY technicals failed: {str(e)[:80]}")
         if proxy_level == "unknown":
             sector_block = (f"No distinct sector ETF resolved for {symbol} "
                             f"(sector metadata unavailable) — rely on the SPY "
                             f"market context; treat sector evidence as missing.")
+            ledger.missing("sector", "sector metadata unavailable")
         else:
             if proxy_level == "industry":
                 proxy_line = (f"Sector: {sector_name} | ETF proxy: {sector_etf} "
@@ -922,10 +968,17 @@ class SingleAgentResearch:
             try:
                 sector_block = proxy_line + "\n" + _technicals_block(
                     sector_etf, _as_of_slice(_cached_frame(sector_etf), as_of))
-            except Exception:
+                ledger.have("sector")
+            except Exception as e:
                 sector_block = f"{sector_etf} data unavailable."
+                ledger.missing("sector", f"{sector_etf} bars unavailable: {str(e)[:60]}")
 
         # --- news (point-in-time) ---
+        # The window is the run's, never this module's: with no value there
+        # is nothing honest to filter by, so refuse rather than guess.
+        if use_news and news_lookback_days is None:
+            raise RunParameterMissing(
+                f"{symbol}: research agent called without news_lookback_days")
         if not use_news:
             news_articles = []
         elif news is not None:
@@ -936,24 +989,22 @@ class SingleAgentResearch:
                     symbol, as_of, lookback_days=news_lookback_days
                 )
             except Exception as e:
+                # The source failed — not a quiet week. Required evidence:
+                # the report is not written blind (raises).
                 logger.warning(f"PIT news fetch failed for {symbol}: {e}")
+                ledger.missing("news_source", f"point-in-time fetch failed: {str(e)[:80]}")
                 news_articles = []
-
-        extra_block = ""
-        if extra_context:
-            # 8000 (was 4000): the assembled blocks (metrics + events +
-            # peers + SPY regime) exceeded the old budget, silently cutting
-            # the later blocks. Callers truncate per block; this is a backstop.
-            extra_block = (
-                "\n== PRECOMPUTED METRICS & EVENTS (validated — prefer these numbers) ==\n"
-                + _smart_truncate(extra_context, 8000) + "\n"
-            )
 
         # Static business identity (sector/industry/summary) — same rationale
         # as _fundamentals_block's info usage: identity is not price data, so
         # it is acceptable in a historical run.
         from services.stock_data import get_company_profile
-        business = get_company_profile(symbol) or "Business profile not available."
+        business = get_company_profile(symbol)
+        if business:
+            ledger.have("business")
+        else:
+            business = "Business profile not available."
+            ledger.missing("business", "company profile lookup failed")
 
         # --- prior stance (cross-day continuity) ---
         # trade_date <= as_of is the lookahead guard (a later session's report
@@ -971,12 +1022,48 @@ class SingleAgentResearch:
             except Exception as e:
                 logger.debug(f"prior report lookup failed for {symbol}: {e}")
         continuity = _continuity_block(prior_report, ohlcv_df, as_of)
+        if prior_report:
+            ledger.have("continuity")
 
         fundamentals_block = _fundamentals_block(symbol, as_of)
+        fund_ok = not fundamentals_block.startswith("Fundamentals not available")
+        if fund_ok:
+            ledger.have("fundamentals")
+        else:
+            ledger.missing("fundamentals", "no filings on or before the as-of date")
+
+        extra_block = ""
+        # 12000: the assembled blocks now open with the situation &
+        # investigation block and can carry political flows too; callers
+        # truncate per block, this is the whole-string backstop. The gaps
+        # block is appended LAST and never truncated away.
+        gaps_block = ledger.prompt_block()
+        if extra_context or gaps_block:
+            extra_block = (
+                "\n== PRECOMPUTED METRICS & EVENTS (validated — prefer these numbers) ==\n"
+                + _smart_truncate(extra_context, 12000)
+                + (("\n\n" + gaps_block) if gaps_block else "")
+                + "\n"
+            )
+        if situation:
+            situation_line = (f"the investigation stage classified {symbol} as "
+                              f"{situation} (see the SITUATION & INVESTIGATION block).")
+        else:
+            situation_line = (f"no situation block was gathered for {symbol} in this "
+                              f"run — classify the situation yourself from the news "
+                              f"and filings blocks before Step 1, and say that you did.")
+        # Rendered once, measured once: the footer reports THIS count and
+        # span. The char budget scales with the article budget so the tail
+        # truncation (which would eat the oldest strata — the whole point of
+        # spreading) cannot fire on a normal block; ~320 chars per line.
+        news_block_text, news_shown, news_shown_span = _news_block(news_articles)
+        news_block_text = _smart_truncate(
+            news_block_text, max(6000, 320 * (MODEL.NEWS_PROMPT_ARTICLES or 50) + 400))
         prompt = SINGLE_AGENT_PROMPT.format(
             ticker=symbol,
             date=as_of,
             sector_etf=sector_etf,
+            situation_line=situation_line,
             track_record_block=track_record or NO_TRACK_RECORD_LINE,
             continuity_block=_smart_truncate(continuity, 1500),
             business_block=_smart_truncate(business, 1200),
@@ -985,7 +1072,7 @@ class SingleAgentResearch:
             price_block=_smart_truncate(_price_action_block(ohlcv_df), 3000),
             tech_block=_smart_truncate(_technicals_block(symbol, ohlcv_df), 2000),
             fundamentals_block=_smart_truncate(fundamentals_block, 2000),
-            news_block=_smart_truncate(_news_block(news_articles), 6000),
+            news_block=news_block_text,
             extra_context=extra_block,
         ) + EPILOGUE_INSTRUCTIONS % {
             "thesis": THESIS_EPILOGUE_SCHEMA if include_thesis else "",
@@ -1074,13 +1161,15 @@ class SingleAgentResearch:
         # Provenance — computed from what was ACTUALLY assembled, never
         # asserted by the LLM. The footer travels inside report_text so every
         # surface (UI, History, PDF, downloads) carries its own audit trail.
-        fund_ok = not fundamentals_block.startswith("Fundamentals not available")
         provenance = {
             "model": self.model,
             "provider": self.provider,
             "as_of": as_of,
             "news_count": len(news_articles),
             "news_window_days": news_lookback_days,
+            "news_span": list(article_span(news_articles)),
+            "news_prompt_articles": news_shown,
+            "news_prompt_span": list(news_shown_span),
             "news_enabled": use_news,
             "ohlcv_bars": int(len(ohlcv_df)) if ohlcv_df is not None else 0,
             "ohlcv_through": (str(ohlcv_df.index.max())[:10]
@@ -1096,11 +1185,16 @@ class SingleAgentResearch:
             "track_record_stated": bool(track_record),
             "prior_report_date": (prior_report or {}).get("trade_date"),
             "prior_decision": (prior_report or {}).get("decision"),
+            "situation": situation,
+            "evidence": ledger.to_dict(),
         }
         news_desc = (
-            f"{len(news_articles)} news articles "
-            f"({news_lookback_days}d point-in-time window)"
-            if use_news else "news disabled for this run"
+            f"{news_shown} of {len(news_articles)} news articles read "
+            f"({news_lookback_days}d point-in-time window; read span "
+            f"{news_shown_span[0]} → {news_shown_span[1]})"
+            if use_news and news_articles else
+            "no news in the window" if use_news else
+            "news disabled for this run"
         )
         if proxy_level == "industry":
             sector_src = f"SPY & {sector_etf} ({industry_name} industry proxy) context"
@@ -1117,7 +1211,10 @@ class SingleAgentResearch:
             f"{'; precomputed metrics/events/peers' if extra_block else ''}"
             + (f"; prior stance from the {prior_report['trade_date']} report"
                if prior_report else "; no prior report on record")
+            + (f"; situation {situation}" if situation else "")
             + "."
+            + (f" **Written without expected evidence: {ledger.summary()}.**"
+               if ledger.degraded else "")
             + " Every figure above comes from these blocks — flagged 'not in"
               " data' where missing.*"
         )
@@ -1163,6 +1260,8 @@ class SingleAgentResearch:
             "figure_check": figure_check,
             "news_count": len(news_articles),
             "sector_etf": sector_etf,
+            "situation": situation,
+            "evidence": ledger.to_dict(),
             "input_tokens": usage_total["input_tokens"],
             "output_tokens": usage_total["output_tokens"],
             "served_by_model": usage_total["model"],

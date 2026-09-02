@@ -330,10 +330,30 @@ class HistoricalNews(Base):
     ticker_sentiment_score: Mapped[float | None] = mapped_column(Double)
     ticker_relevance_score: Mapped[float | None] = mapped_column(Double)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Full timestamp (migration 013): the overnight window needs the hour.
+    # NULL on rows written before it existed.
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("ix_historical_news_lookup", "symbol", "published_date"),
+        Index("ix_historical_news_published_at", "symbol", "published_at"),
     )
+
+
+class NewsCoverage(Base):
+    """Which (symbol, day) pairs have been fetched from the news vendor.
+
+    The ledger behind the point-in-time news store: a run computes the days
+    of its window that are NOT here and fetches only those. A day within the
+    live edge is re-fetched when its fetched_at is older than the live TTL,
+    because the vendor keeps indexing a session's articles for a while.
+    """
+
+    __tablename__ = "news_coverage"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class StrategyEvaluation(Base):

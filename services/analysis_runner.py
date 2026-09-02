@@ -583,6 +583,8 @@ def run_predictions(
                       + ", ".join(f"{m} failed ({err[:60]})"
                                   for m, err in failed.items()))
 
+    if investigation_pool is not None:
+        investigation_pool.shutdown(wait=False)
     results["_meta"] = {
         "predict_date": cutoff_date.isoformat(),
         "target_date": target_date.isoformat(),

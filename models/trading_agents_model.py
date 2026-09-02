@@ -12,8 +12,15 @@ fork advanced to v0.3.1; see TradingAgents_v0.3_Incorporation_Analysis.md). The
 research strategy now lives in-tree behind the BaseModel seam, so it is
 swappable and an upstream release can never silently disable it again.
 
+Evidence discipline (services.evidence_contract): every context block this
+wrapper assembles is classed required / expected / optional. A required block
+that cannot be built raises — the symbol fails visibly instead of producing a
+report that reads as complete. An expected block that cannot be built is
+recorded as a gap that travels into the prompt, the footer, the prediction
+details and the run's completeness check.
+
 The raw_response (full report text) is stored in details for persistence in
-DuckDB/Postgres and viewing in the History tab.
+Postgres and viewing in the History tab.
 """
 
 import logging
@@ -23,8 +30,19 @@ import pandas as pd
 
 from config import MODEL
 from models.base import BaseModel, PredictionResult
+from services.evidence_contract import (
+    OPTIONAL, EvidenceLedger, MissingRequiredEvidence,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _emit(stage: str, message: str, payload: dict | None = None) -> None:
+    try:
+        from services import progress_service as _prog
+        _prog.emit(stage, message, payload=payload)
+    except Exception:
+        pass
 
 
 class TradingAgentsModel(BaseModel):
@@ -60,6 +78,21 @@ class TradingAgentsModel(BaseModel):
 
         try:
             return self._run_analysis(symbol, ohlcv_df, **kwargs)
+        except MissingRequiredEvidence as e:
+            # Deliberate refusal: the report is not written without this.
+            logger.error(str(e))
+            _emit("error", f"{symbol}: research report NOT written — {e.reason} "
+                           f"({e.block}). A report without it would read as "
+                           f"complete and be wrong.")
+            return PredictionResult(
+                model_name=self.name,
+                decision="HOLD",
+                confidence=0.0,
+                up_probability=0.5,
+                details={"missing_required": e.block,
+                         "missing_reason": e.reason},
+                error=str(e),
+            )
         except Exception as e:
             logger.error(f"Single-agent research failed for {symbol}: {e}")
             return PredictionResult(
@@ -91,21 +124,32 @@ class TradingAgentsModel(BaseModel):
         # in the prediction service's common kwargs).
         model_name = (kwargs.get("research_model") or kwargs.get("model")
                       or MODEL.TRADING_AGENTS_MODEL)
+        evidence = (set(kwargs["evidence"]) if kwargs.get("evidence") is not None
+                    else set(MODEL.DEFAULT_EVIDENCE))
+        ledger = EvidenceLedger(symbol)
+
+        # The run's own verdict on the news SOURCE. "unavailable" means the
+        # vendor failed, not that the week was quiet — and a research report
+        # written blind on a news-driven name is the failure this model now
+        # refuses (the sentiment model already abstains on the same signal).
+        news_status = kwargs.get("news_status")
+        if use_news and news_status == "unavailable":
+            ledger.missing("news_source",
+                           "news vendor failed for this symbol in this run")
+        if use_news:
+            ledger.have("news_source")
 
         logger.info(f"Running single-agent research for {symbol} @ {as_of}")
-        try:
-            from services import progress_service as _prog
-            _prog.emit("ta", f"Research {symbol}: gathering point-in-time dataset "
-                             f"(market, sector, news, fundamentals) @ {as_of}")
-        except Exception:
-            pass
+        _emit("ta", f"Research {symbol}: gathering point-in-time dataset "
+                    f"(market, sector, news, fundamentals) @ {as_of}")
 
         # Precomputed, validated context: metrics from the (already truncated)
-        # OHLCV, the event-calendar gate, peer relative strength, and a computed
-        # SPY regime. These are computed here — not asserted by the LLM — and
-        # are all lookahead-safe.
-        extra_blocks = self._build_extra_context(
-            symbol, ohlcv_df, as_of, evidence=kwargs.get("evidence"))
+        # OHLCV, the event-calendar gate, peer relative strength, a computed
+        # SPY regime, and the selected evidence blocks. Computed here — not
+        # asserted by the LLM — and all lookahead-safe.
+        extra_blocks, investigation = self._build_extra_context(
+            symbol, ohlcv_df, as_of, evidence=evidence, ledger=ledger,
+            news=news, target=kwargs.get("target_date"))
 
         # Deferred reflection: resolve any past decisions whose outcome is now
         # known (lookahead-safe — only outcomes on/before as_of) and inject the
@@ -117,14 +161,20 @@ class TradingAgentsModel(BaseModel):
                 past = _refl.get_past_context(symbol)
                 if past:
                     extra_blocks.insert(0, past)
+                    ledger.have("reflection")
             except Exception as e:
                 logger.debug("reflection context failed: %s", e)
+                ledger.missing("reflection", str(e)[:100])
 
         # The one accuracy sentence the report is required to quote verbatim.
         # Measured here (not phrased by the LLM) so a reader sees the platform's
         # own evaluated hit rate next to the model's self-assessed conviction,
         # and so a thin sample produces "not enough history" instead of a number.
         track_record = self._track_record_line(as_of)
+        if track_record:
+            ledger.have("track_record")
+        else:
+            ledger.missing("track_record", "calibration lookup failed")
 
         agent = get_research_agent(model=model_name, backend=kwargs.get("backend"))
         result = agent.analyze(
@@ -136,9 +186,14 @@ class TradingAgentsModel(BaseModel):
             # Per-block cap: one oversized block (usually news-heavy metrics)
             # must not push the later blocks (peers, SPY regime) past the
             # whole-string budget — that's how peers silently vanished.
-            extra_context="\n\n".join(b[:2000] for b in extra_blocks),
+            extra_context="\n\n".join(b[:2600] for b in extra_blocks),
             use_news=use_news,
             include_thesis=kwargs.get("include_thesis", False),
+            # The run's own window, frontend-owned: no fallback here — the
+            # agent raises when it is asked to read news without one.
+            news_lookback_days=kwargs.get("news_lookback_days"),
+            ledger=ledger,
+            situation=(investigation.situation if investigation else None),
         )
 
         decision = (result.get("decision") or "HOLD").upper()
@@ -158,13 +213,20 @@ class TradingAgentsModel(BaseModel):
             kwargs.get("empirical_n", 0),
         )
 
-        try:
-            from services import progress_service as _prog
-            _prog.emit("ta", f"Research {symbol}: {decision} "
-                             f"[reliability {confidence:.0%} · {conf_source}] — "
-                             f"{result.get('news_count', 0)} articles in window")
-        except Exception:
-            pass
+        gaps = ledger.expected_gaps()
+        _emit("ta", f"Research {symbol}: {decision} "
+                    f"[reliability {confidence:.0%} · {conf_source}] — "
+                    f"{result.get('news_count', 0)} articles in window"
+                    + (f"; situation {investigation.situation}" if investigation else "")
+                    + (f"; WRITTEN WITHOUT {len(gaps)} expected block(s)" if gaps else ""))
+        if gaps:
+            # Stage "gap": the report exists, but a reader must know what it
+            # was written without. The run's completeness check turns these
+            # into PARTIAL; the UI counts them separately from crashes.
+            _emit("gap", f"{symbol}: report written without expected evidence — "
+                         f"{ledger.summary()}",
+                  payload={"event": "evidence_gap", "symbol": symbol,
+                           "gaps": [g.to_dict() for g in gaps]})
 
         # Record this decision as pending for a future reflection pass. Store the
         # LLM's stated conviction on the entry purely as a note (not for scoring).
@@ -176,31 +238,38 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 logger.debug("reflection record failed: %s", e)
 
+        details = {
+            "confidence_type": conf_source,
+            "stated_conviction": round(stated_conviction, 2),  # LLM self-report; uncalibrated, unused for scoring
+            "empirical_n": emp_n,
+            "raw_response": raw_response,
+            "trade_date": as_of,
+            "model": result.get("model", ""),
+            "triggers": result.get("triggers", {}),
+            "structured": result.get("structured", {}),
+            "provenance": result.get("provenance", {}),
+            "figure_check": result.get("figure_check"),
+            "news_count": result.get("news_count", 0),
+            "sector_etf": result.get("sector_etf", ""),
+            "used_news": use_news,
+            "evidence": ledger.to_dict(),
+            # Token cost of the report, summed over retries. Persisted so
+            # cost per report is measurable instead of being stored as 0.
+            "input_tokens": result.get("input_tokens", 0),
+            "output_tokens": result.get("output_tokens", 0),
+            "served_by_model": result.get("served_by_model", ""),
+        }
+        if investigation is not None:
+            details["investigation"] = investigation.to_dict()
+            details["input_tokens"] += investigation.input_tokens
+            details["output_tokens"] += investigation.output_tokens
+
         return PredictionResult(
             model_name=self.name,
             decision=decision,
             confidence=round(confidence, 2),
             up_probability=round(up_probability, 4),
-            details={
-                "confidence_type": conf_source,
-                "stated_conviction": round(stated_conviction, 2),  # LLM self-report; uncalibrated, unused for scoring
-                "empirical_n": emp_n,
-                "raw_response": raw_response,
-                "trade_date": as_of,
-                "model": result.get("model", ""),
-                "triggers": result.get("triggers", {}),
-                "structured": result.get("structured", {}),
-                "provenance": result.get("provenance", {}),
-                "figure_check": result.get("figure_check"),
-                "news_count": result.get("news_count", 0),
-                "sector_etf": result.get("sector_etf", ""),
-                "used_news": use_news,
-                # Token cost of the report, summed over retries. Persisted so
-                # cost per report is measurable instead of being stored as 0.
-                "input_tokens": result.get("input_tokens", 0),
-                "output_tokens": result.get("output_tokens", 0),
-                "served_by_model": result.get("served_by_model", ""),
-            },
+            details=details,
         )
 
     @staticmethod
@@ -270,134 +339,253 @@ class TradingAgentsModel(BaseModel):
             up_probability = 0.5
         return confidence, up_probability, source, emp_n
 
+    @staticmethod
+    def _is_live(as_of: str) -> bool:
+        """True when as_of is the latest completed session — the only case
+        in which open-web research cannot see past the data cutoff by more
+        than the overnight gap."""
+        try:
+            from utils.trading_calendar import get_last_completed_trading_day
+            return str(as_of)[:10] >= get_last_completed_trading_day().isoformat()
+        except Exception:
+            return False
+
     def _build_extra_context(
         self, symbol: str, ohlcv_df: pd.DataFrame, as_of: str,
-        evidence: "list[str] | set[str] | None" = None,
-    ) -> list[str]:
+        evidence: "set[str] | list[str] | None" = None,
+        ledger: EvidenceLedger | None = None,
+        news: list | None = None,
+        target: str | None = None,
+    ) -> "tuple[list[str], object | None]":
         """Assemble validated, lookahead-safe context blocks for the prompt.
 
-        ``evidence`` gates the optional Terminal-derived blocks per run
-        (Run-Analysis modal checklist): "options" and "quality". None means
-        both — the scheduled/default path.
-        """
-        evidence = set(evidence) if evidence is not None else {"options", "quality"}
-        extra_blocks: list[str] = []
-        try:
-            # Callers may pass None to request a fresh fetch (stale-cache
-            # healing). The metrics/peer blocks still need a frame — fetch
-            # and slice it here rather than silently dropping the
-            # "validated" PRECOMPUTED METRICS block from the prompt.
-            if ohlcv_df is None or not len(ohlcv_df):
-                from services.stock_data import fetch_stock_data
-                fresh = fetch_stock_data(symbol, period="1y")
-                if fresh is not None and len(fresh):
-                    ohlcv_df = fresh[fresh.index <= str(as_of)]
-            from utils.metrics import (
-                compute_trading_metrics, format_metrics_block,
-                compute_peer_relative_strength,
-            )
-            from utils.events import get_upcoming_events, format_events_block
-            from models.sector_map import get_peers
+        ``evidence`` gates the optional blocks per run (Run-Analysis modal
+        checklist): "options", "quality", "investigation", "political".
+        None means the configured default set.
 
+        Returns (blocks, investigation). Every block records itself on the
+        ledger as present or as a gap with the reason; required blocks
+        raise through ``ledger.missing``.
+        """
+        evidence = set(evidence) if evidence is not None else set(MODEL.DEFAULT_EVIDENCE)
+        ledger = ledger or EvidenceLedger(symbol)
+        extra_blocks: list[str] = []
+        investigation = None
+
+        # Callers may pass None to request a fresh fetch (stale-cache
+        # healing). The metrics/peer blocks still need a frame — fetch and
+        # slice it here rather than silently dropping the "validated"
+        # PRECOMPUTED METRICS block from the prompt.
+        if ohlcv_df is None or not len(ohlcv_df):
+            from services.stock_data import fetch_stock_data
+            fresh = fetch_stock_data(symbol, period="1y")
+            if fresh is not None and len(fresh):
+                ohlcv_df = fresh[fresh.index <= str(as_of)]
+        if ohlcv_df is None or not len(ohlcv_df):
+            ledger.missing("ohlcv", f"no price bars through {as_of}")
+        ledger.have("ohlcv")
+
+        from utils.metrics import (
+            compute_trading_metrics, format_metrics_block,
+            compute_peer_relative_strength,
+        )
+        from utils.events import get_upcoming_events, format_events_block
+        from models.sector_map import get_peers
+
+        # --- validated metrics (required) ---
+        try:
             metrics = compute_trading_metrics(ohlcv_df)
             block = format_metrics_block(symbol, metrics)
-            if block:
-                extra_blocks.append(block)
+        except Exception as e:
+            metrics, block = {}, ""
+            logger.warning(f"{symbol}: metrics block failed: {e}")
+        if block:
+            extra_blocks.append(block)
+            ledger.have("metrics")
+        else:
+            ledger.missing("metrics", "validated metrics could not be computed")
+        last_close = None
+        try:
+            last_close = float(ohlcv_df["Close"].iloc[-1])
+        except Exception:
+            pass
 
+        # --- event calendar (expected) ---
+        try:
             events = get_upcoming_events(symbol, as_of)
             block = format_events_block(symbol, events)
+        except Exception as e:
+            events, block = {}, ""
+            logger.warning(f"{symbol}: events block failed: {e}")
+        if block:
+            extra_blocks.append(block)
+            ledger.have("events")
+        else:
+            ledger.missing("events", "earnings/ex-dividend calendar unavailable")
+
+        # --- peers (expected; "no peers mapped" is a coverage gap worth
+        # seeing, not silence) ---
+        peers = get_peers(symbol)
+        if peers:
+            from models.sector_map import get_sector_etf
+            block = None
+            try:
+                block = compute_peer_relative_strength(
+                    symbol, peers, as_of=as_of, sector_etf=get_sector_etf(symbol))
+            except Exception as e:
+                logger.warning(f"{symbol}: peer RS failed: {e}")
             if block:
                 extra_blocks.append(block)
+                ledger.have("peers")
+            else:
+                logger.warning(f"{symbol}: peer RS block empty "
+                               f"(peers: {', '.join(peers[:6])})")
+                extra_blocks.append(
+                    f"[Peer relative strength — UNAVAILABLE]\n"
+                    f"Known peers: {', '.join(peers[:8])}. Their price "
+                    f"data could not be fetched for this run; do not "
+                    f"infer relative performance.")
+                ledger.missing("peers", "peer price data could not be fetched")
+        else:
+            # A structural absence (no mapping), not a fetch failure: logged
+            # and shown in the details, but it does not degrade the run.
+            ledger.missing("peers", "no peer set mapped for this symbol",
+                           severity=OPTIONAL)
 
-            peers = get_peers(symbol)
-            if peers:
-                from models.sector_map import get_sector_etf
-                block = compute_peer_relative_strength(
-                    symbol, peers, as_of=as_of,
-                    sector_etf=get_sector_etf(symbol),
-                )
-                if block:
-                    extra_blocks.append(block)
-                else:
-                    # Name the gap instead of dropping the block silently —
-                    # the report used to read "peers not in data" with no way
-                    # to tell a fetch failure from a symbol with no peers.
-                    logger.warning(f"{symbol}: peer RS block empty "
-                                   f"(peers: {', '.join(peers[:6])})")
-                    extra_blocks.append(
-                        f"[Peer relative strength — UNAVAILABLE]\n"
-                        f"Known peers: {', '.join(peers[:8])}. Their price "
-                        f"data could not be fetched for this run; do not "
-                        f"infer relative performance."
-                    )
-
-            # SPY regime with actual SMAs — the regime gate should not rest on
-            # eyeballed price ranges.
-            try:
-                from services.stock_data import fetch_stock_data
-                spy = fetch_stock_data("SPY", period="2y")
-                spy = spy[spy.index <= as_of]
-                if len(spy) >= 200:
-                    close = float(spy["Close"].iloc[-1])
-                    sma50 = float(spy["Close"].rolling(50).mean().iloc[-1])
-                    sma200 = float(spy["Close"].rolling(200).mean().iloc[-1])
-                    regime = ("BULL" if close > sma50 and close > sma200
-                              else "BEAR" if close < sma50 and close < sma200
-                              else "MIXED")
-                    extra_blocks.append(
-                        f"[SPY regime — computed through {as_of}]\n"
-                        f"SPY close: ${close:.2f} | 50-day SMA: ${sma50:.2f} | "
-                        f"200-day SMA: ${sma200:.2f}\n"
-                        f"Regime by SMA rule: {regime} "
-                        f"(close {'above' if close > sma50 else 'below'} SMA50, "
-                        f"{'above' if close > sma200 else 'below'} SMA200)"
-                    )
-            except Exception as e:
-                logger.debug(f"SPY regime block failed: {e}")
-
-            # SEC filings (8-K catalyst flags + Form 4 insider transactions)
-            # and the whole-market finviz snapshot context. Both come from
-            # the Terminal's nightly collectors and are point-in-time by
-            # their own stamps; both degrade to absence, never to staleness.
-            try:
-                from services.terminal_data import (
-                    filings_block, market_context_block,
-                )
-                block = filings_block(symbol, as_of)
-                if block:
-                    extra_blocks.append(block)
-                block = market_context_block(symbol, as_of)
-                if block:
-                    extra_blocks.append(block)
-            except Exception as e:
-                logger.debug(f"terminal data blocks failed: {e}")
-
-            # Options positioning (point-in-time chain) and the Bad Apples
-            # quality screen. Both blocks state their own interpretation
-            # limits — positioning context and risk framing, not timing.
-            if "options" in evidence:
-                try:
-                    from services.options_service import (
-                        get_put_call_metrics, format_options_block,
-                    )
-                    block = format_options_block(
-                        symbol, get_put_call_metrics(symbol, as_of))
-                    if block:
-                        extra_blocks.append(block)
-                except Exception as e:
-                    logger.debug(f"Options block failed: {e}")
-
-            if "quality" in evidence:
-                try:
-                    from services.bad_apples_service import (
-                        analyze_symbol as _ba_analyze, format_bad_apples_block,
-                    )
-                    block = format_bad_apples_block(
-                        symbol, _ba_analyze(symbol, as_of))
-                    if block:
-                        extra_blocks.append(block)
-                except Exception as e:
-                    logger.debug(f"Bad apples block failed: {e}")
+        # --- SPY regime (required) ---
+        try:
+            from services.stock_data import fetch_stock_data
+            spy = fetch_stock_data("SPY", period="2y")
+            spy = spy[spy.index <= as_of]
         except Exception as e:
-            logger.warning(f"Extra context build failed for {symbol}: {e}")
-        return extra_blocks
+            spy = None
+            logger.warning(f"{symbol}: SPY fetch failed: {e}")
+        if spy is not None and len(spy) >= 200:
+            close = float(spy["Close"].iloc[-1])
+            sma50 = float(spy["Close"].rolling(50).mean().iloc[-1])
+            sma200 = float(spy["Close"].rolling(200).mean().iloc[-1])
+            regime = ("BULL" if close > sma50 and close > sma200
+                      else "BEAR" if close < sma50 and close < sma200
+                      else "MIXED")
+            extra_blocks.append(
+                f"[SPY regime — computed through {as_of}]\n"
+                f"SPY close: ${close:.2f} | 50-day SMA: ${sma50:.2f} | "
+                f"200-day SMA: ${sma200:.2f}\n"
+                f"Regime by SMA rule: {regime} "
+                f"(close {'above' if close > sma50 else 'below'} SMA50, "
+                f"{'above' if close > sma200 else 'below'} SMA200)")
+            ledger.have("spy")
+        else:
+            ledger.missing("spy", "fewer than 200 SPY bars available")
+
+        # --- SEC filings + finviz market context (optional: Terminal DB) ---
+        filings_text = ""
+        try:
+            from services.terminal_data import filings_block, market_context_block
+            filings_text = filings_block(symbol, as_of)
+            if filings_text:
+                extra_blocks.append(filings_text)
+                ledger.have("filings")
+            else:
+                ledger.missing("filings", "no Terminal filings rows for this window")
+            block = market_context_block(symbol, as_of)
+            if block:
+                extra_blocks.append(block)
+                ledger.have("market_context")
+            else:
+                ledger.missing("market_context", "no finviz snapshot")
+        except Exception as e:
+            logger.debug(f"terminal data blocks failed: {e}")
+            ledger.missing("filings", f"Terminal data unavailable: {str(e)[:80]}")
+
+        # --- options positioning (expected when selected) ---
+        if "options" in evidence:
+            try:
+                from services.options_service import (
+                    get_put_call_metrics, get_put_call_by_expiry,
+                    format_options_block,
+                )
+                metrics_pc = get_put_call_metrics(symbol, as_of)
+                by_expiry = get_put_call_by_expiry(symbol, as_of) if metrics_pc else None
+                block = format_options_block(symbol, metrics_pc, by_expiry)
+            except Exception as e:
+                block = ""
+                logger.warning(f"{symbol}: options block failed: {e}")
+            if block:
+                extra_blocks.append(block)
+                ledger.have("options")
+            else:
+                ledger.missing("options", "no chain returned (vendor throttled, "
+                                          "no listed options, or no key)")
+
+        # --- quality screen (expected when selected) ---
+        quality_text = ""
+        if "quality" in evidence:
+            try:
+                from services.bad_apples_service import (
+                    analyze_symbol as _ba_analyze, format_bad_apples_block,
+                )
+                quality_text = format_bad_apples_block(symbol, _ba_analyze(symbol, as_of))
+            except Exception as e:
+                logger.warning(f"{symbol}: quality screen failed: {e}")
+            if quality_text:
+                extra_blocks.append(quality_text)
+                ledger.have("quality")
+            else:
+                ledger.missing("quality", "quality screen could not be computed")
+
+        # --- political & institutional flows (optional: sparse by nature) ---
+        if "political" in evidence:
+            try:
+                from services.political_service import political_blocks
+                blocks, problems = political_blocks(symbol, as_of)
+            except Exception as e:
+                blocks, problems = [], [str(e)[:120]]
+            extra_blocks.extend(blocks)
+            if blocks and not problems:
+                ledger.have("political")
+            elif problems:
+                ledger.missing("political", "; ".join(problems))
+
+        # --- situation & investigation (expected when selected) ---
+        # Placed FIRST in the prompt's precomputed section: the situation
+        # decides how every other block is read.
+        if "investigation" in evidence:
+            live = self._is_live(as_of)
+            try:
+                from services.investigation_service import (
+                    investigate, format_investigation_block, headlines_for_prompt,
+                )
+                from services.stock_data import get_company_profile
+                from services import usage_service as _usage
+                _emit("ta", f"Research {symbol}: investigating the situation "
+                            f"({'web research' if live and MODEL.INVESTIGATION_MODE != 'off' else 'classification only'})")
+                ctx = _usage.current()
+                with _usage.track("investigation", symbol=symbol,
+                                  trade_date=ctx.trade_date or as_of,
+                                  section=f"investigation:{symbol}"):
+                    investigation = investigate(
+                        symbol, as_of, live=live, target=target,
+                        profile=get_company_profile(symbol) or "",
+                        headlines=headlines_for_prompt(news or []),
+                        filings=filings_text, quality=quality_text,
+                        last_close=last_close)
+                block = format_investigation_block(investigation, last_close)
+                extra_blocks.insert(0, block)
+                ledger.have("investigation")
+                _emit("ta", f"Research {symbol}: situation {investigation.situation} "
+                            f"({investigation.situation_confidence}) — "
+                            f"{investigation.one_line[:140]}",
+                      payload={"event": "investigation", "symbol": symbol,
+                               "situation": investigation.situation,
+                               "web": investigation.web,
+                               "searches": investigation.searches,
+                               "sources": len(investigation.sources),
+                               "findings": len(investigation.findings),
+                               "spread_pct": investigation.spread_pct})
+            except Exception as e:
+                logger.warning(f"{symbol}: investigation failed: {e}")
+                investigation = None
+                ledger.missing("investigation", f"investigation stage failed: {str(e)[:100]}")
+
+        return extra_blocks, investigation

@@ -286,7 +286,7 @@ def av_time_bounds(
 # entries expire after LIVE_TTL_S instead of freezing the first fetch.
 _PIT_NEWS_CACHE: dict = {}
 LIVE_TTL_S = 600.0
-HISTORICAL_TTL_S = 7 * 24 * 3600.0
+HISTORICAL_TTL_S = 24 * 3600.0
 _DISK_CACHE_DIR = "cache/news_window"
 _disk = None
 
@@ -415,40 +415,161 @@ def fetch_point_in_time_news_with_stats(
 
 def _fetch_point_in_time_uncached(symbol, as_of, lookback_days, max_articles,
                                   relevance_threshold, cache_key) -> tuple[list, dict]:
-
-    # Imported here to avoid a circular import at module load.
-    from services.news_service import (
-        NewsUnavailable,
-        fetch_alpha_vantage_news,
-        fetch_yfinance_news,
-    )
-
-    time_from, time_to = av_time_bounds(as_of, lookback_days)
-    av_error = None
-    try:
-        articles = fetch_alpha_vantage_news(
-            symbol,
-            time_from=time_from,
-            time_to=time_to,
-            relevance_threshold=relevance_threshold,
-        )
-    except NewsUnavailable as e:
-        av_error = e
-        articles = []
-
-    if not articles:
-        # yfinance news has no server-side window; fetch then filter.
-        articles = fetch_yfinance_news(symbol, max_articles=max_articles)
-        # Both sources failed. Raising is the point: an empty list here is
-        # indistinguishable from a quiet week, and the caller would store a
-        # prediction made on no news without recording that it had none.
-        if not articles and av_error is not None:
-            raise av_error
-
+    end_day = _coerce_dt(as_of).date()
+    start_day = end_day - timedelta(days=lookback_days)
+    articles = _store_window(symbol, start_day, end_day, relevance_threshold)
     windowed = filter_articles_as_of(articles, as_of, lookback_days)
     result = cap_newest(windowed, max_articles, as_of)
     _cache_put(cache_key, result, live=_window_is_live(as_of))
     return result
+
+
+# ---------------------------------------------------------------------------
+# The durable article store (Postgres historical_news + news_coverage)
+# ---------------------------------------------------------------------------
+# Every article the vendor returns for a (symbol, day) is kept for
+# NEWS_RETENTION_DAYS; a window is served from the store and only the days
+# with no coverage row are fetched. A day at the live edge (today, and the
+# session before it — the vendor keeps indexing a session's articles for
+# hours) is re-fetched when its coverage is older than LIVE_TTL_S.
+
+LIVE_EDGE_DAYS = 2
+_last_prune_day: Optional[str] = None
+
+
+def _prune_once_a_day() -> None:
+    global _last_prune_day
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _last_prune_day == today:
+        return
+    _last_prune_day = today
+    try:
+        from config import MODEL
+        from services.cache_service import get_cache
+        get_cache().prune_news(MODEL.NEWS_RETENTION_DAYS)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"news store prune skipped: {e}")
+
+
+def coverage_gaps(days: list, covered: dict, *, now: datetime,
+                  live_ttl_s: float = LIVE_TTL_S,
+                  live_edge_days: int = LIVE_EDGE_DAYS) -> list[tuple]:
+    """Contiguous (start, end) day ranges that must be fetched.
+
+    A day is missing when it has no coverage row, or when it is within
+    ``live_edge_days`` of today and its row is older than ``live_ttl_s``.
+    Pure, so it is testable without a database.
+    """
+    today = now.date()
+    need = []
+    for d in days:
+        fetched = covered.get(d)
+        if fetched is None:
+            need.append(d)
+            continue
+        if (today - d).days < live_edge_days:
+            age = (now - as_utc(fetched)).total_seconds()
+            if age >= live_ttl_s:
+                need.append(d)
+    ranges: list[tuple] = []
+    for d in need:
+        if ranges and (d - ranges[-1][1]).days == 1:
+            ranges[-1] = (ranges[-1][0], d)
+        else:
+            ranges.append((d, d))
+    return ranges
+
+
+def _store_window(symbol: str, start_day, end_day, relevance_threshold: float) -> list:
+    """Articles for [start_day, end_day] from the store, fetching only the
+    uncovered days from the vendor first. Raises NewsUnavailable when a
+    needed day cannot be fetched — an incomplete window is not served as a
+    complete one."""
+    from services.cache_service import get_cache
+    from services.news_service import fetch_alpha_vantage_news, fetch_yfinance_news
+
+    _prune_once_a_day()
+    cache = get_cache()
+    today = datetime.now(timezone.utc).date()
+    end_day = min(end_day, today)
+    days = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
+    gaps = coverage_gaps(days, cache.news_coverage(symbol, start_day, end_day),
+                         now=datetime.now(timezone.utc))
+    for gap_start, gap_end in gaps:
+        # Everything the vendor returns is stored (relevance is applied at
+        # read time, since callers use different thresholds).
+        fetched = fetch_alpha_vantage_news(
+            symbol,
+            time_from=gap_start.strftime("%Y%m%dT0000"),
+            time_to=gap_end.strftime("%Y%m%dT2359"),
+            relevance_threshold=0.0,
+        )
+        if fetched:
+            cache.store_historical_news([_article_row(a) for a in fetched])
+        covered_days = [gap_start + timedelta(days=i)
+                        for i in range((gap_end - gap_start).days + 1)]
+        cache.mark_news_coverage(symbol, covered_days)
+        logger.info(f"{symbol}: news store fetched {len(fetched)} articles for "
+                    f"{gap_start}→{gap_end}")
+
+    rows = cache.get_historical_news(symbol, start_date=start_day.isoformat(),
+                                     end_date=end_day.isoformat())
+    articles = [_row_to_article(r) for r in rows]
+    if relevance_threshold > 0:
+        articles = [a for a in articles
+                    if a.ticker_relevance_score is not None
+                    and a.ticker_relevance_score >= relevance_threshold]
+    if not articles and not gaps:
+        return articles
+    if not articles:
+        # The vendor answered with nothing for a freshly fetched window; the
+        # yfinance fallback has no server-side window — fetch then filter.
+        return fetch_yfinance_news(symbol, max_articles=0)
+    return articles
+
+
+def _article_row(a) -> dict:
+    """NewsArticle → the historical_news row shape."""
+    pub = getattr(a, "published_at", None)
+    return {
+        "id": a.id, "symbol": a.symbol, "title": a.title, "summary": a.summary,
+        "url": a.url, "source": a.source,
+        "published_at": pub,
+        "published_date": pub.strftime("%Y-%m-%d") if pub else None,
+        "topics": a.topics,
+        "overall_sentiment_score": a.overall_sentiment_score,
+        "overall_sentiment_label": a.overall_sentiment_label,
+        "ticker_sentiment_score": a.sentiment_score,
+        "ticker_relevance_score": a.ticker_relevance_score,
+    }
+
+
+def _row_to_article(r: dict):
+    """historical_news row → NewsArticle (the shape every consumer reads)."""
+    from services.news_service import NewsArticle, _extract_stock_impact
+    pub = r.get("published_at")
+    if pub is None and r.get("published_date"):
+        d = r["published_date"]
+        pub = datetime(d.year, d.month, d.day, 12, tzinfo=timezone.utc)
+    score = r.get("ticker_sentiment_score")
+    if score is None:
+        sentiment = None
+    elif score >= 0.15:
+        sentiment = "bullish"
+    elif score <= -0.15:
+        sentiment = "bearish"
+    else:
+        sentiment = "neutral"
+    return NewsArticle(
+        id=r.get("id"), symbol=r.get("symbol"), title=r.get("title") or "",
+        source=r.get("source"), url=r.get("url"), published_at=pub,
+        summary=r.get("summary"), sentiment=sentiment, sentiment_score=score,
+        impact=_extract_stock_impact(r.get("title") or "", r.get("summary") or ""),
+        ticker_relevance_score=r.get("ticker_relevance_score"),
+        topics=r.get("topics"),
+        overall_sentiment_score=r.get("overall_sentiment_score"),
+        overall_sentiment_label=r.get("overall_sentiment_label"),
+    )
 
 
 def overnight_window_bounds(
@@ -533,17 +654,11 @@ def fetch_overnight_news_with_stats(
 
 def _fetch_overnight_uncached(symbol, start_utc, end_utc, now_utc, anchor_date,
                               max_articles, relevance_threshold, cache_key):
-    from services.news_service import fetch_alpha_vantage_news
-
-    articles = fetch_alpha_vantage_news(
-        symbol,
-        time_from=start_utc.strftime("%Y%m%dT%H%M"),
-        time_to=end_utc.strftime("%Y%m%dT%H%M"),
-        relevance_threshold=relevance_threshold,
-    )
-    # Strict client-side re-check — the vendor bound is advisory here, and
-    # unlike the lookback path an undated article can never qualify (its
-    # position relative to a 17.5-hour window is unknowable).
+    articles = _store_window(symbol, start_utc.date(), end_utc.date(),
+                             relevance_threshold)
+    # Strict client-side window — unlike the lookback path an undated
+    # article can never qualify (its position relative to a 17.5-hour window
+    # is unknowable).
     windowed = [
         a for a in articles
         if (pub := _article_pub_date(a)) is not None

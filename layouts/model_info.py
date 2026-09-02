@@ -6,6 +6,7 @@ trusting it. The honesty is deliberate — measured limitations from this
 platform's benchmarks are part of the explanation, not a footnote.
 """
 
+from config import MODEL
 from dash import dcc, html
 
 # model_id -> (title, what it is, what it reads, why it's useful, caveats)
@@ -172,6 +173,19 @@ _EVIDENCE_BLOCK_ROWS = [
      "investigations, guidance cuts, short-seller reports and dilution. "
      "A high fail count argues for smaller size and skepticism toward "
      "bullish theses; it does not predict next-day direction."),
+    ("investigation", "Situation & investigation (web research)", None,
+     "A tool-using research call first classifies the situation (pending "
+     "acquisition, legal/regulatory overhang, earnings event, leadership "
+     "change, distress, momentum only) and then researches it on the open "
+     "web with citations: deal terms and spread, regulators and milestones, "
+     "the key figures and their track records and affiliations. Live runs "
+     "only — on a backtest the classifier runs without web access, because "
+     "web results cannot be bounded to a past as-of date."),
+    ("political", "Political & institutional flows (Alpha Vantage)", None,
+     "Congressional trades disclosed under the STOCK Act (filed on or "
+     "before the as-of date, with party, chamber and amount band) and 13F "
+     "holder flows (holders adding vs cutting, largest movers). Disclosure "
+     "lags weeks; positioning context, not a timing signal."),
 ]
 
 
@@ -194,7 +208,7 @@ def build_model_info_body(model_id: str, evidence: list | None = None,
     if model_id != "trading_agents":
         return children
 
-    evidence = set(evidence) if evidence is not None else {"options", "quality"}
+    evidence = set(evidence) if evidence is not None else set(MODEL.DEFAULT_EVIDENCE)
     rows = []
     for key, label, always, desc in _EVIDENCE_BLOCK_ROWS:
         included = always if always is not None else key in evidence

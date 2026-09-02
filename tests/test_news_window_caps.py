@@ -151,6 +151,123 @@ class TestFetchRunNews:
         assert "TYL" not in line.split("CAP HIT")[1]
 
 
+class _FakeStore:
+    """In-memory stand-in for the Postgres news store."""
+
+    def __init__(self):
+        self.rows: dict[str, dict] = {}
+        self.coverage: dict[tuple, datetime] = {}
+        self.pruned = 0
+
+    def news_coverage(self, symbol, start, end):
+        return {d: t for (s, d), t in self.coverage.items()
+                if s == symbol and start <= d <= end}
+
+    def mark_news_coverage(self, symbol, days):
+        for d in days:
+            self.coverage[(symbol, d)] = datetime.now(timezone.utc)
+
+    def store_historical_news(self, articles):
+        for a in articles:
+            self.rows[a["id"]] = a
+        return len(articles)
+
+    def get_historical_news(self, symbol, start_date=None, end_date=None):
+        out = []
+        for r in self.rows.values():
+            if r["symbol"] != symbol or not (start_date <= r["published_date"] <= end_date):
+                continue
+            out.append({**r, "published_date": datetime.strptime(
+                r["published_date"], "%Y-%m-%d").date()})
+        return out
+
+    def prune_news(self, retention_days):
+        self.pruned += 1
+        return 0
+
+
+def _av_article(symbol, when, rel=0.6):
+    return SimpleNamespace(id=f"{symbol}-{when:%Y%m%d%H%M}", symbol=symbol, title="t",
+                           summary="", url="u", source="s", published_at=when,
+                           sentiment="neutral", sentiment_score=0.0, impact=None,
+                           topics=None, overall_sentiment_score=0.0,
+                           overall_sentiment_label="Neutral",
+                           ticker_relevance_score=rel)
+
+
+class TestCoverageGaps:
+    NOW = datetime(2026, 8, 31, 15, tzinfo=timezone.utc)
+
+    def _days(self, n):
+        return [self.NOW.date() - timedelta(days=n - 1 - i) for i in range(n)]
+
+    def test_uncovered_days_form_contiguous_ranges(self):
+        days = self._days(10)
+        covered = {d: self.NOW - timedelta(days=5) for d in days[2:5] + days[7:8]}
+        gaps = nw.coverage_gaps(days, covered, now=self.NOW)
+        assert gaps == [(days[0], days[1]), (days[5], days[6]), (days[8], days[9])]
+
+    def test_fully_covered_history_needs_nothing(self):
+        days = self._days(10)[:8]  # ends three days ago — not at the live edge
+        covered = {d: self.NOW - timedelta(days=30) for d in days}
+        assert nw.coverage_gaps(days, covered, now=self.NOW) == []
+
+    def test_live_edge_refetches_when_stale_only(self):
+        days = self._days(3)
+        fresh = {d: self.NOW - timedelta(seconds=30) for d in days}
+        assert nw.coverage_gaps(days, fresh, now=self.NOW) == []
+        stale = {d: self.NOW - timedelta(hours=3) for d in days}
+        assert nw.coverage_gaps(days, stale, now=self.NOW) == [(days[1], days[2])]
+
+
+class TestDurableStore:
+    """A window is fetched ONCE; the next day's run fetches only the new day."""
+
+    def setup_method(self):
+        nw.clear_pit_news_cache()
+        nw._last_prune_day = None
+
+    def test_second_window_fetches_only_the_uncovered_days(self):
+        import services.news_service as ns
+        store = _FakeStore()
+        calls = []
+
+        def av(symbol, time_from=None, time_to=None, relevance_threshold=0.0, **kw):
+            calls.append((time_from[:8], time_to[:8]))
+            start = datetime.strptime(time_from[:8], "%Y%m%d")
+            end = datetime.strptime(time_to[:8], "%Y%m%d")
+            out, cur = [], start
+            while cur <= end:
+                out.append(_av_article(symbol, cur.replace(hour=13)))
+                cur += timedelta(days=1)
+            return out
+
+        with patch("services.cache_service.get_cache", return_value=store), \
+             patch.object(ns, "fetch_alpha_vantage_news", side_effect=av):
+            kept, stats = nw.fetch_point_in_time_news_with_stats(
+                "TYL", "2026-08-20", lookback_days=7, max_articles=0)
+            assert stats["kept"] == 8 and calls == [("20260813", "20260820")]
+            # Next session: one new day, everything else served from the store.
+            nw.clear_pit_news_cache()
+            kept2, stats2 = nw.fetch_point_in_time_news_with_stats(
+                "TYL", "2026-08-21", lookback_days=7, max_articles=0)
+            assert stats2["kept"] == 8 and calls[1:] == [("20260821", "20260821")]
+            assert store.pruned == 1, "retention prune runs once per day"
+
+    def test_relevance_is_applied_at_read_time(self):
+        import services.news_service as ns
+        store = _FakeStore()
+        arts = [_av_article("TYL", datetime(2026, 8, 20, 9), rel=0.9),
+                _av_article("TYL", datetime(2026, 8, 20, 10), rel=0.2)]
+        with patch("services.cache_service.get_cache", return_value=store), \
+             patch.object(ns, "fetch_alpha_vantage_news", return_value=arts) as av:
+            kept, _ = nw.fetch_point_in_time_news_with_stats(
+                "TYL", "2026-08-20", lookback_days=1, max_articles=0,
+                relevance_threshold=0.5)
+            assert av.call_args.kwargs["relevance_threshold"] == 0.0, "store keeps everything"
+            assert [a.ticker_relevance_score for a in kept] == [0.9]
+
+
 class TestFetchCapIsExplicit:
     """The vendor client no longer silently keeps the newest 50."""
 
@@ -162,14 +279,15 @@ class TestFetchCapIsExplicit:
     def test_point_in_time_fetch_reports_and_caches_stats(self):
         import services.news_service as ns
         nw.clear_pit_news_cache()
-        arts = [SimpleNamespace(published_at=datetime(2026, 8, 31 - d), ticker_relevance_score=0.6)
-                for d in range(12)]
-        with patch.object(ns, "fetch_alpha_vantage_news", return_value=arts) as av:
+        store = _FakeStore()
+        arts = [_av_article("TYL", datetime(2026, 8, 31 - d, 12)) for d in range(12)]
+        with patch("services.cache_service.get_cache", return_value=store), \
+             patch.object(ns, "fetch_alpha_vantage_news", return_value=arts) as av:
             kept, stats = nw.fetch_point_in_time_news_with_stats(
                 "TYL", "2026-08-31", lookback_days=30, max_articles=4)
             again = nw.fetch_point_in_time_news("TYL", "2026-08-31", lookback_days=30,
                                                 max_articles=4)
-        assert av.call_count == 1, "second call is served from the PIT cache"
+        assert av.call_count == 1, "second call is served from the cache"
         assert "max_articles" not in av.call_args.kwargs, "no hidden vendor-side cap"
         assert len(kept) == 4 and again == kept
         assert stats["fetched"] == 12 and stats["capped"] and stats["effective_days"] == 4

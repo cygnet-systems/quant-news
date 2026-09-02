@@ -163,7 +163,63 @@ def _metrics(put_vol: int, call_vol: int, put_oi: int, call_oi: int,
     }
 
 
-def format_options_block(symbol: str, m: dict | None) -> str:
+def get_put_call_by_expiry(symbol: str, as_of: str) -> dict | None:
+    """Vendor-computed put/call volume ratio per expiration as of a session
+    (Alpha Vantage HISTORICAL_PUT_CALL_RATIO, dated → point-in-time).
+
+    Complements the whole-chain aggregate above: a 6x full-chain ratio can
+    hide that the front month is 13x and the next is 0.1x. Returns
+    {"as_of", "full_chain", "by_expiry": [(date, ratio), ...]} or None.
+    """
+    chain_date = _chain_date(as_of)
+    key = (symbol.upper() + ":expiry", chain_date)
+    with _CACHE_LOCK:
+        if key in _CACHE:
+            return _CACHE[key]
+    if not API.ALPHA_VANTAGE_API_KEY:
+        return None
+    result = None
+    try:
+        alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
+        response = requests.get(
+            API.ALPHA_VANTAGE_BASE_URL,
+            params={"function": "HISTORICAL_PUT_CALL_RATIO",
+                    "symbol": symbol.upper(), "date": chain_date,
+                    "apikey": API.ALPHA_VANTAGE_API_KEY},
+            timeout=API.DEFAULT_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        for k in ("Note", "Information", "Error Message"):
+            if k in data:
+                logger.warning(f"{symbol}: HISTORICAL_PUT_CALL_RATIO {k}: "
+                               f"{str(data[k])[:150]}")
+                return None
+        rows = []
+        for r in data.get("put_call_ratio_by_expiration") or []:
+            try:
+                if r.get("value") is not None:
+                    rows.append((str(r.get("date"))[:10], float(r["value"])))
+            except (TypeError, ValueError):
+                continue
+        full = data.get("put_call_ratio_full_chain")
+        try:
+            full = float(full) if full is not None else None
+        except (TypeError, ValueError):
+            full = None
+        if rows or full is not None:
+            result = {"as_of": str(data.get("date") or chain_date)[:10],
+                      "full_chain": full, "by_expiry": rows[:6]}
+    except Exception as e:
+        logger.warning(f"{symbol}: put/call by expiry fetch failed: {e}")
+        return None
+    with _CACHE_LOCK:
+        _CACHE[key] = result
+    return result
+
+
+def format_options_block(symbol: str, m: dict | None,
+                         by_expiry: dict | None = None) -> str:
     """Prompt block. Empty string when no data — never a fabricated neutral."""
     if not m:
         return ""
@@ -182,6 +238,15 @@ def format_options_block(symbol: str, m: dict | None) -> str:
         f"({m['put_oi']:,} put OI vs {m['call_oi']:,} call OI)"
     )
     lines.append(f"Session read: {m['read']}")
+    if by_expiry and by_expiry.get("by_expiry"):
+        full = by_expiry.get("full_chain")
+        lines.append(
+            "Vendor put/call volume by expiration"
+            + (f" (full chain {full:.2f})" if full is not None else "")
+            + ": " + " | ".join(f"{d} {v:.2f}" for d, v in by_expiry["by_expiry"])
+            + " — a front-month skew that the whole-chain figure averages away "
+              "is event positioning; a skew spread evenly is a stance."
+        )
     if m["read"] == "low-liquidity":
         lines.append(
             f"Only {m['total_volume']:,} contracts traded — too thin to read; "
