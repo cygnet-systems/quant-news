@@ -33,7 +33,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-from db.models import AnalysisRun, Base, JobRun
+from db.models import AnalysisRun, Base, JobRun, Ticker
 from services import progress_service as prog
 from services import run_service as rs
 
@@ -56,7 +56,8 @@ def db(monkeypatch):
     import db.session as dbs
 
     eng = create_engine("sqlite://")
-    Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__])
+    Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__,
+                                          Ticker.__table__])
     monkeypatch.setattr(dbs, "_engine", eng)
     monkeypatch.setattr(
         dbs, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
@@ -98,7 +99,7 @@ def confirm(db, feed, monkeypatch):
         return app_module.toggle_run_modal(
             None, None, [], None, 1,
             {}, [], {}, True,
-            {"source": "custom", "symbols": symbols}, scope,
+            {"symbols": symbols}, scope,
             {"mode": "normal", "closed": True},
             **dialog)
 
@@ -106,9 +107,9 @@ def confirm(db, feed, monkeypatch):
 
 
 # Output positions of toggle_run_modal.
-IS_OPEN, VALIDATION, PANEL, TOAST_OPEN, TOAST_MSG, INTERVAL, RUN_STORE = \
-    0, 6, 7, 8, 9, 10, 14
-RUN_DISPATCH = 15
+IS_OPEN, VALIDATION, PANEL, TOAST_OPEN, TOAST_MSG, INTERVAL = 0, 3, 4, 5, 6, 7
+RUN_STORE, RUN_DISPATCH, PRESET, PREFS, CUSTOMIZE = 11, 12, 13, 14, 15
+BTN_DISABLED, BTN_LABEL = 16, 17
 
 
 class TestConfirmDispatch:
@@ -130,7 +131,12 @@ class TestConfirmDispatch:
         assert row["status"] == "queued"
         assert row["kind"] == "manual"
         assert row["owner_uid"] == "u1"
-        assert row["preset"] == "full"
+        # Two models and recommendations on is not the Standard preset the
+        # dialog defaulted to: the row says so, and names the fields.
+        assert row["preset"] == "custom"
+        assert run_data["preset"] == "custom"
+        assert row["config"]["preset"] == "standard"
+        assert set(row["config"]["customized"]) == {"models", "recs"}
         assert row["symbols"] == ["NVDA", "AMD"]
         assert row["config"]["models"] == ["kronos_mini", "xgboost_shap"]
         assert row["config"]["scope"] == "full"
@@ -144,6 +150,13 @@ class TestConfirmDispatch:
         assert out[TOAST_OPEN] is True
         assert "nvda, AMD" in out[TOAST_MSG]
         assert out[INTERVAL] == app_module._PROGRESS_POLL_ACTIVE_MS
+        # What the browser remembers, and the confirm button back at rest.
+        assert out[PREFS] == {"preset": "standard", "symbols": ["nvda", "AMD"]}
+        assert out[BTN_DISABLED] is False
+        assert out[BTN_LABEL][-1] == "Run"
+        # The run's symbols joined the lookup cache.
+        from services import ticker_service as ts
+        assert ts.get("NVDA")["source"] == "run" and ts.get("AMD") is not None
 
     def test_refused_while_this_owner_has_a_run(self, confirm, feed):
         first = rs.create_run("manual", ["AAPL"], "u1")
@@ -162,6 +175,10 @@ class TestConfirmDispatch:
         assert button.size == "sm" and button.outline is True
         assert [r["run_id"] for r in rs.list_runs()] == [first]
         assert first not in feed._active_runs()
+        # A refusal restores the confirm button the clientside spinner took.
+        assert out[BTN_DISABLED] is False
+        assert out[BTN_LABEL][-1] == "Run"
+        assert out[PREFS] is dash.no_update
 
     def test_other_owners_run_does_not_block(self, confirm):
         rs.create_run("manual", ["AAPL"], "u2")
@@ -207,9 +224,30 @@ class TestConfirmDispatch:
         out = confirm(["NVDA"], scope="models",
                       model_checks=[True, False, False, False, False])
         row = rs.get_run(out[RUN_STORE]["run_id"])
-        assert row["preset"] == "models"
+        assert row["preset"] == "custom"
+        assert row["config"]["scope"] == "models"
         assert row["config"]["models"] == ["kronos_mini"]
         assert row["config"]["ensemble"] is False
+
+    def test_untouched_preset_is_recorded_by_name(self, confirm):
+        # Quick is the four numerical models; TradingAgents (last box) off.
+        out = confirm(["NVDA"], scope="models", preset="quick",
+                      model_checks=[True] * 4 + [False], recs="off")
+        row = rs.get_run(out[RUN_STORE]["run_id"])
+        assert row["preset"] == "quick"
+        assert row["config"]["customized"] == []
+        assert out[RUN_STORE]["preset"] == "quick"
+        assert out[PREFS]["preset"] == "quick"
+
+    def test_symbol_cache_failure_never_blocks_a_run(self, confirm, monkeypatch):
+        from services import ticker_service as ts
+
+        def _boom(*a, **kw):
+            raise RuntimeError("tickers table missing")
+        monkeypatch.setattr(ts, "ensure_symbols", _boom)
+        out = confirm(["NVDA"])
+        assert out[IS_OPEN] is False
+        assert rs.get_run(out[RUN_STORE]["run_id"])["status"] == "queued"
 
 
 class TestStageDispatchGuard:
@@ -255,16 +293,17 @@ class TestStageDispatchGuard:
         with pytest.raises(PreventUpdate):
             app_module.mark_run_dispatched(None, None)
 
-    def test_full_analysis_flag_follows_the_store_scope(self, db):
-        run_id = rs.create_run("manual", ["NVDA"], "u1")
+    def test_full_analysis_flag_follows_the_row_scope(self, db):
+        run_id = rs.create_run("manual", ["NVDA"], "u1", config={"scope": "full"})
         store = {"run_id": run_id, "scope": "full", "symbols": ["NVDA"]}
         # The armed value names the run, so a stale flag cannot arm another.
-        assert app_module.set_full_analysis_flag(store, "models", {}, None) == run_id
+        assert app_module.set_full_analysis_flag(store, None) == run_id
+        models = rs.create_run("manual", ["NVDA"], "u1", config={"scope": "models"})
         with pytest.raises(PreventUpdate):
             app_module.set_full_analysis_flag(
-                {**store, "scope": "models"}, "full", {}, None)
+                {**store, "run_id": models, "scope": "models"}, None)
         with pytest.raises(PreventUpdate):
-            app_module.set_full_analysis_flag(store, "full", {}, {"run_id": run_id})
+            app_module.set_full_analysis_flag(store, {"run_id": run_id})
 
 
 class TestCloseAndCancel:
@@ -410,25 +449,27 @@ class TestSynthesisFlag:
                   "recs_request": "news+signals", "by_symbol": {"NVDA": {}}}
         with pytest.raises(PreventUpdate):
             asyncio.run(app_module.generate_recommendations_callback(
-                report, None, False, {"symbols": ["NVDA"]}))
+                report, None, False))
         assert rs.get_run(run_id)["status"] == "cancelled"
 
 
 class TestReportStageProgress:
     def test_rejected_report_records_the_stage_and_fails_the_row(self, db, feed,
                                                                  monkeypatch):
-        run_id = rs.create_run("manual", ["NVDA"], "u1", preset="report")
+        run_id = rs.create_run(
+            "manual", ["NVDA"], "u1", preset="report",
+            config={"scope": "report", "target_date": "2026-09-03",
+                    "lookback": None, "max_articles": 25})
         feed.mark_run_pending(run_id)
         monkeypatch.setattr(app_module, "ctx",
                             SimpleNamespace(triggered_id="run-dispatch"))
         store = {"run_id": run_id, "scope": "report", "symbols": ["NVDA"],
                  "owner_uid": "u1", "kind": "manual"}
 
-        # No news window from the dialog: the stage refuses before any
-        # fetch, and the refusal must reach the row as a failed report.
+        # No news window on the row: the stage refuses before any fetch,
+        # and the refusal must reach the row as a failed report.
         out = asyncio.run(app_module.generate_ai_analysis(
-            store, "report", None, {"NVDA": {"prices": "{}"}},
-            "2026-09-03", None, 25, None, None, None, None, None, None, None))
+            store, {"NVDA": {"prices": "{}"}}, None))
 
         assert out["failed"] is True and out["run_id"] == run_id
         row = rs.get_run(run_id)
@@ -543,7 +584,8 @@ class TestRetry:
         assert rs.list_runs() == []
 
     def test_retry_is_a_fresh_run_through_both_stores(self, prev, feed):
-        store, dispatch, is_open, msg = app_module.retry_run(1, prev)
+        out = app_module.retry_run(1, prev, {"mode": "normal", "closed": True})
+        store, dispatch, is_open, msg = out[:4]
 
         assert msg == "" and is_open is dash.no_update
         assert store == dispatch
@@ -566,24 +608,250 @@ class TestRetry:
         assert old["status"] == "failed" and old["error"] == "provider timeout"
         assert new_id in feed._active_runs()
         assert app_module._dispatch_run_id(dispatch, None) == new_id
+        # Acknowledged like a confirm: panel forced open, toast with the
+        # previous run's symbols and estimate, poll at the active rate.
+        panel, toast_open, toast_msg, interval = out[4:]
+        assert panel["closed"] is False and panel["mode"] == "normal"
+        assert toast_open is True
+        assert toast_msg.startswith("NVDA, AMD · ")
+        assert "Reports" in toast_msg
+        assert interval == app_module._PROGRESS_POLL_ACTIVE_MS
 
     def test_retry_refused_while_a_run_is_in_flight(self, prev, feed):
         active = rs.create_run("manual", ["TSLA"], "u1")
 
-        store, dispatch, is_open, msg = app_module.retry_run(1, prev)
+        out = app_module.retry_run(1, prev)
+        store, dispatch, is_open, msg = out[:4]
 
         assert store is dash.no_update and dispatch is dash.no_update
         assert is_open is True
         assert "run in progress" in msg[0]
         assert msg[1].id == "run-cancel-active-btn"
         assert [r["run_id"] for r in rs.list_runs()] == [active, prev["run_id"]]
+        # No acknowledgement for a run that did not start.
+        assert all(v is dash.no_update for v in out[4:])
+
+    def test_retry_of_a_row_without_an_estimate_still_acknowledges(self, db, feed,
+                                                                  monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        prev_id = rs.create_run("manual", ["NVDA"], "u1", preset="report",
+                                config={"scope": "report"})
+        rs.set_status(prev_id, "failed", error="x")
+        out = app_module.retry_run(1, {"run_id": prev_id, "scope": "report"})
+        assert out[0]["retry_of"] == prev_id
+        assert out[5] is True and "duration unknown" in out[6]
 
     def test_retry_without_a_row_says_so(self, db, feed, monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
-        store, dispatch, is_open, msg = app_module.retry_run(1, {"run_id": "gone"})
+        out = app_module.retry_run(1, {"run_id": "gone"})
+        store, dispatch, is_open, msg = out[:4]
         assert store is dash.no_update and is_open is True
         assert "record is gone" in msg
         assert rs.list_runs() == []
+        assert all(v is dash.no_update for v in out[4:])
+
+
+class TestRunConfigAuthority:
+    """A stage runs with the settings on its run row, never with what the
+    dialog's controls show at the time it fires: the dialog is not among
+    its States at all, and where the dispatcher's snapshot disagrees with
+    the row, the row wins. This is what makes a retry (a row copied from
+    the previous one) run the previous run."""
+
+    CONFIG = {
+        "scope": "full", "target_date": "2026-09-03",
+        "prediction_date": "2026-09-02", "lookback": 7, "max_articles": 10,
+        "report_model": "gpt-5.6-luna", "depth": "standard", "recs": "off",
+        "recs_model": "claude-sonnet-5", "evidence": [], "tools": [],
+        "models": ["kronos_mini", "lightgbm"], "ensemble": True,
+        "ensemble_members": ["kronos_mini", "lightgbm", "xgboost_shap"],
+        "ensemble_weights": {"kronos_mini": 1.5, "lightgbm": 0.5},
+        "ensemble_method": "agreement", "ensemble_min_agree": 2,
+    }
+
+    @pytest.fixture
+    def dispatch(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "ctx",
+                            SimpleNamespace(triggered_id="run-dispatch"))
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        return db
+
+    def test_stage_callbacks_read_no_dialog_control(self):
+        from dash._callback import GLOBAL_CALLBACK_MAP
+        dialog = {"run-scope", "run-symbols-store", "run-date-picker",
+                  "run-lookback", "run-max-articles", "run-model", "run-type",
+                  "run-recs", "run-recs-model", "run-evidence", "run-tools",
+                  "run-ensemble-check", "run-ensemble-method",
+                  "run-ensemble-min-agree", "ensemble-config-store"}
+        for wanted in ("ai-analysis-store.data", "model-signals-store.data",
+                       "full-analysis-requested.data", "recommendations-store.data"):
+            cb = next(v for k, v in GLOBAL_CALLBACK_MAP.items()
+                      if wanted in k and "run-dispatch" in {
+                          i["id"] for i in v.get("inputs", [])
+                          if isinstance(i["id"], str)}
+                      or (wanted == "recommendations-store.data"
+                          and k.startswith("..recommendations-store.data")))
+            state_ids = [st["id"] for st in cb.get("state", [])]
+            assert not any(isinstance(i, dict) for i in state_ids), wanted
+            assert not (set(state_ids) & dialog), (wanted, state_ids)
+
+    def test_flag_follows_the_row_when_the_snapshot_disagrees(self, dispatch):
+        full = rs.create_run("manual", ["NVDA"], "u1", config={"scope": "full"})
+        report = rs.create_run("manual", ["NVDA"], "u1", config={"scope": "report"})
+        # The row says full: armed, whatever the snapshot claims.
+        assert app_module.set_full_analysis_flag(
+            {"run_id": full, "scope": "report", "symbols": ["NVDA"]}, None) == full
+        # The row says report: never armed, even when the snapshot says full.
+        with pytest.raises(PreventUpdate):
+            app_module.set_full_analysis_flag(
+                {"run_id": report, "scope": "full", "symbols": ["NVDA"]}, None)
+
+    def test_model_stage_runs_the_rows_config(self, dispatch, feed, monkeypatch):
+        import services.analysis_runner as runner
+        import services.news_window as nw
+        run_id = rs.create_run("manual", ["nvda"], "u1", config=self.CONFIG)
+        feed.mark_run_pending(run_id)
+        # The subprocess stamps its environment; keep that out of the suite.
+        monkeypatch.delenv("QUANTNEWS_RUN_ID", raising=False)
+        monkeypatch.delenv("_DASH_BG_SUBPROCESS", raising=False)
+        seen = {}
+        monkeypatch.setattr(runner, "load_market_data",
+                            lambda symbols, period="2y": {s: {} for s in symbols})
+        monkeypatch.setattr(nw, "fetch_run_news",
+                            lambda symbols, *a, **kw: (
+                                {s: [] for s in symbols},
+                                {s: {"status": "empty", "kept": 0} for s in symbols}))
+
+        def _predict(symbols, stock_data, news, **kw):
+            seen.update(kw, symbols=symbols)
+            return {"_meta": {}}
+        monkeypatch.setattr(runner, "run_predictions", _predict)
+
+        # The snapshot claims a report-only run with another symbol; the
+        # row says full-scope models for NVDA, and the row is what runs.
+        store = {"run_id": run_id, "scope": "models", "symbols": ["amd"],
+                 "owner_uid": "u1", "kind": "manual"}
+        out = app_module.generate_model_signals(store, None)
+
+        assert out["_meta"]["run_id"] == run_id
+        assert seen["symbols"] == ["NVDA"]
+        assert seen["models"] == {"kronos_mini", "lightgbm"}
+        assert str(seen["target_date"]) == "2026-09-03"
+        assert str(seen["cutoff_date"]) == "2026-09-02"
+        assert seen["news_lookback_days"] == 7
+        assert seen["run_ensemble"] is True
+        assert seen["ensemble_config"] == {
+            "enabled_models": ["kronos_mini", "lightgbm", "xgboost_shap"],
+            "weights": {"kronos_mini": 1.5, "xgboost_shap": 1.0, "lightgbm": 0.5,
+                        "deberta_sentiment": 1.0, "trading_agents": 1.0},
+            "method": "agreement", "min_agree": 2}
+        # Full scope: the research kwargs come from the row's report fields.
+        assert seen["research_model"] == "gpt-5.6-luna"
+        assert seen["include_thesis"] is False
+        assert seen["evidence"] == []
+        row = rs.get_run(run_id)
+        assert row["status"] == "running"
+        assert row["stages"]["models"]["state"] == "running"
+
+    def test_report_stage_runs_the_rows_config(self, dispatch, feed, monkeypatch):
+        import services.news_window as nw
+        import services.stock_data as sd
+        import utils.metrics as metrics
+        run_id = rs.create_run("manual", ["NVDA"], "u1", config=self.CONFIG)
+        feed.mark_run_pending(run_id)
+        seen = {}
+
+        def _news(symbols, as_of, target, **kw):
+            seen.update(kw, as_of=as_of, target=target)
+            return ({s: [] for s in symbols},
+                    {s: {"status": "empty", "kept": 0} for s in symbols})
+        monkeypatch.setattr(nw, "fetch_run_news", _news)
+        monkeypatch.setattr(sd, "get_stock_info", lambda sym: SimpleNamespace(
+            name="Nvidia", sector="Tech", industry="Semis"))
+
+        def _no_network(df):
+            raise RuntimeError("metrics need the network")
+        monkeypatch.setattr(metrics, "compute_trading_metrics", _no_network)
+        monkeypatch.setattr(app_module, "_s3_available", False)
+        monkeypatch.setattr(app_module, "get_llm", lambda: None)
+
+        store = {"run_id": run_id, "scope": "report", "symbols": ["AMD"],
+                 "owner_uid": "u1", "kind": "manual"}
+        out = asyncio.run(app_module.generate_ai_analysis(
+            store, {"NVDA": {"prices": "{}"}}, None))
+
+        # The window, cap and dates are the row's; the snapshot's scope and
+        # symbol were ignored (full scope: no research here, no overall
+        # call without articles, so the report is honestly empty).
+        assert seen["lookback_days"] == 7 and seen["max_articles"] == 10
+        assert seen["overnight"] is False
+        assert seen["as_of"] == "2026-09-02" and seen["target"] == "2026-09-03"
+        assert out["scope"] == "full" and out["run_id"] == run_id
+        assert out["news_window"] == {"lookback_days": 7, "overnight": False,
+                                      "max_articles": 10}
+        assert out["as_of"] == "2026-09-02"
+        assert out.get("recs_off") is True and "recs_request" not in out
+        options = next(e["message"] for e in feed.get_feed(run_id)["events"]
+                       if e["message"].startswith("Options:"))
+        assert "model=gpt-5.6-luna" in options and "window=7d" in options
+        assert "type=standard" in options and "recs=off" in options
+        row = rs.get_run(run_id)
+        assert row["stages"]["synthesis"] == {"state": "skipped"}
+        assert row["stages"]["news"]["total"] == 1
+
+    def test_unreadable_row_fails_the_run_instead_of_guessing(self, dispatch, feed,
+                                                              monkeypatch):
+        run_id = rs.create_run("manual", ["NVDA"], "u1", config=self.CONFIG)
+        feed.mark_run_pending(run_id)
+
+        def _boom(rid):
+            raise RuntimeError("db away")
+        monkeypatch.setattr(rs, "get_run", _boom)
+        store = {"run_id": run_id, "scope": "report", "symbols": ["NVDA"],
+                 "owner_uid": "u1", "kind": "manual"}
+        out = asyncio.run(app_module.generate_ai_analysis(store, {}, None))
+        assert out["failed"] is True and "could not be read" in out["error"]
+        assert run_id not in feed._active_runs()
+
+        out = app_module.generate_model_signals(
+            {**store, "scope": "models"}, None)
+        assert "could not be read" in out["_run_failed"]
+
+    def test_confirm_records_the_whole_dialog(self, confirm):
+        out = confirm(["NVDA"], scope="full", lookback=14, max_articles=25,
+                      report_model="gpt-5.6-luna", depth="thesis", recs="auto",
+                      recs_model="claude-sonnet-5", run_evidence=["quality"],
+                      run_tools=["web_research"], run_ensemble=True,
+                      ens_method="agreement", ens_min_agree="2",
+                      ens_members=[True, False, True, False, False],
+                      ens_weights=[1.5, 1.0, "x", 1.0, 1.0])
+        cfg = rs.get_run(out[RUN_STORE]["run_id"])["config"]
+        assert cfg["target_date"] == "2026-09-03"
+        assert cfg["prediction_date"] == "2026-09-02"
+        assert cfg["picked_date"] == "2026-09-03"
+        assert cfg["lookback"] == 14 and cfg["max_articles"] == 25
+        assert cfg["report_model"] == "gpt-5.6-luna" and cfg["depth"] == "thesis"
+        assert cfg["recs"] == "auto" and cfg["recs_model"] == "claude-sonnet-5"
+        assert cfg["evidence"] == ["quality"] and cfg["tools"] == ["web_research"]
+        assert cfg["models"] == ["kronos_mini", "xgboost_shap"]
+        assert cfg["ensemble"] is True
+        assert cfg["ensemble_members"] == ["kronos_mini", "lightgbm"]
+        assert cfg["ensemble_weights"] == {
+            "kronos_mini": 1.5, "xgboost_shap": 1.0, "lightgbm": 1.0,
+            "deberta_sentiment": 1.0, "trading_agents": 1.0}
+        assert cfg["ensemble_method"] == "agreement"
+        assert cfg["ensemble_min_agree"] == 2
+        # A retry copies it verbatim, so it runs the same run.
+        assert app_module._ensemble_config_of(cfg)["enabled_models"] == [
+            "kronos_mini", "lightgbm"]
+
+    def test_confirm_falls_back_to_the_shared_ensemble_store(self, confirm):
+        out = confirm(["NVDA"], ens_members=None,
+                      ensemble_store={"enabled_models": ["lightgbm"],
+                                      "weights": {"lightgbm": 0.7}})
+        cfg = rs.get_run(out[RUN_STORE]["run_id"])["config"]
+        assert cfg["ensemble_members"] == ["lightgbm"]
+        assert cfg["ensemble_weights"] == {"lightgbm": 0.7}
 
 
 class TestWiring:
@@ -594,11 +862,18 @@ class TestWiring:
         return {i["id"] for i in cb.get("inputs", []) if isinstance(i["id"], str)}
 
     def test_confirm_button_feeds_only_the_dispatcher(self):
-        from dash._callback import GLOBAL_CALLBACK_MAP
+        # Plus the clientside spinner, which touches nothing but the
+        # button's own props and runs in the browser.
+        from dash._callback import GLOBAL_CALLBACK_LIST, GLOBAL_CALLBACK_MAP
         listeners = [k for k, v in GLOBAL_CALLBACK_MAP.items()
                      if "run-confirm-btn" in self._inputs(v)]
-        assert len(listeners) == 1
-        assert "run-modal.is_open" in listeners[0]
+        assert len(listeners) == 2
+        server = [k for k in listeners if "run-modal.is_open" in k]
+        assert len(server) == 1
+        spinner = next(c for c in GLOBAL_CALLBACK_LIST
+                       if str(c["output"]).startswith("..run-confirm-btn.disabled"))
+        assert spinner["clientside_function"] is not None
+        assert {i["id"] for i in spinner["inputs"]} == {"run-confirm-btn"}
 
     def test_stages_listen_on_run_dispatch(self):
         from dash._callback import GLOBAL_CALLBACK_MAP
@@ -627,6 +902,32 @@ class TestWiring:
         assert len(listeners) == 1
         assert "run-store.data" in listeners[0]
         assert "run-dispatch.data" in listeners[0]
+        # It acknowledges like the confirm does.
+        for wanted in ("progress-panel-state.data", "run-started-toast.is_open",
+                       "run-started-toast.children", "progress-interval.interval"):
+            assert wanted in listeners[0], wanted
+        # The only button is the Analyze page's failure block, absent on
+        # every other route; the renderer must tolerate that.
+        retry = GLOBAL_CALLBACK_MAP[listeners[0]]
+        btn = next(i for i in retry["inputs"] if i["id"] == "ai-retry-btn")
+        assert btn.get("allow_optional") is True
+
+    def test_retry_button_is_not_a_hidden_placeholder(self):
+        from layouts.main_layout import create_layout
+        from layouts.pages.analyze import create_ai_failure_indicator
+
+        def ids(node, acc):
+            i = getattr(node, "id", None)
+            if isinstance(i, str):
+                acc.add(i)
+            ch = getattr(node, "children", None)
+            for c in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                if c is not None and (hasattr(c, "children") or hasattr(c, "id")):
+                    ids(c, acc)
+            return acc
+
+        assert "ai-retry-btn" not in ids(create_layout(), set())
+        assert "ai-retry-btn" in ids(create_ai_failure_indicator(), set())
 
     def test_toasts_and_run_stores_are_mounted(self):
         from layouts.main_layout import create_layout
@@ -643,7 +944,7 @@ class TestWiring:
             return acc
 
         mounted = ids(create_layout(), set())
-        assert {"run-store", "run-dispatch", "run-dispatched",
+        assert {"run-store", "run-dispatch", "run-dispatched", "run-prefs-store",
                 "run-started-toast", "history-eval-toast"} <= mounted
 
     def test_run_dispatch_is_a_memory_store(self):

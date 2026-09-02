@@ -4,6 +4,8 @@ These sit outside the routed page content so a modal opened from one section
 survives navigation, and so their callbacks always have their Inputs mounted.
 """
 
+import re
+
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
@@ -151,6 +153,192 @@ RUN_SCOPES = [
     ("full", "Full pipeline",
      "Report, then all models, then the synthesis recommendation."),
 ]
+
+EVIDENCE_OPTIONS = [
+    {"label": "Options positioning (put/call)", "value": "options"},
+    {"label": "Quality screen (Bad Apples + news red flags)", "value": "quality"},
+    {"label": "Situation & investigation (web research, live runs)",
+     "value": "investigation"},
+    {"label": "Political & institutional flows", "value": "political"},
+]
+
+TOOL_OPTIONS = [
+    {"label": "Web research. The situation investigation searches the open "
+              "web with citations (on for next-day runs, off for backtests)",
+     "value": "web_research"},
+]
+
+# Presets are dicts over the dialog's own fields (scope, models, recs,
+# evidence, tools). A preset fixes only the fields it names; a field it
+# leaves out keeps whatever the dialog holds and never counts as divergence.
+# Quick leaves tools and evidence alone because a models-only run barely
+# reads them, and it drops TradingAgents: in the models-only path that
+# research runs one symbol at a time inside the prediction subprocess, so
+# with it Quick would be slower than Standard and still pay one LLM call per
+# symbol. Deep is the only preset that turns the open web on, and the date
+# rule (no web research for a backtest) still wins over it.
+RUN_PRESET_ORDER = ["quick", "standard", "deep"]
+DEFAULT_RUN_PRESET = "standard"
+PRESET_FIELDS = ("scope", "models", "recs", "evidence", "tools")
+RUN_PRESETS = {
+    "quick": {
+        "label": "Quick",
+        "hint": "Models only: the four numerical models, no LLM research, "
+                "no report, no recommendations.",
+        "fields": {
+            "scope": "models",
+            "models": [mid for mid, _, _ in RUN_MODELS
+                       if mid != "trading_agents"],
+            "recs": "off",
+        },
+    },
+    "standard": {
+        "label": "Standard",
+        "hint": "Research report and every model. No web research, no "
+                "recommendation synthesis.",
+        "fields": {
+            "scope": "full",
+            "models": [mid for mid, _, _ in RUN_MODELS],
+            "recs": "off",
+            "tools": [],
+        },
+    },
+    "deep": {
+        "label": "Deep",
+        "hint": "Standard plus web research on every evidence block and "
+                "the recommendation synthesis. Slowest, most spend.",
+        "fields": {
+            "scope": "full",
+            "models": [mid for mid, _, _ in RUN_MODELS],
+            "recs": "auto",
+            "evidence": [o["value"] for o in EVIDENCE_OPTIONS],
+            "tools": [o["value"] for o in TOOL_OPTIONS],
+        },
+    },
+}
+
+
+
+def run_confirm_label() -> list:
+    """The confirm button's resting label. A function: the clientside
+    spinner swaps the children out and the server puts these back, so
+    each writer needs its own component instances."""
+    return [html.I(className="bi bi-play-fill me-1"), "Run"]
+
+
+_PASTE_SPLIT = re.compile(r"[,\s;]+")
+
+
+def preset_fields(name: str | None) -> dict:
+    """The field values a preset fixes; the default preset for an unknown
+    name, so a stale localStorage value never yields an empty dialog."""
+    key = name if name in RUN_PRESETS else DEFAULT_RUN_PRESET
+    return {k: (list(v) if isinstance(v, (list, tuple)) else v)
+            for k, v in RUN_PRESETS[key]["fields"].items()}
+
+
+def preset_divergence(name: str | None, values: dict) -> list[str]:
+    """Names of the preset's fields whose dialog value differs from it.
+
+    ``values`` is what the controls hold now, keyed like the preset. List
+    fields compare as sets: the order the checklists report in is not the
+    user's choice. A None dialog value is read as "unmounted", not as a
+    divergence, so a State that never rendered cannot open Customize.
+    """
+    fields = preset_fields(name)
+    diverged = []
+    for field in PRESET_FIELDS:
+        if field not in fields:
+            continue
+        have = values.get(field)
+        if have is None:
+            continue
+        want = fields[field]
+        if isinstance(want, list):
+            if set(have) != set(want):
+                diverged.append(field)
+        elif have != want:
+            diverged.append(field)
+    return diverged
+
+
+def preset_run_tools(name: str | None, target_date) -> list[str]:
+    """Tools for a preset and a target session: never web research for a
+    backtest (the open web cannot be bounded to a past as-of), otherwise the
+    preset's own list, or the date default for a preset that fixes none."""
+    from services.investigation_service import default_tools
+    by_date = default_tools(target_date)
+    if not by_date:
+        return []
+    fixed = preset_fields(name).get("tools")
+    return list(fixed) if fixed is not None else by_date
+
+
+def split_symbol_input(text: str | None) -> list[str]:
+    """Tokens of a typed or pasted symbol string, separators stripped."""
+    return [t for t in _PASTE_SPLIT.split((text or "").strip()) if t]
+
+
+def is_symbol_list(text: str | None) -> bool:
+    """Whether typed text is an explicit list (comma or semicolon separated)
+    rather than a company name with spaces in it."""
+    return any(c in (text or "") for c in ",;")
+
+
+def _paste_option(query: str, tokens: list[str]) -> list[dict]:
+    from services.ticker_service import normalize_symbol
+
+    syms = []
+    for t in tokens:
+        sym = normalize_symbol(t)
+        if sym is None:
+            return []       # a word that is no ticker: not a paste
+        if sym not in syms:
+            syms.append(sym)
+    if not syms:
+        return []
+    return [{"label": f"Add {len(syms)} symbols: {', '.join(syms)}",
+             "value": " ".join(syms), "search": query}]
+
+
+def run_symbol_options(query: str | None, hits: list[dict]) -> list[dict]:
+    """Options for the symbol typeahead from the cache's hits for ``query``.
+
+    Every option carries ``search`` = the query: the Dropdown filters
+    options client-side by tokenising the search string and matching each
+    token against value, label and search, so without it a name hit
+    ("apple" -> AAPL) or a pasted "NVDA, AMD" would be filtered back out.
+    A comma-separated query is a paste and offers one option that adds
+    them all; a space-separated one is a company name first ("advanced
+    micro") and a paste only when the cache has nothing for it and every
+    word is a ticker. No hit at all offers "Add XYZ (check)", which the add
+    path validates with one price lookup before it becomes a chip.
+    """
+    from services.ticker_service import normalize_symbol
+
+    q = (query or "").strip()
+    tokens = split_symbol_input(q)
+    if not tokens:
+        return []
+    if is_symbol_list(q):
+        return _paste_option(q, tokens)
+    options = []
+    for h in hits or []:
+        sym = h.get("symbol")
+        if not sym:
+            continue
+        name = (h.get("name") or "").strip()
+        options.append({"label": f"{sym} · {name}" if name else sym,
+                        "value": sym, "search": q})
+    if options:
+        return options
+    if len(tokens) > 1:
+        return _paste_option(q, tokens)
+    sym = normalize_symbol(tokens[0])
+    if sym:
+        options.append({"label": f"Add {sym} (check)", "value": sym,
+                        "search": q})
+    return options
 
 # Wall-clock components for the pre-flight estimate, in seconds. These are the
 # numbers already recorded elsewhere in the codebase rather than guesses: a
@@ -655,21 +843,6 @@ def run_model_controls(prefix: str, with_info: bool = False,
     return model_checks, ensemble_section
 
 
-EVIDENCE_OPTIONS = [
-    {"label": "Options positioning (put/call)", "value": "options"},
-    {"label": "Quality screen (Bad Apples + news red flags)", "value": "quality"},
-    {"label": "Situation & investigation (web research, live runs)",
-     "value": "investigation"},
-    {"label": "Political & institutional flows", "value": "political"},
-]
-
-TOOL_OPTIONS = [
-    {"label": "Web research. The situation investigation searches the open "
-              "web with citations (on for next-day runs, off for backtests)",
-     "value": "web_research"},
-]
-
-
 def run_evidence_tools(prefix: str, values: dict | None = None):
     """The Evidence-blocks and Tools checklists for any run-configuring dialog."""
     from config import MODEL
@@ -769,9 +942,11 @@ def create_run_modal() -> dbc.Modal:
         default_target = date.today()
         closed_days = []
 
-    from config import MODEL
-
-    sel = _report_param_selects("run")
+    # The selects seed from the default preset so a dialog opened by a
+    # report shortcut (which leaves the preset untouched) does not start
+    # out diverging from it.
+    sel = _report_param_selects(
+        "run", {"recs": preset_fields(DEFAULT_RUN_PRESET)["recs"]})
 
     model_checks, ensemble_section = run_model_controls("run", with_info=True)
 
@@ -784,6 +959,22 @@ def create_run_modal() -> dbc.Modal:
             ],
             className="run-field",
         )
+
+    scope_field = html.Div(
+        [
+            html.Label("What to run", className="input-label"),
+            dbc.RadioItems(
+                id="run-scope",
+                options=[{"label": lbl, "value": val}
+                         for val, lbl, _ in RUN_SCOPES],
+                value=preset_fields(DEFAULT_RUN_PRESET)["scope"],
+                inline=True,
+                className="run-scope-radio",
+            ),
+            html.Div(id="run-scope-hint", className="run-field-hint"),
+        ],
+        className="run-field",
+    )
 
     return dbc.Modal(
         [
@@ -798,53 +989,66 @@ def create_run_modal() -> dbc.Modal:
                 # discoverable by starting the run and watching it fail.
                 html.Div(id="run-preflight", className="run-preflight"),
 
-                # --- Symbols ---
-                # The set a run acts on used to be an invisible rule (always
-                # the watchlist). It is now the dialog's first question, preset
-                # by whichever control opened it: the toolbar button starts
-                # from the watchlist, a per-symbol "New report" starts from
-                # that one symbol. Edits apply to this run only.
+                # --- Preset ---
+                # Three answers to "how much do you want": the segmented
+                # control writes the controls under Customize, which only
+                # unfold when a value there no longer matches the preset.
                 html.Div(
                     [
-                        html.Label("Symbols", className="input-label"),
                         dbc.RadioItems(
-                            id="run-symbols-source",
-                            options=[],  # filled with live counts on open
-                            inline=True,
-                            className="run-scope-radio",
+                            id="run-preset",
+                            options=[{"label": RUN_PRESETS[k]["label"],
+                                      "value": k} for k in RUN_PRESET_ORDER],
+                            value=DEFAULT_RUN_PRESET,
+                            class_name="btn-group run-preset-group",
+                            input_class_name="btn-check",
+                            label_class_name="btn btn-outline-secondary btn-sm",
+                            label_checked_class_name="active",
                         ),
-                        html.Div(id="run-symbols-chips",
-                                 className="run-symbols-chips"),
-                        dbc.Input(
-                            id="run-symbol-add",
-                            type="text",
-                            placeholder="Add a symbol to this run… (Enter)",
-                            size="sm",
-                            className="run-symbol-add",
-                            autoComplete="off",
-                        ),
-                        html.Div(
-                            "Applies to this run only. The watchlist is "
-                            "not changed.",
-                            className="run-field-hint",
-                        ),
+                        html.Div(id="run-preset-hint",
+                                 className="run-field-hint"),
                     ],
                     className="run-field",
                 ),
-                html.Hr(),
 
+                # --- Symbols ---
+                # The set a run acts on is the dialog's first question. The
+                # toolbar button opens it empty; "+ Watchlist" and "+ Last
+                # run" add on top and never replace what is there; a
+                # per-symbol "New report" arrives with that one symbol.
+                # Edits apply to this run only.
                 html.Div(
                     [
-                        html.Label("What to run", className="input-label"),
-                        dbc.RadioItems(
-                            id="run-scope",
-                            options=[{"label": lbl, "value": val}
-                                     for val, lbl, _ in RUN_SCOPES],
-                            value="full",
-                            inline=True,
-                            className="run-scope-radio",
+                        html.Label("Symbols", className="input-label"),
+                        html.Div(
+                            [
+                                dbc.Button("+ Watchlist", id="run-add-watchlist",
+                                           size="sm", outline=True,
+                                           color="secondary", disabled=True),
+                                dbc.Button("+ Last run", id="run-add-lastrun",
+                                           size="sm", outline=True,
+                                           color="secondary", disabled=True),
+                            ],
+                            className="run-add-btns",
                         ),
-                        html.Div(id="run-scope-hint", className="run-field-hint"),
+                        html.Div(id="run-symbols-chips",
+                                 className="run-symbols-chips"),
+                        dcc.Dropdown(
+                            id="run-symbol-search",
+                            options=[],
+                            value=None,
+                            multi=False,
+                            searchable=True,
+                            clearable=False,
+                            placeholder="Search ticker or company",
+                            className="run-symbol-search",
+                        ),
+                        html.Div(
+                            "Type a ticker or a company name, or paste a "
+                            "comma-separated list. Applies to this run only; "
+                            "the watchlist is not changed.",
+                            className="run-field-hint",
+                        ),
                     ],
                     className="run-field",
                 ),
@@ -871,6 +1075,22 @@ def create_run_modal() -> dbc.Modal:
                     "trading day, so a Monday target sees nothing after Friday.",
                 ),
                 html.Div(id="run-data-summary"),
+
+                # --- Customize ---
+                # Everything a preset decides lives here, folded away until
+                # the user wants a hand on it or a value already differs
+                # from the preset (the preflight callback unfolds it then).
+                html.Div(
+                    dbc.Button(
+                        [html.I(className="bi bi-sliders me-1"), "Customize"],
+                        id="run-customize-btn", size="sm", outline=True,
+                        color="secondary",
+                    ),
+                    className="run-customize-row",
+                ),
+                dbc.Collapse([
+                html.Hr(),
+                scope_field,
 
                 # --- News (feeds models AND report, every scope) ---
                 html.Div(
@@ -964,16 +1184,19 @@ def create_run_modal() -> dbc.Modal:
                     ],
                     id="run-recs-section",
                 ),
+                ], id="run-customize-collapse", is_open=False),
             ]),
             dbc.ModalFooter([
                 # Inline validation (e.g. an empty symbol set), me-auto keeps
                 # it left of the buttons in the footer's flex row.
                 html.Div(id="run-validation-msg",
                          className="run-validation-msg text-danger me-auto"),
+                # Sink for the clientside focus callback; never visible.
+                html.Div(id="run-focus-sink", style={"display": "none"}),
                 dbc.Button("Cancel", id="run-cancel-btn", color="secondary",
                            className="me-2"),
-                dbc.Button([html.I(className="bi bi-play-fill me-1"), "Run"],
-                           id="run-confirm-btn", color="success"),
+                dbc.Button(run_confirm_label(), id="run-confirm-btn",
+                           color="success"),
             ]),
         ],
         id="run-modal",

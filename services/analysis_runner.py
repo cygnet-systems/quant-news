@@ -1425,6 +1425,11 @@ def _run_stages(
     started = datetime.now()
 
     prog.emit_memory("run start", symbols=len(symbols))
+    # First structured event, before the price load: this flips the row
+    # from queued to running. A cold load can outlast the stall window,
+    # and a row still queued past it is reaped as a run that never started.
+    prog.emit_progress("news", state="running", done=0, total=len(symbols),
+                       run_id=run_id)
     stock_data = load_market_data(symbols, period=period, force_refresh=force_refresh)
     prog.emit_memory("market data")
     priced = [s for s in symbols if s in stock_data]

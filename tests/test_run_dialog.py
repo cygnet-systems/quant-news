@@ -1,0 +1,490 @@
+"""The Run dialog: presets, additive symbol sources, the ticker typeahead.
+
+The rules worth pinning: a preset fixes only the fields it names and the
+row records the name only while the controls still match it; Customize
+unfolds on divergence and never folds on its own; the toolbar button opens
+EMPTY on the remembered preset while the report shortcuts pre-fill their
+symbols and force the report scope; every symbol source adds and dedupes;
+a typed name becomes a chip only after the cache or one price lookup has
+vouched for it; the typeahead serves the cache's ranking untouched.
+
+Importing app registers every callback; the decorated functions are still
+plain callables, exercised here with a stubbed ctx and an in-memory SQLite.
+Nothing fetches prices (validate_symbol's vendor call is stubbed), runs a
+model or calls an LLM.
+"""
+
+import asyncio
+import os
+from types import SimpleNamespace
+
+import dash
+import diskcache
+import pytest
+from dash.exceptions import PreventUpdate
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from db.models import AnalysisRun, Base, JobRun, Ticker
+from layouts import modals
+from services import progress_service as prog
+from services import run_service as rs
+from services import ticker_service as ts
+
+_flag_before = os.environ.get(prog._ENV_FLAG)
+import app as app_module  # noqa: E402
+
+if _flag_before is None:
+    os.environ.pop(prog._ENV_FLAG, None)
+
+from tests.test_run_dispatch import (  # noqa: E402
+    BTN_DISABLED, BTN_LABEL, CUSTOMIZE, IS_OPEN, PRESET, PREFS, VALIDATION)
+
+SCOPE, SYMBOLS = 1, 2
+ALL_MODELS = [mid for mid, _, _ in modals.RUN_MODELS]
+QUICK_MODELS = [m for m in ALL_MODELS if m != "trading_agents"]
+CHECK_IDS = [{"type": "run-model-check", "model": m} for m in ALL_MODELS]
+
+
+@compiles(JSONB, "sqlite")
+def _jsonb_as_json(type_, compiler, **kw):
+    return "JSON"
+
+
+@pytest.fixture
+def db(monkeypatch):
+    import db.session as dbs
+
+    # One shared connection: the symbol callbacks run their lookups in a
+    # worker thread, and a per-thread in-memory SQLite would be empty there.
+    eng = create_engine("sqlite://", poolclass=StaticPool,
+                        connect_args={"check_same_thread": False})
+    Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__,
+                                          Ticker.__table__])
+    monkeypatch.setattr(dbs, "_engine", eng)
+    monkeypatch.setattr(
+        dbs, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
+    return dbs
+
+
+@pytest.fixture
+def feed(monkeypatch, tmp_path):
+    monkeypatch.setenv(prog._ENV_FLAG, "1")
+    monkeypatch.setattr(prog, "_cache", diskcache.Cache(str(tmp_path)))
+    monkeypatch.setattr(prog, "_local_run", {"id": None, "title": None})
+    monkeypatch.setattr(prog, "_write_audit", lambda *a, **kw: None)
+    monkeypatch.setattr(prog, "_last_db_reap", 0.0)
+    token = prog._run_ctx.set(None)
+    yield prog
+    prog._run_ctx.reset(token)
+
+
+@pytest.fixture
+def tickers(db):
+    ts.upsert([
+        {"symbol": "AAPL", "name": "Apple Inc.", "exchange": "NASDAQ"},
+        {"symbol": "A", "name": "Agilent Technologies"},
+        {"symbol": "AMD", "name": "Advanced Micro Devices"},
+        {"symbol": "APLE", "name": "Apple Hospitality REIT"},
+        {"symbol": "NVDA", "name": "NVIDIA Corp"},
+        {"symbol": "SNAP", "name": "Snap Inc."},
+    ], "index")
+
+
+def _trigger(monkeypatch, triggered_id, value=1, **extra):
+    prop = (triggered_id if isinstance(triggered_id, str)
+            else '{"symbol":"%s","type":"new-report-btn"}' % triggered_id["symbol"])
+    monkeypatch.setattr(app_module, "ctx", SimpleNamespace(
+        triggered_id=triggered_id,
+        triggered=[{"prop_id": f"{prop}.n_clicks", "value": value}],
+        **extra))
+
+
+def _open(monkeypatch, triggered, watchlist=(), prefs=None, ctx_clicks=None):
+    """toggle_run_modal's opener branch for one of the three entry points."""
+    _trigger(monkeypatch, triggered)
+    clicks = {"run-analysis-btn": 1} if triggered == "run-analysis-btn" else {}
+    reports = 1 if triggered == "reports-new-btn" else None
+    return app_module.toggle_run_modal(
+        clicks.get("run-analysis-btn"), reports, ctx_clicks or [], None, None,
+        {}, list(watchlist), {}, False, {}, "full", {},
+        preset=None, prefs=prefs)
+
+
+class TestPresetFields:
+    def test_each_preset_maps_to_the_dialog_fields(self):
+        quick = modals.preset_fields("quick")
+        assert quick == {"scope": "models", "models": QUICK_MODELS,
+                         "recs": "off"}
+        standard = modals.preset_fields("standard")
+        assert standard == {"scope": "full", "models": ALL_MODELS,
+                            "recs": "off", "tools": []}
+        deep = modals.preset_fields("deep")
+        assert deep["scope"] == "full" and deep["recs"] == "auto"
+        assert deep["evidence"] == [o["value"] for o in modals.EVIDENCE_OPTIONS]
+        assert deep["tools"] == ["web_research"]
+        assert set(modals.RUN_PRESET_ORDER) == set(modals.RUN_PRESETS)
+
+    def test_quick_is_the_cheapest_preset(self):
+        # Quick used to keep TradingAgents; the models-only path runs that
+        # research serially, so Quick quoted a longer run than Standard.
+        def est(name, n):
+            f = modals.preset_fields(name)
+            return modals.estimate_run_seconds(
+                f["scope"], n, f["models"], f["recs"] != "off")
+        for n in (1, 3, 8):
+            assert est("quick", n) < est("standard", n) <= est("deep", n)
+        assert "trading_agents" not in modals.preset_fields("quick")["models"]
+
+    def test_unknown_or_stale_name_is_the_default(self):
+        assert modals.preset_fields(None) == modals.preset_fields("standard")
+        assert modals.preset_fields("gone") == modals.preset_fields("standard")
+        # A copy: mutating the answer never edits the preset.
+        modals.preset_fields("quick")["models"].clear()
+        assert modals.preset_fields("quick")["models"] == QUICK_MODELS
+
+    def test_dialog_defaults_match_the_default_preset(self):
+        # A report shortcut leaves the preset alone; the controls it finds
+        # must already sit on Standard or Customize would unfold on open.
+        modal = modals.create_run_modal()
+
+        def find(node, wanted):
+            if getattr(node, "id", None) == wanted:
+                return node
+            ch = getattr(node, "children", None)
+            for c in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                if hasattr(c, "to_plotly_json"):
+                    hit = find(c, wanted)
+                    if hit is not None:
+                        return hit
+            return None
+
+        std = modals.preset_fields("standard")
+        assert find(modal, "run-recs").value == std["recs"]
+        assert find(modal, "run-scope").value == std["scope"]
+        assert find(modal, "run-preset").value == "standard"
+        assert find(modal, "run-customize-collapse").is_open is False
+        search = find(modal, "run-symbol-search")
+        assert search.multi is False and search.searchable is True
+
+    def test_apply_writes_only_what_the_preset_names(self, monkeypatch):
+        _trigger(monkeypatch, "run-preset")
+        scope, checks, recs, evidence, tools = app_module.apply_run_preset(
+            "quick", "2099-01-05", CHECK_IDS)
+        assert scope == "models" and recs == "off"
+        # TradingAgents is the one box Quick unticks.
+        assert checks == [c["model"] != "trading_agents" for c in CHECK_IDS]
+        # Quick fixes neither evidence nor tools: the date default stands.
+        assert evidence is dash.no_update
+        assert tools == ["web_research"]
+
+        scope, checks, recs, evidence, tools = app_module.apply_run_preset(
+            "deep", "2099-01-05", CHECK_IDS)
+        assert scope == "full" and recs == "auto"
+        assert evidence == [o["value"] for o in modals.EVIDENCE_OPTIONS]
+        assert tools == ["web_research"]
+
+        *_, tools = app_module.apply_run_preset("standard", "2099-01-05", CHECK_IDS)
+        assert tools == []
+
+    def test_backtest_date_never_turns_the_web_on(self, monkeypatch):
+        _trigger(monkeypatch, "run-preset")
+        *_, tools = app_module.apply_run_preset("deep", "2024-03-05", CHECK_IDS)
+        assert tools == []
+        # A date change alone touches only the tools. The ALL output still
+        # gets a list (a bare no_update for a wildcard output is a 500).
+        _trigger(monkeypatch, "run-date-picker")
+        out = app_module.apply_run_preset("deep", "2024-03-05", CHECK_IDS)
+        assert out[0] is dash.no_update and out[2] is dash.no_update
+        assert out[1] == [dash.no_update] * 5
+        assert out[3] is dash.no_update and out[4] == []
+
+
+class TestDivergence:
+    def test_matching_controls_do_not_diverge(self):
+        assert modals.preset_divergence("standard", {
+            "scope": "full", "models": list(reversed(ALL_MODELS)),
+            "recs": "off", "tools": [], "evidence": ["options"]}) == []
+
+    def test_each_named_field_is_reported(self):
+        got = modals.preset_divergence("deep", {
+            "scope": "report", "models": ALL_MODELS[:2], "recs": "off",
+            "evidence": ["options"], "tools": []})
+        assert got == ["scope", "models", "recs", "evidence", "tools"]
+
+    def test_unmounted_values_are_not_divergence(self):
+        assert modals.preset_divergence("deep", {"scope": None, "models": None,
+                                                 "recs": None}) == []
+        assert modals.preset_divergence("quick", {"scope": "models",
+                                                  "tools": ["web_research"]}) == []
+
+    def _preflight(self, monkeypatch, preset, scope, checks, recs, evidence,
+                   tools, is_open=True):
+        monkeypatch.setattr(app_module, "ctx", SimpleNamespace(
+            inputs_list=[
+                {"id": "run-modal", "property": "is_open"},
+                {"id": "run-preset", "property": "value"},
+                {"id": "run-scope", "property": "value"},
+                {"id": "run-symbols-store", "property": "data"},
+                [{"id": {"type": "run-model-check", "model": m}, "property": "value",
+                  "value": on} for m, on in zip(ALL_MODELS, checks)],
+            ]))
+        return app_module.run_preflight(
+            is_open, preset, scope, {"symbols": ["NVDA"]}, checks,
+            "claude-haiku-4-5", recs, "claude-sonnet-5", evidence, tools)
+
+    def test_customize_unfolds_only_on_divergence(self, monkeypatch):
+        preflight, hint, collapse = self._preflight(
+            monkeypatch, "standard", "full", [True] * 5, "off",
+            ["options"], [])
+        assert collapse is dash.no_update
+        assert hint == [modals.RUN_PRESETS["standard"]["hint"]]
+        assert preflight and "1 symbol" in str(preflight[-1].to_plotly_json())
+
+        preflight, hint, collapse = self._preflight(
+            monkeypatch, "standard", "report", [True] * 5, "auto",
+            None, [])
+        assert collapse is True
+        assert "what to run, recommendations" in hint[1].children
+
+    def test_closed_dialog_changes_nothing(self, monkeypatch):
+        out = self._preflight(monkeypatch, "standard", "full", [True] * 5,
+                              "off", None, [], is_open=False)
+        assert out == (dash.no_update,) * 3
+
+    def test_customize_button_toggles(self):
+        assert app_module.toggle_run_customize(1, False) is True
+        assert app_module.toggle_run_customize(2, True) is False
+        with pytest.raises(PreventUpdate):
+            app_module.toggle_run_customize(None, False)
+
+
+class TestOpeners:
+    @pytest.fixture(autouse=True)
+    def owner(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+
+    def test_toolbar_opens_empty_on_the_remembered_preset(self, monkeypatch):
+        rs.create_run("manual", ["tsla", "AMD"], "u1")
+        rs.create_run("manual", ["NVDA"], "u2")      # someone else's
+
+        out = _open(monkeypatch, "run-analysis-btn", watchlist=["AAPL", "BE"],
+                    prefs={"preset": "deep", "symbols": ["XYZ"]})
+
+        assert out[IS_OPEN] is True
+        assert out[SYMBOLS] == {"symbols": [], "watchlist": ["AAPL", "BE"],
+                                "lastrun": ["TSLA", "AMD"]}
+        assert out[SCOPE] is dash.no_update      # the preset sets it
+        assert out[PRESET] == "deep"
+        assert out[CUSTOMIZE] is False
+        assert out[VALIDATION] == ""
+        assert out[BTN_DISABLED] is False and out[BTN_LABEL][-1] == "Run"
+        assert out[PREFS] is dash.no_update
+
+    def test_stale_preset_and_no_runs_fall_back(self, monkeypatch):
+        out = _open(monkeypatch, "run-analysis-btn",
+                    prefs={"preset": "turbo", "symbols": ["nvda", ""]})
+        assert out[PRESET] == modals.DEFAULT_RUN_PRESET
+        # No run on record for this owner: the browser's list stands in.
+        assert out[SYMBOLS]["lastrun"] == ["nvda"]
+        out = _open(monkeypatch, "run-analysis-btn", prefs="junk")
+        assert out[PRESET] == modals.DEFAULT_RUN_PRESET
+        assert out[SYMBOLS] == {"symbols": [], "watchlist": [], "lastrun": []}
+
+    def test_reports_entry_prefills_the_watchlist_and_forces_report(self, monkeypatch):
+        out = _open(monkeypatch, "reports-new-btn", watchlist=["AAPL", "BE"])
+        assert out[SYMBOLS]["symbols"] == ["AAPL", "BE"]
+        assert out[SCOPE] == "report"
+        # The preset is left alone: the report scope diverges from it and
+        # the preflight callback unfolds Customize to show that.
+        assert out[PRESET] is dash.no_update
+        assert out[CUSTOMIZE] is False
+
+    def test_per_symbol_entry_prefills_that_symbol(self, monkeypatch):
+        out = _open(monkeypatch, {"type": "new-report-btn", "symbol": "BE"},
+                    watchlist=["AAPL"], ctx_clicks=[1])
+        assert out[SYMBOLS]["symbols"] == ["BE"]
+        assert out[SCOPE] == "report"
+        assert out[PRESET] is dash.no_update
+
+    def test_mount_echo_of_a_context_button_does_not_open(self, monkeypatch):
+        _trigger(monkeypatch, {"type": "new-report-btn", "symbol": "BE"}, value=None)
+        with pytest.raises(PreventUpdate):
+            app_module.toggle_run_modal(None, None, [None], None, None,
+                                        {}, [], {}, False, {}, "full", {})
+
+
+class TestSymbols:
+    def _set(self, monkeypatch, triggered, store, picked=None, clicks=1,
+             remove=()):
+        _trigger(monkeypatch, triggered)
+        add_wl = clicks if triggered == "run-add-watchlist" else None
+        add_lr = clicks if triggered == "run-add-lastrun" else None
+        return asyncio.run(app_module.set_run_symbols(
+            add_wl, add_lr, list(remove), picked, store))
+
+    def test_sources_add_and_dedupe(self, monkeypatch):
+        store = {"symbols": ["NVDA"], "watchlist": ["AAPL", "NVDA"],
+                 "lastrun": ["NVDA", "AMD"]}
+        out, value, msg = self._set(monkeypatch, "run-add-watchlist", store)
+        assert out["symbols"] == ["NVDA", "AAPL"] and msg == ""
+        assert value is dash.no_update
+        with pytest.raises(PreventUpdate):      # nothing left to add
+            self._set(monkeypatch, "run-add-watchlist", out)
+        out, _, _ = self._set(monkeypatch, "run-add-lastrun", out)
+        assert out["symbols"] == ["NVDA", "AAPL", "AMD"]
+        assert out["watchlist"] == ["AAPL", "NVDA"]   # snapshots untouched
+        with pytest.raises(PreventUpdate):      # a mount echo, not a click
+            self._set(monkeypatch, "run-add-lastrun", store, clicks=None)
+
+    def test_remove_chip(self, monkeypatch):
+        monkeypatch.setattr(app_module, "ctx", SimpleNamespace(
+            triggered_id={"type": "run-sym-remove", "symbol": "AAPL"},
+            triggered=[{"prop_id": "x.n_clicks", "value": 1}]))
+        out, _, _ = asyncio.run(app_module.set_run_symbols(
+            None, None, [1, None], None,
+            {"symbols": ["NVDA", "AAPL"], "watchlist": ["AAPL"]}))
+        assert out["symbols"] == ["NVDA"]
+        with pytest.raises(PreventUpdate):
+            asyncio.run(app_module.set_run_symbols(
+                None, None, [None], None, {"symbols": ["AAPL"]}))
+
+    def test_known_pick_becomes_a_chip_and_clears_the_search(self, monkeypatch,
+                                                            tickers):
+        def _never(sym):
+            raise AssertionError("cached symbol must not be fetched")
+        monkeypatch.setattr(ts, "_fetch_info", _never)
+        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+                                    {"symbols": ["NVDA"]}, picked="aapl")
+        assert out["symbols"] == ["NVDA", "AAPL"]
+        assert value is None and msg == ""
+        # The clear echoes back as a None value: nothing happens.
+        with pytest.raises(PreventUpdate):
+            self._set(monkeypatch, "run-symbol-search", out, picked=None)
+
+    def test_unknown_symbol_is_validated_once_then_cached(self, monkeypatch,
+                                                         tickers):
+        calls = []
+
+        def _info(sym):
+            calls.append(sym)
+            return SimpleNamespace(name="Bloom Energy")
+        monkeypatch.setattr(ts, "_fetch_info", _info)
+        out, _, msg = self._set(monkeypatch, "run-symbol-search",
+                                {"symbols": []}, picked="be")
+        assert out["symbols"] == ["BE"] and msg == ""
+        assert calls == ["BE"]
+        assert ts.get("BE")["source"] == "validated"
+        assert ts.get("BE")["name"] == "Bloom Energy"
+
+    def test_no_price_data_is_refused_with_a_message(self, monkeypatch, tickers):
+        def _info(sym):
+            raise ValueError("no data")
+        monkeypatch.setattr(ts, "_fetch_info", _info)
+        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+                                    {"symbols": ["NVDA"]}, picked="ZZZQ")
+        assert out is dash.no_update and value is None
+        assert msg == "No price data for ZZZQ"
+        assert ts.get("ZZZQ") is None
+        # A paste with one bad name still adds the good ones and says why.
+        out, _, msg = self._set(monkeypatch, "run-symbol-search",
+                                {"symbols": []}, picked="AMD ZZZQ, nvda")
+        assert out["symbols"] == ["AMD", "NVDA"]
+        assert msg == "No price data for ZZZQ"
+
+    def test_paste_adds_every_symbol_once(self, monkeypatch, tickers):
+        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+                                    {"symbols": ["AMD"]},
+                                    picked="nvda, AMD;aapl nvda")
+        assert out["symbols"] == ["AMD", "NVDA", "AAPL"]
+        assert value is None and msg == ""
+
+    def test_chips_and_source_buttons(self):
+        chips, wl_label, wl_off, lr_label, lr_off = app_module.render_run_symbol_chips(
+            {"symbols": ["NVDA", "AMD"], "watchlist": ["AAPL", "BE"], "lastrun": []})
+        assert [c.children[0].children for c in chips] == ["NVDA", "AMD"]
+        assert chips[1].children[1].id == {"type": "run-sym-remove", "symbol": "AMD"}
+        assert (wl_label, wl_off) == ("+ Watchlist (2)", False)
+        assert (lr_label, lr_off) == ("+ Last run (0)", True)
+        chips, *_ = app_module.render_run_symbol_chips({})
+        assert chips[0].className == "run-symbols-empty"
+
+    def test_data_summary_follows_the_chip_set(self):
+        out = app_module.render_run_data_summary({"symbols": ["NVDA"]}, {}, {})
+        assert "NVDA" in str(out.to_plotly_json())
+        empty = app_module.render_run_data_summary({}, {}, {})
+        assert "No symbols selected" in str(empty.to_plotly_json())
+        from dash._callback import GLOBAL_CALLBACK_MAP
+        cb = GLOBAL_CALLBACK_MAP["run-data-summary.children"]
+        assert [i["id"] for i in cb["inputs"]] == ["run-symbols-store"]
+
+
+class TestSearch:
+    def _search(self, q):
+        return asyncio.run(app_module.search_run_symbols(q))
+
+    def test_cache_ranking_reaches_the_options_untouched(self, tickers):
+        got = self._search("ap")
+        assert [o["value"] for o in got] == [r["symbol"] for r in ts.search("ap")]
+        assert got[0]["value"] == "APLE"
+        assert all(o["search"] == "ap" for o in got)
+        assert self._search("nvi") == [
+            {"label": "NVDA · NVIDIA Corp", "value": "NVDA", "search": "nvi"}]
+        assert [o["value"] for o in self._search("a")][:3] == ["A", "AMD", "AAPL"]
+
+    def test_empty_and_blank_keep_the_last_list(self, tickers):
+        # The Dropdown clears search_value as it picks; emptying the options
+        # in that same round invalidated the pick before its callback ran.
+        for q in (None, "", "  ,"):
+            with pytest.raises(PreventUpdate):
+                self._search(q)
+
+    def test_no_hit_offers_a_check(self, tickers):
+        assert self._search("zzzq") == [
+            {"label": "Add ZZZQ (check)", "value": "ZZZQ", "search": "zzzq"}]
+        assert self._search("not a ticker!") == []
+        assert self._search("zz!!") == []
+
+    def test_spaces_are_a_company_name_first(self, tickers):
+        # "advanced micro" is a name, not two tickers; only when the cache
+        # has nothing and every word is a ticker does it read as a paste.
+        assert [o["value"] for o in self._search("advanced micro")] == ["AMD"]
+        assert self._search("nvda amd")[0]["label"] == "Add 2 symbols: NVDA, AMD"
+        assert self._search("apple hosp")[0]["value"] == "APLE"
+
+    def test_paste_is_one_option_without_a_lookup(self, monkeypatch):
+        def _never(*a, **kw):
+            raise AssertionError("a paste needs no search")
+        monkeypatch.setattr(ts, "search", _never)
+        assert self._search("nvda, amd amd") == [
+            {"label": "Add 2 symbols: NVDA, AMD", "value": "NVDA AMD",
+             "search": "nvda, amd amd"}]
+
+    def test_search_failure_degrades_to_the_check_option(self, monkeypatch):
+        def _boom(*a, **kw):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(ts, "search", _boom)
+        assert self._search("nvda")[0]["label"] == "Add NVDA (check)"
+
+    def test_cap_is_twelve(self, monkeypatch):
+        seen = {}
+
+        def _search(q, limit):
+            seen["limit"] = limit
+            return []
+        monkeypatch.setattr(ts, "search", _search)
+        self._search("a")
+        assert seen["limit"] == 12
+
+
+class TestRetryScope:
+    def test_scope_comes_from_config_then_legacy_preset(self):
+        assert app_module._run_scope_of(
+            {"preset": "custom", "config": {"scope": "models"}}) == "models"
+        assert app_module._run_scope_of({"preset": "report", "config": {}}) == "report"
+        assert app_module._run_scope_of({"preset": "quick", "config": {}},
+                                        {"scope": "models"}) == "models"
+        assert app_module._run_scope_of({}, None) == "full"

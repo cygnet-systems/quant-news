@@ -15,6 +15,8 @@ Tables:
     trading_agent_reports. TradingAgents research reports
     analysis_runs: one row per analysis run (manual or scheduled), its status,
         per-stage progress and counters
+    tickers: local symbol lookup cache (index constituents, symbols ever run,
+        names accepted after one price lookup)
 """
 
 from datetime import date, datetime
@@ -194,6 +196,32 @@ class StockInfo(Base):
     volume: Mapped[int | None] = mapped_column(BigInteger)
     avg_volume: Mapped[int | None] = mapped_column(BigInteger)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Ticker(Base):
+    """Local symbol lookup behind the Run dialog typeahead.
+
+    source says how the row got here and ranks its trust: 'index' (S&P 500
+    or Russell 2000 constituent list, refreshed weekly), 'validated' (an
+    unknown name one price lookup accepted), 'run' (a symbol some run used).
+    An upsert never lowers the source. membership is a list of index tags
+    (['sp500'], ['r2000']) merged across refreshes.
+    """
+
+    __tablename__ = "tickers"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    name: Mapped[str | None] = mapped_column(Text)
+    exchange: Mapped[str | None] = mapped_column(String(16))
+    membership: Mapped[list | None] = mapped_column(JSONB)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_tickers_name", "name"),
+    )
 
 
 class CacheMetadata(Base):

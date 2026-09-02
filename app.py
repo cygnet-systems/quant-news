@@ -1787,6 +1787,47 @@ _RUN_MODEL_IDS = [
 ]
 
 
+def _ensemble_config_of(config: dict) -> dict | None:
+    """The ensemble the run's config recorded, in the shape the runner and
+    the drawer share; None for a row from before members were recorded
+    (the runner then applies its configured defaults)."""
+    members = config.get("ensemble_members")
+    if members is None:
+        return None
+    weights = {}
+    for model_id in _RUN_MODEL_IDS:
+        try:
+            weights[model_id] = round(
+                float((config.get("ensemble_weights") or {}).get(model_id, 1.0)),
+                1)
+        except (TypeError, ValueError):
+            weights[model_id] = 1.0
+    try:
+        min_agree = int(config.get("ensemble_min_agree"))
+    except (TypeError, ValueError):
+        min_agree = MODEL.ENSEMBLE_MIN_AGREE
+    return {
+        "enabled_models": [m for m in members if m in _RUN_MODEL_IDS],
+        "weights": weights,
+        "method": config.get("ensemble_method") or MODEL.ENSEMBLE_DEFAULT_METHOD,
+        "min_agree": min_agree,
+    }
+
+
+def _run_scope_of(run, run_store=None):
+    """The scope a recorded run ran with. config_json carries it; rows
+    from before presets had a name kept the scope in the preset column."""
+    from layouts.modals import RUN_SCOPES
+    scopes = {v for v, _, _ in RUN_SCOPES}
+    config_scope = ((run or {}).get("config") or {}).get("scope")
+    if config_scope in scopes:
+        return config_scope
+    if (run or {}).get("preset") in scopes:
+        return run["preset"]
+    store_scope = (run_store or {}).get("scope")
+    return store_scope if store_scope in scopes else "full"
+
+
 def _run_owner_uid():
     """Owner of a run confirmed in this request: the signed-in user, None
     when anonymous. The same attribution predictions and reports get, so a
@@ -1798,8 +1839,9 @@ def _run_owner_uid():
         return None
 
 
-def _dispatch_run_id(run_store, dispatched) -> str:
-    """The run a stage callback fires for; PreventUpdate when there is none.
+def _dispatch_run(run_store, dispatched) -> tuple:
+    """The run a stage callback fires for, as ``(run_id, row)``; PreventUpdate
+    when there is none.
 
     The stages trigger on run-dispatch (a memory store the dispatcher
     writes on confirm) rather than on the confirm click: the click's own
@@ -1808,6 +1850,9 @@ def _dispatch_run_id(run_store, dispatched) -> str:
     last one) or a run no longer in flight is not a new confirm. A dict
     with no run_id is a dispatcher bug, not an idle store, and is said so
     on the feed; only None is silent.
+
+    The row rides along because it is the stage's settings (see
+    _run_settings); ``row`` is None only when the record could not be read.
     """
     if run_store is None:
         raise PreventUpdate
@@ -1834,7 +1879,59 @@ def _dispatch_run_id(run_store, dispatched) -> str:
         row = None
     if row is not None and not row["active"]:
         raise PreventUpdate
-    return run_id
+    return run_id, row
+
+
+def _dispatch_run_id(run_store, dispatched) -> str:
+    """_dispatch_run without the row, for callers that only need the id."""
+    return _dispatch_run(run_store, dispatched)[0]
+
+
+def _run_settings(row) -> dict | None:
+    """What a stage runs with: the run row's config_json, written once by
+    the confirm (or copied by a retry) and never by the dialog afterwards.
+
+    The dialog's controls are not consulted: the user may have changed a
+    preset or a model tick since confirming, a retry must re-run what the
+    previous run recorded, and the run page must be able to show exactly
+    what ran. None when the row is unreadable, which a stage treats as a
+    failure of that run rather than a reason to guess.
+    """
+    if row is None:
+        return None
+    return dict(row.get("config") or {})
+
+
+def _run_symbols_of(row, run_store) -> list:
+    """The run's symbol list as the row normalised it (upper-cased, deduped),
+    falling back to the dispatcher's snapshot when the row is unreadable."""
+    return list((row or {}).get("symbols")
+                or (run_store or {}).get("symbols") or [])
+
+
+def _run_acknowledgement(panel_state, symbols, estimate_s, scope) -> tuple:
+    """What every accepted run answers with, confirm and retry alike:
+    the activity panel forced open (a user who once closed it otherwise
+    gets zero feedback), the started toast with symbols, estimate and
+    where the output lands, and the panel's poll snapped to the active
+    rate (waiting for a slow idle tick to notice the active flag cost an
+    idle interval before the first run events rendered). Returns the
+    values for progress-panel-state, run-started-toast is_open/children and
+    progress-interval, in that order."""
+    from layouts.modals import _fmt_duration
+
+    panel = dict(panel_state or {})
+    panel.setdefault("mode", "normal")
+    panel["closed"] = False
+    where = {
+        "models": "predictions will appear on Home and Analyze",
+        "report": "the report will appear under Reports",
+    }.get(scope, "predictions on Home and Analyze, the report under Reports")
+    # A row without an estimate (a retry of one recorded before estimates,
+    # or a scope the estimator prices at zero) still gets its toast.
+    duration = _fmt_duration(estimate_s) if estimate_s else "duration unknown"
+    toast_msg = f"{', '.join(symbols)} · {duration} · {where}."
+    return panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS
 
 
 def _active_run_refusal():
@@ -1901,26 +1998,14 @@ def mark_run_dispatched(run_store, dispatched):
 @callback(
     Output("ai-analysis-store", "data"),
     Input("run-dispatch", "data"),
-    State("run-scope", "value"),
-    State("run-symbols-store", "data"),
+    # Not a dialog control in sight: every setting comes from the run row's
+    # config (see _run_settings). The price store is the only browser-side
+    # input, and only as a warm start for the server-side fill.
     State("stock-data-store", "data"),
-    State("run-date-picker", "date"),
-    State("run-lookback", "value"),
-    State("run-max-articles", "value"),
-    State("run-model", "value"),
-    State("run-type", "value"),
-    State("run-recs", "value"),
-    State("run-recs-model", "value"),
-    State("run-evidence", "value"),
-    State("run-tools", "value"),
     State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(run_store, scope,
-                               run_symbols, stock_data, run_date, lookback,
-                               max_articles_val, model, depth, recs,
-                               recs_model, run_evidence, run_tools,
-                               dispatched):
+async def generate_ai_analysis(run_store, stock_data, dispatched):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1928,27 +2013,28 @@ async def generate_ai_analysis(run_store, scope,
     the minutes-long run holds no callback-threadpool slot while waiting.
     Checks Postgres/S3 cache first if persistence layer is available.
 
-    The Full Analysis modal supplies an as-of date: articles are filtered to
+    The run's config supplies an as-of date: articles are filtered to
     that date, price-derived metrics are computed from truncated OHLCV, and
     live quote data is suppressed for past dates, no lookahead in backtests.
     """
     from datetime import date as date_cls
     from functools import partial
 
-    # The dispatcher's snapshot of scope and symbols wins over the dialog
-    # controls, which the user may have touched since confirming. (A retry
-    # arrives here the same way: retry_run writes a fresh run to the same
-    # store, marked retry_of.)
-    scope = (run_store or {}).get("scope") or scope or "full"
-    run_id = _dispatch_run_id(run_store, dispatched)
+    run_id, row = _dispatch_run(run_store, dispatched)
+    # The run row's config is the ONE record of what was confirmed; the
+    # dialog controls may have moved since (and a retry re-runs what the
+    # previous row recorded, not what the dialog shows now). The
+    # dispatcher's snapshot is only the fallback for an unreadable row.
+    config = _run_settings(row)
+    scope = ((config or {}).get("scope") or (run_store or {}).get("scope")
+             or "full")
     # A models-only run has no report to build.
     if scope == "models":
         raise PreventUpdate
-    # The run's symbol set comes from the dialog (watchlist / last cohort /
-    # custom), not from the watchlist directly. The report does its own
-    # point-in-time fetch per symbol; the browser's news store plays no part.
-    symbols = ((run_store or {}).get("symbols")
-               or (run_symbols or {}).get("symbols") or [])
+    # The run's symbol set is the row's (the dialog's chips, normalised),
+    # not the watchlist. The report does its own point-in-time fetch per
+    # symbol; the browser's news store plays no part.
+    symbols = _run_symbols_of(row, run_store)
     if not symbols:
         raise PreventUpdate
 
@@ -1962,62 +2048,30 @@ async def generate_ai_analysis(run_store, scope,
     progress = partial(prog.emit_progress, run_id=run_id)
     n_symbols = len(symbols)
 
-    # Metric/signal context for symbols outside the browser stores (e.g. a
-    # cohort-scoped or single-symbol run) is fetched server-side.
-    missing = [s for s in symbols
-               if not ((stock_data or {}).get(s) or {}).get("prices")]
-    if missing:
-        stock_data = await asyncio.to_thread(
-            _fill_run_inputs, symbols, stock_data)
+    def _refuse(reason: str) -> dict:
+        emit("error", f"Report rejected: {reason}")
+        progress("report", state="failed", done=0, total=n_symbols)
+        _close_run(run_id, f"Report failed: {reason}", "failed", error=reason)
+        return {"failed": True, "error": reason, "scope": scope,
+                "run_seq": run_id, "run_id": run_id,
+                "generated_at": datetime.now().isoformat()}
 
-    # Target date: the session whose close is being predicted, taken from the
-    # Full Analysis picker when that flow triggered this, else the AI Report
-    # modal's own. Data is cut off at the PREVIOUS trading day, so a Monday
-    # target sees nothing after the preceding Friday's close.
+    if config is None:
+        return _refuse("the run's record could not be read, so its "
+                       "settings are unknown")
+
+    # Target date: the session whose close is being predicted, as the
+    # confirm recorded it. Data is cut off at the PREVIOUS trading day, so
+    # a Monday target sees nothing after the preceding Friday's close.
     today = date_cls.today()
     is_full = scope == "full"
-    picked = str(run_date)[:10] if run_date else None
+    picked = (str(config.get("target_date"))[:10]
+              if config.get("target_date") else None)
     from utils.trading_calendar import resolve_target_and_cutoff
     target_d, as_of_d = resolve_target_and_cutoff(picked)
     is_backtest = target_d < today
     as_of_str = as_of_d.isoformat()
     target_str = target_d.isoformat()
-
-    # One set of controls, read once. There is no longer a second, hidden
-    # parameter panel for another flow to read by mistake.
-    from services.news_window import (
-        RunParameterMissing, normalize_article_cap, normalize_lookback)
-    try:
-        overnight_news, lookback_days = normalize_lookback(lookback)
-        max_articles = normalize_article_cap(max_articles_val)
-    except RunParameterMissing as e:
-        # Refuse, visibly. No default: a report on a window the user did not
-        # pick would be indistinguishable from the one they asked for.
-        emit("error", f"Report rejected: {e}")
-        progress("report", state="failed", done=0, total=n_symbols)
-        _close_run(run_id, f"Report failed: {e}", "failed", error=e)
-        return {"failed": True, "error": str(e), "scope": scope,
-                "run_seq": run_id, "run_id": run_id,
-                "generated_at": datetime.now().isoformat()}
-    window_desc = ("overnight close→open" if overnight_news
-                   else f"{lookback_days}d")
-    report_model = model or "gpt-5.6-luna"
-    include_thesis_flag = (depth or "thesis") != "standard"
-    recs_mode = recs or "auto"
-    recs_model_val = recs_model or "claude-sonnet-5"
-    # Terminal-derived evidence blocks (modal checklist); None only before
-    # the modal has rendered once. Treat as the default, both on.
-    evidence_sel = (sorted(run_evidence) if run_evidence is not None
-                    else sorted(MODEL.DEFAULT_EVIDENCE))
-    # Tools are opt-in: absent means none (the backend never switches one on).
-    tools_sel = sorted(set(run_tools or []))
-    report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
-    # Per-symbol analysis is always the full research agent now, the shallow
-    # summarize_news_structured pass produced a thinner second opinion on the
-    # same data and was removed (2026-08-08). Full pipeline still gets its
-    # research through the prediction stage's trading_agents model; running
-    # it here too would double the LLM spend for identical output.
-    include_research = not is_full
 
     owner_uid = (run_store or {}).get("owner_uid") or _run_owner_uid()
     if is_full:
@@ -2034,10 +2088,52 @@ async def generate_ai_analysis(run_store, scope,
                        + (" (backtest)" if is_backtest else ""),
                        run_id=run_id, owner_uid=owner_uid, kind="manual")
     # First structured event of the run: this is what flips the row from
-    # queued to running, before any fetch.
+    # queued to running. Before the price fill below, not after it: a row
+    # still queued past the stall window is reaped as a run whose stage
+    # never started, and a cold price load can take that long.
     progress("report", state="running", done=0, total=n_symbols)
+
+    # One set of settings, read once, from the row.
+    from services.news_window import (
+        RunParameterMissing, normalize_article_cap, normalize_lookback)
+    try:
+        overnight_news, lookback_days = normalize_lookback(config.get("lookback"))
+        max_articles = normalize_article_cap(config.get("max_articles"))
+    except RunParameterMissing as e:
+        # Refuse, visibly. No default: a report on a window the user did not
+        # pick would be indistinguishable from the one they asked for.
+        return _refuse(str(e))
+    window_desc = ("overnight close→open" if overnight_news
+                   else f"{lookback_days}d")
+    report_model = config.get("report_model") or "gpt-5.6-luna"
+    include_thesis_flag = (config.get("depth") or "thesis") != "standard"
+    recs_mode = config.get("recs") or "auto"
+    recs_model_val = config.get("recs_model") or "claude-sonnet-5"
+    # Terminal-derived evidence blocks (modal checklist); None only when the
+    # modal had not rendered once at confirm. Treat as the default, both on.
+    evidence_sel = (sorted(config["evidence"])
+                    if config.get("evidence") is not None
+                    else sorted(MODEL.DEFAULT_EVIDENCE))
+    # Tools are opt-in: absent means none (the backend never switches one on).
+    tools_sel = sorted(set(config.get("tools") or []))
+    report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
+    # Per-symbol analysis is always the full research agent now, the shallow
+    # summarize_news_structured pass produced a thinner second opinion on the
+    # same data and was removed (2026-08-08). Full pipeline still gets its
+    # research through the prediction stage's trading_agents model; running
+    # it here too would double the LLM spend for identical output.
+    include_research = not is_full
     if recs_mode == "off":
         progress("synthesis", state="skipped")
+
+    # Metric/signal context for symbols outside the browser stores (e.g. a
+    # cohort-scoped or single-symbol run) is fetched server-side.
+    missing = [s for s in symbols
+               if not ((stock_data or {}).get(s) or {}).get("prices")]
+    if missing:
+        stock_data = await asyncio.to_thread(
+            _fill_run_inputs, symbols, stock_data)
+
     emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
     emit("action", f"Options: model={report_model}, window={window_desc}, "
                         f"type={'thesis' if include_thesis_flag else 'standard'}, "
@@ -3063,23 +3159,10 @@ def update_period(clicks, current_period):
 @callback(
     Output("model-signals-store", "data"),
     Input("run-dispatch", "data"),
-    State("run-scope", "value"),
-    State("stock-data-store", "data"),
-    State("run-symbols-store", "data"),
-    State("ensemble-config-store", "data"),
-    State({"type": "run-model-check", "model": ALL}, "value"),
-    State("run-ensemble-check", "value"),
-    State({"type": "run-ens-member", "model": ALL}, "value"),
-    State({"type": "run-ens-weight", "model": ALL}, "value"),
-    State("run-ensemble-method", "value"),
-    State("run-ensemble-min-agree", "value"),
-    State("run-date-picker", "date"),
-    State("run-lookback", "value"),
-    State("run-max-articles", "value"),
-    State("run-model", "value"),
-    State("run-type", "value"),
-    State("run-evidence", "value"),
-    State("run-tools", "value"),
+    # No dialog control and no browser store: the run row's config is the
+    # whole setting set (see _run_settings), and the price input comes from
+    # the server-side cache at a fixed depth. Fewer States also means less
+    # serialised into the subprocess (the price store was never read).
     State("run-dispatched", "data"),
     background=True,
     running=[
@@ -3087,13 +3170,7 @@ def update_period(clicks, current_period):
     ],
     prevent_initial_call=True,
 )
-def generate_model_signals(run_store, scope, stock_data, run_symbols,
-                           ensemble_config, model_checks,
-                           run_ensemble, ens_members, ens_weights, ens_method,
-                           ens_min_agree, predict_date_str, lookback,
-                           max_articles_val, research_model,
-                           research_depth, run_evidence, run_tools,
-                           dispatched):
+def generate_model_signals(run_store, dispatched):
     """Generate model predictions in a background subprocess.
 
     Supports backtesting: when the selected as-of date is in the past, OHLCV
@@ -3108,13 +3185,17 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
     """
     from functools import partial
 
+    run_id, row = _dispatch_run(run_store, dispatched)
+    # The row's config is what this run was confirmed with; the dialog's
+    # controls may have moved since, and a retry re-runs the previous row.
+    # The dispatcher's snapshot only stands in for an unreadable row.
+    config = _run_settings(row)
+    scope = ((config or {}).get("scope") or (run_store or {}).get("scope")
+             or "full")
     # A report-only run has no models to execute.
-    scope = (run_store or {}).get("scope") or scope or "full"
     if scope == "report":
         raise PreventUpdate
-    run_id = _dispatch_run_id(run_store, dispatched)
-    symbols = ((run_store or {}).get("symbols")
-               or (run_symbols or {}).get("symbols") or [])
+    symbols = _run_symbols_of(row, run_store)
     if not symbols:
         raise PreventUpdate
 
@@ -3149,6 +3230,9 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
     # bare HTTP 500 and a forever-running badge". Nothing here may execute
     # unprotected.
     try:
+        if config is None:
+            raise RuntimeError("the run's record could not be read, so its "
+                               "settings are unknown")
         # For anything in this process that reads the run from the
         # environment; the id itself travels as an argument.
         os.environ["QUANTNEWS_RUN_ID"] = run_id
@@ -3191,20 +3275,22 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
         # does not re-filter to its own default.
         from services.news_window import (
             normalize_article_cap, normalize_lookback)
-        overnight_news, lookback_days = normalize_lookback(lookback)
-        max_articles = normalize_article_cap(max_articles_val)
+        overnight_news, lookback_days = normalize_lookback(config.get("lookback"))
+        max_articles = normalize_article_cap(config.get("max_articles"))
         research_kwargs = {"news_lookback_days": lookback_days}
         if is_full_analysis:
             # The research report (trading_agents) honours the report
             # model/depth choices; `research_model` is a distinct kwarg so no
             # other model can mistake it for its own.
             research_kwargs.update({
-                "research_model": research_model or None,
-                "include_thesis": (research_depth or "thesis") != "standard",
-                # Modal checklist; None only before the modal rendered once.
-                "evidence": sorted(run_evidence) if run_evidence is not None
-                            else sorted(MODEL.DEFAULT_EVIDENCE),
-                "tools": sorted(set(run_tools or [])),
+                "research_model": config.get("report_model") or None,
+                "include_thesis": (config.get("depth") or "thesis") != "standard",
+                # Modal checklist; None only when the modal had not
+                # rendered once at confirm.
+                "evidence": (sorted(config["evidence"])
+                             if config.get("evidence") is not None
+                             else sorted(MODEL.DEFAULT_EVIDENCE)),
+                "tools": sorted(set(config.get("tools") or [])),
             })
 
         # Module-level os, a function-local `import os` here once shadowed
@@ -3215,46 +3301,23 @@ def generate_model_signals(run_store, scope, stock_data, run_symbols,
 
         from datetime import date as date_cls
 
-        # The picker holds the TARGET session. The close being predicted.
-        # Models are truncated to `predict_date`, the previous trading day,
-        # so a Monday target trains and scores on nothing after the
-        # preceding Friday.
+        # The row's target_date is the TARGET session, the close being
+        # predicted. Models are truncated to `predict_date`, the previous
+        # trading day, so a Monday target trains and scores on nothing
+        # after the preceding Friday.
         from utils.trading_calendar import resolve_target_and_cutoff
         target_date, predict_date = resolve_target_and_cutoff(
-            predict_date_str[:10] if predict_date_str else None
+            str(config["target_date"])[:10] if config.get("target_date")
+            else None
         )
 
         is_backtest = target_date < date_cls.today()
 
-        _ALL_MODEL_IDS = _RUN_MODEL_IDS
-        selected_models = set()
-        for model_id, checked in zip(_ALL_MODEL_IDS, model_checks or []):
-            if checked:
-                selected_models.add(model_id)
-
-        # Build the ensemble config from the dialog's own controls: they are
-        # what the user sees at click time, whereas the store State could
-        # still be one sync callback behind the last edit. The store keeps
-        # the same values for the drawer and live recompute.
-        from config import MODEL as _MODEL
-        if ens_members is not None:
-            weights = {}
-            for model_id, w in zip(_ALL_MODEL_IDS, ens_weights or []):
-                try:
-                    weights[model_id] = round(float(w), 1)
-                except (TypeError, ValueError):
-                    weights[model_id] = 1.0
-            try:
-                min_agree_val = int(ens_min_agree)
-            except (TypeError, ValueError):
-                min_agree_val = _MODEL.ENSEMBLE_MIN_AGREE
-            ensemble_config = {
-                "enabled_models": [m for m, on
-                                   in zip(_ALL_MODEL_IDS, ens_members) if on],
-                "weights": weights,
-                "method": ens_method or _MODEL.ENSEMBLE_DEFAULT_METHOD,
-                "min_agree": min_agree_val,
-            }
+        # An empty list runs the runner's full set, as an unticked dialog
+        # always did.
+        selected_models = set(config.get("models") or [])
+        run_ensemble = bool(config.get("ensemble"))
+        ensemble_config = _ensemble_config_of(config)
     except Exception as e:
         return _abort_run(e)
 
@@ -5060,23 +5123,54 @@ def download_ai_json(n_clicks, ai_analysis):
 
 
 @callback(
+    Output("run-scope", "value", allow_duplicate=True),
+    Output({"type": "run-model-check", "model": ALL}, "value"),
+    Output("run-recs", "value"),
+    Output("run-evidence", "value"),
     Output("run-tools", "value"),
+    Input("run-preset", "value"),
     Input("run-date-picker", "date"),
-    Input("run-modal", "is_open"),
+    State({"type": "run-model-check", "model": ALL}, "id"),
     prevent_initial_call=True,
 )
-def default_run_tools(ai_date, is_open):
-    """Web research is on for a next-day (forward-testing) run and off for a
-    backtest date, where the open web would leak the future. The user can
-    still flip the box after the date is chosen; this only sets the default
-    each time the date changes or the dialog opens."""
-    if not is_open:
-        raise PreventUpdate
-    from services.investigation_service import default_tools
+def apply_run_preset(preset, run_date, check_ids):
+    """Write the chosen preset into the controls under Customize.
+
+    Tools follow the target session as well as the preset: web research is
+    never on for a backtest date (the open web would leak the future), and
+    a preset that fixes no tools takes the date default. A date change
+    alone touches only the tools, so a customised dialog keeps its values
+    when the user moves the target; a preset change rewrites every field
+    the preset names and leaves the rest alone.
+    """
+    from layouts.modals import preset_fields, preset_run_tools
     from utils.trading_calendar import resolve_target_and_cutoff
-    picked = str(ai_date)[:10] if ai_date else None
-    target_d, _ = resolve_target_and_cutoff(picked)
-    return default_tools(target_d)
+
+    picked = str(run_date)[:10] if run_date else None
+    try:
+        target_d, _ = resolve_target_and_cutoff(picked)
+    except Exception as e:
+        logger.warning("Run dialog: target date unresolved (%s): %s", picked, e)
+        target_d = None
+    tools = preset_run_tools(preset, target_d)
+    # A pattern-matching (ALL) output must always get a list, one entry per
+    # matched checkbox; a bare no_update there is a 500.
+    keep_checks = [dash.no_update] * len(check_ids or [])
+    fired = {t["prop_id"].split(".")[0] for t in (ctx.triggered or [])}
+    if "run-preset" not in fired:
+        return dash.no_update, keep_checks, dash.no_update, dash.no_update, tools
+
+    fields = preset_fields(preset)
+    models = fields.get("models")
+    checks = ([(c or {}).get("model") in models for c in (check_ids or [])]
+              if models is not None else keep_checks)
+    return (
+        fields.get("scope", dash.no_update),
+        checks,
+        fields.get("recs", dash.no_update),
+        fields.get("evidence", dash.no_update),
+        tools,
+    )
 
 
 @callback(
@@ -5234,7 +5328,8 @@ def _run_data_summary(symbols, stock_data, news_data):
         return html.Div(
             [
                 html.Div("No symbols selected", className="empty-state-title"),
-                html.Div("Pick a source above or add a symbol to this run.",
+                html.Div("Search for a symbol above, or add the watchlist "
+                         "or your last run.",
                          className="empty-state-note"),
             ],
             className="empty-state",
@@ -5289,23 +5384,57 @@ def _run_data_summary(symbols, stock_data, news_data):
     ])
 
 
-def _run_source_options(watchlist, cohort_syms):
-    return [
-        {"label": f"Watchlist ({len(watchlist)})", "value": "watchlist",
-         "disabled": not watchlist},
-        {"label": f"Last run ({len(cohort_syms)})", "value": "cohort",
-         "disabled": not cohort_syms},
-        {"label": "Custom", "value": "custom"},
-    ]
+def _last_run_symbols(owner_uid, prefs=None):
+    """The symbols of this owner's newest manual run, for "+ Last run".
+
+    Read from analysis_runs, not the Home cohort: the cohort is whatever
+    the latest cutoff holds (any owner, the scheduled job included), which
+    is not what "run the same names again" means. With no run on record
+    the browser's remembered ad-hoc list stands in.
+    """
+    try:
+        from services import run_service
+        runs = run_service.list_runs(limit=1, kind="manual",
+                                     owner_uid=owner_uid or "")
+    except Exception as e:
+        logger.warning("Run dialog: could not read the last run: %s", e)
+        runs = []
+    if runs and runs[0].get("symbols"):
+        return list(runs[0]["symbols"])
+    return [s for s in ((prefs or {}).get("symbols") or []) if s]
+
+
+def _resolve_run_symbols(tokens, existing):
+    """Split typed/picked tokens into (accepted, rejected) symbols.
+
+    A name the cache knows is accepted on a primary-key read; an unknown
+    one costs one price-info lookup (validate_symbol), after which it is
+    cached as validated. Duplicates of the chips already in the run are
+    dropped silently, not reported.
+    """
+    from services import ticker_service as ts
+
+    accepted, rejected = [], []
+    for raw in tokens:
+        sym = ts.normalize_symbol(raw)
+        if not sym:
+            rejected.append((raw or "").strip().upper() or raw)
+            continue
+        if sym in existing or sym in accepted:
+            continue
+        try:
+            verdict = ts.validate_symbol(sym)
+        except Exception as e:
+            logger.warning("Run dialog: could not validate %s: %s", sym, e)
+            verdict = {"ok": False}
+        (accepted if verdict.get("ok") else rejected).append(sym)
+    return accepted, rejected
 
 
 @callback(
     Output("run-modal", "is_open"),
-    Output("run-data-summary", "children"),
     Output("run-scope", "value"),
     Output("run-symbols-store", "data"),
-    Output("run-symbols-source", "options"),
-    Output("run-symbols-source", "value"),
     Output("run-validation-msg", "children"),
     Output("progress-panel-state", "data", allow_duplicate=True),
     Output("run-started-toast", "is_open"),
@@ -5324,6 +5453,14 @@ def _run_source_options(watchlist, cohort_syms):
     # copy the stage callbacks trigger on (see _dispatch_run_id).
     Output("run-store", "data"),
     Output("run-dispatch", "data"),
+    # Preset and what the browser remembers of it; Customize folds on open.
+    Output("run-preset", "value"),
+    Output("run-prefs-store", "data"),
+    Output("run-customize-collapse", "is_open"),
+    # The clientside click handler swaps the confirm button for a spinner
+    # before the round trip; every server return puts it back.
+    Output("run-confirm-btn", "disabled", allow_duplicate=True),
+    Output("run-confirm-btn", "children", allow_duplicate=True),
     Input("run-analysis-btn", "n_clicks"),
     Input("reports-new-btn", "n_clicks", allow_optional=True),
     Input({"type": "new-report-btn", "symbol": ALL}, "n_clicks"),
@@ -5350,6 +5487,14 @@ def _run_source_options(watchlist, cohort_syms):
     State("run-ensemble-check", "value"),
     State("run-ensemble-method", "value"),
     State("run-ensemble-min-agree", "value"),
+    State("run-preset", "value"),
+    State("run-prefs-store", "data"),
+    # Ensemble members and weights, so the row's config is the WHOLE run:
+    # the stages read nothing else. The shared store stands in when the
+    # controls have not rendered (it is what they would show).
+    State({"type": "run-ens-member", "model": ALL}, "value"),
+    State({"type": "run-ens-weight", "model": ALL}, "value"),
+    State("ensemble-config-store", "data"),
     prevent_initial_call=True,
 )
 def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
@@ -5359,45 +5504,55 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                      report_model=None, depth=None, recs=None,
                      recs_model=None, run_evidence=None, run_tools=None,
                      model_checks=None, run_ensemble=None, ens_method=None,
-                     ens_min_agree=None):
+                     ens_min_agree=None, preset=None, prefs=None,
+                     ens_members=None, ens_weights=None, ensemble_store=None):
     """Open or close the single run dialog, preset by where it was opened.
 
     Two kinds of opener, deliberately: the toolbar button (the ONE global
-    entry point: it starts from the watchlist and whatever scope was last
-    chosen) and contextual shortcuts that carry their context in, the
-    Reports page's New Report (scope=report, watchlist) and any per-symbol
-    New-report button (scope=report, just that symbol). The old Home header
-    duplicate, which carried no context at all, is gone.
+    entry point: it opens EMPTY, on the preset this browser last confirmed
+    with, and "+ Watchlist" / "+ Last run" add names on top) and contextual
+    shortcuts that carry their context in: the Reports page's New Report
+    (scope=report, watchlist) and any per-symbol New-report button
+    (scope=report, just that symbol). Those two force the scope and leave
+    the preset alone, so the dialog opens diverging from it with Customize
+    unfolded, which is an honest picture of what will run.
 
     Confirm is the run dispatcher: one run per owner at a time (a second
     confirm is refused with a Cancel button while one is in flight), then
-    the analysis_runs row is created and its id written to run-store and
-    run-dispatch, which is what starts the stages. It also owns the
-    immediate acknowledgement:
-    force-open the activity panel (a user who once closed it otherwise gets
-    zero feedback) and toast the symbols and the estimate. An empty symbol
-    set keeps the dialog open with an inline message instead of silently
-    no-opping, every downstream stage guards on the list being non-empty.
+    the analysis_runs row is created, with the dialog's every value as its
+    config (the stages read the row, never the dialog, so what ran is what
+    the row says), and its id written to run-store and run-dispatch, which
+    is what starts the stages. The immediate acknowledgement (panel open,
+    toast, fast poll) is _run_acknowledgement, shared with retry. An empty
+    symbol set keeps the dialog open with an inline message instead of
+    silently no-opping, every downstream stage guards on the list being
+    non-empty.
     """
+    from layouts.modals import (DEFAULT_RUN_PRESET, RUN_PRESETS,
+                                run_confirm_label)
+
     triggered = ctx.triggered_id
-    no_sym_update = (dash.no_update,) * 3
     # panel state + toast open/children + poll rate
     no_feedback = (dash.no_update,) * 4
     # date-picker date + max_date_allowed + disabled_days
     no_picker = (dash.no_update,) * 3
     # run-store + run-dispatch
     no_run = (dash.no_update,) * 2
+    # preset value + prefs store + customize collapse
+    no_preset = (dash.no_update,) * 3
+    button_ready = (False, run_confirm_label())
 
     if triggered == "run-cancel-btn":
-        return (False, dash.no_update, dash.no_update) + no_sym_update \
-            + ("",) + no_feedback + no_picker + no_run
+        return (False, dash.no_update, dash.no_update, "") + no_feedback \
+            + no_picker + no_run + no_preset + button_ready
 
     if triggered == "run-confirm-btn":
         symbols = (run_store or {}).get("symbols") or []
-        keep_open = (dash.no_update,) * 6
+        keep_open = (dash.no_update,) * 3
 
         def refuse(message):
-            return keep_open + (message,) + no_feedback + no_picker + no_run
+            return keep_open + (message,) + no_feedback + no_picker + no_run \
+                + no_preset + button_ready
 
         if not symbols:
             return refuse("Add at least one symbol to run.")
@@ -5416,7 +5571,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
 
         # The dialog's values as the row's config, and the estimate the
         # toast quotes; the same inputs the preflight line reads.
-        from layouts.modals import _fmt_duration, estimate_run_seconds
+        from layouts.modals import estimate_run_seconds, preset_divergence
         from utils.trading_calendar import resolve_target_and_cutoff
         selected_models = [m for m, on in zip(_RUN_MODEL_IDS, model_checks or [])
                            if on]
@@ -5430,9 +5585,47 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             logger.warning("Run dialog: target date unresolved (%s): %s",
                            picked, e)
             target_d = cutoff_d = None
+        # The row's preset is the name only while the controls still match
+        # it; anything the user touched makes it "custom", so a later
+        # median-duration estimate keyed on preset never mixes the two.
+        preset_name = preset if preset in RUN_PRESETS else DEFAULT_RUN_PRESET
+        customized = preset_divergence(preset_name, {
+            "scope": scope,
+            "models": selected_models if model_checks else None,
+            "recs": recs or "auto",
+            "evidence": run_evidence,
+            "tools": run_tools,
+        })
+        row_preset = preset_name if not customized else "custom"
+        if ens_members is not None:
+            ensemble_members = [m for m, on in zip(_RUN_MODEL_IDS, ens_members)
+                                if on]
+            ensemble_weights = {}
+            for model_id, w in zip(_RUN_MODEL_IDS, ens_weights or []):
+                try:
+                    ensemble_weights[model_id] = round(float(w), 1)
+                except (TypeError, ValueError):
+                    ensemble_weights[model_id] = 1.0
+        else:
+            ensemble_members = list((ensemble_store or {}).get("enabled_models")
+                                    or MODEL.ENSEMBLE_DEFAULT_ENABLED)
+            ensemble_weights = dict((ensemble_store or {}).get("weights")
+                                    or MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+        try:
+            min_agree_val = int(ens_min_agree)
+        except (TypeError, ValueError):
+            min_agree_val = MODEL.ENSEMBLE_MIN_AGREE
+        # The run, complete: every stage reads its settings from here and
+        # nowhere else, and a retry copies it verbatim.
         config = {
             "scope": scope,
-            "target_date": picked,
+            "preset": preset_name,
+            "customized": customized,
+            # The resolved sessions (the picker's day snaps forward to a
+            # trading day); the raw pick is kept for the record.
+            "target_date": target_d.isoformat() if target_d else picked,
+            "prediction_date": cutoff_d.isoformat() if cutoff_d else None,
+            "picked_date": picked,
             "lookback": lookback,
             "max_articles": max_articles,
             "report_model": report_model,
@@ -5443,14 +5636,15 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             "tools": sorted(set(run_tools or [])),
             "models": selected_models,
             "ensemble": bool(run_ensemble),
-            "ensemble_method": ens_method,
-            "ensemble_min_agree": ens_min_agree,
-            "source": (run_store or {}).get("source"),
+            "ensemble_members": ensemble_members,
+            "ensemble_weights": ensemble_weights,
+            "ensemble_method": ens_method or MODEL.ENSEMBLE_DEFAULT_METHOD,
+            "ensemble_min_agree": min_agree_val,
         }
         try:
             run_id = run_service.create_run(
                 kind="manual", symbols=symbols, owner_uid=owner_uid,
-                preset=scope, config=config,
+                preset=row_preset, config=config,
                 prediction_date=cutoff_d, target_date=target_d,
                 estimate_s=int(round(estimate_s)) if estimate_s else None)
         except Exception as e:
@@ -5461,27 +5655,28 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         # separate callback, and the fast tick below must not see an idle
         # feed and drop straight back to the slow rate.
         prog.mark_run_pending(run_id)
+        # Every symbol that runs joins the lookup cache, so the typeahead
+        # knows it next time. Never worth failing a run over.
+        try:
+            from services import ticker_service
+            ticker_service.ensure_symbols(symbols)
+        except Exception as e:
+            logger.warning("Run dialog: symbol cache not updated: %s", e)
 
-        panel = dict(panel_state or {})
-        panel.setdefault("mode", "normal")
-        panel["closed"] = False
-        where = {
-            "models": "predictions will appear on Home and Analyze",
-            "report": "the report will appear under Reports",
-        }.get(scope, "predictions on Home and Analyze, the report under Reports")
-        toast_msg = (f"{', '.join(symbols)} · {_fmt_duration(estimate_s)}"
-                     f" · {where}.")
         run_data = {
             "run_id": run_id,
             "started": datetime.now().isoformat(),
             "scope": scope,
+            "preset": row_preset,
             "symbols": list(symbols),
             "owner_uid": owner_uid,
             "kind": "manual",
         }
-        return (False, dash.no_update, dash.no_update) + no_sym_update \
-            + ("", panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS) \
-            + no_picker + (run_data, run_data)
+        prefs_out = {"preset": preset_name, "symbols": list(symbols)}
+        return (False, dash.no_update, dash.no_update, "") \
+            + _run_acknowledgement(panel_state, symbols, estimate_s, scope) \
+            + no_picker + (run_data, run_data) \
+            + (dash.no_update, prefs_out, dash.no_update) + button_ready
 
     is_context_btn = (isinstance(triggered, dict)
                       and triggered.get("type") == "new-report-btn")
@@ -5498,33 +5693,28 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
               "reports-new-btn": reports_clicks}.get(triggered):
         raise PreventUpdate
 
+    prefs = prefs if isinstance(prefs, dict) else {}
     watchlist = [s for s in (watchlist or []) if s]
-    cohort_syms = []
-    try:
-        from services import dashboard_service as ds
-        cohort = ds.get_latest_cohort() or {}
-        cohort_syms = [r["symbol"] for r in cohort.get("symbols") or []]
-    except Exception as e:
-        logger.warning("Run dialog: could not read latest cohort: %s", e)
+    lastrun = _last_run_symbols(_run_owner_uid(), prefs)
 
     scope = dash.no_update
+    preset_out = dash.no_update
     if is_context_btn:
         scope = "report"
-        source = "custom"
         run_symbols = [triggered.get("symbol")]
     elif triggered == "reports-new-btn":
         scope = "report"
-        source = "watchlist" if watchlist else "cohort"
-        run_symbols = watchlist or cohort_syms
+        run_symbols = watchlist or lastrun
     else:
-        source = "watchlist" if watchlist else "cohort"
-        run_symbols = watchlist or cohort_syms
+        run_symbols = []
+        remembered = prefs.get("preset")
+        preset_out = (remembered if remembered in RUN_PRESETS
+                      else DEFAULT_RUN_PRESET)
 
     store = {
-        "source": source,
         "symbols": run_symbols,
         "watchlist": watchlist,
-        "cohort": cohort_syms,
+        "lastrun": lastrun,
     }
     picker = no_picker
     try:
@@ -5536,15 +5726,8 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                    for d in non_trading_days("2020-01-01", target)])
     except Exception as e:
         logger.warning("Run dialog: could not refresh target session: %s", e)
-    return (
-        True,
-        _run_data_summary(run_symbols, stock_data, news_data),
-        scope,
-        store,
-        _run_source_options(watchlist, cohort_syms),
-        source,
-        "",
-    ) + no_feedback + picker + no_run
+    return (True, scope, store, "") + no_feedback + picker + no_run \
+        + (preset_out, dash.no_update, False) + button_ready
 
 
 @callback(
@@ -5593,11 +5776,19 @@ def cancel_active_run(n_clicks):
     Output("run-dispatch", "data", allow_duplicate=True),
     Output("run-modal", "is_open", allow_duplicate=True),
     Output("run-validation-msg", "children", allow_duplicate=True),
-    Input("ai-retry-btn", "n_clicks"),
+    # The same acknowledgement a confirm gives (_run_acknowledgement).
+    Output("progress-panel-state", "data", allow_duplicate=True),
+    Output("run-started-toast", "is_open", allow_duplicate=True),
+    Output("run-started-toast", "children", allow_duplicate=True),
+    Output("progress-interval", "interval", allow_duplicate=True),
+    # The button lives in the Analyze page's failure block, so it exists
+    # only there and only after a report failed.
+    Input("ai-retry-btn", "n_clicks", allow_optional=True),
     State("run-store", "data"),
+    State("progress-panel-state", "data"),
     prevent_initial_call=True,
 )
-def retry_run(n_clicks, run_store):
+def retry_run(n_clicks, run_store, panel_state=None):
     """Retry the run this session last started, as a new run.
 
     The old retry re-ran the report stage under the previous run's id,
@@ -5606,8 +5797,10 @@ def retry_run(n_clicks, run_store):
     it is refused while this owner has a run in flight (the dialog opens
     to show why, with the Cancel button), otherwise a fresh manual row is
     created from the previous row's config and handed to the same stores
-    the confirm writes, so the normal dispatch path runs. The dict is
-    marked retry_of so the report stage skips its persistent cache.
+    the confirm writes, so the normal dispatch path runs, and the same
+    acknowledgement the confirm gives (panel open, started toast, fast
+    poll) follows. The dict is marked retry_of so the report stage skips
+    its persistent cache.
     """
     if not n_clicks:
         raise PreventUpdate
@@ -5617,8 +5810,10 @@ def retry_run(n_clicks, run_store):
     from services import progress_service as prog
     from services import run_service
 
+    no_feedback = (dash.no_update,) * 4
+
     def refuse(message):
-        return dash.no_update, dash.no_update, True, message
+        return (dash.no_update, dash.no_update, True, message) + no_feedback
 
     try:
         refusal = _active_run_refusal()
@@ -5642,16 +5837,20 @@ def retry_run(n_clicks, run_store):
         logger.error("Retry: run row not created: %s", e)
         return refuse(f"Could not record the run: {str(e)[:120]}")
     prog.mark_run_pending(run_id)
+    scope = _run_scope_of(prev, run_store)
     run_data = {
         "run_id": run_id,
         "started": datetime.now().isoformat(),
-        "scope": prev["preset"] or (run_store or {}).get("scope") or "full",
+        "scope": scope,
+        "preset": prev["preset"],
         "symbols": list(prev["symbols"]),
         "owner_uid": owner_uid,
         "kind": "manual",
         "retry_of": prev_id,
     }
-    return run_data, run_data, dash.no_update, ""
+    return (run_data, run_data, dash.no_update, "") \
+        + _run_acknowledgement(panel_state, prev["symbols"],
+                               prev["estimate_s"], scope)
 
 
 @callback(
@@ -5690,68 +5889,114 @@ def toggle_model_info(info_clicks, close_click, run_evidence, depth, run_tools):
 
 
 @callback(
+    Output("run-symbol-search", "options"),
+    Input("run-symbol-search", "search_value"),
+    prevent_initial_call=True,
+)
+async def search_run_symbols(search_value):
+    """Typeahead options from the local ticker cache, one indexed query
+    per keystroke and no vendor call. The Dropdown clears search_value on
+    select, which empties the list again."""
+    from layouts.modals import (is_symbol_list, run_symbol_options,
+                                split_symbol_input)
+
+    query = (search_value or "").strip()
+    if not split_symbol_input(query):
+        # The Dropdown clears search_value the moment an option is picked;
+        # emptying the list in that same round made the picked value
+        # invalid before its own callback ran. The last list stays.
+        raise PreventUpdate
+    if is_symbol_list(query):
+        # A paste: one option that adds them all; nothing to look up.
+        return run_symbol_options(query, [])
+    from services import ticker_service
+    try:
+        hits = await asyncio.to_thread(ticker_service.search, query, 12)
+    except Exception as e:
+        logger.warning("Run dialog: symbol search failed: %s", e)
+        hits = []
+    return run_symbol_options(query, hits)
+
+
+@callback(
     Output("run-symbols-store", "data", allow_duplicate=True),
-    Output("run-symbol-add", "value"),
-    Input("run-symbols-source", "value"),
+    Output("run-symbol-search", "value"),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Input("run-add-watchlist", "n_clicks"),
+    Input("run-add-lastrun", "n_clicks"),
     Input({"type": "run-sym-remove", "symbol": ALL}, "n_clicks"),
-    Input("run-symbol-add", "n_submit"),
-    State("run-symbol-add", "value"),
+    Input("run-symbol-search", "value"),
     State("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-def set_run_symbols(source, remove_clicks, add_submit, add_value, store):
+async def set_run_symbols(add_watchlist, add_lastrun, remove_clicks, picked,
+                          store):
     """Edit the run's symbol set without touching the watchlist.
 
-    Switching source swaps in that set wholesale; removing a chip or adding
-    a symbol turns the set custom (the radio follows via its options, the
-    label stays honest). The store's watchlist/cohort snapshots were taken
-    when the dialog opened, which is the set the user was looking at.
+    Every source is additive: "+ Watchlist" and "+ Last run" append what is
+    not there yet, a typeahead pick (or a pasted list) appends after the
+    cache or one price lookup vouches for it, and a chip's cross removes
+    it. The store's watchlist/lastrun snapshots were taken when the dialog
+    opened, which is the set the user was looking at.
     """
+    from layouts.modals import split_symbol_input
+
     store = dict(store or {})
     symbols = list(store.get("symbols") or [])
     triggered = ctx.triggered_id
 
-    if triggered == "run-symbols-source":
-        if not source or source == store.get("source"):
-            raise PreventUpdate  # echo of the open-time preset
-        if source in ("watchlist", "cohort"):
-            store["symbols"] = list(store.get(source) or [])
-        store["source"] = source
-        return store, dash.no_update
+    if triggered in ("run-add-watchlist", "run-add-lastrun"):
+        clicks = add_watchlist if triggered == "run-add-watchlist" else add_lastrun
+        if not clicks:
+            raise PreventUpdate
+        key = "watchlist" if triggered == "run-add-watchlist" else "lastrun"
+        extra = [s for s in (store.get(key) or []) if s and s not in symbols]
+        if not extra:
+            raise PreventUpdate
+        store["symbols"] = symbols + extra
+        return store, dash.no_update, ""
 
     if isinstance(triggered, dict) and triggered.get("type") == "run-sym-remove":
         if not any(c and c > 0 for c in remove_clicks):
             raise PreventUpdate
         sym = triggered.get("symbol")
         store["symbols"] = [s for s in symbols if s != sym]
-        store["source"] = "custom"
-        return store, dash.no_update
+        return store, dash.no_update, ""
 
-    if triggered == "run-symbol-add":
-        if not add_submit or not add_value:
-            raise PreventUpdate
-        new_symbols = [s.strip().upper()
-                       for s in re.split(r"[,\s]+", add_value) if s.strip()]
-        store["symbols"] = symbols + [s for s in new_symbols
-                                      if s and s not in symbols]
-        store["source"] = "custom"
-        return store, ""
+    if triggered == "run-symbol-search":
+        tokens = split_symbol_input(picked)
+        if not tokens:
+            raise PreventUpdate  # the echo of the clear below
+        accepted, rejected = await asyncio.to_thread(
+            _resolve_run_symbols, tokens, symbols)
+        msg = ""
+        if rejected:
+            msg = f"No price data for {', '.join(rejected)}"
+        if not accepted:
+            return dash.no_update, None, msg
+        store["symbols"] = symbols + accepted
+        return store, None, msg
 
     raise PreventUpdate
 
 
 @callback(
     Output("run-symbols-chips", "children"),
-    Output("run-symbols-source", "value", allow_duplicate=True),
+    Output("run-add-watchlist", "children"),
+    Output("run-add-watchlist", "disabled"),
+    Output("run-add-lastrun", "children"),
+    Output("run-add-lastrun", "disabled"),
     Input("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
 def render_run_symbol_chips(store):
-    """Chips for the effective run set, each removable for this run only."""
+    """Chips for the effective run set, each removable for this run only,
+    and the two add buttons with their live counts."""
     store = store or {}
     symbols = store.get("symbols") or []
     if not symbols:
-        chips = [html.Span("No symbols: add one below or pick a source.",
+        chips = [html.Span("No symbols yet: search below, or add the "
+                           "watchlist or your last run.",
                            className="run-symbols-empty")]
     else:
         chips = [
@@ -5769,7 +6014,86 @@ def render_run_symbol_chips(store):
             )
             for sym in symbols
         ]
-    return chips, store.get("source") or "custom"
+    watchlist = [s for s in (store.get("watchlist") or []) if s]
+    lastrun = [s for s in (store.get("lastrun") or []) if s]
+    return (
+        chips,
+        f"+ Watchlist ({len(watchlist)})", not watchlist,
+        f"+ Last run ({len(lastrun)})", not lastrun,
+    )
+
+
+@callback(
+    Output("run-data-summary", "children"),
+    # Input, not State: the summary follows the chip set, the same way the
+    # article preview does; it used to render once on open and go stale.
+    Input("run-symbols-store", "data"),
+    State("stock-data-store", "data"),
+    State("news-data-store", "data"),
+    prevent_initial_call=True,
+)
+def render_run_data_summary(store, stock_data, news_data):
+    return _run_data_summary((store or {}).get("symbols") or [],
+                             stock_data, news_data)
+
+
+@callback(
+    Output("run-customize-collapse", "is_open", allow_duplicate=True),
+    Input("run-customize-btn", "n_clicks"),
+    State("run-customize-collapse", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_run_customize(n_clicks, is_open):
+    if not n_clicks:
+        raise PreventUpdate
+    return not is_open
+
+
+# The confirm button's own acknowledgement, before the round trip: the
+# server's confirm branch takes a lock check, a row insert and a calendar
+# resolve, long enough for a second click. Both server returns (started or
+# refused) restore the label through toggle_run_modal's duplicate outputs.
+clientside_callback(
+    """
+    function(n) {
+        if (!n) {
+            return [window.dash_clientside.no_update,
+                    window.dash_clientside.no_update];
+        }
+        return [true, [
+            {namespace: "dash_html_components", type: "Span",
+             props: {className: "spinner-border spinner-border-sm me-1",
+                     role: "status"}},
+            "Starting\u2026"
+        ]];
+    }
+    """,
+    Output("run-confirm-btn", "disabled"),
+    Output("run-confirm-btn", "children"),
+    Input("run-confirm-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# Cursor in the symbol search when the dialog opens: the modal fades in,
+# so the focus waits for the transition. Best effort: a missing element
+# costs nothing.
+clientside_callback(
+    """
+    function(open) {
+        if (!open) { return ""; }
+        setTimeout(function() {
+            var root = document.getElementById("run-symbol-search");
+            if (!root) { return; }
+            var el = root.querySelector('[role="combobox"], input, button, [tabindex]') || root;
+            try { el.focus(); } catch (e) {}
+        }, 300);
+        return "";
+    }
+    """,
+    Output("run-focus-sink", "children"),
+    Input("run-modal", "is_open"),
+    prevent_initial_call=True,
+)
 
 
 # =============================================================================
@@ -5807,25 +6131,37 @@ def apply_run_scope(scope):
 
 @callback(
     Output("run-preflight", "children"),
+    Output("run-preset-hint", "children"),
+    Output("run-customize-collapse", "is_open", allow_duplicate=True),
     Input("run-modal", "is_open"),
+    Input("run-preset", "value"),
     Input("run-scope", "value"),
     Input("run-symbols-store", "data"),
     Input({"type": "run-model-check", "model": ALL}, "value"),
     Input("run-model", "value"),
     Input("run-recs", "value"),
     Input("run-recs-model", "value"),
+    Input("run-evidence", "value"),
+    Input("run-tools", "value"),
+    prevent_initial_call=True,
 )
-def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
-                  recs_basis, recs_model):
-    """Name what this run needs and cannot reach, before it is started.
+def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
+                  report_model, recs_basis, recs_model, run_evidence,
+                  run_tools):
+    """Name what this run needs and cannot reach, before it is started,
+    and say where the controls have left the preset.
 
-    A missing API key used to surface only as a stage failure minutes in, and
-    the dialog gave no idea how long a run would take.
+    A missing API key used to surface only as a stage failure minutes in,
+    and the dialog gave no idea how long a run would take. The divergence
+    check lives here because this callback already sees every field a
+    preset fixes: when a value no longer matches, Customize unfolds so the
+    difference is on screen; it never folds a section the user opened.
     """
-    from layouts.modals import run_preflight_children
+    from layouts.modals import (DEFAULT_RUN_PRESET, RUN_PRESETS,
+                                preset_divergence, run_preflight_children)
 
     if not is_open:
-        return dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     # Read the ids alongside the values instead of zipping against a
     # hand-maintained order, a pattern-matching Input's ordering is Dash's to
     # decide, and a silent mis-zip here would name the wrong models.
@@ -5834,7 +6170,7 @@ def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
                    and entry[0].get("id", {}).get("type") == "run-model-check"),
                   [])
     selected = [c["id"]["model"] for c in checks if c.get("value")]
-    return run_preflight_children(
+    preflight = run_preflight_children(
         scope or "full",
         (run_symbols or {}).get("symbols") or [],
         selected,
@@ -5842,17 +6178,32 @@ def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
         recs_basis or "auto",
         recs_model or "",
     )
+    preset_name = preset if preset in RUN_PRESETS else DEFAULT_RUN_PRESET
+    customized = preset_divergence(preset_name, {
+        "scope": scope,
+        "models": selected if checks else None,
+        "recs": recs_basis,
+        "evidence": run_evidence,
+        "tools": run_tools,
+    })
+    labels = {"scope": "what to run", "models": "models",
+              "recs": "recommendations", "evidence": "evidence blocks",
+              "tools": "tools"}
+    hint = [RUN_PRESETS[preset_name]["hint"]]
+    if customized:
+        hint.append(html.Span(
+            " Customized: " + ", ".join(labels[f] for f in customized) + ".",
+            className="run-preset-customized"))
+    return preflight, hint, (True if customized else dash.no_update)
 
 
 @callback(
     Output("full-analysis-requested", "data"),
     Input("run-dispatch", "data"),
-    State("run-scope", "value"),
-    State("run-symbols-store", "data"),
     State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
-def set_full_analysis_flag(run_store, scope, run_symbols, dispatched):
+def set_full_analysis_flag(run_store, dispatched):
     """Arm the synthesis stage, but only for a full-pipeline run.
 
     The armed value is the run's id, not a bare True: the stages that read
@@ -5860,13 +6211,15 @@ def set_full_analysis_flag(run_store, scope, run_symbols, dispatched):
     for the run it names, so a flag left behind by a run that ended without
     disarming it cannot make a later run wait for a synthesis that never
     comes. An empty symbol set never arms: the run dialog rejects it inline
-    and no stage will fire.
+    and no stage will fire. The scope is the row's (its config), the same
+    one the other stages read; the dispatcher's snapshot stands in only
+    for an unreadable row.
     """
-    run_id = _dispatch_run_id(run_store, dispatched)
-    scope = (run_store or {}).get("scope") or scope or "full"
-    symbols = ((run_store or {}).get("symbols")
-               or (run_symbols or {}).get("symbols") or [])
-    if scope == "full" and symbols:
+    run_id, row = _dispatch_run(run_store, dispatched)
+    config = _run_settings(row)
+    scope = ((config or {}).get("scope") or (run_store or {}).get("scope")
+             or "full")
+    if scope == "full" and _run_symbols_of(row, run_store):
         return run_id
     raise PreventUpdate
 
@@ -5892,11 +6245,10 @@ from services.analysis_runner import (  # noqa: E402
     Input("ai-analysis-store", "data"),
     Input("model-signals-store", "data"),
     State("full-analysis-requested", "data"),
-    State("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
 async def generate_recommendations_callback(ai_analysis, model_signals,
-                                            requested, run_symbols):
+                                            requested):
     """Generate recommendations when their inputs are ready.
 
     Fires for the Full Analysis flow (requested flag) AND for AI Report runs
@@ -5930,13 +6282,13 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     # the cancel (the report stage cannot be killed), and the cancel has
     # already disarmed the flag, so this landing would otherwise read as a
     # report-only run with recommendations still to produce.
+    row = None
     if run_id:
         try:
             from services import run_service
             row = run_service.get_run(run_id)
         except Exception as e:
             logger.warning("run %s: run row unreadable: %s", run_id[:8], e)
-            row = None
         if row is not None and row["status"] == "cancelled":
             raise PreventUpdate
 
@@ -5987,7 +6339,16 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
         raise PreventUpdate
 
     basis = basis or "news+signals"  # Full Analysis default
-    symbols = (run_symbols or {}).get("symbols") or []
+    # The run's symbols are the row's, not the dialog's current chips (the
+    # dialog may have been reopened and edited while this run was in
+    # flight). Without a readable row, the report's and signals' own
+    # symbol keys are what there is to synthesize over.
+    symbols = list((row or {}).get("symbols") or [])
+    if not symbols:
+        seen = list((ai_analysis.get("by_symbol") or {}).keys())
+        seen += [k for k in (model_signals or {})
+                 if k not in seen and k not in ("_meta", "_run_failed")]
+        symbols = seen
 
     valid_signals = {
         k: v for k, v in (model_signals or {}).items()

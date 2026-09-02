@@ -22,6 +22,16 @@ def test_news_window_default_is_fourteen_days_on_the_frontend():
     assert default_run_params()["lookback"] == 14
 
 
+def test_run_dialog_recommendations_default_matches_the_standard_preset():
+    # The dialog's own default is the Standard preset (recommendations
+    # off); the Schedule modal keeps the config default for its jobs.
+    from layouts.modals import DEFAULT_RUN_PRESET, _report_param_selects, preset_fields
+    assert DEFAULT_RUN_PRESET == "standard"
+    assert preset_fields("standard")["recs"] == "off"
+    assert _report_param_selects("run", {"recs": "off"})["recs"].value == "off"
+    assert _report_param_selects("sj")["recs"].value == "auto"
+
+
 def test_a_missing_window_is_an_error_not_a_default():
     for raw in (None, ""):
         with pytest.raises(RunParameterMissing):

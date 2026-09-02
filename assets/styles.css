@@ -4953,7 +4953,35 @@ body {
 
 .run-symbols-empty { color: var(--text-muted); font-size: var(--text-xs); }
 
-.run-symbol-add { max-width: 280px; }
+.run-symbol-search { max-width: 360px; font-size: var(--text-sm); }
+
+.run-add-btns {
+    display: flex;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    margin-bottom: var(--space-1);
+}
+
+/* Preset segmented control: Bootstrap's btn-check group, sized to the
+   dialog's labels. The checked segment reads as the current answer. */
+.run-preset-group .btn {
+    font-size: var(--text-sm);
+    padding: 4px 18px;
+    color: var(--text-secondary);
+    border-color: var(--border-subtle);
+}
+
+.run-preset-group .btn.active,
+.run-preset-group .btn-check:checked + .btn {
+    color: var(--text-primary);
+    background-color: var(--bg-tertiary);
+    border-color: var(--border-strong, var(--border-subtle));
+    font-weight: 600;
+}
+
+.run-preset-customized { color: var(--warning, #ffc107); }
+
+.run-customize-row { margin: var(--space-2) 0; }
 
 /* --- Page-local action bars --- */
 .analyze-action-bar {

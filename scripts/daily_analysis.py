@@ -54,7 +54,7 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
                         choices=["analyze", "evaluate", "replay", "alpha-lab",
-                                 "cost", "notify-test"])
+                                 "ticker-refresh", "cost", "notify-test"])
     parser.add_argument("--event-move", type=float, default=5.0,
                         help="alpha-lab: one-day move (%%) that defines an "
                              "event (default 5)")
@@ -122,6 +122,20 @@ def main() -> int:
     args = parser.parse_args()
 
     _configure_logging(not args.quiet)
+
+    if args.command == "ticker-refresh":
+        from services import ticker_service
+        summary = ticker_service.refresh()
+        summary["at"] = datetime.now().isoformat()
+        # An unreachable index list leaves last week's rows in place, so it
+        # is a partial (exit 2, mailed as such), not a failure: the cache
+        # still answers, it is just a week staler than it should be.
+        if summary["indexes"] == 0:
+            summary["degraded"] = ["index lists unreachable"]
+        print(json.dumps(summary) if args.json
+              else f"Ticker cache: {summary['indexes']} index symbol(s), "
+                   f"{summary['history']} from run history")
+        return 2 if summary["indexes"] == 0 else 0
 
     from services.analysis_runner import evaluate_pending, run_full_analysis
     from utils.trading_calendar import is_trading_day

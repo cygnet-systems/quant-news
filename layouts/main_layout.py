@@ -34,9 +34,16 @@ def create_layout() -> html.Div:
             # local so past sessions' watchlists survive restarts.
             dcc.Store(id="recent-symbol-groups", data=[], storage_type="local"),
             # The symbol set for the CURRENT run-dialog session: shape
-            # {"source", "symbols", "watchlist", "cohort"}. Session-scoped on
-            # purpose: a one-off run tweak should not survive a reload.
+            # {"symbols", "watchlist", "lastrun"}, the last two being the
+            # snapshots the "+ Watchlist" / "+ Last run" buttons add from.
+            # Memory-scoped on purpose: a one-off run tweak should not
+            # survive a reload.
             dcc.Store(id="run-symbols-store", data={}),
+            # What this browser last confirmed with: {"preset", "symbols"}.
+            # Local so the toolbar button reopens on the same preset next
+            # visit; the symbols stand in for "+ Last run" when no run of
+            # this owner's is on record yet.
+            dcc.Store(id="run-prefs-store", data=None, storage_type="local"),
             # The run the confirm dispatcher last created, shape {"run_id",
             # "started", "scope", "symbols", "owner_uid", "kind"}. Session
             # scoped so the panel can keep following the viewer's own run
@@ -315,9 +322,6 @@ def create_layout() -> html.Div:
             create_data_modal(),
             create_run_modal(),
             create_model_info_modal(),
-
-            # Hidden retry button for AI analysis failover
-            html.Button(id="ai-retry-btn", style={"display": "none"}),
 
             # Ensemble config drawer (offcanvas)
             create_ensemble_config_drawer(),

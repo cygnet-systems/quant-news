@@ -50,6 +50,7 @@ CLI = str(PROJECT_ROOT / "scripts" / "daily_analysis.py")
 
 ANALYSIS_JOB = "daily_analysis"
 EVALUATION_JOB = "daily_evaluation"
+TICKER_REFRESH_JOB = "ticker_refresh"
 
 # Wall-clock ceiling per run, env-tunable. Sized from the measured scheduled
 # runs of 2026-08-14..09-01: 41-55 min typical, 68.6 min worst (a day with
@@ -157,6 +158,17 @@ JOB_TYPES: dict[str, JobType] = {
              "Rank basket size = symbols / this (6 = top/bottom sixth)"),
         ),
     ),
+    "ticker_refresh": JobType(
+        kind="ticker_refresh",
+        label="Ticker refresh",
+        description="Refresh the symbol lookup cache: S&P 500 and Russell "
+                    "2000 constituents plus every symbol ever run. Weekly "
+                    "is enough; index membership changes quarterly",
+        verb="ticker-refresh",
+        needs_symbols=False,
+        default_hour=6,
+        default_minute=0,
+    ),
 }
 
 
@@ -229,11 +241,28 @@ DEFAULT_JOBS = (
         "symbols_csv": None,
         "params_json": {},
     },
+    {
+        "id": TICKER_REFRESH_JOB,
+        "kind": "ticker_refresh",
+        "description": "Refresh the symbol lookup cache from the index lists",
+        # Sunday, well clear of the weekday analysis window.
+        "hour": 6,
+        "minute": 0,
+        "days_of_week": "sun",
+        "symbols_csv": None,
+        "params_json": {},
+    },
 )
 
 
 def seed_default_jobs() -> None:
-    """Create the two standard jobs if they don't exist. Never overwrites."""
+    """Create the standard jobs if none exist. Never overwrites.
+
+    A kind added to DEFAULT_JOBS after a database already has its schedule
+    is NOT picked up here (see the empty-table rule below); it ships with a
+    data migration that inserts the row once, the way 016 installed
+    ticker_refresh, so a later delete stays deleted.
+    """
     for job in DEFAULT_JOBS:
         if job["params_json"] is None:
             job["params_json"] = default_run_params()
