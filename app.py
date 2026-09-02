@@ -3856,6 +3856,7 @@ def toggle_history_section(n_clicks, current_style):
     Output("ta-report-modal", "is_open"),
     Output("ta-report-modal-title", "children"),
     Output("ta-report-modal-body", "children"),
+    Output("ta-report-modal-footer", "children"),
     Input({"type": "view-full-report-btn", "symbol": ALL}, "n_clicks"),
     Input({"type": "ta-view-btn", "report": ALL}, "n_clicks"),
     prevent_initial_call=True,
@@ -3893,8 +3894,9 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
         logger.info("No research report body for %s", triggered)
         raise PreventUpdate
 
-    from models.single_agent import extract_confidence, render_report_markdown
+    from models.single_agent import extract_confidence
     from layouts.formatters import conviction_label, weight_label
+    from layouts.report_view import build_report_view
 
     # The bare "(50%)" this used to print was the reliability weight, sitting
     # unlabeled beside the report body's own conviction line. Both numbers are
@@ -3906,29 +3908,23 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
     from services import progress_service as prog
     prog.emit("action", f"Report viewed: {report.get('symbol', '?')} "
                         f"{report.get('trade_date', '')}")
-    body = [
-        html.Div(
-            [
-                # Was raw UTC with microseconds ("…14:37:42.473370+00:00"),
-                # which also showed tomorrow's date all evening.
-                html.Span(f"Generated: {prog.format_stamp(report.get('created_at'))}",
-                          className="ta-accordion-meta"),
-                html.Span(f" | model: {report.get('model_name', '?')}",
-                          className="ta-accordion-meta"),
-            ],
-            style={"marginBottom": "8px"},
-        ),
-        dcc.Markdown(
-            # Machine-read epilogue is stripped for reading, and the verdict's
-            # field lines become list items so they render as discrete labelled
-            # lines instead of one folded paragraph. The report keeps its own
-            # "Compiled by … Sources: …" footer for transparency.
-            render_report_markdown(report.get("report_text", "")),
-            className="ta-report-body",
-            style={"fontSize": "0.85rem", "lineHeight": "1.6"},
-        ),
-    ]
-    return True, title, body
+    # The report as a page: verdict term sheet, numbered sections with their
+    # takeaways, Read lines pulled out, provenance footer. The PDF below uses
+    # the same structure.
+    body = build_report_view(
+        report.get("report_text", ""),
+        symbol=report.get("symbol", ""), decision=report.get("decision", ""),
+        weight=report.get("confidence"), trade_date=report.get("trade_date", ""),
+        model_name=report.get("model_name", ""),
+        generated=prog.format_stamp(report.get("created_at")),
+    )
+    footer = html.A(
+        [html.I(className="bi bi-file-earmark-pdf me-1"), "Download PDF"],
+        href=f"/api/download/ta-report/{report.get('id', '')}",
+        className="btn btn-sm btn-outline-info",
+        title="The same report as a PDF, formatted like this page",
+    )
+    return True, title, body, footer
 
 
 # =============================================================================
@@ -4342,11 +4338,10 @@ def run_ensemble_effective(ens_on, run_checks, members, method, min_agree):
     Output("scheduler-fp", "data"),
     Input("scheduler-refresh", "n_intervals", allow_optional=True),
     Input("scheduler-action-status", "data", allow_optional=True),
-    State("sched-new-name", "value", allow_optional=True),
-    State("sched-new-symbols", "value", allow_optional=True),
+    State("sj-modal", "is_open", allow_optional=True),
     State("scheduler-fp", "data", allow_optional=True),
 )
-def render_scheduler_panel(_n, _action, draft_name, draft_symbols, last_fp):
+def render_scheduler_panel(_n, _action, modal_open, last_fp):
     """Redraw the schedule panel from the database.
 
     Reads on a timer rather than caching in a Store: the job state is written
@@ -4362,8 +4357,9 @@ def render_scheduler_panel(_n, _action, draft_name, draft_symbols, last_fp):
     from services import scheduler_service
 
     timer_fired = (ctx.triggered_id == "scheduler-refresh")
-    if timer_fired and ((draft_name or "").strip()
-                        or (draft_symbols or "").strip()):
+    if timer_fired and modal_open:
+        # A redraw while the Schedule modal is open would be harmless to the
+        # modal itself (it lives outside the panel) but is pointless.
         raise PreventUpdate
 
     try:
@@ -4388,158 +4384,308 @@ def render_scheduler_panel(_n, _action, draft_name, draft_symbols, last_fp):
                         className="scheduler-empty"), last_fp
 
 
+# --- Schedule modal: one dialog to create, edit or delete a job -------------
+# The value outputs below are, in order, every control the modal renders;
+# _SJ_FIELDS names them once so open/save cannot drift apart.
+_SJ_SCALARS = [
+    ("sj-kind", "value"), ("sj-name", "value"), ("sj-hour", "value"),
+    ("sj-minute", "value"), ("sj-days", "value"), ("sj-tz", "value"),
+    ("sj-visibility", "value"), ("sj-enabled", "value"), ("sj-symbols", "value"),
+    ("sj-lookback", "value"), ("sj-max-articles", "value"),
+    ("sj-ensemble-check", "value"), ("sj-ensemble-method", "value"),
+    ("sj-ensemble-min-agree", "value"), ("sj-model", "value"), ("sj-type", "value"),
+    ("sj-evidence", "value"), ("sj-tools", "value"), ("sj-recs", "value"),
+    ("sj-recs-model", "value"),
+]
+
+
+def _sj_values_from_params(kind: str, params: dict, model_ids, member_ids,
+                           param_ids) -> dict:
+    """Control values for a job's params (defaults filled for missing keys)."""
+    from services.scheduler_service import default_run_params
+    p = {**default_run_params(), **(params or {})} if kind == "analysis" else (params or {})
+    ens = p.get("ensemble") or {}
+    weights = dict(ens.get("weights") or {})
+    return {
+        "sj-lookback": str(p.get("lookback", "")),
+        "sj-max-articles": p.get("max_articles"),
+        "models": [m in set(p.get("models") or model_ids) for m in model_ids],
+        "sj-ensemble-check": bool(p.get("run_ensemble", True)),
+        "sj-ensemble-method": ens.get("method"),
+        "sj-ensemble-min-agree": ens.get("min_agree"),
+        "members": [m in set(ens.get("enabled_models") or member_ids) for m in member_ids],
+        "weights": [weights.get(m, 1.0) for m in member_ids],
+        "sj-model": p.get("report_model"),
+        "sj-type": p.get("depth"),
+        "sj-evidence": list(p.get("evidence") or []),
+        "sj-tools": list(p.get("tools") or []),
+        "sj-recs": p.get("recs"),
+        "sj-recs-model": p.get("recs_model"),
+        "params": [(params or {}).get(pid["key"]) if pid["kind"] == kind else dash.no_update
+                   for pid in param_ids],
+    }
+
+
 @callback(
-    Output({"type": "sched-feedback", "job": MATCH}, "children"),
-    Input({"type": "sched-save", "job": MATCH}, "n_clicks"),
-    State({"type": "sched-enabled", "job": MATCH}, "value"),
-    State({"type": "sched-hour", "job": MATCH}, "value"),
-    State({"type": "sched-minute", "job": MATCH}, "value"),
-    State({"type": "sched-days", "job": MATCH}, "value"),
-    State({"type": "sched-tz", "job": MATCH}, "value"),
-    # Only the analysis job renders a symbol box.
-    State({"type": "sched-symbols", "job": MATCH}, "value", allow_optional=True),
-    State({"type": "sched-visibility", "job": MATCH}, "value"),
-    State({"type": "sched-param", "job": MATCH, "key": ALL}, "value"),
-    State({"type": "sched-param", "job": MATCH, "key": ALL}, "id"),
+    Output("sj-modal", "is_open"),
+    Output("sj-job-id", "data"),
+    Output("sj-title", "children"),
+    Output("sj-delete", "style"),
+    *[Output(cid, prop) for cid, prop in _SJ_SCALARS],
+    Output({"type": "sj-model-check", "model": ALL}, "value"),
+    Output({"type": "sj-ens-member", "model": ALL}, "value"),
+    Output({"type": "sj-ens-weight", "model": ALL}, "value"),
+    Output({"type": "sj-param", "kind": ALL, "key": ALL}, "value"),
+    Input("sched-new-open", "n_clicks"),
+    Input({"type": "sched-edit", "job": ALL}, "n_clicks"),
+    Input("sj-cancel", "n_clicks"),
+    State({"type": "sj-model-check", "model": ALL}, "id"),
+    State({"type": "sj-ens-member", "model": ALL}, "id"),
+    State({"type": "sj-param", "kind": ALL, "key": ALL}, "id"),
     prevent_initial_call=True,
 )
-def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
-                  visibility, param_values, param_ids):
-    """Persist one job's schedule (and its tuning params) and reschedule it."""
-    if not n_clicks:
+def open_schedule_modal(new_click, edit_clicks, cancel_click, model_ids, member_ids,
+                        param_ids):
+    """Open the modal seeded from a job (edit) or from the defaults (create)."""
+    from services import scheduler_service
+
+    trig = ctx.triggered_id
+    n_scalars = len(_SJ_SCALARS)
+    n_models, n_members, n_params = len(model_ids), len(member_ids), len(param_ids)
+    if trig == "sj-cancel" or (trig == "sched-new-open" and not new_click) or (
+            isinstance(trig, dict) and not any(c for c in edit_clicks if c)):
+        if trig == "sj-cancel":
+            return (False, dash.no_update, dash.no_update, dash.no_update,
+                    *([dash.no_update] * n_scalars),
+                    [dash.no_update] * n_models, [dash.no_update] * n_members,
+                    [dash.no_update] * n_members, [dash.no_update] * n_params)
         raise PreventUpdate
 
-    job_id = ctx.triggered_id["job"]
-    try:
-        hour = max(0, min(23, int(hour)))
-        minute = max(0, min(59, int(minute)))
-    except (TypeError, ValueError):
-        return html.Span("Time must be a number", className="scheduler-feedback-error")
-
-    fields = {
-        "enabled": bool(enabled),
-        "hour": hour,
-        "minute": minute,
-        "days_of_week": days,
-        "timezone": tz,
-        "is_public": visibility != "private",
-    }
-    if symbols is not None:
-        cleaned = ",".join(
-            s.strip().upper() for s in str(symbols).replace("\n", ",").split(",")
-            if s.strip()
-        )
-        if not cleaned:
-            return html.Span("Add at least one symbol",
-                             className="scheduler-feedback-error")
-        fields["symbols_csv"] = cleaned
-
-    from services import scheduler_service
-    # Tuning params were create-only: the card never showed them and this
-    # save never wrote them, so a window chosen at creation was frozen.
-    if param_ids:
-        current = next((j.get("params") or {} for j in scheduler_service.list_jobs()
-                        if j["id"] == job_id), {})
-        params = dict(current)
-        for pid, val in zip(param_ids, param_values or []):
-            if val is None or val == "":
-                continue
-            try:
-                params[pid["key"]] = (int(val) if float(val).is_integer()
-                                      else float(val))
-            except (TypeError, ValueError):
-                return html.Span(f"{pid['key']} must be a number",
-                                 className="scheduler-feedback-error")
-        fields["params_json"] = params
-    if not scheduler_service.update_job(job_id, **fields):
-        return html.Span("Save failed", className="scheduler-feedback-error")
-
-    state = "enabled" if enabled else "disabled"
-    return html.Span(f"Saved: {state}, {hour:02d}:{minute:02d} {tz}",
-                     className="scheduler-feedback-ok")
+    model_names = [i["model"] for i in model_ids]
+    member_names = [i["model"] for i in member_ids]
+    if isinstance(trig, dict):
+        job = next((j for j in scheduler_service.list_jobs() if j["id"] == trig["job"]), None)
+        if job is None:
+            raise PreventUpdate
+        kind, job_id = job["kind"], job["id"]
+        title = f"Edit schedule — {job.get('description') or job_id}"
+        delete_style = {}
+        scalars = {
+            "sj-kind": kind, "sj-name": job.get("description") or "",
+            "sj-hour": job["hour"], "sj-minute": job["minute"],
+            "sj-days": job["days_of_week"], "sj-tz": job["timezone"],
+            "sj-visibility": "public" if job.get("is_public", True) else "private",
+            "sj-enabled": bool(job["enabled"]), "sj-symbols": job.get("symbols_csv") or "",
+        }
+        vals = _sj_values_from_params(kind, job.get("params") or {}, model_names,
+                                      member_names, param_ids)
+    else:
+        types = scheduler_service.list_job_types()
+        kind = types[0]["kind"] if types else "analysis"
+        jt = next((t for t in types if t["kind"] == kind), None)
+        job_id, title, delete_style = None, "New schedule", {"display": "none"}
+        scalars = {
+            "sj-kind": kind, "sj-name": "",
+            "sj-hour": jt["default_hour"] if jt else 7,
+            "sj-minute": jt["default_minute"] if jt else 0,
+            "sj-days": "mon-fri", "sj-tz": "US/Eastern", "sj-visibility": "private",
+            "sj-enabled": True, "sj-symbols": "",
+        }
+        vals = _sj_values_from_params(kind, {}, model_names, member_names, param_ids)
+    scalars.update({k: v for k, v in vals.items() if k.startswith("sj-")})
+    return (True, job_id, title, delete_style,
+            *[scalars.get(cid) for cid, _ in _SJ_SCALARS],
+            vals["models"], vals["members"], vals["weights"], vals["params"])
 
 
 @callback(
-    Output({"type": "sched-new-params-group", "kind": ALL}, "style"),
-    Output("sched-new-hour", "value"),
-    Output("sched-new-minute", "value"),
-    Input("sched-new-kind", "value", allow_optional=True),
-    State({"type": "sched-new-params-group", "kind": ALL}, "id"),
+    Output("sj-analysis-section", "style"),
+    Output("sj-symbols-wrap", "style"),
+    Output({"type": "sj-params-group", "kind": ALL}, "style"),
+    Output("sj-hour", "value", allow_duplicate=True),
+    Output("sj-minute", "value", allow_duplicate=True),
+    Input("sj-kind", "value"),
+    State({"type": "sj-params-group", "kind": ALL}, "id"),
+    State("sj-job-id", "data"),
     prevent_initial_call=True,
 )
-def show_kind_params(kind, group_ids):
-    """Reveal only the selected operation's tuning knobs, and start the time
-    at the type's own default (07:00 predict, 18:00 evaluate, …): the
-    declared defaults were exported and then ignored by a hardcoded 08:30."""
+def schedule_modal_kind(kind, group_ids, job_id):
+    """Show the controls the chosen operation uses; seed the time from the
+    type's default on a NEW job only (never clobber an edit)."""
     from services import scheduler_service
-    jt = next((t for t in scheduler_service.list_job_types() if t["kind"] == kind), None)
-    hour = jt["default_hour"] if jt else dash.no_update
-    minute = jt["default_minute"] if jt else dash.no_update
-    return ([{"display": "flex" if g.get("kind") == kind else "none"}
-             for g in (group_ids or [])], hour, minute)
+
+    types = {t["kind"]: t for t in scheduler_service.list_job_types()}
+    jt = types.get(kind)
+    is_analysis = kind == "analysis"
+    takes_symbols = bool(jt and jt["needs_symbols"])
+    hour = minute = dash.no_update
+    if job_id is None and jt:
+        hour, minute = jt["default_hour"], jt["default_minute"]
+    return (
+        {} if is_analysis else {"display": "none"},
+        {} if takes_symbols else {"display": "none"},
+        [{"display": "flex" if g.get("kind") == kind else "none"} for g in (group_ids or [])],
+        hour, minute,
+    )
+
+
+@callback(
+    Output("sj-ensemble-method-hint", "children"),
+    Output("sj-ensemble-min-agree-wrap", "style"),
+    Output({"type": "sj-ens-weight", "model": ALL}, "disabled"),
+    Output("sj-ensemble-body", "style"),
+    Input("sj-ensemble-method", "value"),
+    Input("sj-ensemble-min-agree", "value"),
+    Input("sj-ensemble-check", "value"),
+)
+def schedule_modal_ensemble_ui(method, min_agree, ens_on):
+    """Same explanation and gating the Run dialog shows for its ensemble."""
+    from config import MODEL
+    from layouts.modals import ENSEMBLE_METHODS, ensemble_method_detail
+
+    method = method or MODEL.ENSEMBLE_DEFAULT_METHOD
+    hints = {val: hint for val, _, hint in ENSEMBLE_METHODS}
+    n_weights = len(ctx.outputs_list[2])
+    is_agreement = method == "agreement"
+    try:
+        gate = int(min_agree)
+    except (TypeError, ValueError):
+        gate = MODEL.ENSEMBLE_MIN_AGREE
+    body = html.Div([html.Div(hints.get(method, ""), className="run-field-hint"),
+                     ensemble_method_detail(method, gate)])
+    return (body, {} if is_agreement else {"display": "none"},
+            [is_agreement] * n_weights, {} if ens_on else {"display": "none"})
 
 
 @callback(
     Output("scheduler-action-status", "data", allow_duplicate=True),
-    Output("sched-create-feedback", "children"),
-    Input("sched-create", "n_clicks"),
-    State("sched-new-kind", "value"),
-    State("sched-new-name", "value"),
-    State("sched-new-hour", "value"),
-    State("sched-new-minute", "value"),
-    State("sched-new-days", "value"),
-    State("sched-new-tz", "value"),
-    State("sched-new-symbols", "value"),
-    State("sched-new-visibility", "value"),
-    State({"type": "sched-new-param", "kind": ALL, "key": ALL}, "value"),
-    State({"type": "sched-new-param", "kind": ALL, "key": ALL}, "id"),
+    Output("sj-modal", "is_open", allow_duplicate=True),
+    Output("sj-feedback", "children"),
+    Input("sj-save", "n_clicks"),
+    State("sj-job-id", "data"),
+    *[State(cid, prop) for cid, prop in _SJ_SCALARS],
+    State({"type": "sj-model-check", "model": ALL}, "value"),
+    State({"type": "sj-model-check", "model": ALL}, "id"),
+    State({"type": "sj-ens-member", "model": ALL}, "value"),
+    State({"type": "sj-ens-weight", "model": ALL}, "value"),
+    State({"type": "sj-ens-member", "model": ALL}, "id"),
+    State({"type": "sj-param", "kind": ALL, "key": ALL}, "value"),
+    State({"type": "sj-param", "kind": ALL, "key": ALL}, "id"),
     prevent_initial_call=True,
 )
-def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols,
-                         visibility, param_values, param_ids):
-    """Add a job of any registered operation type."""
+def save_schedule_job(n_clicks, job_id, *rest):
+    """Create or update a job from the modal — schedule AND run settings."""
     if not n_clicks:
         raise PreventUpdate
-    # (param_values/param_ids are the per-kind tuning inputs; filtered to the
-    # selected kind below, so knobs for unselected operations are ignored.)
-
     from services import scheduler_service
+    from services.news_window import (
+        RunParameterMissing, normalize_article_cap, normalize_lookback)
 
+    n = len(_SJ_SCALARS)
+    scalars = dict(zip([cid for cid, _ in _SJ_SCALARS], rest[:n]))
+    (model_vals, model_ids, member_vals, weight_vals, member_ids,
+     param_vals, param_ids) = rest[n:]
+
+    def err(msg):
+        return dash.no_update, dash.no_update, html.Span(msg, className="text-danger")
+
+    kind = scalars["sj-kind"]
     if not kind:
-        return dash.no_update, html.Span("Pick an operation",
-                                         className="scheduler-feedback-error")
+        return err("Pick an operation")
     try:
-        hour, minute = int(hour), int(minute)
+        hour = max(0, min(23, int(scalars["sj-hour"])))
+        minute = max(0, min(59, int(scalars["sj-minute"])))
     except (TypeError, ValueError):
-        return dash.no_update, html.Span("Time must be a number",
-                                         className="scheduler-feedback-error")
-
-    cleaned = ",".join(s.strip().upper()
-                       for s in str(symbols or "").replace("\n", ",").split(",")
-                       if s.strip())
+        return err("Time must be a number")
     needs = {t["kind"]: t["needs_symbols"] for t in scheduler_service.list_job_types()}
-    if needs.get(kind) and not cleaned:
-        return dash.no_update, html.Span("This operation needs at least one symbol",
-                                         className="scheduler-feedback-error")
+    symbols_csv = ",".join(
+        x.strip().upper() for x in str(scalars["sj-symbols"] or "").replace("\n", ",").split(",")
+        if x.strip())
+    if needs.get(kind) and not symbols_csv:
+        return err("This operation needs at least one symbol")
 
-    # Per-kind tuning knobs: only the selected kind's inputs apply.
-    # only_trading_days is read by the symbol-taking (analyze) jobs only.
-    params = {"only_trading_days": True} if needs.get(kind) else {}
-    for pid, val in zip(param_ids or [], param_values or []):
-        if pid.get("kind") == kind and val is not None:
-            params[pid["key"]] = val
+    if kind == "analysis":
+        try:
+            overnight, days = normalize_lookback(scalars["sj-lookback"])
+            cap = normalize_article_cap(scalars["sj-max-articles"])
+        except RunParameterMissing as e:
+            return err(str(e))
+        models = [i["model"] for i, on in zip(model_ids, model_vals or []) if on]
+        if not models:
+            return err("Pick at least one model")
+        weights = {}
+        for i, w in zip(member_ids, weight_vals or []):
+            try:
+                weights[i["model"]] = round(float(w), 1)
+            except (TypeError, ValueError):
+                weights[i["model"]] = 1.0
+        try:
+            min_agree = int(scalars["sj-ensemble-min-agree"])
+        except (TypeError, ValueError):
+            return err("Min. agreeing models must be a number")
+        params = {
+            "only_trading_days": True,
+            "lookback": "overnight" if overnight else days,
+            "max_articles": cap,
+            "models": models,
+            "run_ensemble": bool(scalars["sj-ensemble-check"]),
+            "ensemble": {
+                "method": scalars["sj-ensemble-method"],
+                "min_agree": min_agree,
+                "enabled_models": [i["model"] for i, on in zip(member_ids, member_vals or []) if on],
+                "weights": weights,
+            },
+            "report_model": scalars["sj-model"],
+            "depth": scalars["sj-type"],
+            "recs": scalars["sj-recs"],
+            "recs_model": scalars["sj-recs-model"],
+            "evidence": sorted(scalars["sj-evidence"] or []),
+            "tools": sorted(scalars["sj-tools"] or []),
+        }
+    else:
+        params = {"only_trading_days": True} if needs.get(kind) else {}
+        for pid, val in zip(param_ids or [], param_vals or []):
+            if pid.get("kind") == kind and val is not None:
+                params[pid["key"]] = val
 
-    job_id = scheduler_service.create_job(
-        kind=kind, description=(name or "").strip(), hour=hour, minute=minute,
-        days_of_week=days, timezone=tz, symbols_csv=cleaned or None,
-        params=params,
-        is_public=visibility != "private",
-    )
-    if not job_id:
-        return dash.no_update, html.Span("Could not create the job",
-                                         className="scheduler-feedback-error")
-    return ({"created": job_id, "at": datetime.now().isoformat()},
-            html.Span(f"Created {job_id}", className="scheduler-feedback-ok"))
+    fields = {
+        "description": (scalars["sj-name"] or "").strip(),
+        "hour": hour, "minute": minute,
+        "days_of_week": scalars["sj-days"], "timezone": scalars["sj-tz"],
+        "is_public": scalars["sj-visibility"] != "private",
+        "enabled": bool(scalars["sj-enabled"]),
+        "symbols_csv": symbols_csv or None,
+        "params_json": params,
+    }
+    if job_id:
+        if not scheduler_service.update_job(job_id, **fields):
+            return err("Save failed")
+        return ({"updated": job_id, "at": datetime.now().isoformat()}, False, None)
+    new_id = scheduler_service.create_job(
+        kind=kind, description=fields["description"], hour=hour, minute=minute,
+        days_of_week=fields["days_of_week"], timezone=fields["timezone"],
+        symbols_csv=fields["symbols_csv"], params=params,
+        is_public=fields["is_public"])
+    if not new_id:
+        return err("Could not create the job")
+    if not fields["enabled"]:
+        scheduler_service.update_job(new_id, enabled=False)
+    return ({"created": new_id, "at": datetime.now().isoformat()}, False, None)
+
+
+@callback(
+    Output("scheduler-action-status", "data", allow_duplicate=True),
+    Output("sj-modal", "is_open", allow_duplicate=True),
+    Input("sj-delete", "n_clicks"),
+    State("sj-job-id", "data"),
+    prevent_initial_call=True,
+)
+def delete_schedule_job_from_modal(n_clicks, job_id):
+    if not n_clicks or not job_id:
+        raise PreventUpdate
+    from services import scheduler_service
+    scheduler_service.delete_job(job_id)
+    return {"deleted": job_id, "at": datetime.now().isoformat()}, False
 
 
 @callback(

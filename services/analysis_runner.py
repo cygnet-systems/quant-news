@@ -1177,8 +1177,15 @@ def run_full_analysis(
     evidence: Optional[Iterable[str]] = None,
     max_articles: Optional[int] = None,
     tools: Optional[Iterable[str]] = None,
+    recs_mode: str = "auto",
+    ensemble_config: Optional[dict] = None,
+    run_ensemble: bool = True,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
+
+    ``recs_mode`` (auto | signals | off), ``ensemble_config`` and
+    ``run_ensemble`` are the Run dialog's remaining settings, carried by a
+    scheduled job's params so a job is a saved dialog, not a subset of it.
 
     ``target`` is the session whose close is being predicted (defaults to the
     next unresolved session); data is cut off at the previous trading day.
@@ -1286,6 +1293,8 @@ def run_full_analysis(
         news_status_by_symbol=news_status_by_symbol,
         evidence=evidence,
         news_lookback_days=lookback_days,
+        ensemble_config=ensemble_config,
+        run_ensemble=run_ensemble,
         tools=tools,
     )
     stored, evaluated = persist_predictions(signals)
@@ -1302,7 +1311,15 @@ def run_full_analysis(
     ai_analysis = attach_positioning_quality(ai_analysis, priced, as_of,
                                              evidence=evidence)
 
-    recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
+    # The basis the dialog offers: text analysis + predictions, predictions
+    # only, or no synthesis at all.
+    ai_analysis["recs_request"] = ("signals" if recs_mode == "signals"
+                                   else "news+signals")
+    if recs_mode == "off":
+        prog.emit("luna", "Recommendations off for this job — synthesis skipped")
+        recommendations = None
+    else:
+        recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
 
     # Synthesis rows are written AFTER persist_predictions' auto-evaluate, so
     # on a backtest they used to stay "pending" until the next scheduled

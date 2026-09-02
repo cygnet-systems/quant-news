@@ -48,7 +48,7 @@ def create_data_modal() -> dbc.Modal:
     )
 
 
-def _report_param_selects(prefix: str) -> dict:
+def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
     """Parameter controls for the Run dialog (prefix "run").
 
     The news window and article cap govern EVERY consumer of the run's news
@@ -56,6 +56,7 @@ def _report_param_selects(prefix: str) -> dict:
     why they render in their own always-visible section, not under Report.
     """
     from config import MODEL
+    v = values or {}
 
     return {
         "lookback": dbc.Select(
@@ -71,7 +72,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "1 year (365 days)", "value": "365"},
                 {"label": "Overnight (close → open)", "value": "overnight"},
             ],
-            value=str(MODEL.NEWS_LOOKBACK_DAYS),
+            value=str(v.get("lookback") or MODEL.NEWS_LOOKBACK_DAYS),
             size="sm",
         ),
         # Per-symbol cap on the window: keep the newest N, 0 = all. Applied
@@ -82,7 +83,8 @@ def _report_param_selects(prefix: str) -> dict:
             type="number",
             min=0,
             step=1,
-            value=MODEL.NEWS_MAX_ARTICLES,
+            value=(v["max_articles"] if v.get("max_articles") is not None
+                   else MODEL.NEWS_MAX_ARTICLES),
             size="sm",
         ),
         "model": dbc.Select(
@@ -93,7 +95,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
                 {"label": "Claude Haiku 4.5 (fast)", "value": "claude-haiku-4-5"},
             ],
-            value="gpt-5.6-luna",
+            value=v.get("report_model") or "gpt-5.6-luna",
             size="sm",
         ),
         "type": dbc.Select(
@@ -102,7 +104,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "Deep (company thesis)", "value": "thesis"},
                 {"label": "Standard (faster)", "value": "standard"},
             ],
-            value="thesis",
+            value=v.get("depth") or "thesis",
             size="sm",
         ),
         "recs": dbc.Select(
@@ -112,7 +114,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "From predictions only (no text)", "value": "signals"},
                 {"label": "Off", "value": "off"},
             ],
-            value="auto",
+            value=v.get("recs") or "auto",
             size="sm",
         ),
         "recs-model": dbc.Select(
@@ -122,7 +124,7 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "GPT-5.6 Luna (reasoning)", "value": "gpt-5.6-luna"},
                 {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
             ],
-            value="claude-sonnet-5",
+            value=v.get("recs_model") or "claude-sonnet-5",
             size="sm",
         ),
     }
@@ -517,6 +519,228 @@ def create_model_info_modal() -> dbc.Modal:
     )
 
 
+def run_model_controls(prefix: str, with_info: bool = False,
+                       values: dict | None = None):
+    """The Models + Ensemble controls, for any dialog that configures a run.
+
+    ``prefix`` namespaces every id ("run" for the Run dialog, "sj" for the
+    Schedule modal); the controls are otherwise identical, so a scheduled
+    job is configured with exactly the Run dialog's vocabulary. ``values``
+    seeds the controls (models, run_ensemble, ensemble{method, min_agree,
+    enabled_models, weights}); None = the config defaults.
+    """
+    from config import MODEL
+    v = values or {}
+    ens = v.get("ensemble") or {}
+    selected_models = set(v.get("models") or [mid for mid, _, _ in RUN_MODELS])
+
+    model_checks = [
+        html.Div(
+            [
+                dbc.Checkbox(id={"type": f"{prefix}-model-check", "model": mid},
+                             value=mid in selected_models, className="me-2"),
+                html.Span(display, className="run-model-name"),
+                html.Span(requirement, className="run-model-req"),
+                # Explainer for researchers (Run dialog only; the info
+                # modal's callback is bound to the run ids).
+                html.I(
+                    className="bi bi-info-circle run-model-info-btn ms-auto",
+                    id={"type": "run-model-info", "model": mid},
+                    title=f"What is {display}?",
+                    style={"cursor": "pointer",
+                           "color": "var(--text-secondary)"},
+                ) if with_info else None,
+            ],
+            className="d-flex align-items-center mb-2",
+        )
+        for mid, display, requirement in RUN_MODELS
+    ]
+
+    default_enabled = set(ens.get("enabled_models") or MODEL.ENSEMBLE_DEFAULT_ENABLED)
+    default_weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
+    default_weights.update(ens.get("weights") or {})
+    member_rows = [
+        html.Div(
+            [
+                dbc.Checkbox(id={"type": f"{prefix}-ens-member", "model": mid},
+                             value=mid in default_enabled, className="me-2"),
+                html.Span(display, className="run-model-name"),
+                dcc.Input(
+                    id={"type": f"{prefix}-ens-weight", "model": mid},
+                    type="number", min=0.1, max=2.0, step=0.1,
+                    value=default_weights.get(mid, 1.0),
+                    className="ensemble-weight-input",
+                    style={"width": "70px"},
+                ),
+            ],
+            className="d-flex align-items-center mb-1",
+        )
+        for mid, display, _ in RUN_MODELS
+    ]
+
+    ensemble_section = html.Div(
+        [
+            html.Div(
+                [
+                    dbc.Checkbox(id=f"{prefix}-ensemble-check",
+                                 value=v.get("run_ensemble", True),
+                                 className="me-2"),
+                    html.Span("Ensemble", className="run-model-name"),
+                    html.Span("combines the member models configured below",
+                              className="run-model-req"),
+                    html.I(
+                        className="bi bi-info-circle run-model-info-btn ms-auto",
+                        id={"type": "run-model-info", "model": "ensemble"},
+                        title="What is the Ensemble?",
+                        style={"cursor": "pointer",
+                               "color": "var(--text-secondary)"},
+                    ) if with_info else None,
+                ],
+                className="d-flex align-items-center mb-2",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Label("Combination method",
+                                               className="input-label"),
+                                    dbc.Select(
+                                        id=f"{prefix}-ensemble-method",
+                                        options=[{"label": lbl, "value": val}
+                                                 for val, lbl, _ in ENSEMBLE_METHODS],
+                                        value=ens.get("method") or MODEL.ENSEMBLE_DEFAULT_METHOD,
+                                        size="sm",
+                                    ),
+                                ],
+                                className="run-field",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Min. agreeing models",
+                                               className="input-label"),
+                                    dcc.Input(
+                                        id=f"{prefix}-ensemble-min-agree",
+                                        type="number", min=2, max=len(RUN_MODELS),
+                                        step=1,
+                                        value=ens.get("min_agree") or MODEL.ENSEMBLE_MIN_AGREE,
+                                        className="ensemble-weight-input",
+                                        style={"width": "70px"},
+                                    ),
+                                ],
+                                id=f"{prefix}-ensemble-min-agree-wrap",
+                                className="run-field",
+                            ),
+                        ],
+                        className="run-field-grid",
+                    ),
+                    html.Div(id=f"{prefix}-ensemble-method-hint",
+                             className="run-field-hint mb-2"),
+                    html.Div(
+                        [
+                            html.Label("Members and weights",
+                                       className="input-label"),
+                            html.Div(member_rows),
+                        ],
+                        className="run-field",
+                    ),
+                    html.Div(id=f"{prefix}-ensemble-summary"),
+                ],
+                id=f"{prefix}-ensemble-body",
+                className="ms-4",
+            ),
+        ],
+    )
+    return model_checks, ensemble_section
+
+
+EVIDENCE_OPTIONS = [
+    {"label": "Options positioning (put/call)", "value": "options"},
+    {"label": "Quality screen (Bad Apples + news red flags)", "value": "quality"},
+    {"label": "Situation & investigation (web research, live runs)",
+     "value": "investigation"},
+    {"label": "Political & institutional flows", "value": "political"},
+]
+
+TOOL_OPTIONS = [
+    {"label": "Web research. The situation investigation searches the open "
+              "web with citations (on for next-day runs, off for backtests)",
+     "value": "web_research"},
+]
+
+
+def run_evidence_tools(prefix: str, values: dict | None = None):
+    """The Evidence-blocks and Tools checklists for any run-configuring dialog."""
+    from config import MODEL
+    v = values or {}
+    evidence = dbc.Checklist(
+        id=f"{prefix}-evidence", options=EVIDENCE_OPTIONS,
+        value=(list(v["evidence"]) if v.get("evidence") is not None
+               else list(MODEL.DEFAULT_EVIDENCE)),
+        inline=True, className="run-evidence-checklist",
+    )
+    tools = dbc.Checklist(
+        id=f"{prefix}-tools", options=TOOL_OPTIONS,
+        value=(list(v["tools"]) if v.get("tools") is not None else ["web_research"]),
+        inline=True, className="run-evidence-checklist",
+    )
+    return evidence, tools
+
+
+def run_settings_sections(prefix: str, values: dict | None = None,
+                          with_info: bool = False) -> list:
+    """News / Models / Report / Tools / Recommendations sections with
+    ``prefix``-namespaced ids, seeded from ``values`` (a job's params) or the
+    config defaults. The Schedule modal renders exactly these, so a scheduled
+    job can be configured with everything the Run dialog offers."""
+    v = values or {}
+    sel = _report_param_selects(prefix, v)
+    model_checks, ensemble_section = run_model_controls(prefix, with_info, v)
+    evidence, tools = run_evidence_tools(prefix, v)
+
+    def field(label, control, hint=None):
+        return html.Div(
+            [html.Label(label, className="input-label"), control,
+             html.Div(hint, className="run-field-hint") if hint else None],
+            className="run-field",
+        )
+
+    return [
+        html.Div([
+            html.Hr(), html.H6("News", className="mb-2"),
+            html.Div([
+                field("Window", sel["lookback"],
+                      "Point-in-time: articles published in this many days up "
+                      "to the data cutoff."),
+                field("Article cap per symbol", sel["max_articles"],
+                      "Keep the newest N of the window; 0 = all. The trace "
+                      "reports when this drops articles."),
+            ], className="run-field-grid"),
+        ], id=f"{prefix}-news-section"),
+        html.Div([
+            html.Hr(), html.H6("Models", className="mb-2"),
+            html.Div(model_checks), ensemble_section,
+        ], id=f"{prefix}-models-section"),
+        html.Div([
+            html.Hr(), html.H6("Report", className="mb-2"),
+            html.Div([field("Report model", sel["model"]),
+                      field("Depth", sel["type"])], className="run-field-grid"),
+            html.Div([html.Div("Evidence blocks", className="run-field-label"),
+                      evidence], className="mt-2"),
+        ], id=f"{prefix}-report-section"),
+        html.Div([
+            html.Hr(), html.H6("Tools", className="mb-2"), tools,
+        ], id=f"{prefix}-tools-section"),
+        html.Div([
+            html.Hr(), html.H6("Recommendations", className="mb-2"),
+            html.Div([field("Basis", sel["recs"]),
+                      field("Synthesis model", sel["recs-model"])],
+                     className="run-field-grid"),
+        ], id=f"{prefix}-recs-section"),
+    ]
+
+
 def create_run_modal() -> dbc.Modal:
     """One dialog for every way of starting a run.
 
@@ -549,122 +773,7 @@ def create_run_modal() -> dbc.Modal:
 
     sel = _report_param_selects("run")
 
-    model_checks = [
-        html.Div(
-            [
-                dbc.Checkbox(id={"type": "run-model-check", "model": mid},
-                             value=True, className="me-2"),
-                html.Span(display, className="run-model-name"),
-                html.Span(requirement, className="run-model-req"),
-                # Explainer for researchers: what the model is, what it
-                # reads, and how far to trust it. TradingAgents' opens the
-                # live prompt preview reflecting the Evidence checkboxes.
-                html.I(
-                    className="bi bi-info-circle run-model-info-btn ms-auto",
-                    id={"type": "run-model-info", "model": mid},
-                    title=f"What is {display}?",
-                    style={"cursor": "pointer",
-                           "color": "var(--text-secondary)"},
-                ),
-            ],
-            className="d-flex align-items-center mb-2",
-        )
-        for mid, display, requirement in RUN_MODELS
-    ]
-
-    default_enabled = set(MODEL.ENSEMBLE_DEFAULT_ENABLED)
-    default_weights = dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS)
-    member_rows = [
-        html.Div(
-            [
-                dbc.Checkbox(id={"type": "run-ens-member", "model": mid},
-                             value=mid in default_enabled, className="me-2"),
-                html.Span(display, className="run-model-name"),
-                dcc.Input(
-                    id={"type": "run-ens-weight", "model": mid},
-                    type="number", min=0.1, max=2.0, step=0.1,
-                    value=default_weights.get(mid, 1.0),
-                    className="ensemble-weight-input",
-                    style={"width": "70px"},
-                ),
-            ],
-            className="d-flex align-items-center mb-1",
-        )
-        for mid, display, _ in RUN_MODELS
-    ]
-
-    ensemble_section = html.Div(
-        [
-            html.Div(
-                [
-                    dbc.Checkbox(id="run-ensemble-check", value=True,
-                                 className="me-2"),
-                    html.Span("Ensemble", className="run-model-name"),
-                    html.Span("combines the member models configured below",
-                              className="run-model-req"),
-                    html.I(
-                        className="bi bi-info-circle run-model-info-btn ms-auto",
-                        id={"type": "run-model-info", "model": "ensemble"},
-                        title="What is the Ensemble?",
-                        style={"cursor": "pointer",
-                               "color": "var(--text-secondary)"},
-                    ),
-                ],
-                className="d-flex align-items-center mb-2",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Label("Combination method",
-                                               className="input-label"),
-                                    dbc.Select(
-                                        id="run-ensemble-method",
-                                        options=[{"label": lbl, "value": val}
-                                                 for val, lbl, _ in ENSEMBLE_METHODS],
-                                        value=MODEL.ENSEMBLE_DEFAULT_METHOD,
-                                        size="sm",
-                                    ),
-                                ],
-                                className="run-field",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Min. agreeing models",
-                                               className="input-label"),
-                                    dcc.Input(
-                                        id="run-ensemble-min-agree",
-                                        type="number", min=2, max=len(RUN_MODELS),
-                                        step=1, value=MODEL.ENSEMBLE_MIN_AGREE,
-                                        className="ensemble-weight-input",
-                                        style={"width": "70px"},
-                                    ),
-                                ],
-                                id="run-ensemble-min-agree-wrap",
-                                className="run-field",
-                            ),
-                        ],
-                        className="run-field-grid",
-                    ),
-                    html.Div(id="run-ensemble-method-hint",
-                             className="run-field-hint mb-2"),
-                    html.Div(
-                        [
-                            html.Label("Members and weights",
-                                       className="input-label"),
-                            html.Div(member_rows),
-                        ],
-                        className="run-field",
-                    ),
-                    html.Div(id="run-ensemble-summary"),
-                ],
-                id="run-ensemble-body",
-                className="ms-4",
-            ),
-        ],
-    )
+    model_checks, ensemble_section = run_model_controls("run", with_info=True)
 
     def field(label, control, hint=None):
         return html.Div(
@@ -818,22 +927,7 @@ def create_run_modal() -> dbc.Modal:
                             [
                                 html.Div("Evidence blocks",
                                          className="run-field-label"),
-                                dbc.Checklist(
-                                    id="run-evidence",
-                                    options=[
-                                        {"label": "Options positioning (put/call)",
-                                         "value": "options"},
-                                        {"label": "Quality screen (Bad Apples + news red flags)",
-                                         "value": "quality"},
-                                        {"label": "Situation & investigation (web research, live runs)",
-                                         "value": "investigation"},
-                                        {"label": "Political & institutional flows",
-                                         "value": "political"},
-                                    ],
-                                    value=list(MODEL.DEFAULT_EVIDENCE),
-                                    inline=True,
-                                    className="run-evidence-checklist",
-                                ),
+                                run_evidence_tools("run")[0],
                             ],
                             className="mt-2",
                         ),
@@ -850,19 +944,7 @@ def create_run_modal() -> dbc.Modal:
                     [
                         html.Hr(),
                         html.H6("Tools", className="mb-2"),
-                        dbc.Checklist(
-                            id="run-tools",
-                            options=[
-                                {"label": "Web research. The situation "
-                                          "investigation searches the open "
-                                          "web with citations (on for "
-                                          "next-day runs, off for backtests)",
-                                 "value": "web_research"},
-                            ],
-                            value=["web_research"],
-                            inline=True,
-                            className="run-evidence-checklist",
-                        ),
+                        run_evidence_tools("run")[1],
                     ],
                     id="run-tools-section",
                 ),

@@ -29,6 +29,7 @@ UI, and a job that dies cannot take the server with it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -50,11 +51,14 @@ CLI = str(PROJECT_ROOT / "scripts" / "daily_analysis.py")
 ANALYSIS_JOB = "daily_analysis"
 EVALUATION_JOB = "daily_evaluation"
 
-# Wall-clock ceiling per run. A 20-symbol analysis is ~11 minutes locally but
-# 43 minutes on the CPU-only container (measured 2026-08-06), so the old
-# 45-minute ceiling was two minutes from killing a healthy run. Still short
-# enough that a hung provider call cannot hold the lock all day.
-JOB_TIMEOUT_SECONDS = 75 * 60
+# Wall-clock ceiling per run, env-tunable. Sized from the measured scheduled
+# runs of 2026-08-14..09-01: 41-55 min typical, 68.6 min worst (a day with
+# sequential situation-classification calls). 95 min = worst observed x1.35 —
+# enough that no healthy run has ever come within 25 minutes of it, small
+# enough that a hung provider call cannot hold the advisory lock all morning.
+# Resize with the measured distribution, not by feel: the near-ceiling
+# warning below fires at 80% and is the signal that this needs raising.
+JOB_TIMEOUT_SECONDS = int(os.getenv("JOB_TIMEOUT_MINUTES", "95")) * 60
 
 # What a person reads afterwards to find out what the run did. The subprocess
 # writes its summary to stdout and its log to stderr; both are kept, because
@@ -111,15 +115,8 @@ JOB_TYPES: dict[str, JobType] = {
         needs_symbols=True,
         default_hour=7,
         default_minute=0,
-        params_spec=(
-            ("lookback", "News window (days)", MODEL.NEWS_LOOKBACK_DAYS,
-             "Point-in-time news window ending at the data cutoff"),
-            ("max_articles", "Article cap per symbol", MODEL.NEWS_MAX_ARTICLES,
-             "Keep the newest N of the window; 0 = all"),
-            ("web_research", "Web research tool (1 = on, 0 = off)", 1,
-             "Lets the situation investigation search the open web. On for "
-             "the scheduled next-day run; keep off for backtest dates"),
-        ),
+        # No params_spec: an analysis job is configured with the Run
+        # dialog's full settings (default_run_params) in the Schedule modal.
     ),
     "evaluation": JobType(
         kind="evaluation",
@@ -181,6 +178,32 @@ def list_job_types() -> list[dict]:
 # Job definitions
 # ---------------------------------------------------------------------------
 
+def default_run_params() -> dict:
+    """Every setting the Run dialog offers, at its defaults — the shape an
+    analysis job's params_json carries. One vocabulary for both entry points:
+    a scheduled job is a saved Run dialog."""
+    from layouts.modals import RUN_MODELS
+    return {
+        "only_trading_days": True,
+        "lookback": MODEL.NEWS_LOOKBACK_DAYS,          # days, or "overnight"
+        "max_articles": MODEL.NEWS_MAX_ARTICLES,        # newest N, 0 = all
+        "models": [mid for mid, _, _ in RUN_MODELS],
+        "run_ensemble": True,
+        "ensemble": {
+            "method": MODEL.ENSEMBLE_DEFAULT_METHOD,
+            "min_agree": MODEL.ENSEMBLE_MIN_AGREE,
+            "enabled_models": list(MODEL.ENSEMBLE_DEFAULT_ENABLED),
+            "weights": dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS),
+        },
+        "report_model": MODEL.REPORT_MODEL,
+        "depth": "thesis",                              # thesis | standard
+        "recs": "auto",                                 # auto | signals | off
+        "recs_model": MODEL.RECOMMENDATIONS_MODEL,
+        "evidence": list(MODEL.DEFAULT_EVIDENCE),
+        "tools": ["web_research"],
+    }
+
+
 DEFAULT_JOBS = (
     {
         "id": ANALYSIS_JOB,
@@ -194,9 +217,7 @@ DEFAULT_JOBS = (
         "days_of_week": "mon-fri",
         "symbols_csv": ("PANW,BAC,VZ,HWM,DOC,HPQ,LUV,TPL,MPWR,MCD,"
                         "ROP,ETR,CMS,XYZ,HIG,IP,FLEX,MET,FIS,TYL"),
-        "params_json": {"only_trading_days": True,
-                        "lookback": MODEL.NEWS_LOOKBACK_DAYS,
-                        "max_articles": MODEL.NEWS_MAX_ARTICLES},
+        "params_json": None,  # filled from default_run_params() at seed time
     },
     {
         "id": EVALUATION_JOB,
@@ -213,6 +234,9 @@ DEFAULT_JOBS = (
 
 def seed_default_jobs() -> None:
     """Create the two standard jobs if they don't exist. Never overwrites."""
+    for job in DEFAULT_JOBS:
+        if job["params_json"] is None:
+            job["params_json"] = default_run_params()
     from db.models import ScheduledJob
     from db.session import get_session
     from sqlalchemy import func, select
@@ -526,31 +550,45 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
         cmd += ["--symbols", job["symbols_csv"]]
     if params.get("target"):
         cmd += ["--target", str(params["target"])]
-    if params.get("news_filter"):
-        cmd += ["--news-filter", str(params["news_filter"])]
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
-    # Both REQUIRED for an analysis job. The CLI has no default for them,
+    # Both REQUIRED for an analysis job — the CLI has no default for them,
     # and a job that lacks them fails here with a message that names the fix
     # rather than running on a window nobody chose. (Jobs created before the
-    # form had these knobs: open the Schedule page and save the job once.)
+    # Schedule modal existed: open the job there and save it once.)
     missing = [k for k in ("lookback", "max_articles") if params.get(k) is None]
     if missing:
         raise ValueError(
-            f"job params missing {', '.join(missing)}: open the Schedule page "
-            f"and save this job once to set them")
-    cmd += ["--lookback", str(int(params["lookback"]))]
+            f"job params missing {', '.join(missing)} — open this job on the "
+            f"Schedule page and save it once to set them")
+    overnight = str(params["lookback"]).strip().lower() == "overnight"
+    cmd += ["--news-filter", "overnight" if overnight else "lookback"]
+    cmd += ["--lookback", "1" if overnight else str(int(params["lookback"]))]
     cmd += ["--max-articles", str(int(params["max_articles"]))]
-    # Tools are opt-in per run; the job form defaults this to on for the
-    # forward-testing job, the CLI/backend default is off.
-    if int(params.get("web_research") or 0):
-        cmd += ["--tools", "web_research"]
+    models = params.get("models")
+    if models:
+        cmd += ["--models", models if isinstance(models, str) else ",".join(models)]
     if params.get("report_model"):
         cmd += ["--report-model", params["report_model"]]
     if params.get("recs_model"):
         cmd += ["--recs-model", params["recs_model"]]
-    if params.get("models"):
-        cmd += ["--models", str(params["models"])]
+    if params.get("depth"):
+        cmd += ["--depth", str(params["depth"])]
+    if params.get("recs"):
+        cmd += ["--recs", str(params["recs"])]
+    if params.get("evidence") is not None:
+        ev = params["evidence"]
+        cmd += ["--evidence", (ev if isinstance(ev, str) else ",".join(ev)) or "none"]
+    if params.get("ensemble"):
+        cmd += ["--ensemble-json", json.dumps(params["ensemble"])]
+    if params.get("run_ensemble") is False:
+        cmd.append("--no-ensemble")
+    # tools: the list from the modal; a pre-modal job stored web_research=1.
+    tools = params.get("tools")
+    if tools is None and int(params.get("web_research") or 0):
+        tools = ["web_research"]
+    if tools:
+        cmd += ["--tools", tools if isinstance(tools, str) else ",".join(tools)]
     if params.get("force"):
         cmd.append("--force")
     return cmd

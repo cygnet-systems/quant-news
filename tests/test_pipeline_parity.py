@@ -109,19 +109,55 @@ class TestReuseGuardKnowsTheWindow:
 
 
 class TestSchedulerCommand:
-    def test_zero_article_cap_and_models_reach_the_cli(self):
-        from services import scheduler_service as ss
-        job = {"kind": "analysis", "symbols_csv": "TYL,BAC",
-               "params": {"lookback": 30, "max_articles": 0, "models": "kronos_mini"}}
-        cmd = ss._build_command(job, None)
-        assert cmd[cmd.index("--max-articles") + 1] == "0"
-        assert cmd[cmd.index("--lookback") + 1] == "30"
-        assert cmd[cmd.index("--models") + 1] == "kronos_mini"
+    """A scheduled job is a saved Run dialog: every setting reaches the CLI."""
 
-    def test_analysis_job_exposes_its_news_knobs(self):
+    def test_every_dialog_setting_reaches_the_cli(self):
         from services import scheduler_service as ss
-        keys = {k for k, *_ in ss.JOB_TYPES["analysis"].params_spec}
-        assert {"lookback", "max_articles"} <= keys
+        params = {**ss.default_run_params(), "lookback": 30, "max_articles": 0,
+                  "models": ["kronos_mini"], "run_ensemble": False,
+                  "depth": "standard", "recs": "off", "evidence": [],
+                  "tools": []}
+        cmd = ss._build_command({"kind": "analysis", "symbols_csv": "TYL,BAC",
+                                 "params": params}, None)
+        flag = lambda f: cmd[cmd.index(f) + 1]  # noqa: E731
+        assert flag("--max-articles") == "0" and flag("--lookback") == "30"
+        assert flag("--news-filter") == "lookback"
+        assert flag("--models") == "kronos_mini" and "--no-ensemble" in cmd
+        assert flag("--depth") == "standard" and flag("--recs") == "off"
+        assert flag("--evidence") == "none" and "--tools" not in cmd
+        assert flag("--ensemble-json").startswith("{")
+
+    def test_overnight_window_maps_to_the_news_filter(self):
+        from services import scheduler_service as ss
+        params = {**ss.default_run_params(), "lookback": "overnight"}
+        cmd = ss._build_command({"kind": "analysis", "symbols_csv": "TYL",
+                                 "params": params}, None)
+        assert cmd[cmd.index("--news-filter") + 1] == "overnight"
+        assert cmd[cmd.index("--lookback") + 1] == "1"
+
+    def test_pre_modal_job_still_maps_web_research(self):
+        from services import scheduler_service as ss
+        cmd = ss._build_command({"kind": "analysis", "symbols_csv": "TYL",
+                                 "params": {"lookback": 7, "max_articles": 500,
+                                            "web_research": 1}}, None)
+        assert cmd[cmd.index("--tools") + 1] == "web_research"
+
+    def test_job_without_window_or_cap_is_refused(self):
+        from services import scheduler_service as ss
+        with pytest.raises(ValueError, match="missing"):
+            ss._build_command({"kind": "analysis", "symbols_csv": "TYL",
+                               "params": {"lookback": 7}}, None)
+
+    def test_defaults_mirror_the_run_dialog(self):
+        from config import MODEL
+        from layouts.modals import RUN_MODELS
+        from services import scheduler_service as ss
+        d = ss.default_run_params()
+        assert d["lookback"] == MODEL.NEWS_LOOKBACK_DAYS
+        assert d["max_articles"] == MODEL.NEWS_MAX_ARTICLES
+        assert d["models"] == [m for m, _, _ in RUN_MODELS]
+        assert set(d["evidence"]) == set(MODEL.DEFAULT_EVIDENCE)
+        assert d["recs"] == "auto" and d["depth"] == "thesis"
 
 
 class TestNoNewestFirstSlices:

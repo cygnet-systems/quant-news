@@ -18,10 +18,8 @@ def test_news_window_default_is_fourteen_days_on_the_frontend():
     assert MODEL.NEWS_LOOKBACK_DAYS == 14
     from layouts.modals import _report_param_selects
     assert _report_param_selects("run")["lookback"].value == "14"
-    from services.scheduler_service import DEFAULT_JOBS, JOB_TYPES
-    assert dict(JOB_TYPES["analysis"].params_spec and
-                {k: d for k, _, d, _ in JOB_TYPES["analysis"].params_spec})["lookback"] == 14
-    assert DEFAULT_JOBS[0]["params_json"]["lookback"] == 14
+    from services.scheduler_service import default_run_params
+    assert default_run_params()["lookback"] == 14
 
 
 def test_a_missing_window_is_an_error_not_a_default():

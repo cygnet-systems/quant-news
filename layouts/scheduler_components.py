@@ -170,152 +170,38 @@ def _job_card(job: dict) -> dbc.Card:
         className="scheduler-job-header",
     )
 
-    schedule_row = html.Div(
+    from layouts.schedule_modal import settings_summary
+
+    when = (f"{job['hour']:02d}:{job['minute']:02d} {job['timezone']} · "
+            f"{job['days_of_week']}")
+    syms = [x for x in (job.get("symbols_csv") or "").split(",") if x.strip()]
+    summary = html.Div(
         [
-            html.Div(
-                [
-                    dbc.Label("Time", className="scheduler-label"),
-                    html.Div(
-                        [
-                            dbc.Input(
-                                id={"type": "sched-hour", "job": job_id},
-                                type="number", min=0, max=23, step=1,
-                                value=job["hour"], size="sm",
-                                disabled=not can_manage,
-                                className="scheduler-time-input",
-                            ),
-                            html.Span(":", className="scheduler-time-sep"),
-                            dbc.Input(
-                                id={"type": "sched-minute", "job": job_id},
-                                type="number", min=0, max=59, step=1,
-                                value=job["minute"], size="sm",
-                                disabled=not can_manage,
-                                className="scheduler-time-input",
-                            ),
-                        ],
-                        className="scheduler-time-group",
-                    ),
-                ],
-                className="scheduler-field",
-            ),
-            html.Div(
-                [
-                    dbc.Label("Days", className="scheduler-label"),
-                    dbc.Select(
-                        id={"type": "sched-days", "job": job_id},
-                        options=_DAY_CHOICES,
-                        value=job["days_of_week"],
-                        size="sm",
-                        disabled=not can_manage,
-                    ),
-                ],
-                className="scheduler-field",
-            ),
-            html.Div(
-                [
-                    dbc.Label("Timezone", className="scheduler-label"),
-                    dbc.Select(
-                        id={"type": "sched-tz", "job": job_id},
-                        options=[{"label": tz, "value": tz} for tz in
-                                 ("US/Eastern", "US/Central", "US/Pacific", "UTC")],
-                        value=job["timezone"],
-                        size="sm",
-                        disabled=not can_manage,
-                    ),
-                ],
-                className="scheduler-field",
-            ),
-            html.Div(
-                [
-                    dbc.Label("Visibility", className="scheduler-label"),
-                    dbc.Select(
-                        id={"type": "sched-visibility", "job": job_id},
-                        options=[
-                            {"label": "Public", "value": "public"},
-                            {"label": "Private (only me)", "value": "private"},
-                        ],
-                        value="public" if job.get("is_public", True) else "private",
-                        size="sm",
-                        # Private needs an owner to be visible to anyone at
-                        # all; the service enforces the same rule on write.
-                        disabled=not can_manage or not job.get("owner_uid"),
-                    ),
-                ],
-                className="scheduler-field",
+            html.Div([html.I(className="bi bi-clock me-1"), when],
+                     className="scheduler-meta"),
+            html.Div([html.I(className="bi bi-list-ul me-1"),
+                      f"{len(syms)} symbols: " + ", ".join(syms[:8])
+                      + ("…" if len(syms) > 8 else "")],
+                     className="scheduler-meta") if is_analysis else None,
+            html.Div([html.I(className="bi bi-sliders me-1"), settings_summary(job)],
+                     className="scheduler-meta"),
+        ],
+        className="scheduler-summary",
+    )
+
+    actions = html.Div(
+        [
+            dbc.Button(
+                [html.I(className="bi bi-pencil me-1"), "Edit schedule & settings"],
+                id={"type": "sched-edit", "job": job_id},
+                size="sm", color="secondary", outline=True,
+                disabled=not can_manage,
             ),
         ],
-        className="scheduler-row",
+        className="scheduler-actions",
     )
 
-    children = [header, _status_line(job), schedule_row]
-
-    # The type's tuning knobs, editable in place. They used to be settable
-    # only on the create form and invisible afterwards. A 30-day news
-    # window chosen at creation could never be seen or changed again.
-    spec = job.get("params_spec") or []
-    if spec:
-        params = job.get("params") or {}
-        children.append(html.Div(
-            [
-                html.Div(
-                    [
-                        dbc.Label(item["label"], className="scheduler-label"),
-                        dbc.Input(
-                            id={"type": "sched-param", "job": job_id,
-                                "key": item["key"]},
-                            type="number",
-                            value=params.get(item["key"], item["default"]),
-                            size="sm",
-                            disabled=not can_manage,
-                            className="scheduler-time-input",
-                        ),
-                        html.Small(item["help"], className="scheduler-hint"),
-                    ],
-                    className="scheduler-field",
-                )
-                for item in spec
-            ],
-            className="scheduler-row scheduler-params-row",
-        ))
-
-    if is_analysis:
-        children.append(
-            html.Div(
-                [
-                    dbc.Label("Symbols", className="scheduler-label"),
-                    dbc.Textarea(
-                        id={"type": "sched-symbols", "job": job_id},
-                        value=job.get("symbols_csv") or "",
-                        placeholder="PANW,BAC,VZ,…",
-                        rows=2, size="sm",
-                        disabled=not can_manage,
-                        className="scheduler-symbols",
-                    ),
-                    html.Small(
-                        "Comma-separated. The run targets the session opening "
-                        "that morning, with data cut off at the previous close.",
-                        className="scheduler-hint",
-                    ),
-                ],
-                className="scheduler-field scheduler-field-wide",
-            )
-        )
-
-    children.append(
-        html.Div(
-            [
-                dbc.Button(
-                    [html.I(className="bi bi-save me-1"), "Save schedule"],
-                    id={"type": "sched-save", "job": job_id},
-                    size="sm", color="secondary", outline=True,
-                    disabled=not can_manage,
-                ),
-                html.Span(id={"type": "sched-feedback", "job": job_id},
-                          className="scheduler-feedback"),
-            ],
-            className="scheduler-actions",
-        )
-    )
+    children = [header, _status_line(job), summary, actions]
 
     if job.get("last_detail"):
         children.append(_run_log_block(job["last_detail"], "Last run output"))
@@ -323,193 +209,25 @@ def _job_card(job: dict) -> dbc.Card:
     return dbc.Card(dbc.CardBody(children), className="scheduler-card")
 
 
-def _create_form(job_types: list[dict]) -> html.Div:
-    """Add a job of any registered operation type.
-
-    The symbol box is always rendered but only meaningful for types that take
-    one; the service ignores it otherwise, so the form does not have to
-    re-render on every type change to stay honest.
-    """
-    takes_symbols = [t["kind"] for t in job_types if t["needs_symbols"]]
-    return html.Details(
-        [
-            html.Summary(
-                [html.I(className="bi bi-plus-circle me-1"), "New scheduled job"],
-                className="scheduler-new-summary",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    dbc.Label("Operation", className="scheduler-label"),
-                                    dbc.Select(
-                                        id="sched-new-kind",
-                                        options=[{"label": t["label"], "value": t["kind"]}
-                                                 for t in job_types],
-                                        value=job_types[0]["kind"] if job_types else None,
-                                        size="sm",
-                                    ),
-                                ],
-                                className="scheduler-field",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Label("Name", className="scheduler-label"),
-                                    dbc.Input(id="sched-new-name", type="text", size="sm",
-                                              placeholder="Morning predict"),
-                                ],
-                                className="scheduler-field scheduler-field-grow",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Label("Time", className="scheduler-label"),
-                                    html.Div(
-                                        [
-                                            dbc.Input(id="sched-new-hour", type="number",
-                                                      min=0, max=23, value=8, size="sm",
-                                                      className="scheduler-time-input"),
-                                            html.Span(":", className="scheduler-time-sep"),
-                                            dbc.Input(id="sched-new-minute", type="number",
-                                                      min=0, max=59, value=30, size="sm",
-                                                      className="scheduler-time-input"),
-                                        ],
-                                        className="scheduler-time-group",
-                                    ),
-                                ],
-                                className="scheduler-field",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Label("Days", className="scheduler-label"),
-                                    dbc.Select(id="sched-new-days", options=_DAY_CHOICES,
-                                               value="mon-fri", size="sm"),
-                                ],
-                                className="scheduler-field",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Label("Timezone", className="scheduler-label"),
-                                    dbc.Select(
-                                        id="sched-new-tz",
-                                        options=[{"label": tz, "value": tz} for tz in
-                                                 ("US/Eastern", "US/Central",
-                                                  "US/Pacific", "UTC")],
-                                        value="US/Eastern", size="sm",
-                                    ),
-                                ],
-                                className="scheduler-field",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Label("Visibility", className="scheduler-label"),
-                                    dbc.Select(
-                                        id="sched-new-visibility",
-                                        options=[
-                                            {"label": "Private (only me)",
-                                             "value": "private"},
-                                            {"label": "Public", "value": "public"},
-                                        ],
-                                        # Your schedule is yours by default;
-                                        # anonymous sessions are forced public
-                                        # by the service (nobody could see an
-                                        # ownerless private job again).
-                                        value="private", size="sm",
-                                    ),
-                                ],
-                                className="scheduler-field",
-                            ),
-                        ],
-                        className="scheduler-row",
-                    ),
-                    # Tunable knobs per operation type, from its declarative
-                    # params_spec. Every knob for every type is rendered once
-                    # (hidden ids can't be read by the create callback in Dash
-                    # 4); the container for a type shows only while that type
-                    # is selected, so the visible form stays minimal.
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div(
-                                        [
-                                            dbc.Label(spec["label"],
-                                                      className="scheduler-label"),
-                                            dbc.Input(
-                                                id={"type": "sched-new-param",
-                                                    "kind": t["kind"],
-                                                    "key": spec["key"]},
-                                                type="number",
-                                                value=spec["default"],
-                                                size="sm",
-                                                className="scheduler-time-input",
-                                            ),
-                                            html.Small(spec["help"],
-                                                       className="scheduler-hint"),
-                                        ],
-                                        className="scheduler-field",
-                                    )
-                                    for spec in t["params_spec"]
-                                ],
-                                id={"type": "sched-new-params-group",
-                                    "kind": t["kind"]},
-                                className="scheduler-row scheduler-params-row",
-                                style={"display": "none"},
-                            )
-                            for t in job_types if t.get("params_spec")
-                        ],
-                        id="sched-new-params",
-                    ),
-                    html.Div(
-                        [
-                            dbc.Label("Symbols", className="scheduler-label"),
-                            dbc.Textarea(id="sched-new-symbols", rows=2, size="sm",
-                                         placeholder="PANW,BAC,VZ,…",
-                                         className="scheduler-symbols"),
-                            html.Small(
-                                "Used by: " + (", ".join(takes_symbols) or "no operation"),
-                                className="scheduler-hint",
-                            ),
-                        ],
-                        className="scheduler-field scheduler-field-wide",
-                    ),
-                    html.Div(
-                        [
-                            dbc.Button(
-                                [html.I(className="bi bi-plus-lg me-1"), "Create job"],
-                                id="sched-create", size="sm", color="primary",
-                            ),
-                            html.Span(id="sched-create-feedback",
-                                      className="scheduler-feedback"),
-                        ],
-                        className="scheduler-actions",
-                    ),
-                ],
-                className="scheduler-new-body",
-            ),
-        ],
-        className="scheduler-new",
-    )
-
-
 def build_scheduler_panel(jobs: list[dict], runs: list[dict] | None = None,
                           job_types: list[dict] | None = None) -> html.Div:
     """The whole panel: one card per job, then recent run history."""
     job_types = job_types or []
 
+    new_btn = html.Div(
+        dbc.Button([html.I(className="bi bi-plus-lg me-1"), "New schedule"],
+                   id="sched-new-open", size="sm", color="primary"),
+        className="scheduler-actions mb-3",
+    )
     if not jobs:
-        children = [html.Div(
-            "No scheduled jobs. Create one below, the defaults are only "
-            "seeded into an empty schedule at startup, so a job you delete "
-            "stays deleted.",
+        children = [new_btn, html.Div(
+            "No scheduled jobs. Create one with the button above; the "
+            "defaults are only seeded into an empty schedule at startup, so "
+            "a job you delete stays deleted.",
             className="scheduler-empty",
         )]
     else:
-        children = [_job_card(job) for job in jobs]
-
-    if job_types:
-        children.append(_create_form(job_types))
+        children = [new_btn] + [_job_card(job) for job in jobs]
 
     if runs:
         rows = []

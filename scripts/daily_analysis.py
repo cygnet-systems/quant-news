@@ -89,6 +89,20 @@ def main() -> int:
                              "NEWS_FILTER_MODE")
     parser.add_argument("--models", default=None,
                         help="Comma-separated model ids to run (default: all)")
+    parser.add_argument("--depth", default="thesis", choices=["thesis", "standard"],
+                        help="Report depth: thesis (company thesis) or standard")
+    parser.add_argument("--recs", default="auto", choices=["auto", "signals", "off"],
+                        help="Recommendation basis: auto (text analysis + "
+                             "predictions), signals (predictions only), off")
+    parser.add_argument("--evidence", default=None,
+                        help="Comma-separated evidence blocks for the research "
+                             "prompt (options,quality,investigation,political); "
+                             "'none' for no blocks. Default: config DEFAULT_EVIDENCE")
+    parser.add_argument("--ensemble-json", default=None,
+                        help="Ensemble config as JSON: {method, min_agree, "
+                             "enabled_models, weights}. Default: config")
+    parser.add_argument("--no-ensemble", action="store_true",
+                        help="Skip the ensemble model")
     parser.add_argument("--tools", default="",
                         help="Comma-separated run tools, e.g. web_research "
                              "(lets the investigation search the open web). "
@@ -231,6 +245,12 @@ def main() -> int:
     models = ({m.strip() for m in args.models.split(",") if m.strip()}
               if args.models else None)
 
+    evidence = None
+    if args.evidence is not None:
+        evidence = [e.strip() for e in args.evidence.split(",")
+                    if e.strip() and e.strip().lower() != "none"]
+    ensemble_config = json.loads(args.ensemble_json) if args.ensemble_json else None
+
     summary = run_full_analysis(
         symbols,
         target=args.target,
@@ -238,10 +258,15 @@ def main() -> int:
         max_articles=args.max_articles,
         report_model=args.report_model,
         recs_model=args.recs_model,
+        include_thesis=args.depth != "standard",
         models=models,
         force=args.force,
         news_filter=args.news_filter,
+        evidence=evidence,
         tools=[t.strip() for t in args.tools.split(",") if t.strip()],
+        recs_mode=args.recs,
+        ensemble_config=ensemble_config,
+        run_ensemble=not args.no_ensemble,
     )
 
     if args.json:

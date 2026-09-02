@@ -416,11 +416,14 @@ class ModelConfig:
         "0", "false", "no", "off")
 
     # Recommendations engine (second-pass synthesis model)
-    # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic (says which
-    # side to trust and why, two-sided levels); this is ONE call per run
-    # so the Luna price advantage is ~3 cents, quality wins here.
-    RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "claude-sonnet-5")
-    RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "anthropic")
+    # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic; Luna was equally
+    # fabrication-free and 2x faster. Measured live (2026-08-25..09-01) the
+    # sonnet-5 synthesis call costs ~$0.186 vs ~$0.03 on Luna — $0.16/day,
+    # not the ~3 cents this comment once claimed. Budget directive 2026-09-02:
+    # total spend under $0.80/day with headroom for manual runs, so Luna it
+    # is; the A/B showed the quality gap is taste, not correctness.
+    RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "gpt-5.6-luna")
+    RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "openai")
     # Re-asked once on this model when the primary fails after the report
     # and predictions have already been paid for. The row records the model
     # that actually answered (model_used), so a fallback run is visible.

@@ -9,8 +9,14 @@ from dash import dcc, html
 
 
 def layout() -> html.Div:
+    from layouts.schedule_modal import create_schedule_modal
+    from services import scheduler_service
+
     return html.Div(
         [
+            # One dialog for create/edit/delete, carrying the Run dialog's
+            # full settings. Built once here; callbacks fill it per job.
+            create_schedule_modal(scheduler_service.list_job_types()),
             html.Div(
                 "Jobs run on the application's own clock, not an external cron. "
                 "A job whose window has passed with no success recorded for "
