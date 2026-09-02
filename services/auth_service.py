@@ -9,7 +9,7 @@ sister applications behind one login:
   validate the same accounts and sessions; locally it defaults to the app DB
   and the tables are created on startup if missing.
 - **Cookie**: this app sets its own ``qn_session`` cookie (cookies cannot
-  cross ``*.up.railway.app`` subdomains — that suffix is on the Public
+  cross ``*.up.railway.app`` subdomains: that suffix is on the Public
   Suffix List), signed with the SHARED ``SESSION_COOKIE_SECRET_KEY`` via
   itsdangerous, salt ``qn-session-cookie``.
 - **SSO handoff** (portal contract): the future portal signs the RAW session
@@ -21,7 +21,7 @@ sister applications behind one login:
 
 Identity is exposed through a ContextVar set by the ASGI middleware, so sync
 callbacks (threadpool) and ``asyncio.to_thread`` work inherit it. Anonymous
-requests are allowed everywhere — data defaults to public; ownership only
+requests are allowed everywhere, data defaults to public; ownership only
 attaches when someone is signed in.
 """
 
@@ -44,7 +44,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-import config as _config  # noqa: F401 — imported for its load_dotenv() side effect
+import config as _config  # noqa: F401: imported for its load_dotenv() side effect
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "qn_session")
 COOKIE_SALT = os.environ.get("SESSION_COOKIE_SALT", "qn-session-cookie")
 COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN") or None
 SSO_HANDOFF_SALT = "cygnet-sso-handoff"
-SSO_HANDOFF_MAX_AGE = 60  # seconds — the portal redirect is immediate
+SSO_HANDOFF_MAX_AGE = 60  # seconds: the portal redirect is immediate
 PERSISTENT_COOKIE_MAX_AGE = 7 * 24 * 60 * 60  # matches CRT
 ABSOLUTE_TTL = timedelta(days=7)
 TOUCH_DEBOUNCE = timedelta(seconds=30)
@@ -82,7 +82,7 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Tables — same shapes as CRT's user_store / session_store, so a shared
+# Tables: same shapes as CRT's user_store / session_store, so a shared
 # AUTH_DATABASE_URL means shared accounts and shared sessions.
 # ---------------------------------------------------------------------------
 
@@ -131,7 +131,7 @@ class AuthSession(AuthBase):
 
 
 # ---------------------------------------------------------------------------
-# Auth DB engine — separate from the app engine so it can point at the shared
+# Auth DB engine, separate from the app engine so it can point at the shared
 # Cygnet auth database without touching app data.
 # ---------------------------------------------------------------------------
 
@@ -196,7 +196,7 @@ def unsign_token(signed: str, salt: str = COOKIE_SALT,
 
 
 # ---------------------------------------------------------------------------
-# Current-user identity (ContextVar — inherited by threadpool + to_thread)
+# Current-user identity (ContextVar, inherited by threadpool + to_thread)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -234,7 +234,7 @@ def effective_uid() -> Optional[str]:
 
     In a request thread this is the signed-in user (ContextVar, set by the
     ASGI middleware). In a scheduled-run subprocess there is no request, so
-    scheduler_service exports the owning user's uid as QUANTNEWS_RUN_OWNER —
+    scheduler_service exports the owning user's uid as QUANTNEWS_RUN_OWNER.
     that is how a private daily job's predictions and reports land under
     their owner instead of the anonymous public bucket.
     """
@@ -316,7 +316,7 @@ def _read_session(raw_token: str) -> Optional[AuthSession]:
             return None
         if _now() >= _aware(row.absolute_expiry):
             return None
-        # touch (debounced) — best-effort
+        # touch (debounced): best-effort
         if _now() - _aware(row.last_activity) >= TOUCH_DEBOUNCE:
             try:
                 s.execute(update(AuthSession)

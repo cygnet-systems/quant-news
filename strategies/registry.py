@@ -1,7 +1,7 @@
 """Strategy registry with auto-discovery.
 
 Scans the strategies/ package for BaseStrategy subclasses on init.
-Drop a new .py file with a BaseStrategy subclass — it registers automatically.
+Drop a new .py file with a BaseStrategy subclass, it registers automatically.
 """
 
 import importlib

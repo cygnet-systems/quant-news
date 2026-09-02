@@ -2,13 +2,13 @@
 
 Two point-in-time-aware evidence blocks for the research prompt:
 
-* Congressional trades (``CONGRESS_TRADES``) — STOCK Act disclosures by
+* Congressional trades (``CONGRESS_TRADES``). STOCK Act disclosures by
   House and Senate members, with party, chamber, owner (self/spouse/child)
   and the amount band. Point-in-time on ``filed_date``: a trade is visible
   only from the day it was filed, which is what a reader on ``as_of`` could
   have known. Disclosure lags the trade by up to 45 days, so this is
   positioning context, never a timing signal.
-* Institutional holdings (``INSTITUTIONAL_HOLDINGS``) — 13F holders adding
+* Institutional holdings (``INSTITUTIONAL_HOLDINGS``). 13F holders adding
   vs cutting, with the largest movers. Holder rows carry the quarter-end
   they were reported for and are filtered to ``last_reported <= as_of``;
   the vendor's aggregate counts are a current snapshot and are labelled as
@@ -139,7 +139,7 @@ def get_congress_trades(symbol: str, as_of: str,
 def format_congress_block(symbol: str, c: dict | None) -> str:
     if not c:
         return ""
-    head = (f"[{symbol} — congressional trades (STOCK Act filings visible "
+    head = (f"[{symbol}: congressional trades (STOCK Act filings visible "
             f"through {c['as_of']}, transactions in last {c['window_days']}d)]")
     if not c["n"]:
         return (head + f"\nNone disclosed in the window "
@@ -154,7 +154,7 @@ def format_congress_block(symbol: str, c: dict | None) -> str:
         who = f"{t['politician']} ({t['party'] or '?'}-{t['state'] or '?'}, {t['chamber']})"
         owner = f", {t['owner'].lower()}" if t.get("owner") and t["owner"] != "SELF" else ""
         lines.append(f"- {t['transaction_date']} {t['type']} "
-                     f"{_band(t['amount_min'], t['amount_max'])} — {who}{owner}; "
+                     f"{_band(t['amount_min'], t['amount_max'])}: {who}{owner}; "
                      f"filed {t['filed_date']}")
     lines.append("Disclosures lag the trade by up to 45 days and amounts are "
                  "bands; read as positioning by informed-but-slow actors, "
@@ -230,7 +230,7 @@ def _shares(n: int) -> str:
 def format_institutional_block(symbol: str, h: dict | None) -> str:
     if not h or not h["holders_visible"]:
         return ""
-    lines = [f"[{symbol} — institutional (13F) holder flows, filings reported "
+    lines = [f"[{symbol}: institutional (13F) holder flows, filings reported "
              f"through {h['latest_report']} (visible as of {h['as_of']})]",
              f"{h['visible_added']} holders added vs {h['visible_cut']} cut "
              f"among {h['holders_visible']} visible filers."]

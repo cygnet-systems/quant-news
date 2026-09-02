@@ -16,7 +16,7 @@ def test_required_block_raises_with_symbol_and_reason():
     assert exc.value.symbol == "BHF"
     assert exc.value.block == "news_source"
     assert "vendor throttled" in str(exc.value)
-    # Nothing was recorded as a soft gap — the report is not written at all.
+    # Nothing was recorded as a soft gap. The report is not written at all.
     assert ledger.gaps == []
 
 

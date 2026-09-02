@@ -1,4 +1,4 @@
-"""Persistence service — orchestrates Postgres catalog + S3 object storage.
+"""Persistence service: orchestrates Postgres catalog + S3 object storage.
 
 Cache invalidation strategy:
     1. Hash the input data (stock prices + news + features) for a (symbol, date).
@@ -171,7 +171,7 @@ def store_prediction(
             input_data_hash=input_data_hash,
             model_version=model_version,
             duration_ms=duration_ms,
-            # Re-storing an id invalidates any prior evaluation — same rule as
+            # Re-storing an id invalidates any prior evaluation, same rule as
             # cache_service.store_prediction. Without these explicit Nones the
             # merge keeps the OLD verdict against the NEW decision, and the
             # evaluator never revisits a row whose actual_close survived.
@@ -181,7 +181,7 @@ def store_prediction(
             evaluated_at=None,
             # Ownership must ride the merge too: this writer used to omit it,
             # and merge() then NULLed owner_uid on rows the cache_service
-            # writer had stamped — silently un-owning them.
+            # writer had stamped, silently un-owning them.
             owner_uid=_current_uid(),
             is_public=_default_public(),
         ))
@@ -214,7 +214,7 @@ def get_cached_report(
         # Newest match, not "the only match". One input hash can legitimately
         # have more than one catalog row (the storage-key layout changed, or
         # two processes stored concurrently), and scalar_one_or_none() RAISES
-        # on that — turning a duplicate into a permanently broken cache for
+        # on that: turning a duplicate into a permanently broken cache for
         # that date instead of a cache hit.
         stmt = stmt.order_by(ReportCatalog.created_at.desc()).limit(1)
         row = session.execute(stmt).scalars().first()
@@ -244,7 +244,7 @@ def store_report(
     sym_part = symbol or "portfolio"
     # The input hash is part of the path, not just the catalog row. Without it
     # every portfolio report for a date shared one key, so a run over a
-    # DIFFERENT symbol set overwrote the previous one — the 20-symbol morning
+    # DIFFERENT symbol set overwrote the previous one. The 20-symbol morning
     # report was replaced by a 2-symbol ad-hoc run, and only the newest scope
     # stayed cacheable. Distinct inputs now coexist and each stays retrievable.
     storage_key = (f"reports/{sym_part}/{trade_date}/"
@@ -258,7 +258,7 @@ def store_report(
     )
 
     with get_session() as session:
-        # storage_key is unique but not the PK — upsert by key so re-running
+        # storage_key is unique but not the PK. Upsert by key so re-running
         # a report for the same symbol/date/type overwrites the catalog row.
         existing = session.execute(
             select(ReportCatalog).where(ReportCatalog.storage_key == storage_key)

@@ -43,7 +43,7 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
                   model: str, duration_ms: Optional[int] = None) -> Optional[int]:
     """Normalise a response's token counts, then fan them out two ways.
 
-    1. ``usage_out``, when a caller passed one — an out-parameter rather than a
+    1. ``usage_out``, when a caller passed one. An out-parameter rather than a
        changed return type, because ``generate()`` returns a plain string to a
        couple of dozen call sites and only the report path wants the counts.
     2. The durable ``llm_usage`` table, ALWAYS. Cost telemetry that depended on
@@ -53,7 +53,7 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
 
     Anthropic reports input_tokens/output_tokens; the OpenAI-compatible path
     reports prompt_tokens/completion_tokens. Both are normalised here so
-    callers never branch on provider. Never raises — telemetry must not be
+    callers never branch on provider. Never raises: telemetry must not be
     able to fail a generation that already succeeded.
 
     Returns the llm_usage row id (or None) so the trace row for the same
@@ -111,7 +111,7 @@ def _calibrated(model_name: str, raw_confidence) -> Optional[float]:
         return None
 
 
-# Default model per provider — single source of truth for the three copies of
+# Default model per provider, single source of truth for the three copies of
 # this mapping that used to live in _get_model / generate / failover.
 _DEFAULT_MODELS = {
     "lm_studio": "local-model",
@@ -128,7 +128,7 @@ class LLMService:
     Concurrency: called from ThreadPoolExecutor workers, async callbacks (via
     threads), and the prediction subprocess. The active (client, provider)
     pair lives in a single tuple attribute so reads and failover swaps are
-    atomic reference operations — methods must never mutate client/provider
+    atomic reference operations, methods must never mutate client/provider
     piecewise.
 
     Attributes:
@@ -154,7 +154,7 @@ class LLMService:
     def _make_client(self, provider: str):
         """Construct (and cache) an SDK client for a provider.
 
-        Clients get an explicit timeout — the SDK default of 600s pins a
+        Clients get an explicit timeout. The SDK default of 600s pins a
         worker thread on a hung socket. SDK retries stay at 1 because
         generate() layers its own transient retry on top.
         """
@@ -201,7 +201,7 @@ class LLMService:
 
         The OpenAI-compatible /v1/models endpoint lists every *downloaded*
         model regardless of load state, so a 200 (or a non-empty list)
-        there isn't enough — LM Studio still 400s on every completion with
+        there isn't enough. LM Studio still 400s on every completion with
         "No models loaded". LM Studio's native /api/v0/models endpoint
         exposes a per-model "state" field, so we require at least one llm
         with state == "loaded". If that endpoint isn't reachable we treat
@@ -293,7 +293,7 @@ class LLMService:
                       Creates a temporary client; does not mutate self.
             usage_out: Optional dict, populated in place with input_tokens,
                       output_tokens, model and provider for the call that
-                      actually produced the text — including after a failover,
+                      actually produced the text, including after a failover,
                       so recorded cost matches the model that was really used.
             **kwargs: Provider-specific params (e.g. reasoning_effort for OpenAI).
 
@@ -342,7 +342,7 @@ class LLMService:
                    usage_id: Optional[int] = None) -> None:
             """Record the in-flight attempt. Captured before any parsing, so
             a truncated/unparseable response is preserved verbatim. Never
-            breaks the call path — record_llm_call swallows its own errors."""
+            breaks the call path, record_llm_call swallows its own errors."""
             last_call["open"] = False
             try:
                 from services.trace_service import record_llm_call
@@ -396,7 +396,7 @@ class LLMService:
                     # decision footer is the first casualty, so make it loud.
                     logger.warning(
                         f"LLM response truncated at max_tokens={max_tokens} "
-                        f"(model={use_model}) — output is incomplete"
+                        f"(model={use_model}): output is incomplete"
                     )
                 usage_id = _record_usage(usage_out, response, "anthropic",
                                          use_model, duration_ms=_elapsed_ms())
@@ -418,7 +418,7 @@ class LLMService:
             if is_reasoning:
                 # Reasoning models spend completion budget on reasoning FIRST.
                 # max_completion_tokens == desired content size returns HTTP 200
-                # with EMPTY content once reasoning eats the budget — give
+                # with EMPTY content once reasoning eats the budget, give
                 # headroom on top of the requested content size.
                 effort = kwargs["reasoning_effort"]
                 if effort == "max":
@@ -431,7 +431,7 @@ class LLMService:
                 api_kwargs["temperature"] = temperature
 
             # Transient errors (401 permission flaps, 429, 5xx) shouldn't kill
-            # a whole pipeline — retry once with a short backoff.
+            # a whole pipeline, retry once with a short backoff.
             _begin_attempt(use_provider, use_model, api_kwargs)
             try:
                 response = use_client.chat.completions.create(**api_kwargs)
@@ -454,10 +454,10 @@ class LLMService:
             if is_reasoning and not (content or "").strip():
                 finish = getattr(response.choices[0], "finish_reason", "?")
                 logger.warning(
-                    f"Reasoning model returned empty content (finish_reason={finish}) — "
+                    f"Reasoning model returned empty content (finish_reason={finish}): "
                     f"retrying with low effort"
                 )
-                # The empty answer is itself evidence — keep its row.
+                # The empty answer is itself evidence, keep its row.
                 _trace(content, error=f"empty content (finish_reason={finish})")
                 api_kwargs["reasoning_effort"] = "low"
                 api_kwargs["max_completion_tokens"] = max(max_tokens * 4, 20000)
@@ -474,7 +474,7 @@ class LLMService:
             logger.warning(f"LLM generation error ({use_provider}): {e}")
 
             # The attempt that raised has not been traced yet (the success
-            # paths close their own) — record it before anything else so
+            # paths close their own), record it before anything else so
             # failover attempts stack on top with incremented numbers.
             if last_call.get("open"):
                 _trace(None, ok=False, error=str(e))
@@ -820,7 +820,7 @@ class LLMService:
         temperature: float,
         usage_out: Optional[dict] = None,
     ) -> Optional[str]:
-        """Generate text using Anthropic Claude API (explicit client — used
+        """Generate text using Anthropic Claude API (explicit client, used
         by failover before the active pair is swapped)."""
         kwargs = {
             "model": _DEFAULT_MODELS["anthropic"],
@@ -930,7 +930,7 @@ Respond using this EXACT markdown format:
             return None
 
         # Spread across symbols AND across the window. This used to be
-        # ``articles[:15]`` off a newest-first list — with a 20-symbol run
+        # ``articles[:15]`` off a newest-first list. With a 20-symbol run
         # that was fifteen headlines, mostly one symbol's, from the last day
         # or two, whatever window the user had picked.
         from config import MODEL as _M
@@ -994,7 +994,7 @@ Respond using this EXACT markdown format:
                     # model cannot see the session being predicted; printing
                     # them unconditionally rendered the absence as
                     # "Current Price: $0.00 | Volume: 0 | P/E: N/A" for every
-                    # symbol, and the analyst model — correctly — refused to
+                    # symbol, and the analyst model, correctly, refused to
                     # analyze and reported a broken data feed instead.
                     lines.append(f"Company: {info.get('name', sym)} | Sector: {info.get('sector', 'N/A')} | Industry: {info.get('industry', 'N/A')}")
                     if info.get("market_cap") or info.get("pe_ratio") or info.get("dividend_yield"):
@@ -1035,7 +1035,7 @@ Respond using this EXACT markdown format:
         if avg_score is not None:
             sentiment_summary += f" | Average sentiment score: {avg_score:.3f} (scale: -1 bearish to +1 bullish)"
 
-        system_prompt = """You are a senior equity research analyst. Produce a grounded analysis using ALL provided data — financial metrics, technical signals, AND news. Respond with ONLY valid JSON.
+        system_prompt = """You are a senior equity research analyst. Produce a grounded analysis using ALL provided data. Financial metrics, technical signals, AND news. Respond with ONLY valid JSON.
 
 CRITICAL RULES:
 - Your response must be parseable JSON with no additional text, no markdown code blocks.
@@ -1044,7 +1044,7 @@ CRITICAL RULES:
 - News sentiment should CONFIRM or CHALLENGE the technical/fundamental picture, not replace it.
 - Confidence is your estimated probability (0.0-1.0) that the recommendation direction is correct; high only when technicals, fundamentals, AND sentiment agree.
 - If signals conflict (e.g., bullish news but overbought RSI), lower confidence and note the divergence.
-- DRAWDOWN CAUSALITY: if the stock is down >20% from its period high, state a causal hypothesis with evidence from the news/fundamentals, or write "cause unknown — elevated risk".
+- DRAWDOWN CAUSALITY: if the stock is down >20% from its period high, state a causal hypothesis with evidence from the news/fundamentals, or write "cause unknown, elevated risk".
 - If a VALIDATED METRICS block is present, use its ATR/support/resistance/R:R arithmetic for any risk-reward statement instead of qualitative claims.
 - Treat any VALIDATED block as the source of truth. If two data sources conflict, FLAG the discrepancy rather than inventing a reconciled number. Do not claim historical support/resistance bounces or exact percentage moves unless a data block states them with concrete dates and prices."""
 
@@ -1072,7 +1072,7 @@ CRITICAL RULES:
             )
 
         prompt = f"""Analyze {symbols_str} using the following data:{as_of_line}
-{financial_context if financial_context else "(No financial data available — analysis limited to news only)"}
+{financial_context if financial_context else "(No financial data available. Analysis limited to news only)"}
 {validated_context}
 NEWS ARTICLES:
 {article_text}
@@ -1080,14 +1080,14 @@ NEWS ARTICLES:
 {sentiment_summary}
 
 BREVITY IS A HARD CONSTRAINT: the sentence counts below are maximums, not
-targets. When analyzing multiple symbols, summarize across them — do not
+targets. When analyzing multiple symbols, summarize across them, do not
 narrate each symbol separately. Total response under 450 words.
 
 Respond with this exact JSON structure (no markdown, no extra text):
 
-{{"recommendation": "BULLISH|CAUTIOUS_BULLISH|NEUTRAL|CAUTIOUS_BEARISH|BEARISH", "confidence": 0.0-1.0, "key_developments": "3-4 sentences covering price action, key technicals, and most important news. Reference specific numbers.", "developments_read": "1-2 sentences: what those developments MEAN for a position holder — interpretation, not a restatement of the numbers.", "market_sentiment": "BULLISH|NEUTRAL|BEARISH", "sentiment_explanation": "One sentence on how news sentiment aligns or conflicts with the technical/fundamental picture.", "risk_factors": "1-2 key risks from the data (valuation, volatility, technical weakness, negative news).", "risks_read": "One sentence: which single risk is most live right now and what would trigger it.", "watch_items": ["2-3 short, concrete things to monitor next (a level, a date, a metric) — each checkable"]{thesis_schema}}}"""
+{{"recommendation": "BULLISH|CAUTIOUS_BULLISH|NEUTRAL|CAUTIOUS_BEARISH|BEARISH", "confidence": 0.0-1.0, "key_developments": "3-4 sentences covering price action, key technicals, and most important news. Reference specific numbers.", "developments_read": "1-2 sentences: what those developments MEAN for a position holder. Interpretation, not a restatement of the numbers.", "market_sentiment": "BULLISH|NEUTRAL|BEARISH", "sentiment_explanation": "One sentence on how news sentiment aligns or conflicts with the technical/fundamental picture.", "risk_factors": "1-2 key risks from the data (valuation, volatility, technical weakness, negative news).", "risks_read": "One sentence: which single risk is most live right now and what would trigger it.", "watch_items": ["2-3 short, concrete things to monitor next (a level, a date, a metric), each checkable"]{thesis_schema}}}"""
 
-        # Compilation provenance — computed from what was actually assembled
+        # Compilation provenance: computed from what was actually assembled
         # (never model-asserted) and stamped on every outcome including the
         # sentiment fallback, so readers always see how the analysis was built.
         src_meta = {
@@ -1225,7 +1225,7 @@ Respond with this exact JSON structure (no markdown, no extra text):
             "sentiment_explanation": f"Based on {total} articles: {sentiment_counts['bullish']} bullish, {sentiment_counts['neutral']} neutral, {sentiment_counts['bearish']} bearish.",
         }
 
-    # Model description constant — extend when new models are added
+    # Model description constant, extend when new models are added
     _MODEL_DESCRIPTIONS = {
         "kronos_mini": "Kronos: Time-series probabilistic forecasting using Monte Carlo sampling of future price trajectories",
         "xgboost_shap": "XGBoost: Gradient-boosted decision trees on 18 engineered features (technicals + SPY correlation + news sentiment)",
@@ -1242,7 +1242,7 @@ Respond with this exact JSON structure (no markdown, no extra text):
         The report's preamble (the Verdict block) is always kept whole; the
         `### ` sections are then added in decision-relevance order until the
         character budget runs out. Sections that are pure input restatement
-        (business context, market regime) are dropped — the synthesis prompt
+        (business context, market regime) are dropped, the synthesis prompt
         already carries the model signals and the shallow report fields.
         """
         from models.single_agent import strip_epilogue
@@ -1286,7 +1286,7 @@ Respond with this exact JSON structure (no markdown, no extra text):
         `basis` controls what evidence goes into the prompt and is stamped
         onto the result so History records what a recommendation was built
         from: "research+signals" (verdict-first research reports),
-        "news+signals" (shallow analysis), or "signals" (predictions only —
+        "news+signals" (shallow analysis), or "signals" (predictions only,
         no text analysis at all).
         """
         if not symbols:
@@ -1299,7 +1299,7 @@ Respond with this exact JSON structure (no markdown, no extra text):
 
         system_prompt = f"""You are a senior portfolio strategist. You receive two independent analyses:
 
-1. AI REPORT: Per-symbol research — a verdict plus the report sections most relevant to the decision (bull/bear case, risk, trade plan, news), and/or news-based sentiment fields (recommendation, confidence, key developments, risk factors).
+1. AI REPORT: Per-symbol research, a verdict plus the report sections most relevant to the decision (bull/bear case, risk, trade plan, news), and/or news-based sentiment fields (recommendation, confidence, key developments, risk factors).
 2. MODEL PREDICTIONS: Machine learning model outputs (BUY/SELL/HOLD with confidence scores) from multiple quantitative models.
 
 AVAILABLE MODELS:
@@ -1307,26 +1307,27 @@ AVAILABLE MODELS:
 
 WHAT THE NUMBERS IN THE INPUT MEAN (read this before interpreting any of them):
 - "conviction" is the research report's OWN stated probability that its direction is right. It is a judgement the report made about itself. It has never been scored, so it carries no information about how often that report is actually correct.
-- "track-record weight" is NOT a model saying how sure it is. It is the model's measured directional hit rate on resolved past calls, used as a weight. A value of exactly 0.50 shown as "no track record yet" means the model has not accumulated enough scored calls to earn a weight — it is a placeholder for missing evidence, NOT a claim of 50/50 conviction, and NOT the report "mirroring" anything. Never reason from a 0.50 weight as if the report expressed a neutral view.
+- "track-record weight" is NOT a model saying how sure it is. It is the model's measured directional hit rate on resolved past calls, used as a weight. A value of exactly 0.50 shown as "no track record yet" means the model has not accumulated enough scored calls to earn a weight. It is a placeholder for missing evidence, NOT a claim of 50/50 conviction, and NOT the report "mirroring" anything. Never reason from a 0.50 weight as if the report expressed a neutral view.
 - "up" is the model's probability that the next close is higher. Where it sits at 0.50 alongside a stated direction, the model has declared a direction without an earned edge.
-- A "MEASURED ACCURACY" line inside a research report quotes the platform's evaluated hit rate with a sample size. It is the only number here that has been checked against outcomes. Where it says no rate can be stated, the sample was too thin — do not fill one in.
+- A "MEASURED ACCURACY" line inside a research report quotes the platform's evaluated hit rate with a sample size. It is the only number here that has been checked against outcomes. Where it says no rate can be stated, the sample was too thin. Do not fill one in.
 - If a field is "n/a", it was not reported. Say so; do not substitute 50%.
 
 WHAT THIS PLATFORM HAS ACTUALLY MEASURED (use these findings, do not contradict them):
-- Model agreement is not evidence of a better call. Measured on this platform's own resolved predictions, days on which the models agreed performed WORSE than days they split — the models are correlated momentum readers, so consensus mostly means they all read the same trend, not that the trend is more likely to continue. Never describe unanimity or a 5-model consensus as "highest-conviction" or as a reason to size up. Where they agree, look for the input they are all leaning on and ask whether it is one signal counted several times.
+- Model agreement is not evidence of a better call. Measured on this platform's own resolved predictions, days on which the models agreed performed WORSE than days they split. The models are correlated momentum readers, so consensus mostly means they all read the same trend, not that the trend is more likely to continue. Never describe unanimity or a 5-model consensus as "highest-conviction" or as a reason to size up. Where they agree, look for the input they are all leaning on and ask whether it is one signal counted several times.
 - Stated confidence on this platform has historically been anti-calibrated: higher stated numbers have not produced higher hit rates. Weight evidence, not stated certainty.
 - Directional hit rates across models sit close to 50% over large samples. Treat any thesis that implies a large, reliable edge as suspect.
 
 YOUR ROLE:
 - Synthesize both inputs into specific, actionable recommendations per symbol
-- When the AI report and model predictions DISAGREE, this is the most valuable signal — explain WHY they disagree and which to trust in this context
-- Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa) — they are context that shades conviction, never a standalone reason to flip a direction
-- Where a "Situation" line is present, the call is about that situation's resolution — a pending deal's completion odds and spread to the offer, a regulator's decision, an earnings print — not about trend. Models that only read price are less relevant there; say so in model_notes, and let key_level/change_trigger reference the offer price or the dated event rather than a moving average
+- When the AI report and model predictions DISAGREE, this is the most valuable signal. Explain WHY they disagree and which to trust in this context
+- Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa). They are context that shades conviction, never a standalone reason to flip a direction
+- Where a "Situation" line is present, the call is about how that situation resolves (a pending deal's completion odds and spread to the offer, a regulator's decision, an earnings print), not about trend. Models that only read price are less relevant there; say so in model_notes, and let key_level/change_trigger reference the offer price or the dated event rather than a moving average
 - Where a report says it was WRITTEN WITHOUT expected evidence, lower p_correct for that symbol and name the missing evidence in conflicts; do not treat the absence as neutral
-- "p_correct" is a probability, not a mood: your estimate that the ACTION direction is right for the next session's close, on the 0.50-0.75 scale where 0.50 means "no edge over a coin flip". You will be scored against realized outcomes — a persistent gap between your stated p_correct and your hit rate is a defect. State 0.50-0.55 freely; earn anything above 0.65.
+- "p_correct" is a probability, not a mood: your estimate that the ACTION direction is right for the next session's close, on the 0.50-0.75 scale where 0.50 means "no edge over a coin flip". You will be scored against realized outcomes. A persistent gap between your stated p_correct and your hit rate is a defect. State 0.50-0.55 freely; earn anything above 0.65.
 - Explain which models are most relevant for each symbol's situation
 - Provide an overall portfolio-level summary
 - Be direct and specific. No hedging.
+- Voice: plain sentences a desk would read. No em dashes or en dashes as punctuation (use commas, periods, parentheses). No "not just X, it's Y". No "delve", "dive", "landscape", "unlock", "navigate", "robust", "seamless". No closing recap.
 
 Respond with ONLY valid JSON matching this schema:
 {{
@@ -1335,7 +1336,7 @@ Respond with ONLY valid JSON matching this schema:
     "portfolio_action": "One-line actionable directive",
     "key_conflicts": ["List of notable disagreements between report and models"],
     "risk_assessment": "1-2 sentences on aggregate risk",
-    "watch_items": ["2-3 short portfolio-level things to monitor next — each a checkable level, date, or metric"]
+    "watch_items": ["2-3 short portfolio-level things to monitor next. Each a checkable level, date, or metric"]
   }},
   "by_symbol": {{
     "<SYMBOL>": {{
@@ -1356,7 +1357,7 @@ Respond with ONLY valid JSON matching this schema:
         overall = ai_analysis.get("overall", {})
 
         # Research digest budget per symbol. The synthesis used to see only
-        # the ~600-char verdict block — the analysis sections the research
+        # the ~600-char verdict block. The analysis sections the research
         # model spent its tokens on were discarded before the one call whose
         # job is to weigh them against the quant signals. Scale with symbol
         # count so a 20-name portfolio still fits the context comfortably.
@@ -1385,7 +1386,7 @@ Respond with ONLY valid JSON matching this schema:
                                    if inv.get("spread_pct") is not None else ""))
                 lines.append(
                     f"Situation ({'web-researched' if inv.get('web') else 'classified from supplied evidence'}): "
-                    f"{inv['situation']} ({inv.get('situation_confidence', 'n/a')}) — "
+                    f"{inv['situation']} ({inv.get('situation_confidence', 'n/a')}): "
                     f"{str(inv.get('one_line') or '')[:220]}{deal_str}")
             gaps = [g for g in ((research.get("evidence") or {}).get("gaps") or [])
                     if g.get("severity") == "expected"]
@@ -1401,7 +1402,7 @@ Respond with ONLY valid JSON matching this schema:
                 weight = sym_report.get("confidence")
                 conviction = sym_report.get("stated_conviction")
                 weight_str = (
-                    f"{weight:.0%}" + (" — no track record yet, placeholder"
+                    f"{weight:.0%}" + (": no track record yet, placeholder"
                                        if float(weight) == 0.5 else "")
                     if isinstance(weight, (int, float)) else "n/a")
                 conv_str = (f"{conviction:.2f}"
@@ -1427,17 +1428,17 @@ Respond with ONLY valid JSON matching this schema:
                 lines.append("AI Report: Not available")
 
             # Options positioning and quality screen: validated data, not text
-            # analysis — included even on a signals-only basis.
+            # analysis: included even on a signals-only basis.
             ctx_entry = analysis_by_sym.get(symbol, {})
             pos = ctx_entry.get("positioning") or {}
             if pos.get("pc_volume") is not None:
                 lines.append(
                     f"Options positioning (as of {pos.get('as_of', 'n/a')}): "
                     f"P/C volume {pos['pc_volume']:.2f}, "
-                    f"P/C open-interest {pos['pc_oi']:.2f} — {pos.get('read', '')}"
+                    f"P/C open-interest {pos['pc_oi']:.2f}: {pos.get('read', '')}"
                     if pos.get("pc_oi") is not None else
                     f"Options positioning (as of {pos.get('as_of', 'n/a')}): "
-                    f"P/C volume {pos['pc_volume']:.2f} — {pos.get('read', '')}")
+                    f"P/C volume {pos['pc_volume']:.2f}: {pos.get('read', '')}")
             delta = ctx_entry.get("positioning_delta") or {}
             if delta.get("shift") is not None:
                 direction = ("toward puts" if delta["shift"] > 0
@@ -1455,7 +1456,7 @@ Respond with ONLY valid JSON matching this schema:
                                    (quality.get("failed_checks") or [])[:6])
                 lines.append(
                     f"Quality screen (Bad Apples, as of {quality.get('as_of', 'n/a')}): "
-                    f"{str(quality.get('flag', '')).upper()} — "
+                    f"{str(quality.get('flag', '')).upper()}: "
                     f"{quality['total_fails']}/{quality['total_checks']} checks failed"
                     + (f" ({failed})" if failed else ""))
 
@@ -1471,7 +1472,7 @@ Respond with ONLY valid JSON matching this schema:
                     # (the research arm publishes no up-probability until it
                     # has a track record, and a signal read back from storage
                     # carries NULL rather than a default). `.get(k, default)`
-                    # does not cover that — the key is present and None — and
+                    # does not cover that, the key is present and None, and
                     # formatting None raised, taking the whole synthesis down.
                     # Say "n/a" instead of inventing a 50%.
                     confidence = result.get("confidence")
@@ -1490,7 +1491,7 @@ Respond with ONLY valid JSON matching this schema:
                         placeholder = False
                     conf_str = f"{confidence:.0%}" if confidence is not None else "n/a"
                     if placeholder:
-                        conf_str += " — no track record yet, placeholder"
+                        conf_str += ": no track record yet, placeholder"
                     elif confidence is not None:
                         cal = _calibrated(model_name, confidence)
                         conf_str += (f" (calls at this score have resolved "
@@ -1551,7 +1552,7 @@ Respond with ONLY valid JSON matching this schema:
         parsed = _parse_recommendations_json(raw) if raw else None
 
         if parsed is None and API.ANTHROPIC_API_KEY:
-            # Primary synthesis failed — empty response OR unusable JSON (a
+            # Primary synthesis failed, empty response OR unusable JSON (a
             # truncated payload used to drop the whole day's synthesis on the
             # floor here). A completed AI report + prediction run shouldn't
             # be wasted, so re-ask once on the fallback model.
@@ -1561,7 +1562,7 @@ Respond with ONLY valid JSON matching this schema:
                             else "claude-sonnet-5")
             logger.warning(
                 f"{primary_model} produced no usable synthesis "
-                f"({'empty' if not raw else 'unparseable'}) — "
+                f"({'empty' if not raw else 'unparseable'}): "
                 f"falling back to {fallback}"
             )
             raw = self.generate(
@@ -1592,7 +1593,7 @@ def _extract_json_object(text: str) -> Optional[str]:
 
     The old greedy ``\\{.*\\}`` regex matched from the first ``{`` to the LAST
     ``}`` in the buffer, so a response truncated mid-object "matched" and then
-    failed json.loads — and a code fence stripped globally could corrupt JSON
+    failed json.loads: and a code fence stripped globally could corrupt JSON
     whose string values themselves contained backticks. Scanning braces with
     string/escape tracking sidesteps both.
     """
@@ -1628,7 +1629,7 @@ def _parse_recommendations_json(raw: str) -> Optional[dict]:
     candidate = _extract_json_object(raw)
     if candidate is None:
         logger.warning("No complete JSON object in recommendations response "
-                       f"({len(raw)} chars — likely truncated output)")
+                       f"({len(raw)} chars: likely truncated output)")
         return None
     try:
         parsed = json.loads(candidate)

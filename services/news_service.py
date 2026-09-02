@@ -173,7 +173,7 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
         for item in (news[:max_articles] if max_articles else news):
             # Newer yfinance nests the article under "content" with an ISO
             # pubDate; older builds carry an epoch providerPublishTime. An
-            # article with neither is skipped — stamping it 1970 put it
+            # article with neither is skipped. Stamping it 1970 put it
             # outside every window while still counting as "fetched".
             content = item.get("content") or {}
             epoch = item.get("providerPublishTime")
@@ -187,7 +187,7 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
                     logger.debug(f"{symbol}: yfinance article has unparseable date {iso!r}")
                     continue
             else:
-                logger.debug(f"{symbol}: yfinance article has no publish time — skipped")
+                logger.debug(f"{symbol}: yfinance article has no publish time, skipped")
                 continue
 
             title = item.get("title") or content.get("title", "")
@@ -308,7 +308,7 @@ def fetch_alpha_vantage_news(
 
     AV serves at most 1000 articles per request. Pages are walked newest-first
     by moving ``time_to`` to just before the oldest article of the previous
-    page, so a busy window is no longer silently truncated — the old
+    page, so a busy window is no longer silently truncated, the old
     single-request version capped every symbol at 50 articles and dropped the
     oldest (earliest-catalyst) articles first.
 
@@ -411,7 +411,7 @@ def fetch_alpha_vantage_news(
 
             # Pre-filter by relevance. A None score means the ticker isn't
             # in this article's ticker_sentiment list (i.e. it's market-wide
-            # noise that merely surfaced under a LATEST query) — drop it too.
+            # noise that merely surfaced under a LATEST query), drop it too.
             # When relevance_threshold is 0, filtering is disabled entirely.
             rel = parsed["ticker_relevance_score"]
             if relevance_threshold > 0 and (rel is None or rel < relevance_threshold):
@@ -698,7 +698,7 @@ def fetch_historical_av_news(
             # but these rows do not: the old check returned any hit inside
             # [now-90d, now], so the FIRST fetch froze a symbol's training
             # news forever and every day after it trained on a window with a
-            # growing hole at the recent end — silently, since a partial
+            # growing hole at the recent end. Silently, since a partial
             # window looks exactly like a quiet news period.
             newest = max(result)
             staleness = (end_date.date() - date.fromisoformat(newest)).days
@@ -708,7 +708,7 @@ def fetch_historical_av_news(
                 return result
             logger.info(
                 f"AV news cache for {cache_symbol} ends {newest} "
-                f"({staleness}d before the window end) — refetching"
+                f"({staleness}d before the window end), refetching"
             )
 
     # Fetch from AV API in monthly windows
@@ -787,7 +787,7 @@ def fetch_historical_av_news(
             failed_months.append(f"{time_from[:8]}-{time_to[:8]}: {e}")
     if failed_months:
         raise NewsUnavailable(
-            f"historical news for {cache_symbol} incomplete — "
+            f"historical news for {cache_symbol} incomplete: "
             f"{len(failed_months)}/{months} month slices failed: "
             + "; ".join(failed_months)[:300])
 

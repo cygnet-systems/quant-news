@@ -1,4 +1,4 @@
-"""Scheduler panel — read and edit the app's own job schedule.
+"""Scheduler panel: read and edit the app's own job schedule.
 
 Rendered inside the History tab beside the evaluation controls, because the
 two answer the same question: what has the platform done for me lately, and
@@ -30,7 +30,7 @@ _STATUS_STYLE = {
 
 
 def _relative(when: datetime | None) -> str:
-    """'12m ago' / 'in 3h' — a schedule is read in relative terms."""
+    """'12m ago' / 'in 3h', a schedule is read in relative terms."""
     if not when:
         return "never"
     now = datetime.now(timezone.utc)
@@ -100,7 +100,7 @@ def _job_card(job: dict) -> dbc.Card:
     # Whether this operation takes a symbol list is the type's business, not
     # something this renderer should know per kind.
     is_analysis = job.get("needs_symbols", job["kind"] == "analysis")
-    # can_manage is decided server-side (owner, admin, or legacy unowned) —
+    # can_manage is decided server-side (owner, admin, or legacy unowned). 
     # the service re-checks on every write, so this only shapes the UI.
     can_manage = job.get("can_manage", True)
 
@@ -250,7 +250,7 @@ def _job_card(job: dict) -> dbc.Card:
     children = [header, _status_line(job), schedule_row]
 
     # The type's tuning knobs, editable in place. They used to be settable
-    # only on the create form and invisible afterwards — a 30-day news
+    # only on the create form and invisible afterwards. A 30-day news
     # window chosen at creation could never be seen or changed again.
     spec = job.get("params_spec") or []
     if spec:
@@ -500,7 +500,7 @@ def build_scheduler_panel(jobs: list[dict], runs: list[dict] | None = None,
 
     if not jobs:
         children = [html.Div(
-            "No scheduled jobs. Create one below — the defaults are only "
+            "No scheduled jobs. Create one below, the defaults are only "
             "seeded into an empty schedule at startup, so a job you delete "
             "stays deleted.",
             className="scheduler-empty",

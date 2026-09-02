@@ -4,11 +4,11 @@ Opening the app used to show empty charts. The question it should answer on
 arrival is the one you actually have: what is the current call on each name,
 what did it cost or make, and what is still in flight.
 
-Two panes, one viewport. The left pane is the symbol index — every name in
+Two panes, one viewport. The left pane is the symbol index, every name in
 the latest cohort with its synthesis call and newest research report, one
 click from the report itself. The right pane is the prediction board for the
 same cohort. Clicking a symbol on the left narrows the board to that name;
-clicking it again widens back out. Neither pane scrolls the page — each
+clicking it again widens back out. Neither pane scrolls the page, each
 scrolls internally, so the layout holds at any watchlist size.
 
 Built around the latest prediction cutoff rather than "the last run" because
@@ -32,8 +32,8 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     label = decision if compact else f"{decision}"
 
     # Raw model confidence is anti-calibrated on this platform and is never
-    # shown. The badge is the CALIBRATED value — what this raw confidence has
-    # historically meant for this model — or nothing when the model lacks
+    # shown. The badge is the CALIBRATED value. What this raw confidence has
+    # historically meant for this model, or nothing when the model lacks
     # enough evaluated history to earn a number.
     cal = None
     try:
@@ -46,14 +46,14 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     target = pred.get("target_date")
     title = decision
     if cal is not None:
-        title += (f" — calls like this one have been right {cal:.0%} of the "
+        title += (f": calls like this one have been right {cal:.0%} of the "
                   f"time (calibrated from evaluated history; model claimed "
                   f"{raw_conf:.0%})")
     elif raw_conf is not None:
-        title += (f" — model claims {raw_conf:.0%}, but has too little "
+        title += (f": model claims {raw_conf:.0%}, but has too little "
                   f"evaluated history to calibrate; treat as unsized")
     if made:
-        title += f" — made with data through {made}"
+        title += f": made with data through {made}"
     if target:
         title += f", predicting the {target} close"
     return html.Span(
@@ -110,7 +110,7 @@ def _report_tab(symbol: str, reports: list[dict]) -> html.Div:
     """The Report tab: the selected symbol's latest report, whole.
 
     Reading the latest report is the primary flow, so selecting a symbol
-    puts the report itself on the page — not a button that leads to it.
+    puts the report itself on the page, not a button that leads to it.
     Older reports open in the reader modal via their date chips.
     """
     if not reports:
@@ -465,9 +465,9 @@ def last_run_header(cohort: dict, last_run: dict | None) -> html.Div:
 
 
 def _inflight_strip(open_preds: dict) -> html.Div:
-    """One line per unresolved target session — not a card of its own."""
+    """One line per unresolved target session, not a card of its own."""
     if not open_preds["total"]:
-        return html.Div("Nothing in flight — every call has been scored.",
+        return html.Div("Nothing in flight. Every call has been scored.",
                         className="home-inflight home-empty-note")
     lines = []
     for d in open_preds["dates"]:
@@ -523,7 +523,7 @@ def _symbol_row(row: dict, report: dict | None, active: bool,
                 in_watchlist: bool = True) -> html.Div:
     """One name on the index: the call, the report, and the way in.
 
-    The whole header line is a button — the row IS the filter control for
+    The whole header line is a button. The row IS the filter control for
     the board on the right. Membership is a control too: watchlist rows get
     a remove ✕, cohort-only rows a one-click ＋ into the watchlist (both
     reuse the global manage_symbols patterns). The report line keeps its own
@@ -609,7 +609,7 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
                 watchlist: list[str] | None = None) -> list:
     """The rail rows: watchlist first, then cohort names outside it.
 
-    One list, membership visible — the rail is the union of the watchlist
+    One list, membership visible, the rail is the union of the watchlist
     (the input to the next run) and the latest cohort (the output of the
     last one), grouped so the 5-vs-20 mismatch reads as fact, not mystery.
     Watchlist names with no calls yet still get a row, so a freshly added
@@ -632,7 +632,7 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
 
     if not wl_rows and not extra_rows:
         return [html.Div(f'No symbol matching "{needle}"'
-                         if needle else "No symbols yet — add one above.",
+                         if needle else "No symbols yet. Add one above.",
                          className="home-empty-note")]
 
     def _group(label, count, hint=None):
@@ -646,7 +646,7 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
     out = []
     if wl_rows:
         out.append(_group("Watchlist", len(wl_rows),
-                          "Your symbols — the default set for new runs"))
+                          "Your symbols: the default set for new runs"))
         out.extend(
             _symbol_row(r, reports_by_symbol.get(r["symbol"]),
                         active=(r["symbol"] == active_symbol),
@@ -656,7 +656,7 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
     if extra_rows:
         out.append(_group("Not in watchlist", len(extra_rows),
                           "Covered by the most recent run but not on your "
-                          "watchlist — click ＋ on a row to add it"))
+                          "watchlist: click ＋ on a row to add it"))
         out.extend(
             _symbol_row(r, reports_by_symbol.get(r["symbol"]),
                         active=(r["symbol"] == active_symbol),
@@ -670,7 +670,7 @@ def _jobs_line(jobs: list[dict]) -> html.Div:
     """The scheduler, reduced to a heartbeat: name, time, last outcome."""
     if not jobs:
         return html.Div(
-            dcc.Link("No scheduled jobs — set one up", href="/schedule",
+            dcc.Link("No scheduled jobs. Set one up", href="/schedule",
                      className="home-card-link"),
             className="home-jobs-line",
         )
@@ -705,7 +705,7 @@ def _rail_menu(recent_groups: list[list[str]] | None) -> dbc.DropdownMenu:
     Recent groups are rendered server-side at layout time (the durable
     history is a DB read anyway) and restore through the existing
     search-restore pattern, so no store round-trip is needed. Clear-all
-    keeps its fixed id — manage_symbols takes it as an allow_optional
+    keeps its fixed id, manage_symbols takes it as an allow_optional
     Input now that it exists only on Home.
     """
     items = [dbc.DropdownMenuItem("Recent watchlists", header=True)]
@@ -734,7 +734,7 @@ def _rail_menu(recent_groups: list[list[str]] | None) -> dbc.DropdownMenu:
 
 
 def board_title(cutoffs: list[str] | None, active_cutoff: str | None) -> html.Div:
-    """The board's title row — re-rendered when the cutoff changes.
+    """The board's title row, re-rendered when the cutoff changes.
 
     Exposed (not underscored) because render_home_panes rebuilds it without
     rebuilding the whole page, same as cohort_table and symbol_list.
@@ -791,7 +791,7 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
            symbol_detail=None, cutoffs=None, active_cutoff=None) -> html.Div:
     """Assemble the launch screen from already-shaped data.
 
-    The left rail always renders — it is the watchlist editor now, so a
+    The left rail always renders. It is the watchlist editor now, so a
     brand-new user lands on the add box, not on an empty page telling them
     to find the editor somewhere else.
     """
@@ -813,7 +813,7 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
                         ],
                         className="home-left-titlerow",
                     ),
-                    # Filter only — adding happens in the global watchlist
+                    # Filter only: adding happens in the global watchlist
                     # strip (always mounted) or via a row's ＋ button.
                     dcc.Input(
                         id="home-symbol-search",

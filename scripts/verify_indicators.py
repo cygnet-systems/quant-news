@@ -3,7 +3,7 @@
 The hand-rolled RSI/ATR in the LLM prompt path were replaced with
 utils.metrics.wilder_rsi_series / wilder_atr_series, which claim exact
 equivalence with ta.RSIIndicator / ta.AverageTrueRange (the implementations
-the ML features are built on). This script proves it — including on SHORT
+the ML features are built on). This script proves it, including on SHORT
 frames (15/30/60 bars), where ATR's SMA-seeded recursion diverges hard from
 naive ewm implementations and where walk-forward backtests actually operate.
 
@@ -57,7 +57,7 @@ for symbol in ("AMBA", "SPY"):
           bool(np.allclose(ours_tail, ta_tail, atol=TOL)),
           f"max|diff|={float((ours_tail - ta_tail).abs().max()):.2e}")
 
-    # Short frames — where the seeding matters and backtests actually run
+    # Short frames: where the seeding matters and backtests actually run
     for n in (15, 30, 60):
         sub = df.tail(n)
         a_ours = wilder_atr_series(sub["High"], sub["Low"], sub["Close"]).iloc[-1]

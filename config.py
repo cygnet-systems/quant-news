@@ -242,7 +242,7 @@ class ModelConfig:
     # News window formula for live/scheduled predictions. "lookback" is the
     # historical default: everything relevant from the past NEWS lookback
     # days. "overnight" keeps only articles published between the anchor
-    # session's close and the target session's open — the premise being that
+    # session's close and the target session's open. The premise being that
     # anchor-day intraday news is already priced into the anchor close, so
     # only the overnight tape is NEW information for the move being predicted.
     # Every parameter is an owner-tunable formula input (env-overridable), and
@@ -252,10 +252,10 @@ class ModelConfig:
     # job form, CLI, library fallback) reads. 14, not 7: the 2026-09-01 BHF
     # report saw 1 of the 5 relevant articles Alpha Vantage held because the
     # dialog's 7-day default cut off the CAO resignation and the Delaware
-    # review coverage a week earlier — 14 days is the drawdown-forensics
+    # review coverage a week earlier. 14 days is the drawdown-forensics
     # horizon the research prompt was written for.
     # FRONTEND default only: it seeds the Run dialog select, the job form and
-    # the seeded daily job. No code path falls back to it — a run whose window
+    # the seeded daily job. No code path falls back to it. A run whose window
     # did not arrive from one of those raises RunParameterMissing.
     NEWS_LOOKBACK_DAYS: int = int(os.getenv("NEWS_LOOKBACK_DAYS", "14"))
     NEWS_OVERNIGHT_START_ET: str = os.getenv("NEWS_OVERNIGHT_START_ET", "16:00")
@@ -271,12 +271,12 @@ class ModelConfig:
     NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "500"))
     # The durable news store keeps every fetched article this long, then
     # prunes. A daily 7/14/30-day run reads its window from the store and
-    # fetches only days it has not seen — the same articles are not paid for
+    # fetches only days it has not seen. The same articles are not paid for
     # again every morning.
     NEWS_RETENTION_DAYS: int = int(os.getenv("NEWS_RETENTION_DAYS", "90"))
     # How many of the window's articles a PROMPT actually reads. Sampled
     # spread across the window (services.news_window.select_spread), never
-    # "the newest N" — that is what quietly turned a 30-day window into a
+    # "the newest N", that is what quietly turned a 30-day window into a
     # 3-day one. 0 = every kept article (watch the token bill).
     #   research: per symbol, the trading_agents research report
     #   synthesis: in total across all symbols, the portfolio-level report
@@ -290,7 +290,7 @@ class ModelConfig:
     # No-trade band used to SCORE a HOLD: correct when the target session
     # moved less than the band, i.e. standing aside was right. Without it a
     # HOLD is never right or wrong, so a model can dodge accountability by
-    # holding — 221 stored predictions were unscored for exactly this reason.
+    # holding: 221 stored predictions were unscored for exactly this reason.
     #
     # The band is RELATIVE to each symbol's own typical daily move (its median
     # absolute daily return), times the multiplier below. A fixed band cannot
@@ -310,17 +310,17 @@ class ModelConfig:
     # thinking-budget semantics.
     # 2026-07-26 A/B: Luna matched Sonnet on grounding (0 fabrications),
     # flagged data conflicts explicitly, 2x faster, ~2.8x cheaper at
-    # $1/$6 per M vs $3/$15 — and research is the N-calls-per-run role.
+    # $1/$6 per M vs $3/$15, and research is the N-calls-per-run role.
     TRADING_AGENTS_MODEL: str = "gpt-5.6-luna"
     # Evidence blocks the research prompt and synthesis carry by default
     # (the Run dialog checklist, scheduled runs and the CLI all start from
-    # this list). Adding a key here changes what every default run reads —
+    # this list). Adding a key here changes what every default run reads. 
     # bump PIPELINE_EPOCH alongside.
-    #   options       — point-in-time put/call positioning
-    #   quality       — Bad Apples screen + news red flags
-    #   investigation — situation classifier + web-researched context
+    #   options: point-in-time put/call positioning
+    #   quality: Bad Apples screen + news red flags
+    #   investigation: situation classifier + web-researched context
     #                   (deal terms, regulators, key figures), live runs only
-    #   political     — congressional trades + 13F holder flows (Alpha Vantage)
+    #   political: congressional trades + 13F holder flows (Alpha Vantage)
     DEFAULT_EVIDENCE: tuple[str, ...] = ("options", "quality",
                                          "investigation", "political")
 
@@ -366,7 +366,7 @@ class ModelConfig:
     ENSEMBLE_BUY_THRESHOLD: float = 0.15
     ENSEMBLE_SELL_THRESHOLD: float = -0.15
 
-    # Ensemble defaults (initial UI values — user adjusts from dashboard).
+    # Ensemble defaults (initial UI values. User adjusts from dashboard).
     # These are also what the scheduled pipeline votes with (it passes no
     # ensemble_config), so they must list the full roster: the old 2-model
     # default meant every production ensemble row was a kronos+xgboost vote
@@ -389,10 +389,10 @@ class ModelConfig:
     # How member votes are combined. The scheduled pipeline (which passes no
     # ensemble_config) uses this default, so changing it changes production
     # ensemble rows from that day forward.
-    #   confidence_weighted — weight x member confidence votes on direction
-    #   majority            — weight-only votes; member confidence ignored
-    #   prob_mean           — weighted mean of member up-probabilities
-    #   agreement           — trade only when >= ENSEMBLE_MIN_AGREE members
+    #   confidence_weighted: weight x member confidence votes on direction
+    #   majority: weight-only votes; member confidence ignored
+    #   prob_mean: weighted mean of member up-probabilities
+    #   agreement: trade only when >= ENSEMBLE_MIN_AGREE members
     #                         back one direction and none back the other
     ENSEMBLE_DEFAULT_METHOD: str = "confidence_weighted"
     ENSEMBLE_MIN_AGREE: int = 3
@@ -403,11 +403,11 @@ class ModelConfig:
     ENSEMBLE_TRADING_AGENTS_WEIGHT: float = 0.8
 
     # Research/report model (first-pass per-symbol research). Single source
-    # of truth — the CLI and the UI both resolve None to this, so changing
+    # of truth: the CLI and the UI both resolve None to this, so changing
     # it here changes scheduled runs without touching the job rows.
     REPORT_MODEL: str = os.getenv("REPORT_MODEL", "gpt-5.6-luna")
 
-    # When the news SOURCE fails (not a quiet week — an outage/rate-limit),
+    # When the news SOURCE fails (not a quiet week. An outage/rate-limit),
     # news-dependent models abstain (HOLD, zero confidence) instead of
     # calling direction blind. A blind call scored as a real one poisons
     # calibration and the scoreboard alike.
@@ -418,7 +418,7 @@ class ModelConfig:
     # Recommendations engine (second-pass synthesis model)
     # 2026-07-26 A/B: Sonnet's synthesis was more diagnostic (says which
     # side to trust and why, two-sided levels); this is ONE call per run
-    # so the Luna price advantage is ~3 cents — quality wins here.
+    # so the Luna price advantage is ~3 cents, quality wins here.
     RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "claude-sonnet-5")
     RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "anthropic")
     # Re-asked once on this model when the primary fails after the report
@@ -429,7 +429,7 @@ class ModelConfig:
     # 5000: key_level/change_trigger/watch_items grew the JSON; a truncated
     # payload fails the parser and blanks the whole Luna panel. The synthesis
     # is one call for the WHOLE run, so the ceiling has to cover the widest
-    # watchlist someone runs — ~200 output tokens per symbol, before a
+    # watchlist someone runs, ~200 output tokens per symbol, before a
     # reasoning model spends any of the budget thinking. Env-tunable so a
     # 20-symbol scheduled run doesn't need a code change.
     RECOMMENDATIONS_MAX_TOKENS: int = int(
@@ -445,13 +445,13 @@ MODEL: Final = ModelConfig()
 
 
 # Dollars per MILLION tokens, keyed by model id. Used only to price telemetry
-# rows — token counts themselves come from the provider response and are exact,
+# rows: token counts themselves come from the provider response and are exact,
 # so a wrong rate here misprices a report but never corrupts usage data. The
 # rate applied is copied onto each llm_usage row, so editing this table does
 # not rewrite the cost of calls already made.
 #
 # Seeded from the rates recorded in this repo's own A/B notes (2026-07-26:
-# Luna $1/$6 per M, Sonnet $3/$15 per M — see ModelConfig above). VERIFY
+# Luna $1/$6 per M, Sonnet $3/$15 per M, see ModelConfig above). VERIFY
 # against current provider pricing before treating spend reports as exact.
 LLM_PRICING: Final[dict[str, dict[str, float]]] = {
     # GPT-5.6 tiers after OpenAI's 2026-07-30 cut (Luna -80%): Sol $5/$30,
@@ -474,7 +474,7 @@ def get_llm_rates(model: str | None) -> tuple[float | None, float | None]:
     """(input, output) $/Mtok for a model, or (None, None) when unpriced.
 
     An unknown model records tokens with a NULL cost rather than a guessed
-    one — an unpriced call must be visibly unpriced, not quietly free.
+    one: an unpriced call must be visibly unpriced, not quietly free.
     """
     entry = LLM_PRICING.get((model or "").strip())
     if not entry:
@@ -504,7 +504,7 @@ DB: Final = DatabaseConfig()
 
 
 # =============================================================================
-# OBJECT STORAGE CONFIG (S3-compatible — Railway / MinIO / R2)
+# OBJECT STORAGE CONFIG (S3-compatible. Railway / MinIO / R2)
 # =============================================================================
 
 
@@ -513,8 +513,8 @@ class StorageConfig:
     """S3-compatible object storage settings.
 
     Reads the project's own S3_* names first, then falls back to the standard
-    AWS_* ones. Attaching a bucket on Railway injects the AWS_* set — the
-    names boto3 and every other S3 client already expect — so without this
+    AWS_* ones. Attaching a bucket on Railway injects the AWS_* set, the
+    names boto3 and every other S3 client already expect, so without this
     fallback a correctly provisioned bucket looks entirely absent to the app,
     and report archiving fails silently because uploads are best-effort.
     Falling back beats copying credentials into a second set of variables.
@@ -566,7 +566,7 @@ class StrategyConfig:
     MIN_TRADES_FOR_METRICS: int = 5
 
     # Minimum trades before Sharpe/Sortino are reported at all. A ratio built
-    # from a handful of one-day calls is noise dressed as a number — the old
+    # from a handful of one-day calls is noise dressed as a number, the old
     # n=5 floor produced Sharpe -11.18 on 2 trades. Below this the counting
     # metrics (win rate, return, trade count) still show; the ratios do not.
     MIN_TRADES_FOR_RATIOS: int = 30

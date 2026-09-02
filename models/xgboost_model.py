@@ -110,7 +110,7 @@ class XGBoostModel(BaseModel):
                 sector_etf = f"{sector_etf}->SPY-fallback"
 
         # No lookahead: internally-fetched frames include data past a backtest
-        # cut-off — truncate everything to the as-of date.
+        # cut-off: truncate everything to the as-of date.
         if as_of and sector_df is not None:
             sector_df = sector_df[sector_df.index <= str(as_of)]
 
@@ -164,7 +164,7 @@ class XGBoostModel(BaseModel):
 
         # The cache is only valid for the same training-data window: a model
         # trained on full history must never serve a backtest of an earlier
-        # as-of date (and vice versa) — that would leak future data.
+        # as-of date (and vice versa). That would leak future data.
         data_end = str(ticker_df.index[-1].date()) if len(ticker_df) else ""
         # The training NEWS window is an input too. Price data ending on the
         # same day says nothing about how much news backed each training row,
@@ -248,7 +248,7 @@ class XGBoostModel(BaseModel):
         skipped = 0
 
         # Volatility-scaled ambiguity: a fixed percent threshold makes a
-        # 70%-vol name and a utility the same class problem — noise days on
+        # 70%-vol name and a utility the same class problem, noise days on
         # the volatile name pass as signal, real moves on the quiet name get
         # skipped. Scale the band by each day's own ATR so "ambiguous" means
         # the same thing everywhere: a move small relative to typical range.

@@ -4,7 +4,7 @@ Revision ID: 013
 Revises: 012
 Create Date: 2026-09-02
 
-Point-in-time news used to be cached per (symbol, as_of, window) — a daily
+Point-in-time news used to be cached per (symbol, as_of, window), a daily
 14-day run refetched the same articles every morning. historical_news now
 holds every article the vendor returned (with its full timestamp, so the
 overnight window can be served from it too) and news_coverage records which

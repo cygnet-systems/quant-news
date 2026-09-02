@@ -7,12 +7,12 @@ tests pin the conditions under which stored predictions may be reused.
 
 Each case here corresponds to a way the cache was, or could have been, wrong:
 
-* pipeline_epoch — a data-quality fix upstream of the models changes what they
+* pipeline_epoch: a data-quality fix upstream of the models changes what they
   are fed while nothing else in the key moves (the sector-lookup race, 2026-08-05)
-* previous_close — the vendor revises the cutoff bar after the run
-* research model — the caller asks for a different report model
-* news_count — the vendor indexes late articles for the same window
-* recommendation_synthesis — Luna's own verdict is stored as a prediction and
+* previous_close: the vendor revises the cutoff bar after the run
+* research model: the caller asks for a different report model
+* news_count: the vendor indexes late articles for the same window
+* recommendation_synthesis: Luna's own verdict is stored as a prediction and
   must never be handed back as independent model evidence
 """
 

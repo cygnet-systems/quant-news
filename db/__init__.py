@@ -1,4 +1,4 @@
-"""Database package — SQLAlchemy models, session factory, and Alembic migrations."""
+"""Database package: SQLAlchemy models, session factory, and Alembic migrations."""
 
 from db.models import (
     Base,

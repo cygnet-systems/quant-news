@@ -1,7 +1,7 @@
 """Base model classes and shared prediction infrastructure.
 
 All prediction models inherit from BaseModel and return PredictionResult.
-All P&L computation uses compute_pnl() — the single canonical function.
+All P&L computation uses compute_pnl(). The single canonical function.
 """
 
 from abc import ABC, abstractmethod
@@ -28,7 +28,7 @@ class PredictionResult:
 
     Attributes:
         model_name: Identifier for the model that produced this prediction.
-        decision: Trading decision — "BUY", "SELL", or "HOLD".
+        decision: Trading decision, "BUY", "SELL", or "HOLD".
         confidence: Model confidence in [0, 1]. Interpretation varies by model:
             - XGBoost: class probability (trained probabilistic output)
             - Kronos: Monte Carlo sample proportion

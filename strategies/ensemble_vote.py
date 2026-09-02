@@ -1,4 +1,4 @@
-"""Ensemble vote strategy — majority-weighted vote across models.
+"""Ensemble vote strategy, majority-weighted vote across models.
 
 Requires context: all model predictions for the same (symbol, target_date).
 Uses configurable weights from config.MODEL.ENSEMBLE_*_WEIGHT.

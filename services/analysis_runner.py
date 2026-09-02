@@ -1,4 +1,4 @@
-"""Headless Full Analysis — the dashboard's pipeline without a browser.
+"""Headless Full Analysis, the dashboard's pipeline without a browser.
 
 The Full Analysis button fans out across four Dash callbacks
 (``generate_model_signals`` → ``persist_predictions`` → ``generate_ai_analysis``
@@ -7,7 +7,7 @@ sequence with no renderer attached, so the stages live here and app.py keeps
 only the wiring. Anything that reads a UI control takes a keyword argument
 whose default is what the Full Analysis modal ships with.
 
-Ownership: nothing signs in, so every row lands anonymous — ``owner_uid`` NULL
+Ownership: nothing signs in, so every row lands anonymous, ``owner_uid`` NULL
 and ``is_public`` true, i.e. the public user, visible to everyone.
 
 Lookahead rules are the ones the callbacks enforce and are not relaxed here:
@@ -41,41 +41,41 @@ ALL_MODELS: tuple[str, ...] = (
 )
 
 # Stamped onto every prediction and required to match before one is reused.
-# Bump this whenever a change alters what the models are FED — a data-quality
+# Bump this whenever a change alters what the models are FED, a data-quality
 # fix, a new feature block, a different news window. Version numbers already
 # cover code changes inside a model; this covers everything upstream of them,
 # which is exactly what a stored prediction cannot tell you about itself.
 #
-# 2026-08-05.1 — sector-lookup race fixed. Predictions written before this
+# 2026-08-05.1: sector-lookup race fixed. Predictions written before this
 # may hold sector features that are a duplicate of SPY.
-# 2026-08-08.1 — research prompts now carry options positioning (put/call)
+# 2026-08-08.1: research prompts now carry options positioning (put/call)
 # and the Bad Apples quality screen; earlier research predictions were made
 # without them.
-# 2026-08-08.2 — quality screen adds the PIT news red-flag scan (leadership/
+# 2026-08-08.2: quality screen adds the PIT news red-flag scan (leadership/
 # layoffs/legal/guidance/short-seller/dilution) as an 18th check.
-# 2026-08-08.3 — quality screen grows to 20 checks (short interest, analyst
+# 2026-08-08.3: quality screen grows to 20 checks (short interest, analyst
 # revision momentum); evidence-set selection stamped per prediction.
-# 2026-08-11.1 — feature set v5 (news_present, atr_percentile,
+# 2026-08-11.1: feature set v5 (news_present, atr_percentile,
 # dist_52wk_high_pct; ATR-scaled training labels); ensemble votes run through
 # calibrated confidence + rolling-performance decay; synthesis emits scored
 # p_correct instead of conviction labels; peer blocks add relative valuation;
 # options positioning carries day-over-day flow; SPY regime stamped on every
 # prediction; report figures audited against their prompt.
-# 2026-08-11.2 — research prompts gain SEC filings (8-K events + Form 4
+# 2026-08-11.2: research prompts gain SEC filings (8-K events + Form 4
 # insider transactions) and finviz market-context blocks, from the
 # Terminal's nightly collectors (point-in-time by filing/snapshot stamps).
-# 2026-08-23.1 — research prompts gain the measured-accuracy block and the
+# 2026-08-23.1: research prompts gain the measured-accuracy block and the
 # prior-stance continuity block, news items carry their source, and the report
 # sections are reordered to lead with the symbol's own evidence. A prediction
 # written before this was made from materially different inputs.
-# 2026-09-02.1 — research prompts open with a situation & investigation block
+# 2026-09-02.1: research prompts open with a situation & investigation block
 # (web-researched on live runs: deal terms, regulators, key figures), gain
 # political/institutional flows and by-expiry put/call, lead with a Situation
 # section, and carry an evidence ledger; the default news window is 14 days.
 # Reports written before this were blind to the situation a symbol was in.
 PIPELINE_EPOCH = "2026-09-02.1"
 
-# Conviction labels map to nominal confidences for display only — backtests
+# Conviction labels map to nominal confidences for display only, backtests
 # showed they carry no calibration signal, so the label stays in details.
 _CONVICTION_CONF = {"HIGH": 0.8, "MEDIUM": 0.6, "LOW": 0.4}
 _STANCE = {"BUY": "BULLISH", "SELL": "BEARISH", "HOLD": "NEUTRAL"}
@@ -121,7 +121,7 @@ def merge_research_into_analysis(
             "provenance": det.get("provenance") or {},
             "model": det.get("model", ""),
             # The situation the report was written under and what it was
-            # written without — the synthesis reads both.
+            # written without: the synthesis reads both.
             "investigation": det.get("investigation") or {},
             "evidence": det.get("evidence") or {},
         }
@@ -148,7 +148,7 @@ def merge_research_into_analysis(
 
 def _positioning_delta(sym: str, as_of: str, today: dict) -> dict | None:
     """Day-over-day put/call OI shift from the warmer's previous-session
-    snapshot. None when yesterday wasn't warmed — the delta earns its place
+    snapshot. None when yesterday wasn't warmed. The delta earns its place
     once the system runs daily, and is honestly absent until then."""
     try:
         from services import terminal_cache
@@ -190,7 +190,7 @@ def attach_positioning_quality(
     ``ai_analysis["by_symbol"]`` so the synthesis prompt, the on-screen
     report, the PDF and the markdown export all read one payload.
 
-    Idempotent — symbols that already carry both keys (a cached report from a
+    Idempotent: symbols that already carry both keys (a cached report from a
     run that had them) are skipped; both services cache per (symbol, as_of),
     so a re-attach after a cache restore costs one fetch per missing symbol.
     """
@@ -210,12 +210,12 @@ def attach_positioning_quality(
                 and "positioning_delta" not in entry:
             # Flow over time, not just a snapshot: compare against the
             # previous session's WARMED summary only (cache read, no
-            # network) — a live re-fetch labeled "yesterday" would be
+            # network): a live re-fetch labeled "yesterday" would be
             # current-chain data wearing a costume.
             entry["positioning_delta"] = _positioning_delta(
                 sym, as_of, entry["positioning"])
         # Recompute when absent OR when the stored dict predates the news
-        # red-flag scan — a cached report must not freeze an older screen.
+        # red-flag scan, a cached report must not freeze an older screen.
         stale_quality = (isinstance(entry.get("quality"), dict)
                          and "red_flags" not in entry["quality"])
         if "quality" in evidence and ("quality" not in entry or stale_quality):
@@ -261,7 +261,7 @@ def attach_positioning_quality(
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — market data
+# Stage 1: market data
 # ---------------------------------------------------------------------------
 
 def load_market_data(
@@ -319,7 +319,7 @@ def load_market_data(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — model predictions
+# Stage 2: model predictions
 # ---------------------------------------------------------------------------
 
 def run_predictions(
@@ -346,14 +346,14 @@ def run_predictions(
     through ``ensemble_config``/``run_ensemble``).
 
     A symbol already analysed for this cutoff, against the same closing bar,
-    is reused rather than re-run — the research call is an LLM round trip per
+    is reused rather than re-run. The research call is an LLM round trip per
     symbol, so repeating a run that nothing has changed under is pure spend.
     ``force`` re-runs regardless.
 
     ``evidence`` selects the optional Terminal-derived context blocks
     ("options", "quality") from the Run-Analysis modal; None means both.
     ``tools`` is the dialog's Tools section ("web_research" lets the
-    investigation search the open web); None means none — the backend
+    investigation search the open web); None means none, the backend
     never switches a tool on by itself.
     """
     from services import progress_service as prog
@@ -402,11 +402,11 @@ def run_predictions(
     if needs_historical:
         try:
             from services.news_service import fetch_historical_av_news
-            # This is the run's longest silent phase on a cold cache — say so
+            # This is the run's longest silent phase on a cold cache, say so
             # before it starts instead of letting the feed go dark.
             prog.emit("news", f"Fetching historical news for training (up to "
                               f"{len(symbols)} symbols × "
-                              f"{MODEL.NEWS_LOOKBACK_MONTHS} months — can take "
+                              f"{MODEL.NEWS_LOOKBACK_MONTHS} months: can take "
                               f"minutes on first run)…")
             historical_global_news = fetch_historical_av_news(
                 "", months=MODEL.NEWS_LOOKBACK_MONTHS, as_of=str(cutoff_date))
@@ -452,7 +452,7 @@ def run_predictions(
             skipped[symbol] = "empty price frame"
             continue
 
-        # The target session's own bar must never be visible — live, that bar
+        # The target session's own bar must never be visible, live, that bar
         # is today's partial intraday print.
         if "Date" in df.columns:
             df = df[df["Date"] <= str(cutoff_date)]
@@ -534,7 +534,7 @@ def run_predictions(
         # whether they are still valid rather than assuming they are.
 
         # A news-dependent model that could not read the news must not call a
-        # direction — the call would be scored as if informed, poisoning both
+        # direction: the call would be scored as if informed, poisoning both
         # the scoreboard and calibration. Quiet weeks ("empty") do not
         # abstain; only source failure does.
         from config import MODEL as _MODEL
@@ -545,7 +545,7 @@ def run_predictions(
                 if (isinstance(entry, dict) and not entry.get("error")
                         and entry.get("decision") != "HOLD"):
                     prog.emit("models",
-                              f"{symbol}: {news_model} abstained — news "
+                              f"{symbol}: {news_model} abstained: news "
                               f"source unavailable, blind {entry['decision']} "
                               f"withheld")
                     entry.update(decision="HOLD", confidence=0.0,
@@ -576,7 +576,7 @@ def run_predictions(
                      if isinstance(r, dict) and not r.get("error")}
         prog.emit("models", f"{symbol}: " + ", ".join(
             f"{m}={d}" for m, d in decisions.items()))
-        # One summary line per symbol when anything failed — the decisions
+        # One summary line per symbol when anything failed, the decisions
         # line above only lists the survivors. Abstentions (a deliberate
         # no-call) are not failures.
         failed = {
@@ -587,7 +587,7 @@ def run_predictions(
         if failed:
             ran = len(results[symbol]) - len(failed)
             prog.emit("error",
-                      f"{symbol}: {ran} of {len(results[symbol])} models ran — "
+                      f"{symbol}: {ran} of {len(results[symbol])} models ran: "
                       + ", ".join(f"{m} failed ({err[:60]})"
                                   for m, err in failed.items()))
 
@@ -619,15 +619,15 @@ def _reusable_predictions(
 
     A cache that returns a *nearly* right answer is worse than no cache: the
     predictions are the product, and a stale one is indistinguishable from a
-    fresh one once stored. So reuse is deliberately conservative — every one
+    fresh one once stored. So reuse is deliberately conservative, every one
     of these must hold, and anything unrecognised re-runs:
 
     * every selected model (plus the ensemble) already has a row for this cutoff
-    * the close those rows were made against still equals the close we hold —
+    * the close those rows were made against still equals the close we hold.
       a vendor revision to the cutoff bar invalidates them
     * the research row came from the SAME model that was asked for, so
       switching ``--report-model`` cannot serve the other model's verdict
-    * the news window has not grown since — the vendor indexes late articles
+    * the news window has not grown since. The vendor indexes late articles
       for a session, and a verdict written on 30 articles is not the verdict
       the same prompt gives on 50
     * the pipeline epoch matches; bumping ``PIPELINE_EPOCH`` after a change to
@@ -655,31 +655,31 @@ def _reusable_predictions(
         if prev is None or abs(float(prev) - current_close) > 0.005:
             logger.info(
                 f"{symbol}: stored predictions were made against close "
-                f"{prev} but the cutoff bar now reads {current_close:.2f} — re-running"
+                f"{prev} but the cutoff bar now reads {current_close:.2f}: re-running"
             )
             return None
         if (entry.get("details") or {}).get("pipeline_epoch") != PIPELINE_EPOCH:
             logger.info(f"{symbol}: {name} predates pipeline epoch "
-                        f"{PIPELINE_EPOCH} — re-running")
+                        f"{PIPELINE_EPOCH}: re-running")
             return None
 
     research = (stored.get("trading_agents") or {}).get("details") or {}
     if research_model and research.get("model") not in (None, "", research_model):
         logger.info(f"{symbol}: stored research came from "
-                    f"{research.get('model')}, asked for {research_model} — re-running")
+                    f"{research.get('model')}, asked for {research_model}: re-running")
         return None
 
-    # The evidence set is part of what the research model was FED — a report
+    # The evidence set is part of what the research model was FED, a report
     # written with the quality screen must not be served to a run that
     # excluded it (and vice versa).
     if evidence is not None and "trading_agents" in stored:
         # Rows from this epoch but before the stamp existed were always fed
-        # both blocks — that's what the default was.
+        # both blocks: that's what the default was.
         stored_evidence = research.get("evidence") or ["options", "quality"]
         if sorted(stored_evidence) != sorted(evidence):
             logger.info(f"{symbol}: stored research evidence "
                         f"{stored_evidence} != requested {sorted(evidence)} "
-                        f"— re-running")
+                        f": re-running")
             return None
     # Same for the tools: a report investigated with web access is not the
     # report a run without it would have produced (and vice versa).
@@ -687,20 +687,20 @@ def _reusable_predictions(
         stored_tools = research.get("tools") or []
         if sorted(stored_tools) != sorted(tools):
             logger.info(f"{symbol}: stored research tools {stored_tools} != "
-                        f"requested {sorted(tools)} — re-running")
+                        f"requested {sorted(tools)}: re-running")
             return None
 
     # A blind prediction must not be cached indefinitely: if the source was
     # down when it was made, re-running is exactly what we want next time.
     if research.get("news_status") == "unavailable":
         logger.info(f"{symbol}: stored prediction was made without news "
-                    f"(source unavailable) — re-running")
+                    f"(source unavailable): re-running")
         return None
 
     stored_news = research.get("news_count")
     if stored_news is not None and int(stored_news) != int(news_count):
         logger.info(f"{symbol}: news window changed ({stored_news} → "
-                    f"{news_count} articles) — re-running")
+                    f"{news_count} articles): re-running")
         return None
     # Same count is not the same window: 7 days at 08:00 and overnight at
     # 09:00 can both hold six articles. Rows from before these stamps
@@ -709,11 +709,11 @@ def _reusable_predictions(
                         ("include_thesis", include_thesis)):
         if "trading_agents" in stored and research.get(key) != wanted:
             logger.info(f"{symbol}: stored research {key}="
-                        f"{research.get(key)!r}, asked for {wanted!r} — re-running")
+                        f"{research.get(key)!r}, asked for {wanted!r}: re-running")
             return None
 
     # Only the models this run asked for. The stored set for a date also holds
-    # `recommendation_synthesis` — the synthesis step's OWN output, persisted as a
+    # `recommendation_synthesis`: the synthesis step's OWN output, persisted as a
     # prediction so it gets scored. Handing that back as a model signal would
     # feed the synthesis step its own previous verdict as independent evidence.
     wanted = selected | {"ensemble"}
@@ -724,7 +724,7 @@ def _reusable_predictions(
 def persist_predictions(signals: dict) -> tuple[int, int]:
     """Write predictions (and research reports) to Postgres.
 
-    Returns ``(stored, evaluated)`` — backtest runs are scored immediately,
+    Returns ``(stored, evaluated)``, backtest runs are scored immediately,
     exactly as ``persist_predictions`` does in the app.
     """
     from services import progress_service as prog
@@ -773,7 +773,7 @@ def persist_predictions(signals: dict) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 — AI report
+# Stage 3: AI report
 # ---------------------------------------------------------------------------
 
 def portfolio_metrics_block(symbols: list[str], stock_data: dict, as_of: str) -> str:
@@ -781,7 +781,7 @@ def portfolio_metrics_block(symbols: list[str], stock_data: dict, as_of: str) ->
 
     Live quote fields are withheld from this flow (they would expose the
     session being predicted), which left the portfolio call with no numbers at
-    all — it saw an empty financial block and reported a broken data feed.
+    all: it saw an empty financial block and reported a broken data feed.
     These metrics come from OHLCV truncated to the cutoff, so they are both
     real and lookahead-safe.
     """
@@ -821,7 +821,7 @@ def build_ai_report(
 ) -> dict:
     """Portfolio-level AI analysis for the run.
 
-    The Full Analysis flow skips the shallow per-symbol pass — each symbol's
+    The Full Analysis flow skips the shallow per-symbol pass, each symbol's
     text analysis IS its research report, which arrives on the trading_agents
     signal and is merged in later. Only the portfolio-wide call runs here.
     Identity (name/sector/industry) comes from the live profile; every NUMBER
@@ -841,7 +841,7 @@ def build_ai_report(
         "by_symbol": {},
         "as_of": as_of,
         "generated_at": datetime.now().isoformat(),
-        # What this report was built from — the input-data export and the
+        # What this report was built from. The input-data export and the
         # renderers read it back instead of assuming a window.
         "news_window": {"lookback_days": lookback_days, "overnight": overnight,
                         "max_articles": int(max_articles)},
@@ -882,7 +882,7 @@ def build_ai_report(
         }
         cached = ps.get_cached_report(None, as_of, "ai_report", cache_hash)
         if cached:
-            prog.emit("ai", "AI report cache hit — regeneration skipped",
+            prog.emit("ai", "AI report cache hit, regeneration skipped",
                       payload={**cache_payload, "outcome": "hit"})
             restored = json.loads(cached)
             restored["from_cache"] = True
@@ -892,7 +892,7 @@ def build_ai_report(
         # A miss on inputs that look unchanged is a diagnosable event now:
         # the payload records the hash and what fed it, so a cross-restart
         # miss can be compared against the hit that should have happened.
-        prog.emit("ai", "AI report cache miss — generating fresh",
+        prog.emit("ai", "AI report cache miss, generating fresh",
                   payload={**cache_payload, "outcome": "miss"})
     except Exception as e:
         logger.debug(f"AI report cache check failed: {e}")
@@ -910,7 +910,7 @@ def build_ai_report(
                     as_of_date=as_of,
                     extra_blocks={"metrics": metrics_block} if metrics_block else None,
                     # Depth used to key the cache here and never reach the
-                    # call — "Deep" was a cache miss with a Standard report.
+                    # call, "Deep" was a cache miss with a Standard report.
                     include_thesis=include_thesis,
                     model=report_model,
                     provider=provider,
@@ -961,7 +961,7 @@ def _report_key_summary(news_by_symbol: dict, symbols: list[str],
                         cache_key: dict) -> dict:
     """A compact fingerprint of what fed the report cache hash.
 
-    Instrumentation only — the hash itself is untouched. The news window is
+    Instrumentation only: the hash itself is untouched. The news window is
     the volatile input (a late-indexed article shifts the hash), so the
     per-symbol counts and the newest article timestamp are what make a
     cross-restart miss diagnosable.
@@ -985,7 +985,7 @@ def _report_key_summary(news_by_symbol: dict, symbols: list[str],
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 — recommendation synthesis
+# Stage 4: recommendation synthesis
 # ---------------------------------------------------------------------------
 
 RECOMMENDATION_KEY_VOLATILE = frozenset(
@@ -1025,7 +1025,7 @@ def run_recommendations(
         # Hash the EVIDENCE, not the envelope. `generated_at` (and the
         # `from_cache` marker a cached report carries) change on every run,
         # so including them made the key unique every time and the cache
-        # could never hit — the most expensive call in the run repeated on
+        # could never hit, the most expensive call in the run repeated on
         # identical inputs.
         # Envelope only. recs_model / recs_request are INPUTS: excluding
         # them served one synthesis model's answer to a run that asked for
@@ -1051,13 +1051,13 @@ def run_recommendations(
         }
         cached = ps.get_cached_recommendation(trade_date, rec_data_hash)
         if cached:
-            # Identical evidence in, identical synthesis out — re-asking is
+            # Identical evidence in, identical synthesis out, re-asking is
             # the single most expensive call in the run.
-            prog.emit("luna", "Recommendation cache hit — synthesis skipped",
+            prog.emit("luna", "Recommendation cache hit, synthesis skipped",
                       payload={**rec_cache_payload, "outcome": "hit"})
             cached["from_cache"] = True
             return cached
-        prog.emit("luna", "Recommendation cache miss — synthesizing fresh",
+        prog.emit("luna", "Recommendation cache miss, synthesizing fresh",
                   payload={**rec_cache_payload, "outcome": "miss"})
     except Exception as e:
         logger.debug(f"Recommendation cache check failed: {e}")
@@ -1074,7 +1074,7 @@ def run_recommendations(
         )
     synthesis_ms = int((time.time() - synthesis_started) * 1000)
     if not result:
-        prog.emit("error", "Synthesis model returned empty response — "
+        prog.emit("error", "Synthesis model returned empty response, "
                            "synthesis failed")
         return None
 
@@ -1090,10 +1090,10 @@ def run_recommendations(
         if action not in ("BUY", "SELL", "HOLD"):
             logger.warning(
                 f"{sym}: synthesis action {rec.get('action')!r} is not "
-                f"BUY/SELL/HOLD — dropping this symbol's recommendation")
+                f"BUY/SELL/HOLD, dropping this symbol's recommendation")
             continue
         # p_correct (scored probability) replaced the HIGH/MEDIUM/LOW
-        # conviction labels — measured over 4 weeks, the labels carried no
+        # conviction labels: measured over 4 weeks, the labels carried no
         # calibration signal (HIGH hit 60%, MEDIUM 64%). A probability can be
         # scored against outcomes and calibrated; a mood cannot. The label
         # path stays as fallback for a model that ignores the new schema.
@@ -1102,7 +1102,7 @@ def run_recommendations(
             p_correct = float(p_correct) if p_correct is not None else None
             if p_correct is not None and not 0.4 <= p_correct <= 0.95:
                 logger.warning(f"{sym}: synthesis p_correct {p_correct} out of "
-                               f"range — clamping")
+                               f"range: clamping")
                 p_correct = min(0.95, max(0.4, p_correct))
         except (TypeError, ValueError):
             p_correct = None
@@ -1110,7 +1110,7 @@ def run_recommendations(
             conviction = str(rec.get("conviction", "")).upper()
             if conviction not in _CONVICTION_CONF:
                 logger.warning(f"{sym}: synthesis gave neither p_correct nor a "
-                               f"known conviction ({conviction!r}) — treating "
+                               f"known conviction ({conviction!r}): treating "
                                f"as LOW")
             p_correct = _CONVICTION_CONF.get(conviction, _CONVICTION_CONF["LOW"])
         try:
@@ -1137,7 +1137,7 @@ def run_recommendations(
 
     if rec_data_hash:
         try:
-            # The model that actually answered, not the one configured — a
+            # The model that actually answered, not the one configured, a
             # fallback run used to be indistinguishable from a primary one.
             ps.store_recommendation(
                 trade_date=trade_date,
@@ -1153,7 +1153,7 @@ def run_recommendations(
             logger.warning(f"Failed to persist recommendation: {e}")
 
     actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
-    prog.emit("luna", "Synthesis finished — " + (", ".join(
+    prog.emit("luna", "Synthesis finished, " + (", ".join(
         f"{s}={a}" for s, a in actions.items()) or "done"))
     return result
 
@@ -1184,8 +1184,8 @@ def run_full_analysis(
     next unresolved session); data is cut off at the previous trading day.
     ``news_filter`` selects the news window formula ("lookback" | "overnight",
     default from config). ``lookback_days`` and ``max_articles`` (newest N per
-    symbol, 0 = all) are REQUIRED — they come from the job's params or the
-    CLI, never from a default here. Returns a summary dict — the durable
+    symbol, 0 = all) are REQUIRED. They come from the job's params or the
+    CLI, never from a default here. Returns a summary dict, the durable
     output is in Postgres.
     """
     if lookback_days is None or max_articles is None:
@@ -1206,13 +1206,13 @@ def run_full_analysis(
     as_of = cutoff_date.isoformat()
     started = datetime.now()
 
-    prog.start_run(f"Full Analysis (scheduled) — {len(symbols)} symbols, "
+    prog.start_run(f"Full Analysis (scheduled), {len(symbols)} symbols, "
                    f"target {target_date} (data through {as_of})")
 
     stock_data = load_market_data(symbols, period=period, force_refresh=force_refresh)
     priced = [s for s in symbols if s in stock_data]
     if not priced:
-        prog.finish_run("Full Analysis aborted — no price data")
+        prog.finish_run("Full Analysis aborted, no price data")
         return {"error": "no price data", "symbols": symbols}
 
     max_articles = normalize_article_cap(max_articles)
@@ -1306,7 +1306,7 @@ def run_full_analysis(
 
     # Synthesis rows are written AFTER persist_predictions' auto-evaluate, so
     # on a backtest they used to stay "pending" until the next scheduled
-    # evaluation — every other model's row scored, the synthesis row didn't
+    # evaluation: every other model's row scored, the synthesis row didn't
     # (bitten twice: the stuck 08-06 PANW row, then all 5 in the random-5
     # QA run). Idempotent, so re-evaluating here is cheap.
     if recommendations:
@@ -1319,7 +1319,7 @@ def run_full_analysis(
             logger.warning(f"post-synthesis evaluation failed: {e}")
 
     # The archived JSON is the only durable copy of the portfolio-level report
-    # — predictions and recommendations have their own tables, this does not.
+    #: predictions and recommendations have their own tables, this does not.
     # It used to fail silently at INFO, so an object-storage outage cost every
     # report with nothing to show it had happened.
     archived = False
@@ -1340,7 +1340,7 @@ def run_full_analysis(
         archived = True
     except Exception as e:
         archive_error = str(e)
-        logger.error(f"AI report NOT archived — it is unrecoverable once this "
+        logger.error(f"AI report NOT archived, it is unrecoverable once this "
                      f"process exits: {e}")
         prog.emit("error", f"AI report not archived: {str(e)[:120]}")
 
@@ -1361,8 +1361,8 @@ def run_full_analysis(
             f"{s} ({why})" for s, why in meta["skipped_symbols"].items()))
 
     if degraded:
-        prog.emit("error", "Full Analysis incomplete — " + "; ".join(degraded))
-        prog.finish_run("Full Analysis PARTIAL — " + "; ".join(degraded))
+        prog.emit("error", "Full Analysis incomplete, " + "; ".join(degraded))
+        prog.finish_run("Full Analysis PARTIAL, " + "; ".join(degraded))
     else:
         prog.finish_run("Full Analysis complete (scheduled)")
 
@@ -1393,7 +1393,7 @@ def _assess_completeness(
 ) -> tuple[dict, list[str]]:
     """How much of the run actually landed, and what is missing.
 
-    A run that ships four of six models and no synthesis is not a success —
+    A run that ships four of six models and no synthesis is not a success.
     it is a partial result that happens to have exited zero. Every model
     failure here is caught per model by design (one broken model must not
     lose the other five), so without an explicit completeness check the only
@@ -1401,7 +1401,7 @@ def _assess_completeness(
     how two dead models and a truncated synthesis ran unnoticed for a full
     cycle in production.
 
-    Returns ``(coverage, degraded)`` — symbols scored per model, and a list
+    Returns ``(coverage, degraded)``, symbols scored per model, and a list
     of human-readable reasons, empty when the run is whole.
     """
     expected = set(models or ALL_MODELS) | {"ensemble"}
@@ -1416,7 +1416,7 @@ def _assess_completeness(
             elif (result.get("details") or {}).get("abstained"):
                 # A model declining for lack of input (DeBERTa on a
                 # quiet-news symbol) is a covered symbol with no opinion,
-                # not a hole in the run — counting it as incomplete made
+                # not a hole in the run. Counting it as incomplete made
                 # every thin-news day mail a partial.
                 coverage[name] += 1
                 abstained.append(f"{name}:{symbol}")
@@ -1434,7 +1434,7 @@ def _assess_completeness(
         logger.info("abstentions (no-input, not failures): "
                     + ", ".join(sorted(abstained)))
     # Reports that exist but were written without evidence the run was
-    # configured to gather. Not a crash — but not a whole run either.
+    # configured to gather. Not a crash, but not a whole run either.
     from services.evidence_contract import gaps_from_details
     gap_notes = []
     for symbol in symbols:

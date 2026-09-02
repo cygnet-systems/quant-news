@@ -52,7 +52,7 @@ def _report_param_selects(prefix: str) -> dict:
     """Parameter controls for the Run dialog (prefix "run").
 
     The news window and article cap govern EVERY consumer of the run's news
-    — the sentiment and research models as well as the report — which is
+: the sentiment and research models as well as the report, which is
     why they render in their own always-visible section, not under Report.
     """
     from config import MODEL
@@ -243,7 +243,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
         env = env_for[provider]
         if not _key(env):
             warnings.append(
-                f"{env} is not set — {', '.join(sorted(set(uses)))} will fail.")
+                f"{env} is not set. {', '.join(sorted(set(uses)))} will fail.")
 
     news_needed = does_report or (does_models
                                   and any(m in _NEWS_MODELS for m in models))
@@ -252,7 +252,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
         which = ["the report's news window"] if does_report else []
         which += [display.get(m, m) for m in models if m in _NEWS_MODELS]
         warnings.append(
-            "ALPHA_VANTAGE_API_KEY is not set — no articles will be fetched, so "
+            "ALPHA_VANTAGE_API_KEY is not set. No articles will be fetched, so "
             + ", ".join(which) + " will run on empty news.")
 
     if n == 0:
@@ -262,7 +262,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
         estimate = html.Div(
             [
                 html.I(className="bi bi-clock me-1"),
-                html.Span("No symbols selected — nothing will run. Add at "
+                html.Span("No symbols selected. Nothing will run. Add at "
                           "least one above for a duration estimate."),
             ],
             className="run-preflight-estimate",
@@ -273,7 +273,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
             [
                 html.I(className="bi bi-clock me-1"),
                 html.Span(f"Estimated {_fmt_duration(seconds)} for {n} symbol"
-                          f"{'' if n == 1 else 's'} — approximate, and slower "
+                          f"{'' if n == 1 else 's'}: approximate, and slower "
                           f"when a provider is rate-limiting."),
             ],
             className="run-preflight-estimate",
@@ -290,7 +290,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
     ]
 
 # (value, label, what-it-does hint). The hints are honest about what the
-# platform's own evals found — the selector is only useful if it tells you
+# platform's own evals found, the selector is only useful if it tells you
 # when each method actually differs.
 ENSEMBLE_METHODS = [
     ("confidence_weighted", "Confidence-weighted vote",
@@ -298,7 +298,7 @@ ENSEMBLE_METHODS = [
      "found member confidence carries little calibration signal, so this "
      "mostly tracks the majority vote."),
     ("majority", "Weighted majority vote",
-     "One model, one vote, scaled by its weight. Confidence ignored — the "
+     "One model, one vote, scaled by its weight. Confidence ignored: the "
      "transparent baseline."),
     ("prob_mean", "Mean up-probability",
      "Weighted mean of the members' up-probabilities, thresholded. The "
@@ -308,7 +308,7 @@ ENSEMBLE_METHODS = [
      "BUY/SELL only when at least N members back one direction and none "
      "back the other; otherwise HOLD. Weights ignored. Trades far less, but "
      "replaying it over stored history did NOT show the surviving trades "
-     "being better — at the default gate of 3 it traded 40 times and hit "
+     "being better: at the default gate of 3 it traded 40 times and hit "
      "42.5%. Raise the gate only if you want fewer positions, not because "
      "it is known to be more accurate."),
 ]
@@ -316,7 +316,7 @@ ENSEMBLE_METHODS = [
 # One scenario, run through every method, so the choice can be made by seeing
 # the answers diverge rather than by reading four descriptions. These four
 # members are deliberately split: two BUY, one SELL, one HOLD. The numbers are
-# not illustrative-but-approximate — tests/test_ensemble_methods.py replays
+# not illustrative-but-approximate, tests/test_ensemble_methods.py replays
 # this exact scenario through EnsembleModel and fails if any documented figure
 # drifts from what the combiner really produces.
 ENSEMBLE_EXAMPLE_MEMBERS = [
@@ -329,7 +329,7 @@ ENSEMBLE_EXAMPLE_MEMBERS = [
 
 # Direction is all that changes between methods. Confidence and up-probability
 # always come from the weighted mean member probability, which is why the
-# example resolves to the same 56% either way — worth seeing, because it means
+# example resolves to the same 56% either way. Worth seeing, because it means
 # switching method changes WHAT you trade, never how sure the ensemble claims
 # to be.
 ENSEMBLE_EXAMPLE_PROB = 0.56
@@ -394,7 +394,7 @@ ENSEMBLE_METHOD_DETAIL = {
         ],
         "verdict": "HOLD",
         "why": "One dissenter is enough to veto, regardless of its weight. "
-               "This trades far less often by design — run "
+               "This trades far less often by design. Run "
                "scripts/replay_ensemble_methods.py to see how that has "
                "actually scored on your own history before relying on it.",
     },
@@ -497,7 +497,7 @@ def ensemble_method_detail(method: str, min_agree: int = 3) -> html.Div:
 def create_model_info_modal() -> dbc.Modal:
     """Explainer modal opened by the ⓘ icons in the Run dialog's model list.
 
-    Body is filled by the open callback from layouts.model_info — for
+    Body is filled by the open callback from layouts.model_info: for
     TradingAgents it includes the live prompt preview reflecting the
     Evidence-blocks checklist at the moment it was opened.
     """
@@ -715,7 +715,7 @@ def create_run_modal() -> dbc.Modal:
                             autoComplete="off",
                         ),
                         html.Div(
-                            "Applies to this run only — the watchlist is "
+                            "Applies to this run only. The watchlist is "
                             "not changed.",
                             className="run-field-hint",
                         ),
@@ -853,7 +853,7 @@ def create_run_modal() -> dbc.Modal:
                         dbc.Checklist(
                             id="run-tools",
                             options=[
-                                {"label": "Web research — the situation "
+                                {"label": "Web research. The situation "
                                           "investigation searches the open "
                                           "web with citations (on for "
                                           "next-day runs, off for backtests)",
@@ -884,7 +884,7 @@ def create_run_modal() -> dbc.Modal:
                 ),
             ]),
             dbc.ModalFooter([
-                # Inline validation (e.g. an empty symbol set) — me-auto keeps
+                # Inline validation (e.g. an empty symbol set), me-auto keeps
                 # it left of the buttons in the footer's flex row.
                 html.Div(id="run-validation-msg",
                          className="run-validation-msg text-danger me-auto"),

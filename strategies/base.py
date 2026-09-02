@@ -1,7 +1,7 @@
 """Strategy base classes for prediction evaluation.
 
 Defines the plugin contract: subclass BaseStrategy, implement evaluate(),
-drop the file in strategies/ — auto-discovered by StrategyRegistry.
+drop the file in strategies/. Auto-discovered by StrategyRegistry.
 """
 
 from abc import ABC, abstractmethod
@@ -14,7 +14,7 @@ class StrategySignal:
     """Output from a strategy for a single prediction evaluation.
 
     Attributes:
-        action: Trading action — "BUY", "SELL", "HOLD", or "SKIP".
+        action: Trading action, "BUY", "SELL", "HOLD", or "SKIP".
         position_size: Notional position size in dollars.
         metadata: Strategy-specific context (thresholds, votes, etc.).
     """
@@ -34,7 +34,7 @@ class BaseStrategy(ABC):
         4. The strategy is auto-discovered on next app/CLI start
 
     Set requires_context = True if the strategy needs all model predictions
-    for the same (symbol, target_date) — used by ensemble strategies.
+    for the same (symbol, target_date). Used by ensemble strategies.
     """
 
     requires_context: bool = False
@@ -59,7 +59,7 @@ class BaseStrategy(ABC):
 
         Args:
             prediction: Row from model_predictions (actual_close filled).
-            context: For ensemble strategies — all predictions for the
+            context: For ensemble strategies, all predictions for the
                      same (symbol, target_date). None for single-model strategies.
 
         Returns:

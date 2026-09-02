@@ -2,7 +2,7 @@
 """Scheduled Full Analysis / evaluation for the quant-news dashboard.
 
 Runs the same pipeline as the dashboard's Full Analysis button with no
-browser attached, writing as the public user (anonymous — owner_uid NULL,
+browser attached, writing as the public user (anonymous, owner_uid NULL,
 is_public true), so everything shows up in History, the Scoreboard and the
 Activity Log exactly like a UI run.
 
@@ -92,7 +92,7 @@ def main() -> int:
     parser.add_argument("--tools", default="",
                         help="Comma-separated run tools, e.g. web_research "
                              "(lets the investigation search the open web). "
-                             "Default: none — the scheduled job's form and the "
+                             "Default: none: the scheduled job's form and the "
                              "Run dialog switch this on for next-day runs")
     parser.add_argument("--force", action="store_true",
                         help="Re-run symbols even when an identical analysis "
@@ -116,11 +116,11 @@ def main() -> int:
         today = datetime.now().date()
         # Says so in the summary as well as in prose: the caller mails on what
         # it can parse, and an unparseable no-op reads as a run that produced
-        # nothing — which is the same shape as a real failure.
+        # nothing: which is the same shape as a real failure.
         if args.json:
             print(json.dumps({"no_session": True, "date": today.isoformat()}))
         else:
-            print(f"{today} is not an NYSE session — nothing to do.")
+            print(f"{today} is not an NYSE session, nothing to do.")
         return 0
 
     if args.command == "evaluate":
@@ -135,7 +135,7 @@ def main() -> int:
                    f"unscored; {backlog.get('unscorable', 0)} can never score "
                    f"(no usable previous close)")
         # A clean run leaves no mature prediction unscored. A remaining
-        # backlog is the "evaluated: 0 looked normal" failure shape — exit 2
+        # backlog is the "evaluated: 0 looked normal" failure shape, exit 2
         # so the scheduler records it as partial and mails accordingly.
         return 2 if backlog["pending_mature"] else 0
 
@@ -145,7 +145,7 @@ def main() -> int:
                           top_frac=args.top_frac)
         print(json.dumps(results, indent=None if args.json else 2,
                          default=str))
-        # Exit 0 either way — "no edge found" is a successful experiment.
+        # Exit 0 either way, "no edge found" is a successful experiment.
         return 0
 
     if args.command == "replay":
@@ -172,7 +172,7 @@ def main() -> int:
     if args.command == "notify-test":
         from services import notify_service
 
-        # Names only — never echo the values. This is meant to be run in a
+        # Names only: never echo the values. This is meant to be run in a
         # deployment console, where the output is not necessarily private.
         present = [k for k in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID",
                                "AZURE_CLIENT_SECRET", "NOTIFY_FROM_EMAIL",
@@ -184,8 +184,8 @@ def main() -> int:
         print(f"Missing: {', '.join(missing) or 'none'}")
         # The sender and recipients are not secrets and are the two values
         # most likely to be wrong, so show them.
-        print(f"From:    {os.environ.get('NOTIFY_FROM_EMAIL', '—')}")
-        print(f"To:      {os.environ.get('NOTIFY_TO_EMAIL', '—')}")
+        print(f"From:    {os.environ.get('NOTIFY_FROM_EMAIL', ', ')}")
+        print(f"To:      {os.environ.get('NOTIFY_TO_EMAIL', ', ')}")
         if missing:
             print("\nNotifications are OFF until every variable is set.")
             return 1
@@ -194,7 +194,7 @@ def main() -> int:
         # The failure reason is logged by the sender, which knows the status
         # code and can name the specific fix; repeating a guess here would
         # only compete with it.
-        print("\nSent." if ok else "\nSend FAILED — see the logged reason above.")
+        print("\nSent." if ok else "\nSend FAILED, see the logged reason above.")
         return 0 if ok else 1
 
     if args.command == "cost":
@@ -222,7 +222,7 @@ def main() -> int:
         print(f"\nTotal: ${total:.4f} over {args.days} days "
               f"(rates last verified {LLM_PRICING_VERIFIED_ON})")
         if unpriced:
-            print(f"WARNING: {unpriced} call(s) had no price for their model — "
+            print(f"WARNING: {unpriced} call(s) had no price for their model, "
                   f"tokens counted, cost excluded. Add them to LLM_PRICING.")
         return 0
 
@@ -250,7 +250,7 @@ def main() -> int:
         if summary.get("error"):
             print(f"Failed: {summary['error']}")
         else:
-            print(f"Target {summary['target_date']} (data through {summary['as_of']}) — "
+            print(f"Target {summary['target_date']} (data through {summary['as_of']}): "
                   f"{summary['predictions_stored']} predictions stored in "
                   f"{summary['duration_s']}s")
             if summary.get("skipped"):
@@ -261,7 +261,7 @@ def main() -> int:
                 print(f"  PARTIAL: {reason}")
 
     # Three outcomes, not two. A run that stored predictions but lost whole
-    # models, or produced no synthesis, is neither a success nor a failure —
+    # models, or produced no synthesis, is neither a success nor a failure. 
     # collapsing it into either one is what hid a two-model outage for a full
     # cycle. 2 is the caller's cue to record it as partial.
     if summary.get("error") or not summary.get("predictions_stored"):

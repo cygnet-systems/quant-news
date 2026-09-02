@@ -2,7 +2,7 @@
 
 Groundwork for per-user data isolation behind Cygnet SSO. Everything existing
 and everything written anonymously stays public (is_public defaults TRUE,
-owner_uid NULL) — behavior is unchanged until a signed-in user creates
+owner_uid NULL), behavior is unchanged until a signed-in user creates
 private content.
 
 The auth `users`/`sessions` tables are NOT managed here: they mirror

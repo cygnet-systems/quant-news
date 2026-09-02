@@ -2,7 +2,7 @@
 
 Written for equity researchers who don't know the models: what each one is,
 what it reads, why it's on the panel, and what our own backtests say about
-trusting it. The honesty is deliberate — measured limitations from this
+trusting it. The honesty is deliberate, measured limitations from this
 platform's benchmarks are part of the explanation, not a footnote.
 """
 
@@ -12,14 +12,14 @@ from dash import dcc, html
 # model_id -> (title, what it is, what it reads, why it's useful, caveats)
 MODEL_EXPLAINERS = {
     "kronos_mini": {
-        "title": "Kronos — price-path forecaster",
+        "title": "Kronos: price-path forecaster",
         "what": (
             "A small time-series foundation model (transformer) that reads "
             "the last ~90 daily OHLCV bars and Monte-Carlo samples possible "
             "next-day price paths. The BUY/SELL/HOLD call is the direction "
             "most sampled paths agree on."
         ),
-        "reads": "Price history only — no news, no fundamentals.",
+        "reads": "Price history only, no news, no fundamentals.",
         "why": (
             "The one voice on the panel that is pure price action. When "
             "Kronos disagrees with the news-driven models, that split is "
@@ -27,7 +27,7 @@ MODEL_EXPLAINERS = {
         ),
         "caveats": (
             "Our 200-day, 5-symbol backtest measured ~49% directional "
-            "accuracy on active calls — statistically a coin flip. It "
+            "accuracy on active calls, statistically a coin flip. It "
             "carries a structural SELL tilt that flatters it in down or "
             "flat tapes. Its self-reported confidence is the worst "
             "calibrated of the panel. Treat it as a tape-reading opinion, "
@@ -35,7 +35,7 @@ MODEL_EXPLAINERS = {
         ),
     },
     "xgboost_shap": {
-        "title": "XGBoost SHAP — engineered-feature classifier",
+        "title": "XGBoost SHAP: engineered-feature classifier",
         "what": (
             "Gradient-boosted decision trees retrained from scratch for "
             "each symbol on every run, using only data available up to the "
@@ -52,12 +52,12 @@ MODEL_EXPLAINERS = {
         "caveats": (
             "Behaves like a momentum-long strategy: it is right on "
             "uptrending names and wrong on downtrends. Measured 52% "
-            "accuracy at scale — inside the noise band of 50%. Its edge, "
+            "accuracy at scale, inside the noise band of 50%. Its edge, "
             "if any, is thinner than realistic transaction costs."
         ),
     },
     "lightgbm": {
-        "title": "LightGBM — second opinion on the same features",
+        "title": "LightGBM: second opinion on the same features",
         "what": (
             "A different gradient-boosting algorithm (leaf-wise growth) "
             "trained on the identical 18 features as XGBoost. Same inputs, "
@@ -72,18 +72,18 @@ MODEL_EXPLAINERS = {
         ),
         "caveats": (
             "Shares XGBoost's momentum-long bias and its coin-flip-at-scale "
-            "track record — two agreeing weak learners are not one strong "
+            "track record: two agreeing weak learners are not one strong "
             "one."
         ),
     },
     "deberta_sentiment": {
-        "title": "DeBERTa — news-sentiment reader",
+        "title": "DeBERTa: news-sentiment reader",
         "what": (
             "A transformer NLP model that scores each article in the "
             "point-in-time news window (relevance-filtered) and votes "
             "BUY/SELL/HOLD from the aggregate sentiment balance."
         ),
-        "reads": "News headlines and summaries only — no price data at all.",
+        "reads": "News headlines and summaries only, no price data at all.",
         "why": (
             "Quantifies the news narrative without technical bias. Useful "
             "as a cross-check: bullish tape + bearish news flow is a "
@@ -91,13 +91,13 @@ MODEL_EXPLAINERS = {
         ),
         "caveats": (
             "Blind to valuation and price. Abstains when the window is "
-            "empty, and a throttled news source can silently starve it — "
+            "empty, and a throttled news source can silently starve it. "
             "check the news-status note on the run. Sentiment is measured "
             "coin-flip as a 1-day direction signal here, like the others."
         ),
     },
     "trading_agents": {
-        "title": "TradingAgents — LLM research analyst",
+        "title": "TradingAgents: LLM research analyst",
         "what": (
             "A large language model given a strict research procedure and "
             "ONLY validated, lookahead-safe data blocks (computed by our "
@@ -109,7 +109,7 @@ MODEL_EXPLAINERS = {
         "reads": (
             "Validated metric blocks: price action, technicals, "
             "fundamentals (as-of filtered), point-in-time news, event "
-            "calendar, peer relative strength, SPY regime — plus the "
+            "calendar, peer relative strength, SPY regime, plus the "
             "optional evidence blocks selected below (options positioning, "
             "quality screen). The exact prompt is shown under 'View "
             "research prompt'."
@@ -119,18 +119,18 @@ MODEL_EXPLAINERS = {
             "(a regulatory probe, a guidance cut) against the numbers and "
             "explain its reasoning in prose a researcher can audit line "
             "by line. Every figure it cites must come from a supplied "
-            "block — fabrication is checkable."
+            "block: fabrication is checkable."
         ),
         "caveats": (
             "Its stated confidence carries no calibration signal (we "
             "measured it), so scoring uses its realized hit-rate instead. "
             "Report-layer backtests showed ~60% on small active-call "
-            "samples with a SELL tilt that fit the regime — not proven "
+            "samples with a SELL tilt that fit the regime, not proven "
             "alpha. Read it for the reasoning, not the verdict alone."
         ),
     },
     "ensemble": {
-        "title": "Ensemble — weighted vote",
+        "title": "Ensemble: weighted vote",
         "what": (
             "A configurable weighted majority vote across the enabled "
             "member models, with an optional minimum-agreement gate."
@@ -143,7 +143,7 @@ MODEL_EXPLAINERS = {
         "caveats": (
             "Measured on our production data: 52.3% hit rate, "
             "anti-calibrated, and days when all members AGREED were "
-            "slightly WORSE than average — the members are correlated "
+            "slightly WORSE than average, the members are correlated "
             "momentum voters, so consensus mostly means 'the trend is "
             "obvious', not 'the call is safe'."
         ),
@@ -152,21 +152,21 @@ MODEL_EXPLAINERS = {
 
 _EVIDENCE_BLOCK_ROWS = [
     ("metrics", "Validated metrics", True,
-     "ATR, support/resistance, reward:risk, volume vs average, drawdown — "
+     "ATR, support/resistance, reward:risk, volume vs average, drawdown. "
      "computed from OHLCV truncated to the as-of date."),
     ("events", "Event calendar", True,
      "Upcoming earnings/ex-dividend dates; gates the hold window."),
     ("peers", "Peer relative strength", True,
-     "1-month and 1-week returns vs named peers and the sector ETF — "
+     "1-month and 1-week returns vs named peers and the sector ETF. "
      "separates company-specific moves from sector-wide repricing."),
     ("spy", "SPY regime", True,
      "Bull/bear/mixed by 50- and 200-day SMA rule, computed, not eyeballed."),
     ("options", "Options positioning (put/call)", None,
      "Put/call volume and open-interest ratios from the point-in-time "
-     "chain. Presented as positioning context — hedging vs speculation — "
+     "chain. Presented as positioning context, hedging vs speculation, "
      "never as a standalone timing signal (our 1-day test showed only a "
      "weak, non-significant directional lean)."),
-    ("quality", "Quality screen — Bad Apples + news red flags", None,
+    ("quality", "Quality screen: Bad Apples + news red flags", None,
      "20 pass/fail checks (performance vs benchmark, fundamentals, "
      "valuation, short interest, analyst-revision momentum, insider "
      "selling) plus a news scan for leadership departures, layoffs, "
@@ -179,7 +179,7 @@ _EVIDENCE_BLOCK_ROWS = [
      "change, distress, momentum only) and then researches it on the open "
      "web with citations: deal terms and spread, regulators and milestones, "
      "the key figures and their track records and affiliations. Live runs "
-     "only — on a backtest the classifier runs without web access, because "
+     "only: on a backtest the classifier runs without web access, because "
      "web results cannot be bounded to a past as-of date."),
     ("political", "Political & institutional flows (Alpha Vantage)", None,
      "Congressional trades disclosed under the STOCK Act (filed on or "
@@ -221,7 +221,7 @@ def build_model_info_body(model_id: str, evidence: list | None = None,
                                              "fontWeight": "700"}),
                 html.Strong(label + ": "),
                 html.Span(desc + ("" if included else
-                                  " — excluded by the Evidence checkboxes.")),
+                                  ": excluded by the Evidence checkboxes.")),
             ],
             style={} if included else {"opacity": 0.6},
         ))
@@ -232,11 +232,11 @@ def build_model_info_body(model_id: str, evidence: list | None = None,
                       style={"color": ("var(--positive)" if web_on
                                        else "var(--text-muted)"),
                              "fontWeight": "700"}),
-            html.Strong("Tool — web research: "),
+            html.Strong("Web research tool: "),
             html.Span("the investigation searches the open web with "
                       "citations (on by default for next-day runs)"
                       if web_on else
-                      "off — the investigation classifies from the supplied "
+                      "off: the investigation classifies from the supplied "
                       "evidence only (the default for backtest dates, where "
                       "the open web would leak the future)."),
         ],

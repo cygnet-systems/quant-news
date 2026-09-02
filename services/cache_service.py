@@ -3,7 +3,7 @@
 Provides a caching layer using PostgreSQL via SQLAlchemy to minimize API calls
 and enable fast local data access with SQL query capabilities.
 
-Migrated from DuckDB — same public API, Postgres backend.
+Migrated from DuckDB, same public API, Postgres backend.
 """
 
 import hashlib
@@ -49,7 +49,7 @@ def _usable_price(v) -> bool:
     true for it). One pre-market vendor fetch on 2026-08-18 wrote NaN closes
     into stock_prices, which store_prediction copied into previous_close for
     an entire day's predictions and the evaluator then crashed serializing
-    NaN into JSONB — killing the whole run's transaction.
+    NaN into JSONB, killing the whole run's transaction.
     """
     return v is not None and not isinstance(v, str) \
         and math.isfinite(v) and v > 0
@@ -142,7 +142,7 @@ def _visible(model_cls):
 
 
 def _current_run_id():
-    """The pipeline run this write belongs to ("adhoc" outside a run —
+    """The pipeline run this write belongs to ("adhoc" outside a run.
     same grouping the activity log and llm_usage use)."""
     try:
         from services import progress_service as prog
@@ -171,7 +171,7 @@ class CacheService:
             "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 7300,
         }
         if period not in period_map:
-            logger.warning(f"unknown price period {period!r} — treating as 1y")
+            logger.warning(f"unknown price period {period!r}: treating as 1y")
         return period_map.get(period, 365)
 
     def is_cached(self, symbol: str, data_type: str = "prices") -> bool:
@@ -315,7 +315,7 @@ class CacheService:
 
             # Coverage at BOTH ends. The old check only tested the oldest
             # bar, so a cache whose newest bar was a week old was served as
-            # fresh (from_cache=True, no api_error) — every metric block and
+            # fresh (from_cache=True, no api_error). Every metric block and
             # feature vector then ran on stale prices. 4 calendar days
             # allows a long weekend.
             reaches_present = (
@@ -348,7 +348,7 @@ class CacheService:
                         metadata["cache_time"] = cache_info.get("last_updated") if cache_info else None
                         return df, metadata
             elif oldest and not reaches_present:
-                logger.info(f"{symbol}: cached prices end {newest} — refetching")
+                logger.info(f"{symbol}: cached prices end {newest}: refetching")
 
         from services.stock_data import fetch_stock_data
         try:
@@ -437,8 +437,8 @@ class CacheService:
 
         with get_session() as session:
             # Replace only the dates this fetch actually covers. Deleting the
-            # whole symbol first meant any short fetch — the evaluator's 3mo
-            # backfill, or a truncated yfinance response — destroyed the full
+            # whole symbol first meant any short fetch, the evaluator's 3mo
+            # backfill, or a truncated yfinance response, destroyed the full
             # stored history and silently replaced it with the shorter frame.
             new_dates = [d for d in cache_df["date"].tolist() if d is not None]
             session.execute(delete(StockPrice).where(
@@ -466,7 +466,7 @@ class CacheService:
                     CacheMetadata.data_type == "prices",
                 )
             ).scalar_one_or_none()
-            # Count what the table actually holds — the merge above means the
+            # Count what the table actually holds. The merge above means the
             # stored history can be longer than this fetch.
             total_rows = session.execute(
                 select(func.count()).select_from(StockPrice)
@@ -684,7 +684,7 @@ class CacheService:
             # partial pre-market bar can sit at the top with a NaN close, and
             # storing that as previous_close makes the row unscorable (and
             # once crashed the evaluator wholesale). Scan a few and take the
-            # first real one; NULL when none is — the evaluator skips NULLs.
+            # first real one; NULL when none is, the evaluator skips NULLs.
             recent_closes = session.execute(
                 select(StockPrice.close)
                 .where(StockPrice.symbol == symbol, StockPrice.date <= str(pred_date))
@@ -697,7 +697,7 @@ class CacheService:
             # Re-storing an existing id keeps its owner and visibility. The
             # merge used to take them from the CURRENT writer, so a private
             # job re-running a symbol hid a public UI prediction (and vice
-            # versa) — the row changed hands as a side effect of a rerun.
+            # versa): the row changed hands as a side effect of a rerun.
             existing = session.get(ModelPrediction, pred_id)
             owner_uid = existing.owner_uid if existing else _current_uid()
             is_public = (bool(existing.is_public) if existing
@@ -725,7 +725,7 @@ class CacheService:
                 ensemble_method=details.get("method"),
                 input_data_hash=data_hash,
                 # The run that produced this row, and how long the model took
-                # — what lets the Trace page join a run to its predictions.
+                #: what lets the Trace page join a run to its predictions.
                 run_id=_current_run_id(),
                 duration_ms=result.get("duration_ms"),
                 created_at=datetime.now(timezone.utc),
@@ -759,7 +759,7 @@ class CacheService:
         """Stored predictions for a symbol, keyed by model name.
 
         ``prediction_date`` defaults to today; pass the run's data cutoff to
-        ask "has this exact analysis already been done?" — which is what lets
+        ask "has this exact analysis already been done?": which is what lets
         a repeated run reuse work instead of re-paying for it.
         """
         from db.models import ModelPrediction
@@ -782,7 +782,7 @@ class CacheService:
                     "predicted_close": r.predicted_close,
                     "details": r.details_json or {},
                     "model_version": r.model_version,
-                    # The bar this call was made against — a reuse check needs
+                    # The bar this call was made against. A reuse check needs
                     # it to tell "already done" from "done on stale data".
                     "previous_close": r.previous_close,
                     "error": None,
@@ -902,12 +902,12 @@ class CacheService:
             if skipped_no_prev:
                 logger.warning(
                     f"Evaluation skipped {skipped_no_prev} prediction(s) with "
-                    f"no usable previous_close — these can never score")
+                    f"no usable previous_close, these can never score")
 
         return evaluated
 
     def evaluation_backlog(self) -> dict:
-        """Mature predictions still unevaluated — the number that should be
+        """Mature predictions still unevaluated, the number that should be
         zero after a healthy evaluation run, and the alarm when it isn't."""
         import pytz
 
@@ -958,7 +958,7 @@ class CacheService:
         everywhere. Falls back to the fixed band when history is too short.
 
         ``before_date`` bounds the history to bars strictly before the
-        prediction's target session — the band a HOLD is judged against must
+        prediction's target session, the band a HOLD is judged against must
         not be derived from prices that hadn't printed yet.
         """
         from db.models import StockPrice
@@ -1001,8 +1001,8 @@ class CacheService:
         """Score HOLD rows that were resolved before HOLDs were scorable.
 
         `evaluate_predictions` only considers rows with `actual_close IS NULL`,
-        so rows already resolved under the old rule — where a HOLD got
-        `was_correct = None` — are permanently invisible to it. Any future
+        so rows already resolved under the old rule. Where a HOLD got
+        `was_correct = None`, are permanently invisible to it. Any future
         change to how a decision is scored needs a pass like this one, or the
         history keeps whatever verdict the rule at the time produced.
 
@@ -1134,7 +1134,7 @@ class CacheService:
         * ``created_at < generated_before`` is the self-exclusion guard, and it
           is what makes a same-cutoff re-run work. Every report this app writes
           carries trade_date = the run's DATA CUTOFF, and the run dialog caps
-          the target at the next session — so re-running a name today produces
+          the target at the next session, so re-running a name today produces
           a report with the identical trade_date as this morning's. A strict
           ``<`` on trade_date silently hid the predecessor in exactly the case
           a reader is checking continuity. Ordering by (trade_date, created_at)
@@ -1173,7 +1173,7 @@ class CacheService:
     def latest_reports_by_symbol(self, symbols: list[str] | None = None) -> dict[str, dict]:
         """Newest research report per symbol, without the report body.
 
-        One DISTINCT ON query instead of a query per symbol — the Home page
+        One DISTINCT ON query instead of a query per symbol, the Home page
         needs "does this name have a report, and what did it say" for every
         row, and report_text would drag megabytes through the session for a
         headline that only needs the verdict fields.
@@ -1232,7 +1232,7 @@ class CacheService:
         `total`/`correct`/`accuracy` cover ACTIVE (BUY/SELL) calls only, so the
         headline number keeps meaning "directional hit rate" now that HOLDs are
         also scored. HOLD accountability is reported alongside as hold_*, and
-        `all_*` covers both — mixing them into one rate would compare a
+        `all_*` covers both, mixing them into one rate would compare a
         directional call against a no-trade-band call.
         """
         from db.models import ModelPrediction
@@ -1423,7 +1423,7 @@ class CacheService:
         from db.models import StrategyMetrics
         metrics_id = f"{strategy_name}_{symbol or 'all'}_{period}"
         # Non-finite floats (inf Sharpe on a zero-variance series) serialize
-        # to the invalid JSON token "Infinity" and fail the whole insert —
+        # to the invalid JSON token "Infinity" and fail the whole insert. 
         # sanitize at the persistence boundary regardless of caller hygiene.
         metrics = _sanitize_json(metrics)
         with get_session() as session:
@@ -1747,7 +1747,7 @@ class CacheService:
         model: str | None = None,
         outcome: str | None = None,
     ) -> list[dict]:
-        """Every visible prediction matching the History filters — no row cap.
+        """Every visible prediction matching the History filters, no row cap.
 
         Filters run in SQL (on target_date, the session predicted) so the
         page sees the whole matching set and paginates it, instead of the

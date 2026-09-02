@@ -1,7 +1,7 @@
 """The defaults every entry point shares: one news window, one evidence
 list, and an options block that names the by-expiry skew.
 
-The news window default (14 days) lives in the FRONTEND only — the Run
+The news window default (14 days) lives in the FRONTEND only, the Run
 dialog select, the job form and the seeded daily job all seed from
 config.NEWS_LOOKBACK_DAYS. No code path may fall back to it: a run whose
 window did not arrive raises RunParameterMissing (2026-09-02, owner's

@@ -99,7 +99,7 @@ def invalidate_memo() -> None:
 
 # Luna's per-symbol verdict is persisted as a prediction row and scored like a
 # model. It IS counted in the scorecards and the P&L series: although it reads
-# the other models' output, it makes its own call over reports + signals — a
+# the other models' output, it makes its own call over reports + signals, a
 # distinct prediction, exactly like the ensemble row, which was always counted.
 # The name is still special-cased where the LAYOUT differs: the Home cohort
 # board gives it its own slot instead of a column in the models grid.
@@ -150,11 +150,11 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
 
     Beyond the raw aggregates, each group carries the three honesty stats the
     profit question actually turns on:
-      * hit_se — binomial standard error of the hit rate; a 60% on 11 trades
+      * hit_se: binomial standard error of the hit rate; a 60% on 11 trades
         is a coin flip wearing a costume, and the SE is what says so.
-      * net_pnl — pnl minus a per-trade friction haircut (see _cost_bps),
+      * net_pnl: pnl minus a per-trade friction haircut (see _cost_bps),
         because gross P&L on small caps flatters every edge.
-      * concentration — the largest single symbol's share of gross |P&L|;
+      * concentration: the largest single symbol's share of gross |P&L|;
         an "edge" that is one ticker is a position, not a strategy.
     """
     groups: dict[str, dict] = {}
@@ -174,7 +174,7 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
                 g["trades"] += 1
                 g["trade_hits"] += 1 if p["was_correct"] else 0
             else:
-                # A scored HOLD still took no position — count it as held so
+                # A scored HOLD still took no position. Count it as held so
                 # the "N held" chip survives the HOLD-scoring rule change.
                 g["holds"] += 1
         elif state == "held" and not is_trade:

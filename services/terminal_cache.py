@@ -2,19 +2,19 @@
 
 The Terminal's cache warmer (scripts/warm_options_cache.py, nightly post-close)
 pre-computes per-symbol put/call summaries (`md_putcall`), ATM option snapshots
-(`md_atm_opt`) and `.info` blobs (`md_info`) into a shared L2 — Redis when
+(`md_atm_opt`) and `.info` blobs (`md_info`) into a shared L2. Redis when
 REDIS_URL is set there, else its Postgres `data_cache_entries` table. This
 module reads those entries so quant-news reuses the precomputed data instead
 of re-fetching from Alpha Vantage / yfinance.
 
-Contract (mirrors the Terminal's data_cache.py — do not drift):
+Contract (mirrors the Terminal's data_cache.py: do not drift):
   key   = sha256(json.dumps({"ns": namespace, **kwargs}, sort_keys=True,
                             default=str))
   redis = JSON envelope {"ts": epoch, "ns": ..., "p": payload_json_string}
   pg    = data_cache_entries(cache_key, namespace, ts, payload)
 
 Entries are keyed by market session ("YYYY-MM-DD" of the last finalized
-session), so no TTL check is needed here — a row either matches the session
+session), so no TTL check is needed here. A row either matches the session
 asked for or the key misses. Strictly read-only; never raises: any backend
 problem degrades to None and the caller's own fetch path.
 """

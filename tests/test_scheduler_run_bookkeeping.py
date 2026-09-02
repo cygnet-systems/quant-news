@@ -3,7 +3,7 @@
 The 2026-08-11 outage lived in one transaction: run_job finalizes the JobRun
 row and stamps last_success_date in the same session, and the stamp read
 job["timezone"] from a dict that never carried that key. The KeyError rolled
-back the WHOLE finalize — the row stayed "running" forever, the day stayed
+back the WHOLE finalize, the row stayed "running" forever, the day stayed
 unstamped, the watchdog mailed "overdue" about a job that had succeeded, and
 catch-up re-ran the full analysis every half hour all day (28 phantom rows,
 each dying the same way).
@@ -12,7 +12,7 @@ These tests pin the two guarantees that prevent a repeat:
 
 * the job dict run_job builds carries the timezone, and the stamp lands in
   the JOB's timezone (the original point of the change that broke this)
-* a garbage timezone value degrades to a fallback date — it must never take
+* a garbage timezone value degrades to a fallback date. It must never take
   the row bookkeeping down with it
 """
 
@@ -125,7 +125,7 @@ def test_bad_timezone_cannot_orphan_the_run_row(db, quiet_run):
     assert result["status"] == "success"
     (run,) = _run_rows(db)
     assert run.status == "success", (
-        "a timezone problem rolled back the run finalize — this is the "
+        "a timezone problem rolled back the run finalize. This is the "
         "2026-08-11 phantom-'running' bug again")
     assert run.finished_at is not None
     with db.get_session() as session:

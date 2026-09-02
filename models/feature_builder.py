@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # "topics" -- every av_*/global_* feature trained as constant 0.0 on cache
 # hits. Both spellings now read; all news-trained models must be refit.
 # v5 (2026-08-11): +news_present (blind-vs-quiet disambiguation),
-# +atr_percentile, +dist_52wk_high_pct (regime features — R2000 test showed
+# +atr_percentile, +dist_52wk_high_pct (regime features. R2000 test showed
 # failures cluster in high-vol names and the model could not see volatility
 # regime at all). 18 -> 21 features; cached models retrain on version bump.
 FEATURE_VERSION: int = 5
@@ -159,7 +159,7 @@ class LiveFeatureBuilder:
 
         # Regime / evidence features (v3 additions).
         # news_present separates "quiet week" (topic features 0.0 WITH
-        # articles seen) from "blind" (topic features 0.0 with NO articles) —
+        # articles seen) from "blind" (topic features 0.0 with NO articles), 
         # without it those opposite situations are the same input.
         features["news_present"] = 1.0 if av_news else 0.0
         features.update(self._regime_features(ticker_df))
@@ -183,10 +183,10 @@ class LiveFeatureBuilder:
     def _regime_features(self, df: pd.DataFrame) -> dict[str, float]:
         """Volatility-regime and trend-position features (v3).
 
-        atr_percentile: today's ATR within its own trailing year — whipsaw
+        atr_percentile: today's ATR within its own trailing year, whipsaw
         risk is the documented failure mode, and absolute ATR is not
         comparable across names the way its own percentile is.
-        dist_52wk_high_pct: percent below the trailing-252-session high —
+        dist_52wk_high_pct: percent below the trailing-252-session high.
         separates "extended near highs" from "washed out", which momentum
         features alone conflate.
         """

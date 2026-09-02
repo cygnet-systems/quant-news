@@ -112,7 +112,7 @@ def create_period_selector(selected: str = "1y") -> dbc.ButtonGroup:
         Button group for period selection.
     """
     # Organized short -> long in three clusters: days, trading weeks, then
-    # calendar months/years. Sub-6mo values are DISPLAY windows — the data
+    # calendar months/years. Sub-6mo values are DISPLAY windows, the data
     # layer keeps a 6-month daily floor underneath (see app._PERIOD_CONFIG),
     # and 1D/3D/1W render intraday bars on the price chart.
     periods = [
@@ -173,7 +173,7 @@ def create_indicator_toggles() -> html.Div:
 def create_data_actions(include_refresh: bool = True) -> html.Div:
     """Page-local data actions (refresh, export, view).
 
-    Rendered on the pages whose data they act on — Analyze (all three) and
+    Rendered on the pages whose data they act on. Analyze (all three) and
     Performance (export/view only). The ids are fixed and shared across the
     two pages; only one page is mounted at a time, so this is the same
     single-mount pattern as reports-new-btn. Their callbacks take these as
@@ -225,7 +225,7 @@ def create_recommendation_banner(
     Returns:
         Styled recommendation banner component.
     """
-    # Handle loading state — point at the toolbar's run dialog
+    # Handle loading state, point at the toolbar's run dialog
     if recommendation == "LOADING":
         return html.Div(
             [

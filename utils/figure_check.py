@@ -1,13 +1,13 @@
 """Post-hoc numeric validation of LLM report text against its source data.
 
 The report contract says every figure must come from the provided data blocks
-("flagged 'not in data' where missing") — but a prompt rule is a request, not
+("flagged 'not in data' where missing"), but a prompt rule is a request, not
 a check. This is the check: extract the numbers the report actually cites and
 verify each one appears somewhere in the data the model was shown.
 
-Matching is deliberately tolerant — a report legitimately rounds 94.196 to
+Matching is deliberately tolerant, a report legitimately rounds 94.196 to
 94.20 or "$94", is REQUIRED by the prompt to round price levels to a tick, and
-may drop a minus sign or a percent marker — so a figure counts as grounded
+may drop a minus sign or a percent marker, so a figure counts as grounded
 when the source contains any number of the same magnitude within that
 rounding. What this catches is not sloppy rounding but invention: prices,
 percentages, and ratios that appear in no input at all.
@@ -29,7 +29,7 @@ _FIGURE_RE = re.compile(
 
 _SOURCE_NUM_RE = re.compile(r"-?[0-9][\d,]*\.?\d*")
 
-# Integers below this are ignored as figures — they are almost always
+# Integers below this are ignored as figures. They are almost always
 # structure (step 3, top 5, 50-day) rather than data claims.
 _MIN_BARE_INT = 100
 
@@ -82,13 +82,13 @@ def check_figures(
 
     Returns the count of figures checked and the distinct figures with no
     source match. Derived arithmetic the model performs (differences, ratios
-    of two grounded numbers) will show as unmatched — treat the result as a
+    of two grounded numbers) will show as unmatched. Treat the result as a
     review signal, not a hard failure: a HIGH unmatched ratio means the
     report is inventing, a few unmatched entries usually mean arithmetic.
 
     Comparison is on MAGNITUDE. A source "MACD: -0.040" and a report writing
     "0.040" are the same reading, and this check exists to catch numbers that
-    came from nowhere, not sign or percent-formatting differences — matching
+    came from nowhere, not sign or percent-formatting differences, matching
     signed made a grounded figure look invented.
 
     ``ignore_values`` drops figures the report legitimately generates rather

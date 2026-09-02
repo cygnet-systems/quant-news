@@ -181,11 +181,11 @@ def test_block_carries_deal_terms_spread_figures_and_sources():
                         sources=[{"url": "u", "title": "t"}], searches=4,
                         spread_pct=32.1)
     block = format_investigation_block(inv, 52.99)
-    assert block.startswith("[BHF — situation & investigation as of 2026-09-01 (web research")
+    assert block.startswith("[BHF: situation & investigation as of 2026-09-01 (web research")
     assert "Deal: Aquarian Capital, $70.00 per share cash, announced 2025-11-06" in block
     assert "$52.99 vs $70.00 = +32.1%" in block
-    assert "Delaware Department of Insurance — Form A review opened (2026-08-17)" in block
-    assert "Rudy Sahay — Aquarian founder" in block
+    assert "Delaware Department of Insurance: Form A review opened (2026-08-17)" in block
+    assert "Rudy Sahay: Aquarian founder" in block
     assert "(src: WSJ | 2026-08-16 | https://wsj.com/x)" in block
     assert "Open questions: Does Aquarian's financing" in block
     assert "4 web searches, 1 sources consulted" in block
@@ -210,7 +210,7 @@ def test_research_model_records_gap_when_investigation_fails():
     with patch("services.investigation_service.investigate", side_effect=boom), \
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df), \
-         patch("services.stock_data.get_company_profile", return_value="BHF — insurer"):
+         patch("services.stock_data.get_company_profile", return_value="BHF: insurer"):
         blocks, inv = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger,
             tools=["web_research"])

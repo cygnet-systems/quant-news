@@ -29,7 +29,7 @@ def _get_client():
             aws_secret_access_key=STORAGE.SECRET_KEY,
             region_name=STORAGE.REGION,
             # Bounded, always: an object-store stall without timeouts blocks
-            # the archive step — and with it the whole run — indefinitely
+            # the archive step, and with it the whole run, indefinitely
             # (prime suspect in the 2026-09-01 54-minute tail hang). Better
             # to fail the archive, mark the run partial, and keep the data
             # that is already in Postgres.

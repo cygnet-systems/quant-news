@@ -1,18 +1,18 @@
 """Read-only bridge to the Terminal's historical tables.
 
 The CygnetResearchTerminal cron collects, nightly, into its Postgres:
-  * finviz_snapshots   — whole-market screener rows (JSONB payload per name)
-  * edgar_events       — every 8-K and Form 4 filing (SEC daily index)
-  * edgar_form4_tx     — parsed insider transactions with direction/size
+  * finviz_snapshots: whole-market screener rows (JSONB payload per name)
+  * edgar_events: every 8-K and Form 4 filing (SEC daily index)
+  * edgar_form4_tx, parsed insider transactions with direction/size
 
 This module turns those into POINT-IN-TIME prompt blocks for the research
 and synthesis layers: every query filters on the SEC's own filed_date or the
 snapshot_date, both of which are stamped at collection time, so a backtest
-can never see the future. Strictly read-only and never raises — a missing
+can never see the future. Strictly read-only and never raises, a missing
 table or dead connection degrades to an empty block and the run proceeds
 without the evidence (the block's absence is itself visible in the prompt).
 
-Connection: HISTORICAL_DATABASE_URL — the Terminal's historical-data
+Connection: HISTORICAL_DATABASE_URL, the Terminal's historical-data
 Postgres (a different database from its warm-cache/Redis tier, hence a
 different env var than terminal_cache's). Falls back to
 TERMINAL_CACHE_DATABASE_URL for single-database dev setups.
@@ -91,13 +91,13 @@ def filings_block(symbol: str, as_of: str, days: int = 45) -> str:
     if not eights and not tx:
         return ""
 
-    lines = [f"[SEC filings — point-in-time through {as_of}]"]
+    lines = [f"[SEC filings: point-in-time through {as_of}]"]
     if eights:
         shown = (f"{len(eights)} most recent of {len(eights_all)} "
                  if len(eights_all) > len(eights) else "")
         lines.append(f"8-K filings (last {days}d, {shown}newest first): "
                      + "; ".join(f"{d}" for d, _ in eights)
-                     + " — an 8-K is a material corporate event; a price gap "
+                     + ": an 8-K is a material corporate event; a price gap "
                        "near one of these dates likely has a filed cause.")
     else:
         lines.append(f"No 8-K filings in the last {days}d.")
@@ -113,7 +113,7 @@ def filings_block(symbol: str, as_of: str, days: int = 45) -> str:
             f"{b_n} open-market BUY totaling ${b_usd:,.0f}{officer_note}; "
             f"{s_n} SELL totaling ${s_usd:,.0f}. "
             f"Net: ${b_usd - s_usd:+,.0f}. Open-market buys are the "
-            f"informative side — sales are often scheduled/diversification.")
+            f"informative side: sales are often scheduled/diversification.")
     else:
         lines.append(f"No open-market insider buys or sells in {days}d.")
     return "\n".join(lines)
@@ -159,7 +159,7 @@ def market_context_block(symbol: str, as_of: str) -> str:
         WHERE snapshot_date = :d AND ticker = :sym
     """, {"d": snap_date, "sym": symbol.upper()})
 
-    lines = [f"[Market context — finviz screener snapshot {snap_date}]"]
+    lines = [f"[Market context: finviz screener snapshot {snap_date}]"]
     if breadth and breadth[0][0]:
         n, up_frac, med_rvol = breadth[0]
         lines.append(f"Universe breadth ({n} names): "

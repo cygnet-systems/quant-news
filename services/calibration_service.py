@@ -2,14 +2,14 @@
 
 Raw model confidences are demonstrably anti-calibrated on this platform
 (claimed 71% → 42.5% actual across the live era). Everything that consumes
-a confidence — UI badges, ensemble weights, the scoreboard — should go
+a confidence: UI badges, ensemble weights, the scoreboard, should go
 through :func:`calibrate` instead of trusting the raw number.
 
 The mapping is an isotonic regression fit per model on (raw_confidence,
 was_correct) pairs from evaluated ACTIVE calls (HOLDs carry no direction to
 score). Isotonic is the right shape here: it is monotone, so a model whose
 confidence is directionally meaningful keeps its ordering, and a model whose
-confidence is pure noise flattens toward its base rate — which is itself the
+confidence is pure noise flattens toward its base rate, which is itself the
 honest answer.
 
 Fits are cached in-process for CALIBRATION_TTL_S and refit lazily; the data
@@ -46,7 +46,7 @@ def _pav(pairs: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Pool-adjacent-violators on (raw_conf, outcome) pairs, ascending by raw.
 
     Returns the isotonic step function as (raw, calibrated) knots. Implemented
-    directly — scikit-learn is not a dependency of this project.
+    directly: scikit-learn is not a dependency of this project.
     """
     pairs = sorted(pairs, key=lambda p: p[0])
     # Each block: [sum_y, count, min_x]
@@ -138,7 +138,7 @@ def calibrate(model_name: str, raw_confidence: Optional[float],
     """Map a raw confidence to its historical hit rate for this model.
 
     Returns None when there is not enough evaluated history to say anything
-    (< MIN_SAMPLES active evaluated calls) — callers should then show no
+    (< MIN_SAMPLES active evaluated calls). Callers should then show no
     number rather than an unearned one. ``as_of`` (backtests) restricts the
     history to outcomes resolved by that date.
     """
@@ -163,7 +163,7 @@ def rolling_hit_rate(model_name: str, days: int = 30,
                      as_of: Optional[str] = None) -> Optional[float]:
     """Decay-free rolling hit rate on active calls over the last `days`.
 
-    Used for performance-decay ensemble weighting. None below MIN_SAMPLES/3 —
+    Used for performance-decay ensemble weighting. None below MIN_SAMPLES/3.
     a weekly-scale window needs a lower floor than the full calibration fit,
     but still refuses single-digit sample sizes. TTL-cached: a 20-symbol
     batch would otherwise repeat the same query per member per symbol.
@@ -213,13 +213,13 @@ def evaluated_hit_rate(
 ) -> dict:
     """Evaluated directional hit rate on active (non-HOLD) calls.
 
-    ``model_name`` None means every model — the platform-wide number. ``as_of``
+    ``model_name`` None means every model. The platform-wide number. ``as_of``
     bounds the window's upper edge so a historical/backtest run cannot quote a
     rate measured on sessions it has not reached yet; None means "through the
     latest evaluated row".
 
     Returns ``{"n", "hit_rate", "days", "through", "model"}`` with ``hit_rate``
-    None whenever ``n`` is below :data:`MIN_STATEABLE_SAMPLES` — callers must
+    None whenever ``n`` is below :data:`MIN_STATEABLE_SAMPLES`, callers must
     then say so rather than print an unearned number.
     """
     from db.session import get_session
@@ -277,7 +277,7 @@ def track_record_sentence(
         stats = evaluated_hit_rate(model_name, days=days, as_of=as_of)
     except Exception as e:  # a DB hiccup must not take a report down
         logger.warning(f"track record lookup failed: {e}")
-        return ("Unavailable for this run — the evaluated history could not "
+        return ("Unavailable for this run, the evaluated history could not "
                 "be read, so no hit rate is stated.")
 
     label = model_name or "all models on this platform"
@@ -293,7 +293,7 @@ def track_record_sentence(
 
 
 def invalidate() -> None:
-    """Force a refit on next use — call after an evaluation run."""
+    """Force a refit on next use. Call after an evaluation run."""
     global _fitted_at
     _fitted_at = 0.0
     _hit_cache.clear()

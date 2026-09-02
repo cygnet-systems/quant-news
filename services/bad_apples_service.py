@@ -9,14 +9,14 @@ Point-in-time adaptations for this pipeline's as_of contract:
   - price history (stock and benchmark) is truncated to as_of
   - quarterly statements keep only fiscal periods ending on/before as_of
     (same convention as the fundamentals block in models/single_agent.py;
-    report-date lag is not modeled — yfinance doesn't expose it)
+    report-date lag is not modeled. Yfinance doesn't expose it)
   - insider transactions and earnings history are filtered to as_of
   - snapshot-only ``info`` fields (multiples, analyst targets, leverage
     ratios) cannot be rewound; those checks are labeled "snapshot" in their
     note so a backtest reader knows they reflect today's values
 
 The 2026-08-07 experiment showed fail-count is NOT a next-day direction
-signal (high-fail names rallied on that bounce day) — it is a quality/risk
+signal (high-fail names rallied on that bounce day). It is a quality/risk
 screen. It feeds the research and synthesis prompts as context, not a gate.
 """
 
@@ -531,11 +531,11 @@ def check_insider_selling(tk, as_of):
 
 
 # ---------------------------------------------------------------------------
-# News red flags — PIT window scan
+# News red flags. PIT window scan
 # ---------------------------------------------------------------------------
 
 # Keyword-matched categories over the point-in-time news window. Hits are
-# surfaced WITH their headline so the research model can judge context — for
+# surfaced WITH their headline so the research model can judge context, for
 # a cybersecurity name like PANW, "breach"/"hack" mentions are usually about
 # the product space, not the company.
 _RED_FLAG_PATTERNS = [
@@ -575,7 +575,7 @@ def scan_news_red_flags(symbol: str, as_of: str,
     """Scan the point-in-time news window for red-flag headlines.
 
     Returns a list of {category, headline, date, url} (empty when clean),
-    or None when the news source is unavailable — "no news access" must not
+    or None when the news source is unavailable, "no news access" must not
     render as "no red flags".
     """
     try:
@@ -715,7 +715,7 @@ def _pit_quarters(frame, as_of):
 
 def analyze_symbol(symbol: str, as_of: str) -> dict:
     """Run the full scorecard for one symbol as of a date. Cached per
-    (symbol, as_of); never raises — a failed fetch yields n/a checks."""
+    (symbol, as_of); never raises: a failed fetch yields n/a checks."""
     from services.stock_data import get_ticker
 
     sym = symbol.strip().upper()
@@ -733,7 +733,7 @@ def analyze_symbol(symbol: str, as_of: str) -> dict:
         tk = None
 
     # The Terminal's nightly warmer caches the full .info blob per market
-    # session — for that session the snapshot fields are ALSO point-in-time
+    # session: for that session the snapshot fields are ALSO point-in-time
     # correct, and the yfinance call is skipped entirely.
     info = None
     try:
@@ -827,33 +827,33 @@ def format_bad_apples_block(symbol: str, result: dict) -> str:
     checks = result.get("checks") or []
     if not checks or all(c["status"] == "n/a" for c in checks):
         return ""
-    lines = [f"[{symbol} — Bad Apples quality screen as of {result['as_of']} "
+    lines = [f"[{symbol}: Bad Apples quality screen as of {result['as_of']} "
              f"(vs {result.get('benchmark') or 'benchmark'})]"]
     if result["total_fails"]:
         by_cat = ", ".join(f"{cat} {s['fail']}"
                            for cat, s in result["scores"].items() if s["fail"])
-        lines.append(f"Verdict: {result['flag'].upper()} — "
+        lines.append(f"Verdict: {result['flag'].upper()}: "
                      f"{result['total_fails']} of {result['total_checks']} "
                      f"checks failed ({by_cat})")
     else:
-        lines.append(f"Verdict: CLEAN — 0 of {result['total_checks']} "
+        lines.append(f"Verdict: CLEAN: 0 of {result['total_checks']} "
                      f"checks failed")
     for c in checks:
         if c["status"] != "fail":
             continue
-        detail = f" — {c['note']}" if c["note"] else ""
+        detail = f": {c['note']}" if c["note"] else ""
         lines.append(f"FAIL {c['category']}: {c['check']} = {c['value']}{detail}")
     red_flags = result.get("red_flags") or []
     if red_flags:
         lines.append(f"News red-flag mentions ({RED_FLAG_LOOKBACK_DAYS}d window, "
-                     f"keyword-matched — judge each against its headline):")
+                     f"keyword-matched: judge each against its headline):")
         for h in red_flags[:6]:
             when = f" ({h['date']})" if h.get("date") else ""
             lines.append(f"  [{h['category']}] {h['headline']}{when}")
     if result.get("headcount"):
         lines.append(f"Headcount (snapshot): {result['headcount']:,} full-time employees")
     lines.append(
-        "This is a QUALITY/RISK screen, not a timing signal — a high fail "
+        "This is a QUALITY/RISK screen, not a timing signal. A high fail "
         "count argues for smaller size, tighter risk, and skepticism toward "
         "bullish theses; it does not predict next-day direction."
     )

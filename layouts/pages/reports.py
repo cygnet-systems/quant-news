@@ -21,7 +21,7 @@ from layouts.history_sections import (
 def _action_bar() -> html.Div:
     """Generate a report from here, not from a toolbar two pages away.
 
-    The button opens the shared run modal preset to report scope — the page
+    The button opens the shared run modal preset to report scope, the page
     stays the single archive, the modal stays the single place a run is
     configured.
     """

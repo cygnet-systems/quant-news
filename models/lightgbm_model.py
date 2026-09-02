@@ -1,6 +1,6 @@
 """LightGBM model for next-day directional prediction.
 
-Mirrors xgboost_model.py exactly — same 18 SHAP-selected features,
+Mirrors xgboost_model.py exactly: same 18 SHAP-selected features,
 same walk-forward training, same disk cache. Swaps XGBClassifier
 for LGBMClassifier.
 """
@@ -104,7 +104,7 @@ class LightGBMModel(BaseModel):
                 sector_etf = f"{sector_etf}->SPY-fallback"
 
         # No lookahead: internally-fetched frames include data past a backtest
-        # cut-off — truncate everything to the as-of date.
+        # cut-off: truncate everything to the as-of date.
         if as_of and sector_df is not None:
             sector_df = sector_df[sector_df.index <= str(as_of)]
 
@@ -154,7 +154,7 @@ class LightGBMModel(BaseModel):
         cache_path = MODELS_CACHE_DIR / f"{symbol}_lightgbm.pkl"
         meta_path = MODELS_CACHE_DIR / f"{symbol}_lightgbm_meta.json"
 
-        # Cache validity is tied to the training-data window — a model trained
+        # Cache validity is tied to the training-data window, a model trained
         # on full history must not serve an earlier-as-of backtest (leak).
         data_end = str(ticker_df.index[-1].date()) if len(ticker_df) else ""
         # The training NEWS window is an input too. Price data ending on the
@@ -227,7 +227,7 @@ class LightGBMModel(BaseModel):
         labels: list[int] = []
         skipped = 0
 
-        # ATR-scaled ambiguity band — see xgboost_model._train_from_history
+        # ATR-scaled ambiguity band, see xgboost_model._train_from_history
         # for the rationale; the two trainers must label identically.
         atr_col = ticker_full["ATR"] if "ATR" in ticker_full.columns else None
 

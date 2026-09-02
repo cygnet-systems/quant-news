@@ -92,7 +92,7 @@ def create_nav_rail() -> html.Div:
 def create_topbar() -> html.Div:
     """Global toolbar: where you are, plus the one global action.
 
-    run-analysis-btn must stay mounted on every route — toggle_run_modal takes
+    run-analysis-btn must stay mounted on every route. Toggle_run_modal takes
     it as a fixed-id Input, and it is the single entry point to the run dialog
     (page-local shortcuts use the {"type": "new-report-btn"} pattern instead).
     """
@@ -138,7 +138,7 @@ def create_watchlist_strip() -> html.Div:
     """The watchlist, always in view and editable from every page.
 
     One slim row under the toolbar: chips with a remove ✕ and an inline add
-    box. This is THE editor — the Home rail shows the same set with more
+    box. This is THE editor, the Home rail shows the same set with more
     context (calls, reports, membership groups) but its input only filters.
     Chips use the wl-remove pattern, distinct from the rail rows'
     remove-symbol pattern, because both surfaces are mounted at once on Home

@@ -1,6 +1,6 @@
 """Research-driven single-agent prediction model.
 
-Wraps `models.single_agent.SingleAgentResearch` — a self-contained,
+Wraps `models.single_agent.SingleAgentResearch`: a self-contained,
 lookahead-safe research agent that gathers SPY / sector / ticker technicals,
 point-in-time news, and fundamentals, then produces a full-text analysis with a
 BUY/SELL/HOLD decision in a single LLM call.
@@ -14,7 +14,7 @@ swappable and an upstream release can never silently disable it again.
 
 Evidence discipline (services.evidence_contract): every context block this
 wrapper assembles is classed required / expected / optional. A required block
-that cannot be built raises — the symbol fails visibly instead of producing a
+that cannot be built raises. The symbol fails visibly instead of producing a
 report that reads as complete. An expected block that cannot be built is
 recorded as a gap that travels into the prompt, the footer, the prediction
 details and the run's completeness check.
@@ -55,7 +55,7 @@ class TradingAgentsModel(BaseModel):
 
     def is_ready(self) -> bool:
         # Key check follows the DEFAULT model's provider (a per-call
-        # research_model override still degrades gracefully — predict()
+        # research_model override still degrades gracefully, predict()
         # catches provider errors and returns HOLD/error).
         if MODEL.TRADING_AGENTS_MODEL.startswith("gpt-"):
             return bool(os.environ.get("OPENAI_API_KEY"))
@@ -82,7 +82,7 @@ class TradingAgentsModel(BaseModel):
         except MissingRequiredEvidence as e:
             # Deliberate refusal: the report is not written without this.
             logger.error(str(e))
-            _emit("error", f"{symbol}: research report NOT written — {e.reason} "
+            _emit("error", f"{symbol}: research report NOT written, {e.reason} "
                            f"({e.block}). A report without it would read as "
                            f"complete and be wrong.")
             return PredictionResult(
@@ -121,7 +121,7 @@ class TradingAgentsModel(BaseModel):
         use_news = kwargs.get("use_news", True)   # False for the news-ablation arm
         use_reflection = kwargs.get("use_reflection", False)  # opt-in memory loop
         # research_model: the Full Analysis pipeline's explicit choice (a
-        # distinct key — "model" is too generic to share across all models
+        # distinct key, "model" is too generic to share across all models
         # in the prediction service's common kwargs).
         model_name = (kwargs.get("research_model") or kwargs.get("model")
                       or MODEL.TRADING_AGENTS_MODEL)
@@ -130,7 +130,7 @@ class TradingAgentsModel(BaseModel):
         ledger = EvidenceLedger(symbol)
 
         # The run's own verdict on the news SOURCE. "unavailable" means the
-        # vendor failed, not that the week was quiet — and a research report
+        # vendor failed, not that the week was quiet, and a research report
         # written blind on a news-driven name is the failure this model now
         # refuses (the sentiment model already abstains on the same signal).
         news_status = kwargs.get("news_status")
@@ -146,15 +146,15 @@ class TradingAgentsModel(BaseModel):
 
         # Precomputed, validated context: metrics from the (already truncated)
         # OHLCV, the event-calendar gate, peer relative strength, a computed
-        # SPY regime, and the selected evidence blocks. Computed here — not
-        # asserted by the LLM — and all lookahead-safe.
+        # SPY regime, and the selected evidence blocks. Computed here: not
+        # asserted by the LLM, and all lookahead-safe.
         tools = sorted(set(kwargs.get("tools") or []))
         extra_blocks, investigation = self._build_extra_context(
             symbol, ohlcv_df, as_of, evidence=evidence, ledger=ledger,
             news=news, target=kwargs.get("target_date"), tools=tools)
 
         # Deferred reflection: resolve any past decisions whose outcome is now
-        # known (lookahead-safe — only outcomes on/before as_of) and inject the
+        # known (lookahead-safe, only outcomes on/before as_of) and inject the
         # recent lessons ahead of the validated blocks.
         if use_reflection:
             try:
@@ -187,11 +187,11 @@ class TradingAgentsModel(BaseModel):
             track_record=track_record,
             # Per-block cap: one oversized block (usually news-heavy metrics)
             # must not push the later blocks (peers, SPY regime) past the
-            # whole-string budget — that's how peers silently vanished.
+            # whole-string budget, that's how peers silently vanished.
             extra_context="\n\n".join(b[:2600] for b in extra_blocks),
             use_news=use_news,
             include_thesis=kwargs.get("include_thesis", False),
-            # The run's own window, frontend-owned: no fallback here — the
+            # The run's own window, frontend-owned: no fallback here, the
             # agent raises when it is asked to read news without one.
             news_lookback_days=kwargs.get("news_lookback_days"),
             ledger=ledger,
@@ -201,12 +201,12 @@ class TradingAgentsModel(BaseModel):
         decision = (result.get("decision") or "HOLD").upper()
         # The LLM's own CONFIDENCE line is the model's self-report. Our own
         # results show it carries no calibration signal, so it is NEVER
-        # propagated into scoring — only kept as labeled transparency metadata.
+        # propagated into scoring, only kept as labeled transparency metadata.
         stated_conviction = float(result.get("confidence") or 0.5)
         raw_response = result.get("raw_response", "")
 
-        # Honest confidence + up_probability. Prefer a GROUNDED signal — the
-        # model's realized directional hit-rate from resolved outcomes — over a
+        # Honest confidence + up_probability. Prefer a GROUNDED signal, the
+        # model's realized directional hit-rate from resolved outcomes, over a
         # self-declared number. Until a track record exists we stay neutral
         # ("no declaration"), so a confident-sounding LLM cannot over-weight
         # itself in the ensemble or clear the confidence gate on words alone.
@@ -217,7 +217,7 @@ class TradingAgentsModel(BaseModel):
 
         gaps = ledger.expected_gaps()
         _emit("ta", f"Research {symbol}: {decision} "
-                    f"[reliability {confidence:.0%} · {conf_source}] — "
+                    f"[reliability {confidence:.0%} · {conf_source}]: "
                     f"{result.get('news_count', 0)} articles in window"
                     + (f"; situation {investigation.situation}" if investigation else "")
                     + (f"; WRITTEN WITHOUT {len(gaps)} expected block(s)" if gaps else ""))
@@ -225,7 +225,7 @@ class TradingAgentsModel(BaseModel):
             # Stage "gap": the report exists, but a reader must know what it
             # was written without. The run's completeness check turns these
             # into PARTIAL; the UI counts them separately from crashes.
-            _emit("gap", f"{symbol}: report written without expected evidence — "
+            _emit("gap", f"{symbol}: report written without expected evidence, "
                          f"{ledger.summary()}",
                   payload={"event": "evidence_gap", "symbol": symbol,
                            "gaps": [g.to_dict() for g in gaps]})
@@ -280,7 +280,7 @@ class TradingAgentsModel(BaseModel):
         """The accuracy sentence for this run, or an explicit "can't say".
 
         Prefers this model's own evaluated history and falls back to the
-        platform-wide number when the research arm alone is too thin — a
+        platform-wide number when the research arm alone is too thin, a
         reader is better served by "all models, n=140" than by silence. Both
         are bounded to `as_of` so a historical run cannot quote a rate
         measured on sessions it has not reached.
@@ -294,12 +294,12 @@ class TradingAgentsModel(BaseModel):
             everything = cal.evaluated_hit_rate(None, days=90, as_of=as_of)
             if everything["hit_rate"] is not None:
                 return (f"This research model has only {own['n']} "
-                        f"scored non-HOLD calls in the last 90 days — too few to "
+                        f"scored non-HOLD calls in the last 90 days, too few to "
                         f"quote. Across all models on this platform the figure is "
                         f"{everything['hit_rate']:.0%} directionally correct "
                         f"(n={everything['n']}, through {everything['through']}). "
                         f"Coin-flip is 50%.")
-            # Neither is quotable — the "not enough history" wording lives in
+            # Neither is quotable, the "not enough history" wording lives in
             # calibration_service so every surface says it the same way.
             return cal.track_record_sentence("trading_agents", days=90, as_of=as_of)
         except Exception as e:
@@ -315,7 +315,7 @@ class TradingAgentsModel(BaseModel):
 
         confidence = realized directional hit-rate when a track record exists,
         else 0.5 (neutral). up_probability leans in the decision's direction only
-        by the *earned* edge (hit_rate - 0.5); with no history it stays 0.5 — the
+        by the *earned* edge (hit_rate - 0.5); with no history it stays 0.5: the
         model declares a direction, not an invented probability.
         """
         if emp_acc is None:
@@ -355,7 +355,7 @@ class TradingAgentsModel(BaseModel):
         ``evidence`` gates the optional blocks per run (Run-Analysis modal
         checklist): "options", "quality", "investigation", "political".
         None means the configured default set. ``tools`` is the run's tool
-        switches from the same dialog — "web_research" lets the
+        switches from the same dialog, "web_research" lets the
         investigation search the open web; absent means off.
 
         Returns (blocks, investigation). Every block records itself on the
@@ -368,7 +368,7 @@ class TradingAgentsModel(BaseModel):
         investigation = None
 
         # Callers may pass None to request a fresh fetch (stale-cache
-        # healing). The metrics/peer blocks still need a frame — fetch and
+        # healing). The metrics/peer blocks still need a frame, fetch and
         # slice it here rather than silently dropping the "validated"
         # PRECOMPUTED METRICS block from the prompt.
         if ohlcv_df is None or not len(ohlcv_df):
@@ -436,7 +436,7 @@ class TradingAgentsModel(BaseModel):
                 logger.warning(f"{symbol}: peer RS block empty "
                                f"(peers: {', '.join(peers[:6])})")
                 extra_blocks.append(
-                    f"[Peer relative strength — UNAVAILABLE]\n"
+                    f"[Peer relative strength. UNAVAILABLE]\n"
                     f"Known peers: {', '.join(peers[:8])}. Their price "
                     f"data could not be fetched for this run; do not "
                     f"infer relative performance.")
@@ -463,7 +463,7 @@ class TradingAgentsModel(BaseModel):
                       else "BEAR" if close < sma50 and close < sma200
                       else "MIXED")
             extra_blocks.append(
-                f"[SPY regime — computed through {as_of}]\n"
+                f"[SPY regime: computed through {as_of}]\n"
                 f"SPY close: ${close:.2f} | 50-day SMA: ${sma50:.2f} | "
                 f"200-day SMA: ${sma200:.2f}\n"
                 f"Regime by SMA rule: {regime} "
@@ -569,7 +569,7 @@ class TradingAgentsModel(BaseModel):
                 extra_blocks.insert(0, block)
                 ledger.have("investigation")
                 _emit("ta", f"Research {symbol}: situation {investigation.situation} "
-                            f"({investigation.situation_confidence}) — "
+                            f"({investigation.situation_confidence}): "
                             f"{investigation.one_line[:140]}",
                       payload={"event": "investigation", "symbol": symbol,
                                "situation": investigation.situation,

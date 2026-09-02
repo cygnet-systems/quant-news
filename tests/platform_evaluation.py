@@ -87,7 +87,7 @@ def test_news_fetching():
             if len(sources) >= 3:
                 log(PASS, "AV-sources", f"{len(sources)} unique sources", ", ".join(list(sources)[:5]))
             else:
-                log(WARN, "AV-sources", f"Only {len(sources)} sources — low diversity")
+                log(WARN, "AV-sources", f"Only {len(sources)} sources: low diversity")
 
             # Sentiment distribution
             sentiments = Counter(a.sentiment for a in av_articles)
@@ -158,7 +158,7 @@ def test_llm_analysis():
     if llm.is_available():
         log(PASS, "LLM-provider", f"Provider: {info['provider']}")
     else:
-        log(FAIL, "LLM-provider", "No LLM provider available — skipping LLM tests")
+        log(FAIL, "LLM-provider", "No LLM provider available, skipping LLM tests")
         return
 
     for symbol in TEST_SYMBOLS[:2]:  # Test 2 symbols to save API costs
@@ -222,7 +222,7 @@ def test_llm_analysis():
             else:
                 log(WARN, "LLM-alignment",
                     f"LLM rec ({rec}) differs from raw sentiment ({raw_lean}: {bullish_count}B/{bearish_count}Be)",
-                    "LLM may be applying deeper reasoning — not necessarily wrong")
+                    "LLM may be applying deeper reasoning, not necessarily wrong")
         else:
             log(FAIL, "LLM-structured", f"{symbol}: Structured analysis returned None")
 
@@ -383,7 +383,7 @@ def test_stock_data_and_indicators():
             if len(df) >= 200:
                 log(PASS, "Data-rows", f"{symbol}: {len(df)} trading days (1y)")
             else:
-                log(WARN, "Data-rows", f"{symbol}: Only {len(df)} rows — expected ~250 for 1y")
+                log(WARN, "Data-rows", f"{symbol}: Only {len(df)} rows: expected ~250 for 1y")
 
             # NaN check
             nan_pct = df[list(expected_cols)].isna().mean()
@@ -399,7 +399,7 @@ def test_stock_data_and_indicators():
             if days_stale <= 3:  # weekend buffer
                 log(PASS, "Data-fresh", f"{symbol}: Latest data: {last_date.date()} ({days_stale}d ago)")
             else:
-                log(WARN, "Data-fresh", f"{symbol}: Latest data: {last_date.date()} ({days_stale}d ago — stale)")
+                log(WARN, "Data-fresh", f"{symbol}: Latest data: {last_date.date()} ({days_stale}d ago: stale)")
 
             # 4c. Technical indicators
             df_ind = add_indicators_to_df(df)
@@ -407,7 +407,7 @@ def test_stock_data_and_indicators():
             log(INFO, "Indicators", f"{symbol}: {len(indicator_cols)} indicators added", ", ".join(indicator_cols[:10]))
 
             # Check key indicators are computed. Names must match what
-            # add_indicators_to_df actually emits ("RSI", not "RSI_14") —
+            # add_indicators_to_df actually emits ("RSI", not "RSI_14"). 
             # the old list made this check permanently WARN, which is how
             # an RSI formula drift went unnoticed.
             key_indicators = ["SMA_20", "SMA_50", "RSI", "MACD"]

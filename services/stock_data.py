@@ -171,7 +171,7 @@ def get_company_profile(symbol: str, max_chars: int = 900) -> str:
             cut = summary[:max_chars].rfind(". ")
             summary = summary[:cut + 1] if cut > max_chars * 0.5 else summary[:max_chars]
         parts = [
-            f"{info.get('shortName', symbol)} — {info.get('sector', 'N/A')} / {info.get('industry', 'N/A')}",
+            f"{info.get('shortName', symbol)}: {info.get('sector', 'N/A')} / {info.get('industry', 'N/A')}",
         ]
         if summary:
             parts.append(summary)
@@ -269,7 +269,7 @@ def get_multiple_stocks(
             df = fetch_stock_data(symbol, period)
             result[symbol.upper()] = df
         except ValueError as e:
-            # Every fetch failure arrives as ValueError — an outage is not an
+            # Every fetch failure arrives as ValueError. An outage is not an
             # "invalid symbol". Say which symbol vanished and why.
             logger.warning(f"{symbol}: dropped from multi-symbol fetch: {e}")
             continue

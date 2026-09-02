@@ -87,17 +87,17 @@ def format_events_block(symbol: str, events: dict, window_days: int = 5) -> str:
     if not events:
         return ""
     if events.get("unavailable"):
-        return (f"[{symbol} — event calendar]\n"
-                "Calendar lookup unavailable — event risk (earnings/ex-dividend) "
+        return (f"[{symbol}: event calendar]\n"
+                "Calendar lookup unavailable, event risk (earnings/ex-dividend) "
                 "is UNKNOWN for the hold window. Treat as unverified, not as absent.")
-    lines = [f"[{symbol} — event calendar for the {window_days}-day hold window "
+    lines = [f"[{symbol}: event calendar for the {window_days}-day hold window "
              f"ending {events.get('window_end', '?')}]"]
     ne = events.get("next_earnings")
     lines.append(f"Next earnings: {ne or 'not found'}"
-                 + (" — INSIDE HOLD WINDOW" if events.get("earnings_in_window") else ""))
+                 + (": INSIDE HOLD WINDOW" if events.get("earnings_in_window") else ""))
     xd = events.get("ex_dividend")
     lines.append(f"Next ex-dividend: {xd or 'not found'}"
-                 + (" — INSIDE HOLD WINDOW" if events.get("exdiv_in_window") else ""))
+                 + (": INSIDE HOLD WINDOW" if events.get("exdiv_in_window") else ""))
     if events.get("in_window"):
         lines.append("GATE: a scheduled event falls inside the hold window. Cap confidence "
                      "at 0.6 and state the event risk explicitly in the risk assessment.")

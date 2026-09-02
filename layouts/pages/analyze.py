@@ -45,7 +45,7 @@ def get_date_range(articles: list) -> str:
                 else:
                     dt = pub
                 # Articles mix tz-aware and naive timestamps depending on
-                # source/cache — strip tzinfo so min/max can compare them.
+                # source/cache: strip tzinfo so min/max can compare them.
                 if dt.tzinfo is not None:
                     dt = dt.replace(tzinfo=None)
                 dates.append(dt)
@@ -143,7 +143,7 @@ def create_ai_failure_indicator() -> html.Div:
                         style={"fontSize": "1.2rem", "color": "#FFD700"},
                     ),
                     html.Span(
-                        "AI analysis unavailable — the LLM provider didn't respond.",
+                        "AI analysis unavailable. The LLM provider didn't respond.",
                         className="loading-inline-text",
                         style={"color": "var(--text-secondary)", "marginLeft": "8px"},
                     ),
@@ -188,7 +188,7 @@ def create_recommendations_section(rec_data: dict, symbol: str | None = None) ->
                     html.I(className="bi bi-lightning-fill", style={"color": ACCENT, "marginRight": "6px"}),
                     html.Span("Recommendations", style={"color": ACCENT}),
                     html.Span(
-                        f" — {model_used}" if model_used else "",
+                        f": {model_used}" if model_used else "",
                         style={"color": "var(--text-muted)", "fontSize": "0.75rem", "marginLeft": "8px"},
                     ),
                     html.Span(
@@ -325,7 +325,7 @@ def create_recommendations_section(rec_data: dict, symbol: str | None = None) ->
         return html.Div(children, className="recommendations-section")
 
     else:
-        # Per-symbol view — rec_data is already the symbol's dict
+        # Per-symbol view, rec_data is already the symbol's dict
         action = rec_data.get("action", "")
         if not action:
             return None
@@ -580,12 +580,12 @@ def build_overall_tab_content(
             sym_analysis = analysis_by_symbol.get(symbol, {})
             sym_articles = articles_by_symbol.get(symbol, [])
 
-            rec = sym_analysis.get("recommendation", "—")
+            rec = sym_analysis.get("recommendation", "n/a")
             confidence = sym_analysis.get("confidence")
             article_count = len(sym_articles)
 
             # Determine color class for recommendation
-            rec_lower = rec.lower() if rec != "—" else ""
+            rec_lower = rec.lower() if rec != "n/a" else ""
             if "bullish" in rec_lower:
                 rec_class = "rec-bullish"
             elif "bearish" in rec_lower:
@@ -594,10 +594,10 @@ def build_overall_tab_content(
                 rec_class = "rec-neutral"
 
             # Format recommendation display
-            rec_display = rec.replace("_", " ") if rec != "—" else "—"
+            rec_display = rec.replace("_", " ") if rec != "n/a" else "n/a"
 
             # Format confidence
-            conf_display = f"{int(confidence * 100)}%" if confidence else "—"
+            conf_display = f"{int(confidence * 100)}%" if confidence else "n/a"
 
             table_rows.append(
                 html.Tr(
@@ -736,7 +736,7 @@ def create_positioning_quality_section(analysis: dict) -> html.Div | None:
         q_children = [
             html.Strong("Quality screen: "),
             html.Span(label, style={"color": color, "fontWeight": "600"}),
-            html.Span(f" — {quality['total_fails']}/{quality['total_checks']}"
+            html.Span(f": {quality['total_fails']}/{quality['total_checks']}"
                       f" checks failed"),
         ]
         failed = quality.get("failed_checks") or []
@@ -770,7 +770,7 @@ def create_positioning_quality_section(analysis: dict) -> html.Div | None:
         ], className="key-developments-content", style={"marginTop": "8px"}))
 
     children.append(html.Div(
-        "Positioning and quality shade conviction and sizing — neither is a "
+        "Positioning and quality shade conviction and sizing. Neither is a "
         "standalone timing signal.",
         className="research-report-footnote",
     ))
@@ -805,7 +805,7 @@ def build_tab_content(
     # -- Unify the two research-text sources --
     # The research report reaches this tab through EITHER the AI Report flow
     # (analysis["research"]) OR the prediction pipeline (trading_agents entry
-    # in the signals store — the only path in Full Analysis, which no longer
+    # in the signals store, the only path in Full Analysis, which no longer
     # runs the shallow per-symbol pass). One resolution, one rendering.
     research = (analysis or {}).get("research") or {}
     if not research.get("raw_response") and model_signals and not is_overall:
@@ -824,7 +824,7 @@ def build_tab_content(
                 }
 
     # When the shallow pass didn't run, the research epilogue supplies the
-    # banner stance and the watch/thesis panels — same fields, same renderer,
+    # banner stance and the watch/thesis panels. Same fields, same renderer,
     # one analyst voice. Existing shallow keys always win (dict-merge order).
     if research.get("raw_response"):
         st = research.get("structured") or {}
@@ -873,7 +873,7 @@ def build_tab_content(
         )
     elif articles and not ai_failed:
         # Awaiting-analysis banner. It already names the toolbar action, so the
-        # separate loading indicator below is suppressed for this state — the
+        # separate loading indicator below is suppressed for this state, the
         # two together printed the same guidance sentence twice. A FAILED
         # analysis is not "awaiting" anything, so the banner sits out and the
         # failure indicator speaks alone.
@@ -884,13 +884,13 @@ def build_tab_content(
     if rec_banner:
         children.append(rec_banner)
 
-    # -- Research Report — the verdict-first deep dive (either source) --
+    # -- Research Report: the verdict-first full report (either source) --
     if research.get("raw_response"):
         from models.single_agent import extract_confidence, render_report_markdown
         r_dec = research.get("decision", "HOLD")
         r_cls = ("positive" if r_dec == "BUY"
                  else "negative" if r_dec == "SELL" else "neutral")
-        # Verdict fields become list items here too — a single newline between
+        # Verdict fields become list items here too. A single newline between
         # them folds into one paragraph in every markdown renderer.
         body = render_report_markdown(research["raw_response"])
         r_stated = research.get("stated_conviction")
@@ -945,7 +945,7 @@ def build_tab_content(
                 className="key-developments-content",
             ),
         ]
-        # v3 interpretation line — old cached payloads simply lack the key
+        # v3 interpretation line, old cached payloads simply lack the key
         if analysis.get("developments_read"):
             kd_children.append(html.Div(
                 [html.I(className="bi bi-arrow-return-right me-1"),
@@ -997,7 +997,7 @@ def build_tab_content(
         # same "Use Run analysis in the toolbar" sentence on the page.
         children.append(create_ai_failure_indicator())
 
-    # -- Watch Items / Company Thesis — from either tier (shallow JSON or the
+    # -- Watch Items / Company Thesis, from either tier (shallow JSON or the
     # research epilogue); rendered identically so there is ONE report style.
     if analysis:
         watch = analysis.get("watch_items") or []
@@ -1280,7 +1280,7 @@ def create_context_panel() -> html.Div:
                     html.Span(id="llm-status", className="llm-status-badge"),
                     # The "Predicting..." badge moved to the global topbar
                     # (layouts/nav.py) so every route shows a running job.
-                    # Hidden — keeps download_report_pdf callback wired
+                    # Hidden: keeps download_report_pdf callback wired
                     html.Button(id="download-report-btn", style={"display": "none"}),
                 ],
                 className="panel-header-row",

@@ -1,18 +1,18 @@
-"""Alpha Lab — standing hypothesis tests over the live prediction history.
+"""Alpha Lab: standing hypothesis tests over the live prediction history.
 
 Three candidate edges were proposed and hand-tested on 2026-08-11; none was
 significant on the data available (12 prediction dates). Rather than shipping
 them as trading features on faith, they live here as experiments that re-run
-on a schedule against the GROWING dataset and report when — if ever — one
+on a schedule against the GROWING dataset and report when, if ever, one
 crosses significance. The verdict framework is fixed in advance so the
 goalposts cannot move with the noise:
 
-  * cross_sectional — daily Spearman IC of the composite model score vs
+  * cross_sectional: daily Spearman IC of the composite model score vs
     next-session return, and the top-k/bottom-k long-short spread.
     PASS requires |t| >= 2 on the spread with >= 40 trading days.
-  * event_drift — signed 5- and 10-session drift after a >= move_pct one-day
+  * event_drift: signed 5- and 10-session drift after a >= move_pct one-day
     move. PASS requires |t| >= 2 with >= 300 events per horizon.
-  * calibration_gate — walk-forward per-model isotonic calibration; trade
+  * calibration_gate: walk-forward per-model isotonic calibration; trade
     only calibrated p >= gate. PASS requires the gated subset to beat the
     ungated hit rate by >= 3pp with >= 100 gated trades.
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _DIR = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.0}
 
-# Pre-registered pass criteria — see module docstring.
+# Pre-registered pass criteria, see module docstring.
 MIN_DAYS_XS = 40
 MIN_EVENTS = 300
 MIN_GATED = 100
@@ -186,7 +186,7 @@ def test_calibration_gate(preds: pd.DataFrame, gate: float = 0.55) -> dict:
     }
 
 
-# Human-readable identity of each hypothesis — the email and the UI both
+# Human-readable identity of each hypothesis. The email and the UI both
 # render from this, so the explanation cannot drift between surfaces. A
 # FUNCTION of the run's parameters: the method text used to hardcode 5% /
 # 0.55 / n/6 while the job ran whatever its params_spec said.
@@ -211,7 +211,7 @@ def hypothesis_info(move_pct: float = 5.0, gate: float = 0.55,
             "example": "Aug 10, 20 names: top-3 by score (PANW 0.61, MPWR 0.58, "
                        "HWM 0.57) average +0.9% the next day; bottom-3 (LUV "
                        "0.38, VZ 0.41, DOC 0.43) average −0.4%. That day's "
-                       "spread = +1.3%. One good day means nothing — the test "
+                       "spread = +1.3%. One good day means nothing, the test "
                        "needs the AVERAGE daily spread to be ≥2 standard errors "
                        "above zero across 40+ days before it passes.",
         },
@@ -233,7 +233,7 @@ def hypothesis_info(move_pct: float = 5.0, gate: float = 0.55,
                        "+2% (the move CONTINUED). If it bounces +3%, signed "
                        "drift is −3% (it REVERSED). Averaged over hundreds of "
                        "such events the drift has been ≈0%: big moves neither "
-                       "continue nor reverse reliably — so neither side is "
+                       "continue nor reverse reliably, so neither side is "
                        "tradable.",
         },
         "calibration_gate": {
@@ -254,7 +254,7 @@ def hypothesis_info(move_pct: float = 5.0, gate: float = 0.55,
                        f"gated OUT below {gate:g}. Kronos claims 65% and its "
                        "'65%' calls hit 58% → calibrated p = 0.58 → trades. "
                        "The gate passes only if the kept subset beats "
-                       "take-everything by 3+ points over 100+ trades — so far "
+                       "take-everything by 3+ points over 100+ trades, so far "
                        "it has not.",
         },
     }
@@ -268,7 +268,7 @@ def _status(t: dict) -> str:
     """significant | settled_null | accruing.
 
     A test at full pre-registered power whose statistic is still nowhere
-    (|t| < 1) is SETTLED, not 'still trying' — pretending otherwise turns the
+    (|t| < 1) is SETTLED, not 'still trying'. Pretending otherwise turns the
     digest into three eternal maybes.
     """
     if t.get("significant"):
@@ -316,7 +316,7 @@ def run_all(move_pct: float = 5.0, gate: float = 0.55,
     if passing:
         prog.emit("action",
                   f"Alpha Lab: {', '.join(passing)} crossed the pre-registered "
-                  f"bar — review before acting; this is a flag, not a trade")
+                  f"bar: review before acting; this is a flag, not a trade")
 
     # Persist the snapshot so the trajectory is auditable.
     try:

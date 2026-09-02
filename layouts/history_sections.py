@@ -198,7 +198,7 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
                     [
                         dbc.ButtonGroup(
                             [
-                                # The common case — "what did we just do?" —
+                                # The common case, "what did we just do?": 
                                 # needed a calendar click before this.
                                 dbc.Button("Today", id={"type": "history-date-btn", "range": "today"},
                                            size="sm", outline=True, color="secondary",
@@ -465,7 +465,7 @@ def build_ta_reports_section(ta_reports, page=None):
             className="ta-symbol-group",
         ))
 
-    # Cards only — View opens the report in a modal. The old duplicate
+    # Cards only: View opens the report in a modal. The old duplicate
     # accordion stack below the cards (two ways to open the same report)
     # is gone.
     return collapsible_section(
@@ -498,7 +498,7 @@ def build_saved_reports_section(reports, page=None):
             raw_type, raw_type.replace("_", " ").title())
         fmt = (r.get("file_format") or "").upper()
         # JSON-stored AI reports are converted to Markdown on download
-        # (serve_saved_report) — label the button by what the user GETS.
+        # (serve_saved_report), label the button by what the user GETS.
         if fmt == "JSON":
             fmt = "MD"
         storage_key = r.get("storage_key", "")
@@ -511,7 +511,7 @@ def build_saved_reports_section(reports, page=None):
                 className="history-dl-btn",
             )
         else:
-            dl_btn = html.Span(fmt or "—", className="history-fmt-badge")
+            dl_btn = html.Span(fmt or "n/a", className="history-fmt-badge")
 
         report_rows.append(html.Tr([
             html.Td(r.get("trade_date", "")), html.Td(sym), html.Td(rtype), html.Td(dl_btn),
@@ -568,7 +568,7 @@ def page_slice(items: list, bucket: str, page_state: dict | None):
 
 def _inputs_link(symbols_qs: str, as_of: str, lookback, cls: str, title: str):
     """The point-in-time inputs download. Rendered only when the record
-    carries the news window it was made with — the export refuses to rebuild
+    carries the news window it was made with. The export refuses to rebuild
     inputs at a window the run did not use."""
     if not lookback:
         return html.Span(
@@ -614,7 +614,7 @@ def build_predictions_section(predictions, deferred: bool = False, page=None):
         decision = p.get("decision", "HOLD")
         dec_cls = "positive" if decision == "BUY" else "negative" if decision == "SELL" else "neutral"
         conf = p.get("confidence")
-        conf_str = f"{int(conf * 100)}%" if conf else "—"
+        conf_str = f"{int(conf * 100)}%" if conf else "n/a"
         pnl = p.get("pnl_dollars")
         correct = p.get("was_correct")
         if pnl is not None:
@@ -739,7 +739,7 @@ def build_recommendations_section(recommendations, page=None):
         overall = result.get("overall", {})
         action = overall.get("portfolio_action", "") if overall else ""
         # Evidence basis: what this recommendation was synthesized FROM.
-        # Old rows predate the field — label them as the legacy default.
+        # Old rows predate the field. Label them as the legacy default.
         basis = result.get("basis") or "news+signals"
         basis_label = {
             "research+signals": "Research + predictions",
@@ -753,7 +753,7 @@ def build_recommendations_section(recommendations, page=None):
             sym_qs, rec_as_of, (result.get("news_window") or {}).get("lookback_days"),
             "history-dl-btn",
             "Download all model inputs + news behind this recommendation (.xlsx)",
-        ) if sym_qs and rec_as_of else html.Span("—")
+        ) if sym_qs and rec_as_of else html.Span("n/a")
         rec_rows.append(html.Tr([
             html.Td(created), html.Td(syms), html.Td(model),
             html.Td(basis_label, className="history-rec-basis"),
@@ -817,7 +817,7 @@ def build_activity_section(activity_scope="all", stages=None, symbol=None,
             # ad-hoc ids ("adhoc", "auth") repeat across users, so run_id
             # alone would emit duplicate Dash component ids.
             run_blocks.append(collapsible_section(
-                f"{started} — {owner}{run['title']}",
+                f"{started}: {owner}{run['title']}",
                 f"activity-{run_idx}",
                 html.Div(lines, className="activity-run-feed"),
                 icon_class="bi-clock-history",
@@ -830,7 +830,7 @@ def build_activity_section(activity_scope="all", stages=None, symbol=None,
             ))
 
         if is_admin:
-            hint = ("Every pipeline run, newest first — you are an "
+            hint = ("Every pipeline run, newest first. You are an "
                     "Administrator, so this spans all users. Click a run to "
                     "expand its events.") if scope == "all" else (
                    "Your own pipeline runs, newest first. Click a run to "

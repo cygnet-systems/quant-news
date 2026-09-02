@@ -499,7 +499,7 @@ def _create_ensemble_card(result: dict) -> html.Div:
 def _create_weight_bar(weights_used: dict) -> html.Div:
     """Create a horizontal weight composition bar.
 
-    Pure CSS flex bar — each segment's flex-grow equals the model's weight.
+    Pure CSS flex bar, each segment's flex-grow equals the model's weight.
     Color-coded per model with initials inside.
     """
     total = sum(weights_used.values())

@@ -4,14 +4,14 @@ Every context block the research prompt carries is classed here as
 required, expected or optional. The classes decide what happens when a
 block cannot be built:
 
-  required  — the report is not written. ``MissingRequiredEvidence`` is
+  required: the report is not written. ``MissingRequiredEvidence`` is
               raised, the model returns an error row, and the run reports a
               failed symbol instead of a call that looks like one.
-  expected  — the report is written, but the gap travels with it: into the
+  expected: the report is written, but the gap travels with it: into the
               prompt (so the model says what it could not see), the footer,
               the prediction details and the run's completeness check, which
               marks the run PARTIAL.
-  optional  — absence is normal (a symbol with no congressional trades, a
+  optional: absence is normal (a symbol with no congressional trades, a
               first report with no prior stance) and is only logged.
 
 Before this, an options fetch that hit the vendor's rate limit produced a
@@ -87,7 +87,7 @@ class MissingRequiredEvidence(RuntimeError):
         self.block = block
         self.reason = reason
         super().__init__(
-            f"{symbol}: required evidence missing — "
+            f"{symbol}: required evidence missing, "
             f"{BLOCK_LABELS.get(block, block)}: {reason}")
 
 
@@ -150,7 +150,7 @@ class EvidenceLedger:
         gaps = self.expected_gaps()
         if not gaps:
             return ""
-        lines = ["[Evidence NOT available for this report — do not infer it]"]
+        lines = ["[Evidence NOT available for this report. Do not infer it]"]
         for g in gaps:
             lines.append(f"- {g.label}: {g.reason}")
         lines.append("Where a section would rest on one of these, say the "

@@ -2,9 +2,9 @@
 
 Resolution is metadata-driven: a symbol's OWN industry/sector names (from its
 info metadata) are mapped name -> ETF. An industry-level ETF (e.g.
-Semiconductors -> SMH) is preferred when one is mapped — it is a much tighter
+Semiconductors -> SMH) is preferred when one is mapped. It is a much tighter
 comparator than a broad sector fund; otherwise the sector-level SPDR is used.
-There is deliberately no ticker -> ETF table — a hardcoded symbol map silently
+There is deliberately no ticker -> ETF table. A hardcoded symbol map silently
 mislabels anything it doesn't know (e.g. it sent Consumer-Defensive UNFI to
 XLK) and goes stale as listings change. Falls back to SPY when metadata is
 unavailable, which callers treat as "no distinct sector context". The resolved
@@ -42,7 +42,7 @@ SECTOR_TO_ETF: dict[str, str] = {
 
 # Industry name -> industry ETF, preferred over the broad sector fund when
 # mapped (XLK is dominated by mega-caps; SMH/XBI/IGV track the actual cohort).
-# Deliberately sparse — only liquid, well-known industry ETFs. Unmapped
+# Deliberately sparse: only liquid, well-known industry ETFs. Unmapped
 # industries fall through to the sector-level SPDR.
 INDUSTRY_TO_ETF: dict[str, str] = {
     "Semiconductors": "SMH",
@@ -115,7 +115,7 @@ def get_sector_info(symbol: str) -> dict:
     Returns:
         {"etf", "sector", "industry", "level"} where level is "industry"
         (industry ETF matched), "sector" (sector SPDR), or "unknown"
-        (metadata unavailable — etf falls back to SPY, which callers should
+        (metadata unavailable: etf falls back to SPY, which callers should
         treat as "no distinct sector context", not as a sector).
     """
     symbol = symbol.upper()
@@ -128,7 +128,7 @@ def get_sector_info(symbol: str) -> dict:
     # the research agent concurrently); without this lock they all missed the
     # cache together and yfinance returned an EMPTY info dict to some of them.
     # Those callers silently got etf="SPY", so the sector features were a
-    # duplicate of the SPY features — measured at 11 of 40 GBM predictions in
+    # duplicate of the SPY features. Measured at 11 of 40 GBM predictions in
     # one 20-symbol run, and nondeterministic between models on one symbol.
     with _sector_lock:
         cached = _sector_cache.get(symbol)
@@ -161,7 +161,7 @@ def get_sector_info(symbol: str) -> dict:
             # the company. Caching it would pin every later consumer in this
             # process to the SPY fallback; leaving it uncached costs one retry.
             logger.warning(
-                f"Sector metadata unavailable for {symbol} — falling back to "
+                f"Sector metadata unavailable for {symbol}: falling back to "
                 f"SPY for this call only (not cached; sector features will be "
                 f"a duplicate of SPY wherever this result is used)"
             )

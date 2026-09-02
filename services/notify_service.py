@@ -1,4 +1,4 @@
-"""Email notifications for scheduled runs — morning calls, evening results.
+"""Email notifications for scheduled runs. Morning calls, evening results.
 
 The transport is inherited from CygnetResearchTerminal's ``cron_jobs/notify.py``:
 Microsoft Graph ``sendMail`` with client-credentials auth, reading the SAME
@@ -10,9 +10,9 @@ What is NOT inherited is the message shape. CRT reports whether a data-loading
 job moved bytes; the interesting content here is what the platform decided and
 whether it was right, so the two mails are:
 
-* **Prediction** (after the morning analysis) — the call per symbol, what the
+* **Prediction** (after the morning analysis). The call per symbol, what the
   models disagreed about, and what the run cost.
-* **Result** (after the evening evaluation) — how those calls actually landed:
+* **Result** (after the evening evaluation). How those calls actually landed:
   hit rate, P&L, and which names were wrong.
 
 Every function is best-effort. A mail server problem must never fail a run
@@ -62,7 +62,7 @@ def _config() -> Optional[dict]:
     cfg = {k: os.environ.get(k) for k in _REQUIRED}
     missing = [k for k, v in cfg.items() if not v]
     if missing:
-        logger.debug(f"Email notifications disabled — missing: {', '.join(missing)}")
+        logger.debug(f"Email notifications disabled, missing: {', '.join(missing)}")
         return None
     return cfg
 
@@ -115,7 +115,7 @@ def _send(subject: str, html: str) -> bool:
         logger.info(f"Notification sent: {subject}")
         return True
     except Exception:
-        logger.exception("Failed to send notification email — continuing")
+        logger.exception("Failed to send notification email, continuing")
         return False
 
 
@@ -126,19 +126,19 @@ def _diagnose(status: int, sender: str) -> str:
     different fixes, so name them rather than making the reader guess.
     """
     if status == 401:
-        return ("the token was rejected — check AZURE_TENANT_ID, "
+        return ("the token was rejected, check AZURE_TENANT_ID, "
                 "AZURE_CLIENT_ID and AZURE_CLIENT_SECRET")
     if status == 403:
-        return ("authenticated but not allowed — the app registration needs "
+        return ("authenticated but not allowed, the app registration needs "
                 "Mail.Send as an APPLICATION permission with admin consent, "
                 "and any application access policy must include this mailbox")
     if status == 404:
-        return (f"the tenant has no mailbox at {sender} — Graph resolves "
+        return (f"the tenant has no mailbox at {sender}: Graph resolves "
                 f"/users/{{id}} by primary UPN or object id, so an alias or "
                 f"proxy address will 404. Create it (a shared mailbox needs "
                 f"no licence) or set NOTIFY_FROM_EMAIL to the primary UPN")
     if status == 429:
-        return "throttled by Graph — the next scheduled run will try again"
+        return "throttled by Graph, the next scheduled run will try again"
     return "see the Graph response above"
 
 
@@ -162,7 +162,7 @@ def _wrap(title: str, subtitle: str, body: str) -> str:
         f'<div style="color:#666;font-size:13px;margin-bottom:16px">{subtitle}</div>'
         f'{body}'
         '<p style="color:#999;font-size:12px;margin-top:22px">'
-        'Sent by quant-news. Predictions are model output, not advice — the '
+        'Sent by quant-news. Predictions are model output, not advice, the '
         'platform has shown no demonstrable alpha at scale.</p></div>'
     )
 
@@ -201,7 +201,7 @@ def notify_analysis(summary: dict, cost: float | None = None,
         # which, and show the run's own output either way.
         reason = ("The run reported success but its summary could not be read, "
                   "so what it produced is unknown. The predictions may well be "
-                  "stored — check the Schedule page."
+                  "stored: check the Schedule page."
                   if not summary else
                   "The run completed and produced no per-symbol calls.")
         return notify_job_failure("daily_analysis", f"{reason}\n\n{log}".strip())
@@ -232,7 +232,7 @@ def notify_analysis(summary: dict, cost: float | None = None,
         f'{counts["BUY"]} buy · {counts["SELL"]} sell · {counts["HOLD"]} hold<br>'
         f'{" · ".join(meta)}</p>'
     )
-    subject = (f"Pre-open calls {summary.get('target_date', '')} — "
+    subject = (f"Pre-open calls {summary.get('target_date', '')}: "
                f"{counts['BUY']}B/{counts['SELL']}S/{counts['HOLD']}H")
     return _send(subject, _wrap(
         "Pre-open calls",
@@ -274,7 +274,7 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
         logger.warning(f"evaluation notification query failed: {e}")
         return False
 
-    # "Nothing scored" has two very different causes — a holiday, or an
+    # "Nothing scored" has two very different causes. A holiday, or an
     # evaluator that keeps skipping the same rows. Check which one before
     # calling it normal.
     backlog = {}
@@ -290,12 +290,12 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
             by_date = ", ".join(f"{d}: {n}" for d, n in
                                 (backlog.get("by_target_date") or {}).items())
             return _send(
-                f"EVALUATION STALLED — {pending} mature predictions unscored",
+                f"EVALUATION STALLED: {pending} mature predictions unscored",
                 _wrap("Nothing scored, but the backlog is not empty",
                       f"Target session {target}",
                       f"<p>{pending} predictions whose target session has "
                       f"closed are still unscored ({by_date}). The evaluator "
-                      f"is skipping them — most likely a missing close for "
+                      f"is skipping them, most likely a missing close for "
                       f"the target date or a NULL previous_close. This will "
                       f"not fix itself.</p>"))
         return _send(
@@ -333,7 +333,7 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
         model_rows += (
             f'<tr><td style="{_TD}">{_MODEL_LABEL.get(m, m)}</td>'
             f'<td style="{_TD}">{a["active"]}</td>'
-            f'<td style="{_TD}">{f"{acc:.0f}%" if acc is not None else "—"}</td>'
+            f'<td style="{_TD}">{f"{acc:.0f}%" if acc is not None else "n/a"}</td>'
             f'<td style="{_TD};color:{_pnl_color(a["pnl"])}">{_fmt_pnl(a["pnl"])}</td></tr>'
         )
     model_rows += (
@@ -349,7 +349,7 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
 
     def _cell(r) -> str:
         if r is None:
-            return f'<td style="{_MTD};color:#ccc">—</td>'
+            return f'<td style="{_MTD};color:#ccc">: </td>'
         pnl = float(r["pnl"] or 0)
         if r["decision"] == "HOLD":
             return (f'<td style="{_MTD};color:#A0A0A0">HOLD'
@@ -405,10 +405,10 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
         body += (
             f'<p style="color:#D93900;font-size:13px;margin-top:8px">'
             f'⚠ {backlog["pending_mature"]} mature prediction(s) remain '
-            f'unscored ({by_date}) — the evaluator is skipping them.</p>'
+            f'unscored ({by_date}): the evaluator is skipping them.</p>'
         )
     return _send(
-        f"Results {target} — {overall:.0f}% on {total_active} calls, {_fmt_pnl(total_pnl)}",
+        f"Results {target}: {overall:.0f}% on {total_active} calls, {_fmt_pnl(total_pnl)}",
         _wrap("Results", f"Target session {target}", body),
     )
 
@@ -418,7 +418,7 @@ def send_test() -> bool:
 
     Exercises the same token + sendMail call the scheduled notifications use,
     so a success here means the app registration, the sender mailbox and the
-    recipients are all genuinely working — not merely configured.
+    recipients are all genuinely working, not merely configured.
     """
     cfg = _config()
     if cfg is None:
@@ -461,14 +461,14 @@ def notify_partial(job_id: str, reasons: list[str], summary: dict) -> bool:
         )
     body += ('<p style="color:#666;font-size:13px;margin-top:14px">'
              'Today is recorded as not-yet-successful, so /healthz reports it '
-             'overdue. It will not retry on its own — re-run it from the '
+             'overdue. It will not retry on its own. Re-run it from the '
              'Schedule page once the cause is fixed.</p>')
-    return _send(f"⚠️ quant-news: {job_id} partial — {reasons[0] if reasons else 'incomplete'}",
+    return _send(f"⚠️ quant-news: {job_id} partial: {reasons[0] if reasons else 'incomplete'}",
                  _wrap("Partial run", summary.get("target_date", job_id), body))
 
 
 def notify_job_failure(job_id: str, detail: str) -> bool:
-    """The failure mail — carries the run's own output, not a pointer to it.
+    """The failure mail, carries the run's own output, not a pointer to it.
 
     A mail that only says "check the app" is a mail that costs a login before
     it tells you anything, and the tail of the run log is usually the whole
@@ -490,7 +490,7 @@ def notify_job_failure(job_id: str, detail: str) -> bool:
 
 
 def notify_alpha_lab(results: dict) -> bool:
-    """Alpha Lab digest: one card per standing hypothesis — what it tests,
+    """Alpha Lab digest: one card per standing hypothesis, what it tests,
     what a pass would mean, where it stands. Loud only when something crosses
     the pre-registered bar; a settled-dead hypothesis says so instead of
     reading as an eternal maybe."""
@@ -498,9 +498,9 @@ def notify_alpha_lab(results: dict) -> bool:
     passing = results.get("passing") or []
 
     STATUS_STYLE = {
-        "significant": ("#2e7d32", "SIGNIFICANT — review before acting"),
-        "settled_null": ("#8a6d3b", "SETTLED — no effect at full power"),
-        "accruing": ("#777", "not significant yet — power accruing"),
+        "significant": ("#2e7d32", "SIGNIFICANT: review before acting"),
+        "settled_null": ("#8a6d3b", "SETTLED: no effect at full power"),
+        "accruing": ("#777", "not significant yet, power accruing"),
     }
 
     cards = []
@@ -535,7 +535,7 @@ def notify_alpha_lab(results: dict) -> bool:
             f"</div>")
 
     headline = (f"{len(passing)} hypothesis(es) crossed the pre-registered "
-                f"bar: {', '.join(passing)} — review before acting"
+                f"bar: {', '.join(passing)}: review before acting"
                 if passing else
                 "No standing hypothesis is significant. Settled entries are "
                 "closed questions; accruing entries gain power every "
@@ -555,7 +555,7 @@ def notify_overdue(job_ids: list[str]) -> bool:
     names = ", ".join(job_ids)
     body = (f'<p>These jobs have no successful run today and their scheduled '
             f'window has passed: <strong>{names}</strong>.</p>'
-            f'<p style="color:#666;font-size:13px">The app is reachable — this '
+            f'<p style="color:#666;font-size:13px">The app is reachable, this '
             f'is a job problem, not an uptime one. Check <code>/healthz</code>.</p>')
     return _send(f"⚠️ quant-news: {names} overdue",
                  _wrap("Job overdue", names, body))

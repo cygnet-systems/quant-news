@@ -2,18 +2,18 @@
 
 Every call through :meth:`LLMService.generate` lands here as one row: exact
 token counts from the provider response, the rates applied, the derived cost,
-and — via :func:`track` — what the call was actually for.
+and: via :func:`track`: what the call was actually for.
 
 This is a one-way sink. Nothing recorded here is ever read back into a prompt;
 it exists to answer "what did today's run cost, and which stage spent it".
 
 Attribution uses a ContextVar rather than threading a parameter through two
 dozen call sites: the stage that starts the work declares itself once, and any
-LLM call underneath it — including ones inside a model class several layers
-down — inherits that label.
+LLM call underneath it, including ones inside a model class several layers
+down: inherits that label.
 
 Context crosses ``asyncio.to_thread`` and new tasks for free. It does NOT
-cross a bare ``ThreadPoolExecutor.submit`` — worker threads start empty — so
+cross a bare ``ThreadPoolExecutor.submit``: worker threads start empty, so
 the prediction pipeline submits through ``copy_context().run`` to carry the
 label into the models it fans out. A stage that forgets this records as
 "unknown" rather than losing the row.
@@ -36,7 +36,7 @@ class UsageContext:
 
     ``section`` narrows ``stage`` to the report section served (e.g.
     "research:BE", "ai_report:overall", "recommendations"). It rides the
-    same ContextVar; only the trace table stores it — llm_usage is keyed by
+    same ContextVar; only the trace table stores it. Llm_usage is keyed by
     stage alone and stays unchanged.
     """
 
@@ -89,7 +89,7 @@ def record(
     ok: bool = True,
     error: str | None = None,
 ) -> int | None:
-    """Write one usage row. Never raises — telemetry must not break a run.
+    """Write one usage row. Never raises: telemetry must not break a run.
 
     Returns the new row's id (so the trace row for the same physical call
     can link to its cost record), or None when the write was skipped.

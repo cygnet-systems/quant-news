@@ -125,7 +125,7 @@ def non_trading_days(start: Union[str, date, datetime],
                      end: Union[str, date, datetime]) -> list[date]:
     """All non-trading calendar dates in [start, end] (weekends + holidays).
 
-    One schedule query instead of per-day is_trading_day() calls — this
+    One schedule query instead of per-day is_trading_day() calls, this
     feeds date-picker disabled_days lists, which span a year or more.
     """
     start_d, end_d = _to_date(start), _to_date(end)
@@ -155,13 +155,13 @@ def resolve_target_and_cutoff(
     """Resolve a user-selected TARGET date to ``(target, data_cutoff)``.
 
     The target is the session whose close is being predicted, so it must be
-    a trading day — a weekend/holiday selection snaps forward to the next
+    a trading day, a weekend/holiday selection snaps forward to the next
     one. Everything the models and the report are allowed to see is cut off
     at the *previous trading day*: a Monday target sees nothing after the
     preceding Friday's close, and a target after a holiday skips the holiday.
 
     Returns:
-        (target, data_cutoff) — both trading days, cutoff strictly before target.
+        (target, data_cutoff), both trading days, cutoff strictly before target.
     """
     target = _to_date(value) if value else get_default_target_day()
     if not is_trading_day(target):

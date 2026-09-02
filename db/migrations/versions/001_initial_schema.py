@@ -1,4 +1,4 @@
-"""Initial schema — predictions, reports, recommendations, data snapshots.
+"""Initial schema: predictions, reports, recommendations, data snapshots.
 
 Revision ID: 001
 Revises: None

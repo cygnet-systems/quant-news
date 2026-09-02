@@ -4,7 +4,7 @@ The 2026-08-06 failure lived entirely in this seam. The analysis ran, stored
 120 predictions and exited zero; the scheduler then parsed the run's summary
 out of the 25-line tail it had kept for display, found nothing (a 20-symbol
 summary is 53 lines of indented JSON), and mailed "produced no recommendations
-— check the History tab" about a run that had produced twenty of them.
+: check the History tab" about a run that had produced twenty of them.
 
 So these tests pin the two halves that must not drift back together:
 

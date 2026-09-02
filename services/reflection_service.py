@@ -5,16 +5,16 @@ the framework), reimplemented natively so it depends only on our own price data.
 
 The problem it solves: you cannot reflect on an outcome you do not have yet. So:
 
-  1. record_pending() — when the agent makes a call, append a *pending* entry.
-  2. resolve_pending() — on a later run, for any pending entry whose hold window
+  1. record_pending(): when the agent makes a call, append a *pending* entry.
+  2. resolve_pending(): on a later run, for any pending entry whose hold window
      has elapsed and whose realized price is available, compute the raw return and
      the alpha vs. SPY, ask the LLM for a 2-4 sentence lesson, and mark it resolved.
-  3. get_past_context() — inject the most recent same-ticker decisions (full) plus
+  3. get_past_context(), inject the most recent same-ticker decisions (full) plus
      a few recent cross-ticker lessons (reflection-only) into the next prompt.
 
 The learning signal is realized alpha, not self-grading, and the loop is naturally
 lookahead-safe: at as-of date T it only resolves decisions whose outcome date is
-already <= T. Storage is an append-only JSONL file with atomic rewrites — human
+already <= T. Storage is an append-only JSONL file with atomic rewrites, human
 readable, greppable, crash-safe, and swappable for a table later.
 """
 
@@ -151,8 +151,8 @@ REFLECTION_SYSTEM = (
     "(BUY, SELL, or HOLD), the realized forward return, and the alpha vs SPY. "
     "Correctness rule: a BUY is correct iff the return was POSITIVE; a SELL is "
     "correct iff the return was NEGATIVE; a HOLD took no position. Do NOT infer "
-    "the direction from the sign of the return — use the stated decision. Write a "
-    "SHORT lesson (2-4 sentences): (1) was the call correct given the rule above — "
+    "the direction from the sign of the return. Use the stated decision. Write a "
+    "SHORT lesson (2-4 sentences): (1) was the call correct given the rule above. "
     "cite the alpha figure; (2) which part of the thesis held or failed; (3) one "
     "concrete, reusable lesson for next time. No preamble."
 )
@@ -208,7 +208,7 @@ def resolve_pending(
             continue  # outcome not yet due as of `as_of`
         raw, alpha, days = realized_alpha(symbol, e["as_of"], hold, benchmark)
         if raw is None or alpha is None:
-            continue  # price not available yet — retry on a later run
+            continue  # price not available yet, retry on a later run
         e["raw_return"] = round(raw, 4)
         e["alpha_return"] = round(alpha, 4)
         e["reflection"] = reflect_fn(e["decision"], e.get("thesis", ""), raw, alpha)
@@ -272,7 +272,7 @@ def get_past_context(symbol: str, n_same: int = _N_SAME, n_cross: int = _N_CROSS
     if not same and not cross:
         return ""
 
-    parts = ["[PAST DECISIONS & OUTCOMES — learn from these, do not repeat mistakes]"]
+    parts = ["[PAST DECISIONS & OUTCOMES, learn from these, do not repeat mistakes]"]
     if same:
         parts.append(f"Prior {symbol} calls (most recent first):")
         for e in same:

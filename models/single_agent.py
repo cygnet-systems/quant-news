@@ -1,16 +1,16 @@
-"""Self-contained single-agent research model — decoupled from TradingAgents.
+"""Self-contained single-agent research model, decoupled from TradingAgents.
 
 This is a native quant-news reimplementation of the single-LLM-call research
 agent we previously imported from `tradingagents.baselines.single_agent`. That
 import broke when the upstream fork's `main` advanced to v0.3.1 (the `baselines`
-submodule lives only on a feature branch, and its pre-v0.3.0 internal API —
+submodule lives only on a feature branch, and its pre-v0.3.0 internal API,
 `tradingagents.llm`, `agent_utils.normalize_content`, the flat `get_*` tools,
-`signal_processing.extract_*` — was all moved/renamed/deleted upstream).
+`signal_processing.extract_*`: was all moved/renamed/deleted upstream).
 
 Design goals (per the incorporation analysis, §6 Tier 0-C):
   * Robust / swappable: implements the `BaseModel` contract, so the research
     strategy is one interchangeable implementation behind a stable seam. No
-    dependency on any TradingAgents internal — an upstream release can never
+    dependency on any TradingAgents internal. An upstream release can never
     silently kill this model again.
   * Lookahead-safe: every data block is bounded to `as_of`. News uses the
     half-open UTC window (services.news_window); OHLCV is staleness-guarded;
@@ -44,7 +44,7 @@ from services.news_window import (
 logger = logging.getLogger(__name__)
 
 # Reject an OHLCV frame whose latest row is more than this many calendar days
-# before the requested date — catches the "present but wrong" year-old frame a
+# before the requested date, catches the "present but wrong" year-old frame a
 # simple empty-check misses (ported from TradingAgents MAX_OHLCV_STALE_DAYS).
 MAX_OHLCV_STALE_DAYS = 10
 
@@ -53,7 +53,7 @@ SINGLE_AGENT_PROMPT = """You are a trading analyst deciding, at the close of {da
 
 IMPORTANT: Use ONLY information available through the close of {date}. Every data
 block below is bounded to that date; do not reason about anything that happened
-afterward. Your thesis window is 1-5 trading days — focus on catalysts and
+afterward. Your thesis window is 1-5 trading days. Focus on catalysts and
 momentum that play out within it. Ignore long-term (months/years) arguments.
 
 Every number you cite must be traceable to the data below:
@@ -62,35 +62,35 @@ Every number you cite must be traceable to the data below:
   you need is not in the data, write "not in data" instead of guessing.
 - Treat the PRECOMPUTED METRICS / verified blocks as the source of truth. Where two
   blocks give different values for the same thing, name both numbers and say which
-  block each came from, then carry that uncertainty into the call — never average
+  block each came from, then carry that uncertainty into the call. Never average
   them into a third number that appears in neither block. Do not claim historical
   support/resistance bounces or exact percentage moves unless a data block states
   them with concrete dates and prices.
 - Do not prefix price LEVELS with +/- signs; signs belong on returns/changes only.
 - A claim about a group (peers, sectors, models) must hold for EVERY member you
   name. If it doesn't, name only the members it holds for, or quantify exactly
-  ("3 of 4 peers") — never stretch "all" or "much" over a member the numbers
+  ("3 of 4 peers"), never stretch "all" or "much" over a member the numbers
   don't support.
 - Use only the evidence in this prompt. You cannot browse. The SITUATION &
   INVESTIGATION block, when present, was gathered by a research stage WITH web
-  access before this prompt was built and carries its own sources — cite those
+  access before this prompt was built and carries its own sources. Cite those
   exactly as you cite news. If something is missing, say so explicitly rather
   than filling it in. A block headed "Evidence NOT available" lists what this
   run could not gather; never reason as if those inputs were neutral.
 - NEWS ATTRIBUTION: every claim you take from a news article must name the outlet
   and the publication date inline, e.g. "shares fell 18.9% (Reuters, 2026-08-14)".
-  Each article below carries "src:" and a date — use those exact values. If you
+  Each article below carries "src:" and a date. Use those exact values. If you
   cannot attribute a news claim to a listed article, leave the claim out entirely
   rather than stating it unsourced.
 - WRITE FOR A READER WHO CANNOT SEE THESE INSTRUCTIONS. Never name, quote, or
   allude to any instruction, section label, or rule from this prompt in your
-  output — no "framework", "step", "gate", "cap", "penalty", "discipline",
+  output: no "framework", "step", "gate", "cap", "penalty", "discipline",
   "as instructed", or "per the rules". State conclusions about the market, never
   conclusions about your own instructions.
 - The ALL-CAPS names in the verdict format below (REASSESS_TO_BUY, MOVE_TO_SELL,
   SINCE LAST REPORT, and the rest) are field labels for that block ONLY. They are
   machine keys, not words. Never write one inside a sentence anywhere else in the
-  report — in prose, say "turn bullish"/"turn bearish" or name the price level.
+  report: in prose, say "turn bullish"/"turn bearish" or name the price level.
 
 Analyze ALL of the following data carefully before deciding.
 
@@ -123,12 +123,12 @@ Analyze ALL of the following data carefully before deciding.
 {extra_context}
 == HOW TO REASON (this is the order to think in, not the order to write in) ==
 
-**Step 0: Situation (read this first)** — {situation_line}
+**Step 0: Situation (read this first)**: {situation_line}
 The situation decides how every other block is read:
 - PENDING_ACQUISITION: the next 1-5 sessions are about deal-completion odds,
   not trend. Anchor to the offer price and the computed spread; weigh the
   regulatory milestones, the break risk and the decisive actors named in the
-  block. Moving averages are secondary here — never call a direction "because
+  block. Moving averages are secondary here. Never call a direction "because
   price is below its SMAs" when the spread to a cash offer is the real question.
   Triggers may be events (a regulator's order, a hearing, a vote) rather than
   price levels; a price trigger must be stated relative to the offer price.
@@ -138,12 +138,12 @@ The situation decides how every other block is read:
 - EARNINGS_EVENT: the event gate in Step 4 applies.
 - MOMENTUM_ONLY or no situation block: Steps 1-3 carry the call.
 
-**Step 1: Market Regime (Systematic Risk)** — from the SPY block:
+**Step 1: Market Regime (Systematic Risk)**: from the SPY block:
 - SPY above 50 SMA AND 200 SMA with positive MACD = BULL (prior lean BUY)
 - SPY below 50 SMA AND 200 SMA with negative MACD = BEAR (prior lean SELL)
-- Mixed = NEUTRAL (no prior — decide on ticker-specific evidence)
+- Mixed = NEUTRAL (no prior, decide on ticker-specific evidence)
 
-**Step 1b: Sector Regime ({sector_etf})** — leading, lagging, or in line vs SPY.
+**Step 1b: Sector Regime ({sector_etf})**: leading, lagging, or in line vs SPY.
 Outperforming = tailwind (strengthens BUY); underperforming = headwind.
 
 **Step 2: Idiosyncratic Analysis ({ticker})**
@@ -164,17 +164,17 @@ Neutral: RSI 45-55 with flat MACD; no material catalyst; tight range (<1% moves)
   section as the reason the position is smaller than the evidence would allow.
 - If {ticker} is down >20% from its period high, state a causal hypothesis backed
   by the news/fundamentals blocks; if none is identifiable, write exactly
-  "cause unknown — elevated risk" and treat it as bearish.
+  "cause unknown: elevated risk" and treat it as bearish.
 - Any risk/reward claim must use the support/resistance and ATR arithmetic from
   the PRECOMPUTED METRICS block (when present) rather than your own arithmetic.
 
 DECISIVENESS: commit to a clear BUY or SELL whenever the strongest evidence warrants
-one. Reserve HOLD for when the evidence is genuinely balanced — do not hedge by default.
+one. Reserve HOLD for when the evidence is genuinely balanced. Do not hedge by default.
 
 WHAT CONVICTION MEANS: CONVICTION is YOUR estimated probability (0.0-1.0) that the
 direction of your call is correct over the next 1-5 sessions. It is a judgement, not
-a measurement — it is not the same thing as the measured track record above, and it
-has not itself been scored against outcomes. 0.5 means no edge — use it only when
+a measurement: it is not the same thing as the measured track record above, and it
+has not itself been scored against outcomes. 0.5 means no edge. Use it only when
 evidence is genuinely balanced, and prefer HOLD in that case.
 
 PRICE LEVELS ARE APPROXIMATE: the moving averages and support/resistance levels in
@@ -182,9 +182,23 @@ these blocks are recomputed each run from vendor bars that get revised, so a lon
 average can shift by a dollar or more between one session's report and the next.
 Never present a level as an exact tripwire. Round every trigger, invalidation and
 target level to the nearest $0.05 under $50, the nearest $0.25 from $50 to $500,
-and the nearest $1 above $500 — or give a narrow band ("$146.50-$147.00"). Say
+and the nearest $1 above $500, or give a narrow band ("$146.50-$147.00"). Say
 "as of {date}" next to the levels in the Trade Plan so a reader knows when they
 were measured.
+
+
+== VOICE AND PUNCTUATION ==
+Write like one analyst who means it, for a desk that will trade on it.
+- Never use an em dash or an en dash as punctuation. Use a comma, a period, a colon
+  after a label, or parentheses. Hyphens inside compound words are fine.
+- No "it's not just X, it's Y" constructions. State Y.
+- No "delve", "dive into", "deep dive", "landscape", "unlock", "navigate",
+  "leverage" (except as the financial term), "robust", "seamless".
+- No "in conclusion", "in summary", "to summarize", and no closing recap.
+- No filler openers ("it is worth noting", "importantly"). Say the thing.
+- Vary sentence length. One long sentence, then a short one. Do not write every
+  sentence to the same length or the same shape.
+- Do not pad. A section with three real points beats one with six restated ones.
 
 == REQUIRED OUTPUT FORMAT (markdown) ==
 
@@ -192,7 +206,7 @@ You MUST BEGIN your response with exactly this block:
 
 ## Verdict
 FINAL TRANSACTION PROPOSAL: **BUY** (or **SELL** or **HOLD**)
-CONVICTION: **0.X** — this report's own probability that the direction is right, not a measured hit rate
+CONVICTION: **0.X** (this report's own probability that the direction is right, not a measured hit rate)
 MEASURED ACCURACY: <copy the single line under "HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY" above, word for word and digit for digit; do not paraphrase it, do not round it, and do not substitute a number of your own>
 SINCE LAST REPORT: <one line. If there is a prior stance above: name its date and call, say whether either trigger it stated was actually met by the price action shown, and if your call differs from it while no trigger was met, say so plainly in this same line. If that prior report used the same data cutoff as this run, no new price exists, so a different call is a change of interpretation on identical evidence and must be labelled that way. If there is no prior stance above, write exactly "no prior report on record">
 REASSESS_TO_BUY: <one concrete single-line trigger with a rounded level from the data, e.g. "close above 50-day SMA (~$X.XX) on >1.2x avg volume">
@@ -202,60 +216,60 @@ MOVE_TO_SELL: <one concrete single-line trigger with a rounded level from the da
 - <what the next session must show for the thesis to stay alive>
 
 Then the analysis, as sections in this order. Formatting rules:
-- Section headings: "### <n>. <Name> — <one-line takeaway>" (the takeaway IS the
-  interpretation, e.g. "### 1. Technicals — bearish trend, but stretched").
+- Section headings: "### <n>. <Name>: <one-line takeaway>" (the takeaway IS the
+  interpretation, e.g. "### 1. Technicals: bearish trend, but stretched").
 - END each section with one line: "**Read:** <what this means for the trade>".
   The Read line must be usable ONLY for {ticker}: anchor it to at least one of
   this symbol's own values from the blocks (a level, an indicator reading, a
   named article, a peer gap). If the same sentence would still be true with a
-  different ticker pasted in, it is wrong — rewrite it. In particular, never
+  different ticker pasted in, it is wrong. Rewrite it. In particular, never
   write a takeaway of the shape "the market provides a supportive/unsupportive
   backdrop, but <indicator> limits confidence"; that sentence describes nothing
   about this company.
 - Interpret, don't compute: cite numbers verbatim from the blocks; use the
   precomputed distances/R:R rather than doing arithmetic yourself.
-- Plain markdown only (###, **bold**, - bullets). No HTML. Keep each section tight —
-  the value is the takeaway and the Read line, not exhaustive narration.
-- Format large figures human-readably — "$4.69B market cap", "$1.40B revenue",
-  "1.52M shares" — never paste raw unformatted values like "4694163968".
+- Plain markdown only (###, **bold**, - bullets). No HTML. Keep each section tight.
+  The value is the takeaway and the Read line, not exhaustive narration.
+- Format large figures human-readably, "$4.69B market cap", "$1.40B revenue",
+  "1.52M shares": never paste raw unformatted values like "4694163968".
   Rounding for readability is not estimating; the underlying digits must come
   from the data.
 
-1. Situation & Key Figures — what kind of situation {ticker} is in and the one
+1. Situation & Key Figures: what kind of situation {ticker} is in and the one
    question that decides the next 1-5 sessions. From the SITUATION &
    INVESTIGATION block: the deal or proceeding and its terms (offer price,
    spread, consideration, approvals and their status), the dated milestones,
-   and the decisive actors with what the sourced record says about them —
+   and the decisive actors with what the sourced record says about them,
    every fact with its src and date. If the block says a finding is an
    inference, say so. If no situation block was gathered, say exactly that in
    one sentence and classify the situation yourself from the news block. For
    MOMENTUM_ONLY, one short paragraph saying nothing situational is in play.
-2. Technicals ({ticker}) — cover price vs ALL THREE SMAs (20/50/200 — the
+2. Technicals ({ticker}): cover price vs ALL THREE SMAs (20/50/200, the
    200SMA anchors the long-term trend and must not be skipped), RSI, MACD,
    volume, and volatility. In a PENDING_ACQUISITION, state every level relative
    to the offer price as well.
-3. News & Catalysts — company-specific first, then sector, then macro. Every
+3. News & Catalysts: company-specific first, then sector, then macro. Every
    claim carries its outlet and date inline; is anything actually new?
-4. Fundamentals — valuation and quality, only as they bear on the 1-5 day window
+4. Fundamentals: valuation and quality, only as they bear on the 1-5 day window
    (in a PENDING_ACQUISITION, only as they bear on completion or break value)
-5. Peer Comparison — {ticker} vs the peer set in the data; company-specific move
+5. Peer Comparison: {ticker} vs the peer set in the data; company-specific move
    or sector-wide repricing? (omit this section only if no peer block was provided)
-6. Business Context — what the company actually does, and which of tomorrow's
+6. Business Context: what the company actually does, and which of tomorrow's
    drivers (sector beta, own catalysts, liquidity) dominate for a name this size
-7. Market & Sector Backdrop — SPY regime and {sector_etf} versus SPY, in AT MOST
+7. Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
    three sentences. This context is identical for every symbol analysed today, so
    it earns no more space than that; spend the words on what it changes for
    {ticker} specifically
-8. Bull vs Bear — the debate, not a summary. First "**Bull:**" with the 2-3
+8. Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
    strongest arguments FOR upside, each anchored to a specific number or article
    in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
-   same standard. Argue each side at full strength — do not soften the side you
+   same standard. Argue each side at full strength. Do not soften the side you
    disagree with. The Read line states which side wins over 1-5 sessions and on
    what evidence the loser's case would take over.
-9. Risk — systematic / sector / idiosyncratic; name the single biggest risk to
+9. Risk: systematic / sector / idiosyncratic; name the single biggest risk to
    THIS call and the falsification conditions that would flip it. Name any
    evidence this run could not gather and what it would have changed.
-10. Trade Plan — stance; the key levels (support, resistance, SMAs) rounded as
+10. Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
    described above and stamped "as of {date}"; invalidation (which close, level
    or event kills the thesis); what to watch next session. If a prior stance is
    shown above, this section must also say in one sentence what changed since
@@ -263,26 +277,28 @@ Then the analysis, as sections in this order. Formatting rules:
 """
 
 
-# Appended to the prompt (not part of the format template — the JSON braces
+# Appended to the prompt (not part of the format template, the JSON braces
 # would need escaping there). One extra fenced block makes the research call
 # also the machine-readable analysis: stance for the UI banner, watch items,
 # and news-vs-technicals alignment, in the same voice as the report itself.
 EPILOGUE_INSTRUCTIONS = """
 == STRUCTURED EPILOGUE (mandatory) ==
 
-After the last numbered section, END your response with exactly one fenced JSON block — valid
+After the last numbered section, END your response with exactly one fenced JSON block, valid
 JSON, double quotes, no comments, and NOTHING after the closing fence:
 
 ```json
 {"stance": "BULLISH|CAUTIOUS_BULLISH|NEUTRAL|CAUTIOUS_BEARISH|BEARISH",
  "sentiment_alignment": "<one sentence: does the news sentiment confirm or conflict with the technical picture, and which should the reader weight here>",
- "watch_items": ["<2-3 short, concrete, checkable items — a level, a date, a metric>"]%(thesis)s}
+ "watch_items": ["<2-3 short, concrete, checkable items. A level, a date, a metric>"]%(thesis)s}
 ```
 
 The stance MUST be consistent with your Verdict: BUY maps to BULLISH
 (CAUTIOUS_BULLISH if CONVICTION < 0.6), SELL to BEARISH (CAUTIOUS_BEARISH if
 CONVICTION < 0.6), HOLD to NEUTRAL. watch_items must reuse levels/dates already
-cited in your report — do not introduce new numbers here.
+cited in your report. Do not introduce new numbers here.
+Text inside the JSON follows the same voice rules as the report: no em dashes,
+no "not just X, it's Y", no filler.
 """
 
 THESIS_EPILOGUE_SCHEMA = (
@@ -300,7 +316,7 @@ VALID_STANCES = {"BULLISH", "CAUTIOUS_BULLISH", "NEUTRAL",
 
 
 # Sector ETF resolution lives in models.sector_map: the symbol's OWN sector
-# metadata mapped sector-name -> SPDR ETF (no hardcoded ticker table — that
+# metadata mapped sector-name -> SPDR ETF (no hardcoded ticker table, that
 # silently mislabeled anything it didn't know, e.g. UNFI -> XLK).
 from models.sector_map import get_sector_info
 
@@ -347,7 +363,7 @@ def _assert_ohlcv_not_stale(df: pd.DataFrame, as_of: str, symbol: str) -> None:
     if stale_days > MAX_OHLCV_STALE_DAYS:
         raise ValueError(
             f"{symbol}: latest OHLCV row is {latest.date()}, {stale_days} days "
-            f"before requested {requested.date()} (stale) — refusing to use it"
+            f"before requested {requested.date()} (stale): refusing to use it"
         )
 
 
@@ -384,7 +400,7 @@ def _technicals(df: pd.DataFrame) -> dict:
     def sma(n):
         return _sf(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None
 
-    # RSI(14)/ATR(14): shared true-Wilder helpers — the same math as the ta
+    # RSI(14)/ATR(14): shared true-Wilder helpers, the same math as the ta
     # library the ML features use, so the LLM and the models see one number.
     # (The previous hand-rolled RSI was a simple rolling mean claiming to be
     # Wilder's; it sat ~9 points below the standard value.)
@@ -392,7 +408,7 @@ def _technicals(df: pd.DataFrame) -> dict:
     rsi = _sf(wilder_rsi_series(close).iloc[-1]) if len(close) >= 15 else None
     atr = _sf(wilder_atr_series(high, low, close).iloc[-1]) if len(df) >= 14 else None
 
-    # MACD (12/26) + signal(9) — needs enough bars to mean anything; None
+    # MACD (12/26) + signal(9). Needs enough bars to mean anything; None
     # (rendered "n/a"), never a fabricated 0.0 that reads as a real value.
     macd_last = macd_sig_last = None
     if len(close) >= 26:
@@ -430,7 +446,7 @@ def _technicals_block(name: str, df: pd.DataFrame) -> str:
     if not t:
         return f"No data for {name}."
     trend = []
-    # Percent distances precomputed — the LLM interprets, it must not do
+    # Percent distances precomputed, the LLM interprets, it must not do
     # this arithmetic itself.
     for key, label in (("sma20", "20SMA"), ("sma50", "50SMA"), ("sma200", "200SMA")):
         ref = t[key]
@@ -472,7 +488,7 @@ def _news_block(articles: list, n: Optional[int] = None) -> tuple[str, int, tupl
     """Point-in-time headlines, each carrying the outlet and date to cite.
 
     The prompt requires inline attribution on every news-derived claim, so the
-    outlet has to be in the block the model reads — without ``src:`` here the
+    outlet has to be in the block the model reads, without ``src:`` here the
     only honest option left to the model is to drop the claim.
 
     Shows up to ``n`` (config NEWS_PROMPT_ARTICLES) articles SPREAD across
@@ -503,7 +519,7 @@ def _news_block(articles: list, n: Optional[int] = None) -> tuple[str, int, tupl
             date = str(a.get("published_at") or a.get("published_date") or "?")[:10]
             source = a.get("source")
         relf = f"{rel:.2f}" if isinstance(rel, (int, float)) else "?"
-        # "unattributed" is deliberately not a plausible outlet name — the
+        # "unattributed" is deliberately not a plausible outlet name, the
         # prompt tells the model to drop claims it cannot attribute, and a
         # blank would have read as "no source needed".
         src = str(source).strip() if source else "unattributed"
@@ -530,7 +546,7 @@ def _fundamentals_block(symbol: str, as_of: str) -> str:
     Best-effort: yfinance exposes fiscal-period-end columns, so we drop any
     statement column dated after as_of (the fundamentals look-ahead filter).
     Note: yfinance keys on period-end, not filing date, so a report can surface
-    a few days early vs. when it was actually public — acceptable for a 1-5 day
+    a few days early vs. when it was actually public. Acceptable for a 1-5 day
     horizon where fundamentals are a minor input.
     """
     try:
@@ -579,7 +595,7 @@ def _fundamentals_block(symbol: str, as_of: str) -> str:
                         growth.append(
                             f"Revenue YoY: {(rev / prev_rev - 1) * 100:+.1f}%")
                     if pd.notna(ni) and pd.notna(prev_ni):
-                        # A negative base makes the ratio meaningless — state
+                        # A negative base makes the ratio meaningless, state
                         # the swing instead of a nonsense percentage.
                         if prev_ni > 0:
                             growth.append(
@@ -610,7 +626,7 @@ NO_TRACK_RECORD_LINE = (
 )
 
 NO_PRIOR_REPORT_BLOCK = (
-    "No earlier report for this symbol is on record — this is the first stance "
+    "No earlier report for this symbol is on record. This is the first stance "
     "in the archive, so there is nothing to be consistent with yet."
 )
 
@@ -627,7 +643,7 @@ def _price_since(df: pd.DataFrame, since: str) -> str:
     idx = pd.to_datetime(df.index)
     span = df[idx >= pd.to_datetime(since)]
     if span.empty or len(span) < 2:
-        # The prior report's own session is the only bar we have — no move to
+        # The prior report's own session is the only bar we have, no move to
         # report, and saying "flat" would be a fabrication.
         return (f"Price action since that report: no completed session between "
                 f"{since} and the latest bar in this dataset.")
@@ -648,7 +664,7 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     """The previous stance on this symbol, its triggers, and what price did.
 
     Without this the model has no memory across days and a stance can flip
-    overnight while every invalidation level it published went untouched — the
+    overnight while every invalidation level it published went untouched, the
     defect this block exists to make visible.
 
     A predecessor written against the SAME data cutoff is called out as such:
@@ -667,8 +683,8 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     same_cutoff = bool(as_of) and prior_date == str(as_of)[:10]
 
     lines = [
-        (f"Previous report — trade date {prior_date or '?'}"
-         + (" (SAME data cutoff as this run — an earlier run today)"
+        (f"Previous report: trade date {prior_date or '?'}"
+         + (" (SAME data cutoff as this run. An earlier run today)"
             if same_cutoff else "")
          + f", written by {prior.get('model_name') or 'an earlier run'}."),
         f"  Call: {(prior.get('decision') or '?').upper()}"
@@ -685,7 +701,7 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     if not triggers:
         lines.append("  It published no machine-readable trigger levels.")
     if same_cutoff:
-        lines.append("  No new price data exists since that report — it saw "
+        lines.append("  No new price data exists since that report, it saw "
                      "exactly the bars shown below. Any difference in your call "
                      "is a change of interpretation, not a response to news or "
                      "price.")
@@ -720,7 +736,7 @@ def extract_decision(text: str) -> str:
     found = re.findall(r"\b(BUY|SELL|HOLD)\b", (text or "").upper())
     if found:
         logger.warning(
-            "extract_decision: Verdict anchor missing — falling back to last "
+            "extract_decision: Verdict anchor missing, falling back to last "
             f"keyword ({found[-1]}); decision may be unreliable"
         )
         return found[-1]
@@ -731,7 +747,7 @@ def extract_confidence(text: str) -> float:
     """The report's stated CONFIDENCE, or 0.5 when it cannot be read.
 
     The fallback is indistinguishable from a report that genuinely said 0.50,
-    so it is logged — silently defaulting made a parse failure look like a
+    so it is logged, silently defaulting made a parse failure look like a
     real neutral call.
     """
     m = _CONF_RE.search(text or "")
@@ -741,11 +757,11 @@ def extract_confidence(text: str) -> float:
         except ValueError:
             logger.warning(
                 "extract_confidence: CONFIDENCE anchor found but unparseable "
-                f"({m.group(1)!r}) — defaulting to 0.5"
+                f"({m.group(1)!r}): defaulting to 0.5"
             )
             return 0.5
     logger.warning(
-        "extract_confidence: no CONFIDENCE anchor in report — defaulting to "
+        "extract_confidence: no CONFIDENCE anchor in report, defaulting to "
         "0.5; this is NOT a stated neutral call"
     )
     return 0.5
@@ -810,7 +826,7 @@ def render_report_markdown(text: str) -> str:
     Strips the machine-read epilogue, then rewrites the verdict block's field
     lines into list items. The model writes those fields one per line with a
     single newline between them, which every CommonMark renderer folds into one
-    paragraph — so both the in-app modal and the PDF were emitting the whole
+    paragraph: so both the in-app modal and the PDF were emitting the whole
     verdict as a run-on sentence with "REASSESS_TO_BUY:" stranded mid-prose.
     List items survive that folding, and unlike trailing-whitespace hard breaks
     they cannot be silently eaten by a strip() somewhere in the pipeline. The
@@ -834,8 +850,8 @@ def render_report_markdown(text: str) -> str:
                      if key.upper() == m.group(1).upper())
         # The model bolds its own values ("**BUY**"); a bold label plus a bold
         # value reads as one undifferentiated run, so the leading bold span is
-        # unwrapped. A plain strip("*") cannot do this — the closing "**" sits
-        # mid-string on lines like "**0.56** — this report's own probability".
+        # unwrapped. A plain strip("*") cannot do this. The closing "**" sits
+        # mid-string on lines like "**0.56**: this report's own probability".
         value = _LEADING_BOLD_RE.sub(r"\1", m.group(2).strip()).strip()
         out.append(f"- **{label}:** {value}" if value else f"- **{label}**")
     return "\n".join(out) + (sep + tail if sep else "")
@@ -856,7 +872,7 @@ _STANCE_DIR = {"BULLISH": "BUY", "CAUTIOUS_BULLISH": "BUY", "NEUTRAL": "HOLD",
 
 
 def _extract_triggers(text: str) -> dict:
-    # Tolerate a parenthetical between the label and the colon — models
+    # Tolerate a parenthetical between the label and the colon, models
     # write e.g. "MOVE_TO_SELL (add to short / confirm): ..." and the strict
     # form silently dropped the trigger.
     triggers = {}
@@ -878,7 +894,7 @@ class SingleAgentResearch:
     def __init__(self, model: Optional[str] = None, provider: Optional[str] = None,
                  max_tokens: int = 6000):
         self.model = model or MODEL.TRADING_AGENTS_MODEL
-        # Provider follows the model unless explicitly overridden — a gpt-*
+        # Provider follows the model unless explicitly overridden, a gpt-*
         # research model must route to OpenAI (the old hardcoded "anthropic"
         # default made every gpt-* selection fail with a provider mismatch).
         self.provider = provider or (
@@ -939,7 +955,7 @@ class SingleAgentResearch:
         # industry ETF when mapped (tighter cohort), sector SPDR otherwise.
         # The proxy level is stated in the block so the report is explicit
         # about what it is comparing against. SPY as the resolved ETF means
-        # the metadata is unknown — say so instead of presenting a duplicate
+        # the metadata is unknown, say so instead of presenting a duplicate
         # SPY block as sector evidence.
         sinfo = get_sector_info(symbol)
         sector_etf = sinfo["etf"]
@@ -954,7 +970,7 @@ class SingleAgentResearch:
             ledger.missing("spy", f"SPY technicals failed: {str(e)[:80]}")
         if proxy_level == "unknown":
             sector_block = (f"No distinct sector ETF resolved for {symbol} "
-                            f"(sector metadata unavailable) — rely on the SPY "
+                            f"(sector metadata unavailable), rely on the SPY "
                             f"market context; treat sector evidence as missing.")
             ledger.missing("sector", "sector metadata unavailable")
         else:
@@ -989,13 +1005,13 @@ class SingleAgentResearch:
                     symbol, as_of, lookback_days=news_lookback_days
                 )
             except Exception as e:
-                # The source failed — not a quiet week. Required evidence:
+                # The source failed, not a quiet week. Required evidence:
                 # the report is not written blind (raises).
                 logger.warning(f"PIT news fetch failed for {symbol}: {e}")
                 ledger.missing("news_source", f"point-in-time fetch failed: {str(e)[:80]}")
                 news_articles = []
 
-        # Static business identity (sector/industry/summary) — same rationale
+        # Static business identity (sector/industry/summary), same rationale
         # as _fundamentals_block's info usage: identity is not price data, so
         # it is acceptable in a historical run.
         from services.stock_data import get_company_profile
@@ -1040,7 +1056,7 @@ class SingleAgentResearch:
         gaps_block = ledger.prompt_block()
         if extra_context or gaps_block:
             extra_block = (
-                "\n== PRECOMPUTED METRICS & EVENTS (validated — prefer these numbers) ==\n"
+                "\n== PRECOMPUTED METRICS & EVENTS (validated. Prefer these numbers) ==\n"
                 + _smart_truncate(extra_context, 12000)
                 + (("\n\n" + gaps_block) if gaps_block else "")
                 + "\n"
@@ -1050,11 +1066,11 @@ class SingleAgentResearch:
                               f"{situation} (see the SITUATION & INVESTIGATION block).")
         else:
             situation_line = (f"no situation block was gathered for {symbol} in this "
-                              f"run — classify the situation yourself from the news "
+                              f"run: classify the situation yourself from the news "
                               f"and filings blocks before Step 1, and say that you did.")
         # Rendered once, measured once: the footer reports THIS count and
         # span. The char budget scales with the article budget so the tail
-        # truncation (which would eat the oldest strata — the whole point of
+        # truncation (which would eat the oldest strata. The whole point of
         # spreading) cannot fire on a normal block; ~320 chars per line.
         news_block_text, news_shown, news_shown_span = _news_block(news_articles)
         news_block_text = _smart_truncate(
@@ -1084,7 +1100,7 @@ class SingleAgentResearch:
         # Deterministic post-generation validation: the Verdict block and the
         # structured epilogue are the machine-readable parts of the report. If
         # either is missing/unparseable the decision would fall through to
-        # heuristics that can silently mislabel — one retry is cheap insurance.
+        # heuristics that can silently mislabel. One retry is cheap insurance.
         # Reasoning models bill reasoning as output tokens; reasoning_effort
         # routes generate() through its max_completion_tokens headroom logic
         # so the report (and its epilogue) actually completes.
@@ -1112,7 +1128,7 @@ class SingleAgentResearch:
             if attempt_usage:
                 usage_total["input_tokens"] += attempt_usage.get("input_tokens", 0)
                 usage_total["output_tokens"] += attempt_usage.get("output_tokens", 0)
-                # Record what actually served the call — a failover may have
+                # Record what actually served the call. A failover may have
                 # moved it off the requested model.
                 usage_total["model"] = attempt_usage.get("model") or usage_total["model"]
                 usage_total["provider"] = (attempt_usage.get("provider")
@@ -1124,7 +1140,7 @@ class SingleAgentResearch:
                 break
             logger.warning(
                 f"{symbol}: report missing Verdict anchors or epilogue "
-                f"(attempt {attempt}) — {'retrying' if attempt == 1 else 'using fallbacks'}"
+                f"(attempt {attempt}): {'retrying' if attempt == 1 else 'using fallbacks'}"
             )
 
         decision = extract_decision(raw_text)
@@ -1158,7 +1174,7 @@ class SingleAgentResearch:
             }
         structured["source"] = epilogue_source
 
-        # Provenance — computed from what was ACTUALLY assembled, never
+        # Provenance: computed from what was ACTUALLY assembled, never
         # asserted by the LLM. The footer travels inside report_text so every
         # surface (UI, History, PDF, downloads) carries its own audit trail.
         provenance = {
@@ -1215,20 +1231,20 @@ class SingleAgentResearch:
             + "."
             + (f" **Written without expected evidence: {ledger.summary()}.**"
                if ledger.degraded else "")
-            + " Every figure above comes from these blocks — flagged 'not in"
+            + " Every figure above comes from these blocks, flagged 'not in"
               " data' where missing.*"
         )
 
         # Deterministic figure audit: every number the report cites should
         # exist in the prompt it was generated from. The prompt IS the source
-        # of record here — auditing against it needs no extra fetch and can't
+        # of record here, auditing against it needs no extra fetch and can't
         # drift from what the model actually saw. High unmatched ratios mean
         # invention; a few stragglers are usually the model's own arithmetic.
         figure_check = None
         try:
             from utils.figure_check import check_figures
             # The stated conviction is the model's own judgement, so it exists
-            # in no data block by construction — auditing it guaranteed one
+            # in no data block by construction. Auditing it guaranteed one
             # false positive on every report.
             fc = check_figures(raw_text, prompt, ignore_values=(confidence,))
             figure_check = {
@@ -1245,7 +1261,7 @@ class SingleAgentResearch:
                 _prog.emit("error",
                            f"{symbol}: {len(fc.unmatched)}/{fc.checked} report "
                            f"figures lack a source in the data shown to the "
-                           f"model — treat unverified numbers as suspect")
+                           f"model: treat unverified numbers as suspect")
         except Exception as e:
             logger.debug(f"figure check skipped: {e}")
 

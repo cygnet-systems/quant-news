@@ -12,33 +12,33 @@ MODEL_DISPLAY = {
 
 
 # Two unrelated numbers used to sit unlabeled inches apart on the same report:
-# a modal titled "MRAM — SELL (50%)" beside body text reading "CONFIDENCE:
+# a modal titled "MRAM. SELL (50%)" beside body text reading "CONFIDENCE:
 # 0.68". The 50% is the model's measured directional hit rate (0.5 = it has
-# not earned one yet — NOT the model saying it is 50% sure); the 0.68 is the
+# not earned one yet. NOT the model saying it is 50% sure); the 0.68 is the
 # report's own stated conviction. Every surface that shows either one goes
 # through these so the wording can never drift apart again.
 
 def weight_label(confidence) -> str:
     """Reader-facing label for the stored reliability weight."""
     if confidence is None:
-        return "track-record weight — unrated"
+        return "track-record weight: unrated"
     try:
         value = float(confidence)
     except (TypeError, ValueError):
-        return "track-record weight — unrated"
+        return "track-record weight: unrated"
     if value == 0.5:
-        return "track-record weight — unrated"
+        return "track-record weight: unrated"
     return f"track-record weight {value:.0%}"
 
 
 def conviction_label(stated) -> str:
     """Reader-facing label for the report's own stated conviction."""
     if stated is None:
-        return "conviction — not stated"
+        return "conviction: not stated"
     try:
         return f"conviction {float(stated):.2f}"
     except (TypeError, ValueError):
-        return "conviction — not stated"
+        return "conviction: not stated"
 
 
 def confidence_tooltip() -> str:
@@ -58,11 +58,11 @@ def json_report_to_markdown(data: dict) -> str:
     overall = data.get("overall", {})
     if overall:
         lines.append("# Portfolio Summary\n")
-        rec = overall.get("recommendation", "—")
+        rec = overall.get("recommendation", "n/a")
         conf = overall.get("confidence", 0)
         lines.append(f"**Recommendation:** {rec}  ")
         lines.append(f"**Confidence:** {int(conf * 100) if isinstance(conf, float) and conf <= 1 else conf}%  ")
-        lines.append(f"**Sentiment:** {overall.get('market_sentiment', '—')}\n")
+        lines.append(f"**Sentiment:** {overall.get('market_sentiment', ', ')}\n")
         if overall.get("sentiment_explanation"):
             lines.append(f"{overall['sentiment_explanation']}\n")
         if overall.get("key_developments"):
@@ -73,11 +73,11 @@ def json_report_to_markdown(data: dict) -> str:
         lines.append("---\n")
         for sym, info in by_symbol.items():
             lines.append(f"# {sym}\n")
-            rec = info.get("recommendation", "—")
+            rec = info.get("recommendation", "n/a")
             conf = info.get("confidence", 0)
             lines.append(f"**Recommendation:** {rec}  ")
             lines.append(f"**Confidence:** {int(conf * 100) if isinstance(conf, float) and conf <= 1 else conf}%  ")
-            lines.append(f"**Sentiment:** {info.get('market_sentiment', '—')}\n")
+            lines.append(f"**Sentiment:** {info.get('market_sentiment', ', ')}\n")
             if info.get("key_developments"):
                 lines.append(f"### Key Developments\n{info['key_developments']}\n")
             if info.get("sentiment_explanation"):
@@ -97,12 +97,12 @@ def json_report_to_markdown(data: dict) -> str:
                         f"P/C volume {pos['pc_volume']:.2f} "
                         f"({pos.get('put_volume', 0):,} puts / "
                         f"{pos.get('call_volume', 0):,} calls), "
-                        f"P/C open interest {pcoi} — {pos.get('read', '')}\n")
+                        f"P/C open interest {pcoi}: {pos.get('read', '')}\n")
                 if quality.get("total_checks"):
                     flag = str(quality.get("flag", "")).replace("_", " ").upper()
                     lines.append(
                         f"**Quality screen (Bad Apples)** as of "
-                        f"{quality.get('as_of', '?')}: {flag} — "
+                        f"{quality.get('as_of', '?')}: {flag}: "
                         f"{quality['total_fails']}/{quality['total_checks']} "
                         f"checks failed")
                     for f in (quality.get("failed_checks") or [])[:8]:

@@ -46,7 +46,7 @@ def _get_predictor() -> "KronosPredictor":
     tokenizer.eval()
     model.eval()
 
-    # Force CPU in background subprocesses — MPS deadlocks after fork() on macOS.
+    # Force CPU in background subprocesses. MPS deadlocks after fork() on macOS.
     # The env var is set by the background callback in app.py.
     import os
     device = "cpu" if os.environ.get("_DASH_BG_SUBPROCESS") else None

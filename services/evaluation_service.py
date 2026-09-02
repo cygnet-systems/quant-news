@@ -285,7 +285,7 @@ def _safe_float(value) -> Optional[float]:
 
     Infinity must be caught here: vectorbt returns inf Sharpe/Sortino for a
     zero-variance series (e.g. one trade), json.dumps happily emits the
-    non-standard token "Infinity", and Postgres rejects it — the whole
+    non-standard token "Infinity", and Postgres rejects it, the whole
     strategy_metrics insert then fails.
     """
     if value is None:

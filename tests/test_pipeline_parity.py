@@ -136,5 +136,5 @@ class TestNoNewestFirstSlices:
                         and isinstance(node.value, ast.Name)
                         and node.value.id in ("articles", "news_articles", "shown")):
                     raise AssertionError(
-                        f"{rel}:{node.lineno} slices {node.value.id} — use select_spread")
+                        f"{rel}:{node.lineno} slices {node.value.id}: use select_spread")
             assert "select_spread" in src, rel

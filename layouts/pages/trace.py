@@ -1,14 +1,14 @@
 """Trace page: one run, fully joined back together.
 
 The Activity page answers "what did the system do"; this page answers "why
-did it conclude this" for a single run — the data that was fetched (counts,
+did it conclude this" for a single run. The data that was fetched (counts,
 windows, cache hits with their hash), each model's inputs and outcome, and
 every LLM call down to the exact prompts and raw response.
 
 Everything renders from Postgres (activity_log payloads, model_predictions
 by run_id, llm_traces), so a run is inspectable while it executes and
 forever after. The LLM list deliberately renders envelopes only; prompt and
-response bodies are fetched one call at a time when expanded — a run can
+response bodies are fetched one call at a time when expanded, a run can
 hold dozens of multi-kilobyte prompts and the list must not drag them all
 through every poll.
 """
@@ -33,7 +33,7 @@ _DATA_EVENTS = ("news_window", "data_load", "enrichment", "cache")
 
 
 def run_options(runs: list[dict]) -> list[dict]:
-    """Dropdown options for the selector — shared by the initial render and
+    """Dropdown options for the selector. Shared by the initial render and
     the poll's refresh so both agree on the cap hint."""
     options = [{"label": r["label"], "value": r["run_id"]} for r in runs]
     if len(runs) >= RUN_LIMIT:
@@ -58,7 +58,7 @@ def list_trace_runs(limit: int = RUN_LIMIT) -> list[dict]:
             continue
         seen.add(run["run_id"])
         # A run with no completion boundary is only "running" while its feed
-        # is fresh — an abandoned run (crashed process, killed scheduler)
+        # is fresh: an abandoned run (crashed process, killed scheduler)
         # never writes one, and must not claim to be running hours later.
         stale = False
         try:
@@ -79,7 +79,7 @@ def list_trace_runs(limit: int = RUN_LIMIT) -> list[dict]:
             status = "running"
         out.append({
             "run_id": run["run_id"],
-            "label": (f"{run['started']:%m-%d %H:%M} — "
+            "label": (f"{run['started']:%m-%d %H:%M}: "
                       f"{(run['title'] or 'Activity')[:70]} · {status}"),
             "status": status,
         })
@@ -92,7 +92,7 @@ def layout(runs: list[dict] | None = None,
     runs = runs if runs is not None else list_trace_runs()
     if selected_run is None and runs:
         selected_run = runs[0]["run_id"]
-        # A run in flight is what the viewer came to watch — select it over
+        # A run in flight is what the viewer came to watch, select it over
         # the merely-most-recent one.
         try:
             from services import progress_service as prog
@@ -144,8 +144,8 @@ def layout(runs: list[dict] | None = None,
 def build_trace_body(run_id: str | None) -> html.Div:
     """The three trace groups, each in its own wrapper.
 
-    The wrappers are what the poll callback rewrites — separately, per
-    watermark — so fresh Data events cannot destroy an LLM body the user has
+    The wrappers are what the poll callback rewrites, separately, per
+    watermark: so fresh Data events cannot destroy an LLM body the user has
     expanded, and vice versa. They must exist even with no run selected:
     the callback's Outputs target them unconditionally.
     """
@@ -253,7 +253,7 @@ def _payload_detail(payload: dict) -> html.Div:
         capped = [s for s, d in detail.items() if d.get("capped")]
         if capped:
             parts.append(html.Span(
-                f"Cap dropped the OLDEST articles for {', '.join(sorted(capped))} — "
+                f"Cap dropped the OLDEST articles for {', '.join(sorted(capped))}: "
                 f"the effective window is shorter than requested.",
                 style={"color": "var(--warning, #ffc107)"}))
     elif kind == "data_load":
@@ -262,7 +262,7 @@ def _payload_detail(payload: dict) -> html.Div:
             f"{s}: {v.get('bars', 0)} bars"
             + (f" {v.get('start')}→{v.get('end')}" if v.get("end") else "")
             + (f" ({v.get('source')})" if v.get("source") else "")
-            + (" — FAILED" if v.get("error") else "")
+            + (": FAILED" if v.get("error") else "")
             for s, v in sorted(by_sym.items()))))
     elif kind == "enrichment":
         by_sym = payload.get("by_symbol") or {}
@@ -288,7 +288,7 @@ def _payload_detail(payload: dict) -> html.Div:
                 v = ", ".join(str(x) for x in v)
             parts.append(_kv(k, v))
     else:
-        # Unknown payloads still render — raw, but never lost.
+        # Unknown payloads still render, raw, but never lost.
         parts.append(html.Pre(json.dumps(payload, indent=2, default=str),
                               className="trace-pre"))
     return html.Div(parts, className="trace-payload-detail",
@@ -353,13 +353,13 @@ def _model_group(model_events: list[dict], preds: list[dict]) -> html.Div:
         # arm's number is a measured track-record weight (0.5 = none earned
         # yet), every other model's is its own raw score. Say which.
         if not isinstance(v, (int, float)):
-            return "—"
+            return "n/a"
         if model == "trading_agents":
             return "unrated" if float(v) == 0.5 else f"{v:.0%} measured"
         return f"{v:.0%} raw"
 
     def _dur(v):
-        return f"{v / 1000:.1f}s" if isinstance(v, (int, float)) else "—"
+        return f"{v / 1000:.1f}s" if isinstance(v, (int, float)) else "n/a"
 
     header = html.Thead(html.Tr([
         html.Th("Symbol"), html.Th("Model"), html.Th("Decision"),
@@ -385,19 +385,19 @@ def _model_group(model_events: list[dict], preds: list[dict]) -> html.Div:
             status = "stored"
         else:
             status = "ran"
-        # A failed or abstaining model made no call — its error-carrying
+        # A failed or abstaining model made no call, its error-carrying
         # HOLD (0%) placeholder must never render as a decision.
         no_call = bool(row.get("error"))
         body.append(html.Tr([
-            html.Td(sym or "—"),
-            html.Td(model or "—"),
-            html.Td("—" if no_call else (row.get("decision") or "—")),
-            html.Td("—" if no_call else _conf(row.get("confidence"), model or ""),
+            html.Td(sym or "n/a"),
+            html.Td(model or "n/a"),
+            html.Td("n/a" if no_call else (row.get("decision") or "n/a")),
+            html.Td(", " if no_call else _conf(row.get("confidence"), model or ""),
                     className="num"),
             html.Td(_dur(row.get("duration_ms")), className="num"),
-            html.Td(inp.get("bars", "—"), className="num"),
-            html.Td(inp.get("last_bar") or "—", className="num"),
-            html.Td(inp.get("news", "—"), className="num"),
+            html.Td(inp.get("bars", "n/a"), className="num"),
+            html.Td(inp.get("last_bar") or "n/a", className="num"),
+            html.Td(inp.get("news", "n/a"), className="num"),
             html.Td(status),
         ]))
     return html.Div(
@@ -430,13 +430,13 @@ def _llm_group(calls: list[dict]) -> html.Div:
 
 def _llm_call_row(c: dict) -> html.Div:
     ok = bool(c.get("ok"))
-    tokens = "—"
+    tokens = ", "
     if c.get("input_tokens") is not None or c.get("output_tokens") is not None:
         tokens = f"{c.get('input_tokens') or 0}→{c.get('output_tokens') or 0}"
     cost = (f"${c['cost_usd']:.4f}" if isinstance(c.get("cost_usd"), float)
-            else "—")
+            else "n/a")
     dur = (f"{c['duration_ms'] / 1000:.1f}s"
-           if isinstance(c.get("duration_ms"), (int, float)) else "—")
+           if isinstance(c.get("duration_ms"), (int, float)) else "n/a")
     ts = c.get("created_at")
     ts_str = (_prog.format_clock(ts) if hasattr(ts, "strftime") else str(ts))
 
@@ -479,7 +479,7 @@ def _llm_call_row(c: dict) -> html.Div:
 
 
 def render_llm_bodies(bodies: dict | None) -> html.Div:
-    """The expanded view of one call — fetched only when the row is opened."""
+    """The expanded view of one call. Fetched only when the row is opened."""
     if not bodies:
         return _empty("Trace bodies not found (or not visible to you).")
 

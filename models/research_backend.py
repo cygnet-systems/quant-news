@@ -1,4 +1,4 @@
-"""Swappable research-agent backend — the seam for ingesting future TradingAgents.
+"""Swappable research-agent backend, the seam for ingesting future TradingAgents.
 
 The `trading_agents` model calls a `ResearchAgent` (the `analyze(...)` contract)
 rather than a concrete class, so the research strategy is one interchangeable
@@ -11,7 +11,7 @@ Selection (first match wins):
 
 To ingest a new TradingAgents version when one ships that is worth adopting:
   1. Pin it:  pip install 'tradingagents==X.Y.Z'  (never depend on an unpinned
-     sibling checkout again — that is exactly what broke us at v0.3.1).
+     sibling checkout again, that is exactly what broke us at v0.3.1).
   2. Implement `TradingAgentsAdapter.analyze()` to map our (symbol, as_of, ...)
      call onto that version's *public* API and return the standard result dict.
   3. Set RESEARCH_BACKEND=tradingagents.
@@ -31,7 +31,7 @@ class ResearchAgent(Protocol):
     """The contract every research backend must satisfy.
 
     Returns a dict with at least: decision (BUY/SELL/HOLD), confidence (0-1,
-    the backend's self-report — the model layer decides how much to trust it),
+    the backend's self-report, the model layer decides how much to trust it),
     raw_response (full text), and optionally triggers / news_count / sector_etf.
     """
 
@@ -77,7 +77,7 @@ class TradingAgentsAdapter:
     """Adapter over a pinned external TradingAgents release.
 
     Intentionally a stub until a version worth adopting ships. It raises a clear,
-    actionable error rather than silently degrading — so choosing this backend
+    actionable error rather than silently degrading, so choosing this backend
     without wiring it fails loudly instead of returning fake HOLDs (the failure
     mode we just removed).
     """

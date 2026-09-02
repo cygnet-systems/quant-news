@@ -8,8 +8,8 @@ from services.llm_service import LLMService
 def _signals(gaps=None, investigation=None):
     details = {
         "raw_response": "## Verdict\nFINAL TRANSACTION PROPOSAL: **SELL**\n\n"
-                        "### 1. Situation & Key Figures — pending deal\ntext\n"
-                        "### 8. Bull vs Bear — x\ntext\n",
+                        "### 1. Situation & Key Figures, pending deal\ntext\n"
+                        "### 8. Bull vs Bear, x\ntext\n",
         "evidence": {"present": ["metrics"], "gaps": gaps or [],
                      "degraded": bool(gaps)},
         "investigation": investigation or {},
@@ -66,7 +66,7 @@ def test_synthesis_lines_carry_situation_spread_and_gaps():
     svc._client_cache, svc._active = {}, (None, None)
     svc.generate_recommendations(merged, signals, ["BHF"], basis="research+signals")
     prompt = captured["prompt"]
-    assert ("Situation (web-researched): PENDING_ACQUISITION (high) — "
+    assert ("Situation (web-researched): PENDING_ACQUISITION (high): "
             "Merger arb: will Delaware approve?; deal: Aquarian at $70.00, "
             "gross spread +32.1%") in prompt
     assert "WRITTEN WITHOUT expected evidence: options positioning (throttled)" in prompt
@@ -84,4 +84,4 @@ def test_synthesis_tolerates_string_offer_and_missing_spread():
     svc.generate = lambda prompt, system_prompt=None, **kw: captured.setdefault("p", prompt) and None
     svc._client_cache, svc._active = {}, (None, None)
     svc.generate_recommendations(merged, _signals(None, inv), ["BHF"], basis="research+signals")
-    assert "Situation (classified from supplied evidence): STRATEGIC_REVIEW (low) — bid rumour; deal: n/a" in captured["p"]
+    assert "Situation (classified from supplied evidence): STRATEGIC_REVIEW (low): bid rumour; deal: n/a" in captured["p"]

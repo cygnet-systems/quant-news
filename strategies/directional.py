@@ -1,4 +1,4 @@
-"""Directional strategy — follow the model's signal directly.
+"""Directional strategy: follow the model's signal directly.
 
 If model says BUY, go long. If SELL, go short. HOLD maps to SKIP.
 Simplest possible baseline strategy.

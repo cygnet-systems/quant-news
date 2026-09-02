@@ -32,7 +32,7 @@ def _search_history_rows(searches: list[dict]) -> html.Div:
     for s in searches:
         # last_used_at is a UTC isoformat string. Slicing it to 16 chars
         # printed raw UTC with no zone marker, so a late-evening ET search
-        # showed under TOMORROW's date — a wrong day, not just a wrong hour.
+        # showed under TOMORROW's date, a wrong day, not just a wrong hour.
         last = _prog.format_stamp(s.get("last_used_at"))
         rows.append(html.Tr([
             html.Td(html.Button(

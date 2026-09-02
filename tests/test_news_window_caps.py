@@ -208,7 +208,7 @@ class TestCoverageGaps:
         assert gaps == [(days[0], days[1]), (days[5], days[6]), (days[8], days[9])]
 
     def test_fully_covered_history_needs_nothing(self):
-        days = self._days(10)[:8]  # ends three days ago — not at the live edge
+        days = self._days(10)[:8]  # ends three days ago, not at the live edge
         covered = {d: self.NOW - timedelta(days=30) for d in days}
         assert nw.coverage_gaps(days, covered, now=self.NOW) == []
 

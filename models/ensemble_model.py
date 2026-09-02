@@ -1,11 +1,11 @@
-"""Live ensemble model — combines individual models under a selectable method.
+"""Live ensemble model, combines individual models under a selectable method.
 
 Runs after all individual models complete (Phase 3). Receives their
 results via other_results kwarg. Uses ensemble_config from the UI
 to determine which models participate, their weights, and how the
 votes are combined (see METHODS).
 
-All configuration is transparent — metadata shows exactly which
+All configuration is transparent, metadata shows exactly which
 models voted, their weights, the method, and the computed score.
 """
 
@@ -22,18 +22,18 @@ logger = logging.getLogger(__name__)
 _DIRECTION_MAP = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.0}
 
 # Combination methods. Every method takes its confidence/up_probability from
-# the weighted mean member probability (the calibrated formula — see the Brier
+# the weighted mean member probability (the calibrated formula, see the Brier
 # note in predict()); they differ only in how the DIRECTION is decided.
-#   confidence_weighted — each vote counts weight x the member's own
+#   confidence_weighted: each vote counts weight x the member's own
 #       confidence. Platform evals found member confidence carries little
 #       calibration signal, so this mostly behaves like `majority` with noise.
-#   majority — each vote counts its config weight only. One model, one
+#   majority: each vote counts its config weight only. One model, one
 #       (weighted) vote; transparent baseline.
-#   prob_mean — direction from the weighted mean up-probability itself,
+#   prob_mean: direction from the weighted mean up-probability itself,
 #       thresholded. The best-calibrated signal the members publish.
-#   agreement — trade only on consensus: at least `min_agree` members back one
+#   agreement: trade only on consensus: at least `min_agree` members back one
 #       direction and none back the other, else HOLD. Weights are ignored.
-#       Cuts trade count, which matters because whipsaw — not direction — is
+#       Cuts trade count, which matters because whipsaw, not direction, is
 #       the documented failure mode (R2000 diversity test, 2026-07).
 METHODS = ("confidence_weighted", "majority", "prob_mean", "agreement")
 
@@ -57,11 +57,11 @@ class EnsembleModel(BaseModel):
         """Combine individual model predictions via weighted vote.
 
         Required kwargs:
-            other_results: dict[str, dict] — model_name → result dict
+            other_results: dict[str, dict], model_name → result dict
                 from Phase 1+2 predictions.
 
         Optional kwargs:
-            ensemble_config: dict — from UI store:
+            ensemble_config: dict: from UI store:
                 {"enabled_models": [...], "weights": {model: weight, ...},
                  "method": one of METHODS, "min_agree": int}
                 If not provided, uses config defaults.
@@ -89,7 +89,7 @@ class EnsembleModel(BaseModel):
             min_agree = MODEL.ENSEMBLE_MIN_AGREE
 
         if not other_results:
-            # No inputs means no vote — an error result is never persisted,
+            # No inputs means no vote. An error result is never persisted,
             # where a 0-confidence HOLD row would be scored as if decided.
             return PredictionResult(
                 model_name=self.name,
@@ -129,14 +129,14 @@ class EnsembleModel(BaseModel):
             )
 
         # The vote weight decides the DIRECTION only, per `method`. It
-        # deliberately does not decide the confidence — see below.
+        # deliberately does not decide the confidence, see below.
         #
         # Direction weights run through two evaluated-history corrections:
-        #   * calibrate() — what this member's raw confidence has historically
+        #   * calibrate(): what this member's raw confidence has historically
         #     meant (isotonic fit). Raw confidences are anti-calibrated here,
         #     and `confidence_weighted` on raw numbers rewards overconfidence.
         #     Members without enough history get shrunk halfway toward 0.5.
-        #   * rolling_hit_rate() — decays chronically-wrong members instead of
+        #   * rolling_hit_rate(), decays chronically-wrong members instead of
         #     letting config weights carry them at full strength; clamped to
         #     [0.5x, 1.5x] so one hot or cold month cannot zero a member out.
         # The probability aggregation below stays config-weight-only: that
@@ -183,7 +183,7 @@ class EnsembleModel(BaseModel):
                 effective = weight * cal_conf * perf_factor
             elif method == "agreement":
                 effective = 1.0
-            else:  # majority, prob_mean — config weight x performance decay
+            else:  # majority, prob_mean, config weight x performance decay
                 effective = weight * perf_factor
             weighted_score += effective * direction
             total_weight += effective
@@ -226,7 +226,7 @@ class EnsembleModel(BaseModel):
         if method == "agreement":
             # Consensus gate: trade only when enough members back one side
             # and nobody backs the other. min_agree above the number of
-            # running members means the gate can never open — the UI warns,
+            # running members means the gate can never open, the UI warns,
             # and the details below make the abstention auditable.
             if buy_votes >= min_agree and sell_votes == 0:
                 action = "BUY"
@@ -246,11 +246,11 @@ class EnsembleModel(BaseModel):
         # per-model confidences cancel in weighted_score/total_weight, so
         # `normalized` is exactly +/-1 no matter how unsure the members were,
         # pinning confidence at 1.0. That fired on ~45% of predictions, whose
-        # realised up-rate was 0.499 — the ensemble claimed certainty on a coin
+        # realised up-rate was 0.499: the ensemble claimed certainty on a coin
         # flip. Measured over a 2024-2026 walk-forward plus a 2026-04..07
         # holdout, this change improves Brier from 0.408 to 0.263 (design) and
         # 0.381 to 0.255 (holdout); a constant 0.5 forecast scores 0.25, so the
-        # old formula was worse than declining to answer. It adds no edge — it
+        # old formula was worse than declining to answer. It adds no edge, it
         # stops the ensemble overstating what it knows.
         up_probability = mean_member_p
         confidence = min(abs(up_probability - 0.5) * 2, 1.0)

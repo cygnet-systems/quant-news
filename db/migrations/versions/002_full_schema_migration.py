@@ -1,4 +1,4 @@
-"""Full schema migration — DuckDB tables to Postgres, merge prediction_runs into model_predictions.
+"""Full schema migration. DuckDB tables to Postgres, merge prediction_runs into model_predictions.
 
 Revision ID: 002
 Revises: 001

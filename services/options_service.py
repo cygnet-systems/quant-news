@@ -2,7 +2,7 @@
 
 Put/call ratios per symbol per date via Alpha Vantage HISTORICAL_OPTIONS,
 which serves the full chain (volume, open interest) as it stood on a given
-trading day — so the same call is lookahead-safe live and in backtests.
+trading day: so the same call is lookahead-safe live and in backtests.
 
 The 2026-08-07 one-day experiment (20 symbols) showed the volume P/C carries
 only a weak directional lean (low-P/C names outperformed high-P/C by ~1.2pp,
@@ -43,7 +43,7 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
     Tiered: the Terminal's warmed L2 cache first (nightly post-close warmer,
     no network cost beyond a local cache read), then Alpha Vantage
     HISTORICAL_OPTIONS. Returns None when neither has the chain (unlisted
-    options, throttled, no key) — callers must treat that as "no data",
+    options, throttled, no key), callers must treat that as "no data",
     not neutral positioning.
     """
     chain_date = _chain_date(as_of)
@@ -87,7 +87,7 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
             if k in data:
                 logger.warning(f"{symbol}: HISTORICAL_OPTIONS {k}: "
                                f"{str(data[k])[:150]}")
-                return None  # transient — do not cache
+                return None  # transient: do not cache
         contracts = data.get("data") or []
         if contracts:
             result = _aggregate(contracts, chain_date)
@@ -102,7 +102,7 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
 
 def _aggregate_warm(summary: dict, chain_date: str) -> dict:
     """Metrics from the Terminal warmer's per-expiry summary. Covers
-    expirations within its 90-day cutoff — near-dated positioning, vs the
+    expirations within its 90-day cutoff. Near-dated positioning, vs the
     all-expiry AV aggregate."""
     put_vol = call_vol = put_oi = call_oi = 0
     for e in summary.get("expiries") or []:
@@ -220,12 +220,12 @@ def get_put_call_by_expiry(symbol: str, as_of: str) -> dict | None:
 
 def format_options_block(symbol: str, m: dict | None,
                          by_expiry: dict | None = None) -> str:
-    """Prompt block. Empty string when no data — never a fabricated neutral."""
+    """Prompt block. Empty string when no data, never a fabricated neutral."""
     if not m:
         return ""
     window = (" (expirations within 90d)"
               if m.get("expiry_window") == "≤90d" else "")
-    lines = [f"[{symbol} — options positioning from the chain as of "
+    lines = [f"[{symbol}: options positioning from the chain as of "
              f"{m['as_of']}{window}]"]
     pcv = f"{m['pc_volume']:.2f}" if m.get("pc_volume") is not None else "n/a"
     pcoi = f"{m['pc_oi']:.2f}" if m.get("pc_oi") is not None else "n/a"
@@ -244,12 +244,12 @@ def format_options_block(symbol: str, m: dict | None,
             "Vendor put/call volume by expiration"
             + (f" (full chain {full:.2f})" if full is not None else "")
             + ": " + " | ".join(f"{d} {v:.2f}" for d, v in by_expiry["by_expiry"])
-            + " — a front-month skew that the whole-chain figure averages away "
+            + ": a front-month skew that the whole-chain figure averages away "
               "is event positioning; a skew spread evenly is a stance."
         )
     if m["read"] == "low-liquidity":
         lines.append(
-            f"Only {m['total_volume']:,} contracts traded — too thin to read; "
+            f"Only {m['total_volume']:,} contracts traded: too thin to read; "
             f"ignore this block for direction."
         )
     else:

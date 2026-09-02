@@ -1,14 +1,14 @@
 """Per-run trace capture and retrieval.
 
 Write side: :func:`record_llm_call` stores one ``llm_traces`` row per
-physical LLM API call — the exact bodies and request parameters, captured
+physical LLM API call, the exact bodies and request parameters, captured
 before any parsing so truncated/unparseable responses survive. Attribution
 (run/stage/section/symbol) comes from the same ContextVar the cost telemetry
 uses, so a trace row and its ``llm_usage`` twin always agree on what the call
 was for. Token/cost math stays in ``llm_usage`` alone.
 
 Read side: the queries behind the Trace page. The list query deliberately
-never selects the Text bodies — a run can hold dozens of multi-kilobyte
+never selects the Text bodies. A run can hold dozens of multi-kilobyte
 prompts, and the list only needs the envelope; :func:`get_llm_call_bodies`
 fetches one row's bodies when the user expands it.
 
@@ -25,7 +25,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Cap per-body storage. Nothing in the pipeline legitimately exceeds this —
+# Cap per-body storage. Nothing in the pipeline legitimately exceeds this. 
 # a runaway payload should not be able to bloat the table unboundedly.
 _MAX_BODY_CHARS = 200_000
 
@@ -53,7 +53,7 @@ def record_llm_call(
     duration_ms: Optional[int] = None,
     usage_id: Optional[int] = None,
 ) -> None:
-    """Write one llm_traces row. Never raises — same contract as usage.record."""
+    """Write one llm_traces row. Never raises: same contract as usage.record."""
     try:
         from db.models import LLMTrace
         from db.session import get_session
@@ -137,7 +137,7 @@ def _visible_clause():
 
 
 def list_llm_calls(run_id: str, after_id: int = 0, limit: int = 500) -> list[dict]:
-    """The envelope of every LLM call in a run — no Text bodies.
+    """The envelope of every LLM call in a run, no Text bodies.
 
     ``after_id`` supports incremental polling (WHERE run_id = X AND id > N).
     ``error`` is truncated server-side so a stack trace cannot drag the whole
@@ -276,7 +276,7 @@ def list_run_predictions(run_id: str) -> list[dict]:
 
 
 def latest_run_marker() -> int:
-    """Id of the newest run boundary visible to this user — the poll's cheap
+    """Id of the newest run boundary visible to this user, the poll's cheap
     "did the run list change?" probe (start_run writes a stage='run' event
     the moment a run opens, so a new run moves this immediately)."""
     try:
@@ -299,7 +299,7 @@ def latest_run_marker() -> int:
 
 
 def run_watermarks(run_id: str) -> dict:
-    """Newest row ids for a run — the poll's cheap "anything new?" probe."""
+    """Newest row ids for a run. The poll's cheap "anything new?" probe."""
     try:
         from sqlalchemy import func, select
 

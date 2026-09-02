@@ -209,7 +209,7 @@ def test_data_snapshot_invalidation():
 
 def main():
     print("=" * 60)
-    print("Persistence Layer — End-to-End Test")
+    print("Persistence Layer: End-to-End Test")
     print("=" * 60)
 
     tests = [

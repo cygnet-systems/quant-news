@@ -2,7 +2,7 @@
 
 scripts/replay_ensemble_methods.py compares combination methods by replaying
 them over stored history. That comparison is only meaningful if a replayed
-verdict is judged by the same rules as a real one — a second, subtly different
+verdict is judged by the same rules as a real one. A second, subtly different
 scoring function would produce a ranking that reflects the scorer rather than
 the methods.
 

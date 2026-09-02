@@ -1,4 +1,4 @@
-"""Report generation service — HTML-to-PDF trading analysis reports.
+"""Report generation service. HTML-to-PDF trading analysis reports.
 
 Generates professional analysis reports styled after TradingAgents output.
 Reports include: executive summary, model predictions with timestamps,
@@ -117,19 +117,19 @@ def _build_ta_predictions_section(predictions: list[dict]) -> str:
     first = predictions[0] if predictions else {}
     pred_date = first.get("prediction_date", "")
     target_date = first.get("target_date", "")
-    # Always rendered — a missing date shows as "—" rather than the whole
+    # Always rendered: a missing date shows as ", " rather than the whole
     # line vanishing, so a broken date is visible instead of silent.
-    meta = f"<strong>Target date (close being predicted):</strong> {_esc(target_date) or '—'}"
-    meta += f" &nbsp;&nbsp;<strong>Data through:</strong> {_esc(pred_date) or '—'}"
+    meta = f"<strong>Target date (close being predicted):</strong> {_esc(target_date) or ', '}"
+    meta += f" &nbsp;&nbsp;<strong>Data through:</strong> {_esc(pred_date) or ', '}"
     rows.append(f"<p class='meta'>{meta}</p>")
 
     rows.append("<table><tr><th>Model</th><th>Signal</th><th>Confidence</th>"
                 "<th>Up Prob</th><th>Target</th><th>Result</th></tr>")
     for p in predictions:
         conf = p.get("confidence")
-        conf_str = f"{int(conf * 100)}%" if conf is not None else "—"
+        conf_str = f"{int(conf * 100)}%" if conf is not None else "n/a"
         up = p.get("up_probability")
-        up_str = f"{up:.2f}" if up is not None else "—"
+        up_str = f"{up:.2f}" if up is not None else "n/a"
         pnl = p.get("pnl_dollars")
         correct = p.get("was_correct")
         if pnl is not None:
@@ -142,7 +142,7 @@ def _build_ta_predictions_section(predictions: list[dict]) -> str:
             f"<tr><td>{_esc(p.get('model_name', ''))}</td>"
             f"<td>{_esc(p.get('decision', ''))}</td>"
             f"<td>{conf_str}</td><td>{up_str}</td>"
-            f"<td>{_esc(p.get('target_date', '')) or '—'}</td><td>{result}</td></tr>"
+            f"<td>{_esc(p.get('target_date', '')) or ', '}</td><td>{result}</td></tr>"
         )
     rows.append("</table><hr/>")
     return "\n".join(rows)
@@ -218,7 +218,7 @@ def generate_ta_report_pdf(
 
     # Two different numbers, and the header used to conflate them: the stored
     # confidence is the track-record-grounded reliability weight (0.5 until a
-    # record exists — it is NOT the model saying "50% sure"), while the LLM's
+    # record exists: it is NOT the model saying "50% sure"), while the LLM's
     # own conviction lives in the report text's CONFIDENCE line.
     conf_pct = int((confidence or 0) * 100)
     stated = extract_confidence(report_text)
@@ -235,7 +235,7 @@ def generate_ta_report_pdf(
         "<p><strong>Conviction (this report's own):</strong> "
         + (f"{stated:.2f}" if stated is not None else "not stated")
         + " &nbsp;&nbsp; <strong>Track-record weight (measured):</strong> "
-        + ("unrated — not enough resolved calls yet"
+        + ("unrated: not enough resolved calls yet"
            if confidence in (None, 0.5) else f"{conf_pct}%")
         + "</p><p class='meta'>Conviction is the report's own estimate and has "
           "never been scored; the track-record weight is this model's measured "
@@ -404,7 +404,7 @@ def _build_provenance_box(
 
     Transparency contract: every layer of the report names the model that
     wrote it and the data it was given. All values here are computed from the
-    payloads (stamped at generation time) — never asserted by an LLM.
+    payloads (stamped at generation time), never asserted by an LLM.
     """
     rows = ["<h2>How This Report Was Compiled</h2>"]
     items: list[tuple[str, str, str]] = []  # (layer, model, inputs)
@@ -600,7 +600,7 @@ def _build_model_predictions_section(
         if not sym_models:
             continue
 
-        rows.append(f"<h3>{symbol} — Model Signals</h3>")
+        rows.append(f"<h3>{symbol}: Model Signals</h3>")
         rows.append("""
         <table>
         <thead><tr>
@@ -683,14 +683,14 @@ def _sym_positioning_quality_html(sym: dict) -> list[str]:
             f"<p><strong>Options Positioning</strong> (chain as of "
             f"{_esc(pos.get('as_of', '?'))}): P/C volume {pcv} "
             f"({pos.get('put_volume', 0):,} puts / {pos.get('call_volume', 0):,} calls), "
-            f"P/C open interest {pcoi} — {_esc(pos.get('read', ''))}</p>"
+            f"P/C open interest {pcoi}: {_esc(pos.get('read', ''))}</p>"
         )
     quality = sym.get("quality") or {}
     if quality.get("total_checks"):
         flag = str(quality.get("flag", "")).replace("_", " ").upper()
         rows.append(
             f"<p><strong>Quality Screen (Bad Apples)</strong> as of "
-            f"{_esc(quality.get('as_of', '?'))}: {_esc(flag)} — "
+            f"{_esc(quality.get('as_of', '?'))}: {_esc(flag)}: "
             f"{quality['total_fails']}/{quality['total_checks']} checks failed</p>"
         )
         failed = quality.get("failed_checks") or []
@@ -714,7 +714,7 @@ def _sym_positioning_quality_html(sym: dict) -> list[str]:
             rows.append("</ul>")
     if rows:
         rows.append("<p class='meta'>Positioning and quality shade conviction "
-                    "and sizing — neither is a standalone timing signal.</p>")
+                    "and sizing: neither is a standalone timing signal.</p>")
     return rows
 
 
@@ -740,7 +740,7 @@ def _build_ai_analysis_section(
         if rec:
             rows.append(f"<p><strong>Portfolio Overview:</strong> {_esc(rec)}"
                         f"{f' ({_esc(conf)}% confidence)' if conf else ''}"
-                        f"{f' — compiled by {_esc(model_used)}' if model_used else ''}</p>")
+                        f"{f': compiled by {_esc(model_used)}' if model_used else ''}</p>")
 
         devs = overall.get("key_developments", [])
         if devs:
@@ -756,7 +756,7 @@ def _build_ai_analysis_section(
                 rows.append(f"<li>{_esc(r)}</li>")
             rows.append("</ol>")
 
-    # Per-symbol chapters — the full research report when one exists, else
+    # Per-symbol chapters, the full research report when one exists, else
     # the news-summary tier. One template either way.
     by_symbol = ai_analysis.get("by_symbol", {})
     for symbol in symbols:
@@ -768,7 +768,7 @@ def _build_ai_analysis_section(
         if research.get("raw_response"):
             decision = research.get("decision", "")
             model_used = research.get("model") or (research.get("provenance") or {}).get("model", "")
-            rows.append(f"<h3>{_esc(symbol)} — Research Report</h3>")
+            rows.append(f"<h3>{_esc(symbol)}: Research Report</h3>")
             meta_bits = []
             if decision:
                 meta_bits.append(f"<strong>Verdict:</strong> {_esc(decision)}")
@@ -786,7 +786,7 @@ def _build_ai_analysis_section(
             conf = sym.get("confidence", "")
             model_used = sym.get("model_used", "")
             src = sym.get("sources") or {}
-            rows.append(f"<h3>{_esc(symbol)} — News Analysis</h3>")
+            rows.append(f"<h3>{_esc(symbol)}: News Analysis</h3>")
             rows.append(f"<p><strong>Recommendation:</strong> {_esc(rec)}"
                         f"{f' ({_esc(conf)}% confidence)' if conf else ''}</p>")
 
@@ -814,7 +814,7 @@ def _build_ai_analysis_section(
                     f"validated blocks ({_esc(blocks)}).</p>"
                 )
 
-        # Shared panels — identical for both tiers.
+        # Shared panels: identical for both tiers.
         rows.extend(_sym_positioning_quality_html(sym))
         if sym.get("sentiment_explanation"):
             rows.append(f"<p><strong>News vs. Technicals:</strong> "

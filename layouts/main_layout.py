@@ -30,12 +30,12 @@ def create_layout() -> html.Div:
             # They re-derive automatically: their callbacks fire on
             # "selected-symbols", which is restored on load.
             dcc.Store(id="selected-symbols", data=[], storage_type="local"),
-            # Recent symbol GROUPS (list of lists, newest first, capped) —
+            # Recent symbol GROUPS (list of lists, newest first, capped). 
             # local so past sessions' watchlists survive restarts.
             dcc.Store(id="recent-symbol-groups", data=[], storage_type="local"),
             # The symbol set for the CURRENT run-dialog session: shape
             # {"source", "symbols", "watchlist", "cohort"}. Session-scoped on
-            # purpose — a one-off run tweak should not survive a reload.
+            # purpose: a one-off run tweak should not survive a reload.
             dcc.Store(id="run-symbols-store", data={}),
             # Home prediction-board symbol narrow. Session-scoped on purpose:
             # "show me AAPL" answers a question you are asking now, not one
@@ -82,7 +82,7 @@ def create_layout() -> html.Div:
             # Page offsets per archive bucket ({"predictions": 200, ...}).
             # Session-scoped; filter changes reset it.
             dcc.Store(id="history-page", data={}),
-            # Activity Log scope. Honoured only for Administrators — the
+            # Activity Log scope. Honoured only for Administrators, the
             # server pins everyone else to their own rows regardless.
             dcc.Store(id="history-activity-scope", data="all", storage_type="local"),
             # Activity page filters. At root so a filter survives navigating
@@ -91,11 +91,11 @@ def create_layout() -> html.Div:
             dcc.Store(id="history-eval-status", data=None),
             dcc.Store(id="active-tab-store", data=None, storage_type="local"),
 
-            # URL — drives the once-per-page-load auth chip render and carries
+            # URL: drives the once-per-page-load auth chip render and carries
             # ?login_error= back from the /auth/login redirect.
             dcc.Location(id="url", refresh=False),
 
-            # Cygnet SSO login modal. Native html.Form POST to /auth/login —
+            # Cygnet SSO login modal. Native html.Form POST to /auth/login. 
             # the server sets the signed session cookie on the redirect, which
             # a Dash callback cannot do.
             dbc.Modal(
@@ -118,7 +118,7 @@ def create_layout() -> html.Div:
                                           className="form-control mb-3",
                                           persistence=False),
                                 # Sessions are persistent (7-day) like the SSO
-                                # handoff — no "keep me signed in" toggle.
+                                # handoff: no "keep me signed in" toggle.
                                 dcc.Input(name="remember", type="hidden", value="1"),
                                 html.Button("Sign in", type="submit",
                                             className="btn btn-primary w-100"),
@@ -210,12 +210,12 @@ def create_layout() -> html.Div:
             dcc.Store(id="full-analysis-requested", data=False),
 
             # Raw-data modal + download for the news analysis (the JSON is
-            # machine food — the synthesis step and the renderers eat it — but
+            # machine food: the synthesis step and the renderers eat it, but
             # it should still be inspectable and exportable on demand)
             dcc.Download(id="download-ai-json"),
             dbc.Modal(
                 [
-                    dbc.ModalHeader(dbc.ModalTitle("Analysis — raw data"), close_button=True),
+                    dbc.ModalHeader(dbc.ModalTitle("Analysis: raw data"), close_button=True),
                     dbc.ModalBody(html.Pre(id="ai-json-body", className="ai-json-body")),
                     dbc.ModalFooter(
                         dbc.Button([html.I(className="bi bi-download me-1"), "Download .json"],
@@ -224,7 +224,7 @@ def create_layout() -> html.Div:
                 ],
                 id="ai-json-modal", is_open=False, size="lg", scrollable=True,
             ),
-            # Research report reader — replaces the History accordion stack
+            # Research report reader, replaces the History accordion stack
             dbc.Modal(
                 [
                     dbc.ModalHeader(dbc.ModalTitle(id="ta-report-modal-title"), close_button=True),

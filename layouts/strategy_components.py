@@ -142,7 +142,7 @@ def _create_evaluations_table(evaluations: list[dict]) -> html.Div:
             result_icon = "bi-clock"
             result_color = COLORS.TEXT_MUTED
 
-        pnl_text = f"${pnl:+.0f}" if pnl is not None else "—"
+        pnl_text = f"${pnl:+.0f}" if pnl is not None else "n/a"
         pnl_color = (
             COLORS.POSITIVE if pnl and pnl > 0
             else COLORS.NEGATIVE if pnl and pnl < 0

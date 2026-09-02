@@ -33,7 +33,7 @@ config.set_main_option("sqlalchemy.url", db_url)
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode — emit SQL to stdout."""
+    """Run migrations in 'offline' mode. Emit SQL to stdout."""
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,

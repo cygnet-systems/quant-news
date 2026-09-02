@@ -33,7 +33,7 @@ SCOREBOARD_TIPS = {
                 "it looks.",
     "Calibration": "Claimed vs delivered: the model's average stated "
                    "confidence against its actual hit rate. Red means it "
-                   "claims at least 15 points more than it delivers — its "
+                   "claims at least 15 points more than it delivers, its "
                    "confidence cannot be used for sizing.",
     "P&L": "Total dollars across all trades at $1,000 notional each, gross "
            "(before friction).",
@@ -41,7 +41,7 @@ SCOREBOARD_TIPS = {
                "(8-40 bps by price bucket: cheaper stocks trade wider). The "
                "number a real account would keep.",
     "$/Trade": "Gross P&L divided by Trades: the average edge per position. "
-               "Judge this together with Net P&L — many small wins can "
+               "Judge this together with Net P&L. Many small wins can "
                "vanish into friction.",
 }
 
@@ -74,7 +74,7 @@ def trade_detail_table(trades: list[dict]) -> html.Table:
             result, result_cls = "✗ wrong", "negative"
         else:
             # A scored HOLD: it has P&L (0) but no directional verdict.
-            result, result_cls = "—", ""
+            result, result_cls = "n/a", ""
         pnl = p.get("pnl_dollars")
         pnl_cls = ("positive" if pnl and pnl > 0
                    else "negative" if pnl and pnl < 0 else "")
@@ -91,10 +91,10 @@ def trade_detail_table(trades: list[dict]) -> html.Table:
             html.Td(
                 ("unrated" if (p.get("model_name") == "trading_agents"
                                and conf is not None and float(conf) == 0.5)
-                 else f"{int(conf * 100)}%" if conf else "—"),
+                 else f"{int(conf * 100)}%" if conf else "n/a"),
                 className="num"),
             html.Td(html.Span(result, className=result_cls)),
-            html.Td(html.Span(f"${pnl:+.2f}" if pnl is not None else "—",
+            html.Td(html.Span(f"${pnl:+.2f}" if pnl is not None else "n/a",
                               className=f"num {pnl_cls}")),
         ])
 
@@ -106,7 +106,7 @@ def trade_detail_table(trades: list[dict]) -> html.Table:
         html.Thead(html.Tr([
             html.Th("Date"), html.Th("Model"), html.Th("Signal"),
             html.Th("Score",
-                    title="The model's own stored score — a measured "
+                    title="The model's own stored score, a measured "
                           "track-record weight for TradingAgents (unrated "
                           "until it has enough resolved calls), a raw "
                           "uncalibrated probability for the others. Not the "
@@ -145,7 +145,7 @@ def scoreboard_rows(groups: list[dict], group_key: str,
                                     "coin flip at 2 standard errors")
                         if g.get("significant") else
                         html.Span(hit_txt, className="scoreboard-muted",
-                                  title="Within 2 SE of 50% — statistically "
+                                  title="Within 2 SE of 50%, statistically "
                                         "indistinguishable from chance at "
                                         "this sample size"))
         else:
@@ -160,7 +160,7 @@ def scoreboard_rows(groups: list[dict], group_key: str,
                 className=f"num {cal_cls}",
                 title=f"Claims {g['avg_confidence']:.0%} on average, delivers "
                       f"{g['hit_rate']:.0%}"
-                      + (" — overconfident by more than 15 points; its stated"
+                      + (": overconfident by more than 15 points; its stated"
                          " confidence cannot size positions" if gap > 0.15
                          else ""),
             )
@@ -180,11 +180,11 @@ def scoreboard_rows(groups: list[dict], group_key: str,
         conc_flag = (html.Span(
             f" ⚠ {conc:.0%} one name",
             className="scoreboard-muted",
-            title="This share of gross P&L comes from a single symbol — "
+            title="This share of gross P&L comes from a single symbol. "
                   "an edge that is one ticker is a position, not a strategy",
         ) if conc is not None and conc > 0.4 and trades >= 10 else "")
-        # A symbol row is a question — "what did we actually call on this
-        # name, and when was it right?" — so make it the way to ask it.
+        # A symbol row is a question, "what did we actually call on this
+        # name, and when was it right?": so make it the way to ask it.
         sym_trades = (trades_by_symbol or {}).get(g["name"]) \
             if group_key == "symbol" else None
         first_cell = (
@@ -270,7 +270,7 @@ def scorecard(preds: list[dict]) -> html.Div:
     right = sum(1 for p in evaluated if p.get("was_correct") is True)
     wrong = sum(1 for p in evaluated if p.get("was_correct") is False)
 
-    # Counts are the natural handles for "show me those" — reading a number
+    # Counts are the natural handles for "show me those", reading a number
     # and then hunting for a filter that reproduces it is the long way round.
     def _chip(label, outcome, count, extra=""):
         return html.Button(
@@ -307,7 +307,7 @@ def scorecard(preds: list[dict]) -> html.Div:
     if not evaluated:
         return html.Div([eval_bar, empty_history_message(False, "scored predictions")])
 
-    # Range by TARGET date — the session whose close these were scored
+    # Range by TARGET date, the session whose close these were scored
     # against. Labelling it by prediction_date showed the data cutoff instead,
     # so a run made this morning for today's close read as "to 2026-08-04" and
     # looked like today was missing when all of it was present.
@@ -357,7 +357,7 @@ def model_filter_row(history_data, model="all") -> html.Div:
 
     Lives outside #archive-body for the same reason the filter bar does: a
     rebuilt dropdown re-fires its value Input, which writes the store, which
-    would rebuild whatever contains it — a render loop.
+    would rebuild whatever contains it, a render loop.
     """
     preds = (history_data or {}).get("predictions", [])
     names = sorted({p.get("model_name") for p in preds if p.get("model_name")})
@@ -441,8 +441,8 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
 
 _LAB_STATUS = {
     "significant": ("SIGNIFICANT", "positive",
-                    "Crossed the pre-registered bar — review before acting"),
-    "settled_null": ("SETTLED — NO EFFECT", "neutral",
+                    "Crossed the pre-registered bar, review before acting"),
+    "settled_null": ("SETTLED: NO EFFECT", "neutral",
                      "Reached full statistical power with no effect; this "
                      "question is closed unless the regime changes"),
     "accruing": ("ACCRUING", "muted",
@@ -473,7 +473,7 @@ def alpha_lab_section() -> html.Div:
     """The standing edge-hypothesis scoreboard, self-explanatory.
 
     Every hypothesis card carries its plain-language description, the exact
-    method/formula, and a worked example — the reader should never need the
+    method/formula, and a worked example. The reader should never need the
     source to understand what a verdict means. Explanations come from
     services.alpha_lab.HYPOTHESIS_INFO so this page, the email digest and the
     test itself can never drift apart.

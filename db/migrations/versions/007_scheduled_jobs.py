@@ -2,8 +2,8 @@
 
 Moves scheduling into the application. The app already ran an in-process
 APScheduler for the daily evaluation with the schedule hardcoded in config;
-this makes the schedule data — editable from the dashboard, surviving a
-redeploy — and adds a run history so a missed or failed run is visible rather
+this makes the schedule data. Editable from the dashboard, surviving a
+redeploy: and adds a run history so a missed or failed run is visible rather
 than inferred from logs.
 """
 

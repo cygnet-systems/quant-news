@@ -2,7 +2,7 @@
 
 Three gaps this closes, together forming the Trace view's storage:
 
-* No prompt text was stored anywhere — llm_usage records tokens/cost per call
+* No prompt text was stored anywhere. Llm_usage records tokens/cost per call
   but the exact system prompt, prompt and raw response were discarded after
   parsing, so "why did it conclude this?" had no answer. llm_traces keeps the
   bodies, one row per PHYSICAL API call (retries and failover attempts

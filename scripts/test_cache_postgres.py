@@ -205,7 +205,7 @@ def test_clear():
 
 def main():
     print("=" * 60)
-    print("CacheService (Postgres) — Integration Test")
+    print("CacheService (Postgres): Integration Test")
     print("=" * 60)
 
     tests = [

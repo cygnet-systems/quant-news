@@ -1,4 +1,4 @@
-"""Confidence threshold strategy — only act on high-conviction signals.
+"""Confidence threshold strategy, only act on high-conviction signals.
 
 Filters out low-confidence predictions. Only executes when model
 confidence exceeds a configurable threshold (default from config).

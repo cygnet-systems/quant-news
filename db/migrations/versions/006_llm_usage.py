@@ -2,7 +2,7 @@
 
 One row per LLM API call: exact token counts from the provider response, the
 $/Mtok rates applied, and the derived cost. Rates are stored per row on
-purpose — repricing a model must not rewrite the cost of calls already made.
+purpose: repricing a model must not rewrite the cost of calls already made.
 
 Nothing in this table is ever read back into a prompt; it exists to attribute
 spend to the stage that caused it (research / ai_report / recommendations).

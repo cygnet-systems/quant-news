@@ -1,10 +1,10 @@
-"""In-app job scheduling — the app owns its own clock.
+"""In-app job scheduling, the app owns its own clock.
 
 Replaces the external cron/launchd arrangement: an APScheduler
 ``BackgroundScheduler`` lives in the server process (started from the ASGI
 lifespan) and runs the daily analysis and evaluation itself. That works
 because the app is deployed as a single always-on service with exactly one
-uvicorn worker — the constraint the Dockerfile already states for models and
+uvicorn worker: the constraint the Dockerfile already states for models and
 caches applies to the scheduler for the same reason.
 
 Three things make this safe to run against a shared database:
@@ -12,7 +12,7 @@ Three things make this safe to run against a shared database:
 **Advisory lock.** A deploy can briefly leave the old and new instances both
 alive, and both would fire the same job. Every run takes a Postgres
 session-level advisory lock keyed on the job id and gives up immediately if
-another process holds it. An analysis firing twice is not just wasted CPU —
+another process holds it. An analysis firing twice is not just wasted CPU.
 it is a duplicate LLM bill.
 
 **Catch-up by date, not by boot.** A restart across the scheduled window would
@@ -65,7 +65,7 @@ RUN_LOG_MAX_LINES = 400
 
 _scheduler = None
 _lock = threading.Lock()
-# Schedule spec last applied to the live scheduler, per job — the comparison
+# Schedule spec last applied to the live scheduler, per job, the comparison
 # point for the database sync below.
 _applied: dict[str, tuple] = {}
 # Last overdue alert sent, so the half-hourly watchdog does not mail the
@@ -82,8 +82,8 @@ _last_overdue_alert: dict[str, object] = {}
 class JobType:
     """One kind of scheduled operation.
 
-    Declarative so a new operation — options flow, a rebalance, a different
-    research pass — is an entry in this table plus a CLI verb, rather than
+    Declarative so a new operation. Options flow, a rebalance, a different
+    research pass: is an entry in this table plus a CLI verb, rather than
     another branch in the command builder and another special case in the UI.
     ``needs_symbols`` drives whether the form shows a symbol list at all.
     """
@@ -97,7 +97,7 @@ class JobType:
     default_minute: int = 0
     # Tunable knobs, rendered by the schedule UI as labeled inputs and stored
     # in params_json: (param_key, label, default, help). Declarative so a new
-    # knob is one tuple here — not a form change, a callback change and a
+    # knob is one tuple here, not a form change, a callback change and a
     # command-builder change.
     params_spec: tuple = ()
 
@@ -186,7 +186,7 @@ DEFAULT_JOBS = (
         "id": ANALYSIS_JOB,
         "kind": "analysis",
         "description": "Full Analysis on the watchlist, before the open",
-        # 07:00 ET — two and a half hours before the open (was 08:30; a
+        # 07:00 ET: two and a half hours before the open (was 08:30; a
         # 40-minute container run finishing near the bell left no reading
         # time). The previous session's bar settled overnight either way.
         "hour": 7,
@@ -346,8 +346,8 @@ def create_job(kind: str, description: str, hour: int, minute: int,
             symbols_csv=symbols_csv if job_type.needs_symbols else None,
             params_json=params or {},
             owner_uid=_owner_uid(),
-            # An anonymous session cannot own a private job — nobody could
-            # ever see it again — so ownerless jobs are forced public.
+            # An anonymous session cannot own a private job, nobody could
+            # ever see it again, so ownerless jobs are forced public.
             is_public=bool(is_public) or _owner_uid() is None,
         ))
 
@@ -441,7 +441,7 @@ def _running_jobs() -> set[str]:
     """Jobs genuinely in flight right now.
 
     Bounded by the job timeout, because a "running" row is only evidence that
-    a process STARTED one — a container killed mid-run (every deploy does
+    a process STARTED one, a container killed mid-run (every deploy does
     this) never gets to write its ending. Treating those as running forever
     would pin the job: the UI disables its Run-now button, and the overdue
     check skips anything running, so /healthz would report healthy while
@@ -468,7 +468,7 @@ def reap_abandoned_runs() -> int:
     """Close out runs whose process died, so history says so.
 
     Without this the row stays "running" and the failure is invisible in both
-    the panel and the run table — indistinguishable from a job still working.
+    the panel and the run table. Indistinguishable from a job still working.
     """
     from datetime import timedelta
 
@@ -530,14 +530,14 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
         cmd += ["--news-filter", str(params["news_filter"])]
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
-    # Both REQUIRED for an analysis job — the CLI has no default for them,
+    # Both REQUIRED for an analysis job. The CLI has no default for them,
     # and a job that lacks them fails here with a message that names the fix
     # rather than running on a window nobody chose. (Jobs created before the
     # form had these knobs: open the Schedule page and save the job once.)
     missing = [k for k in ("lookback", "max_articles") if params.get(k) is None]
     if missing:
         raise ValueError(
-            f"job params missing {', '.join(missing)} — open the Schedule page "
+            f"job params missing {', '.join(missing)}: open the Schedule page "
             f"and save this job once to set them")
     cmd += ["--lookback", str(int(params["lookback"]))]
     cmd += ["--max-articles", str(int(params["max_articles"]))]
@@ -560,7 +560,7 @@ def run_job(job_id: str, trigger: str = "schedule",
             overrides: Optional[dict] = None) -> dict:
     """Execute one job under the advisory lock. Returns a result summary.
 
-    ``overrides`` are merged over the job's stored params for this run only —
+    ``overrides`` are merged over the job's stored params for this run only.
     the backfill path uses this to pass an explicit ``target`` session.
     """
     from db.models import JobRun, ScheduledJob
@@ -581,7 +581,7 @@ def run_job(job_id: str, trigger: str = "schedule",
 
     lock = _AdvisoryLock(job_id)
     if not lock.acquire():
-        logger.info(f"{job_id}: another instance holds the lock — skipping")
+        logger.info(f"{job_id}: another instance holds the lock, skipping")
         return {"status": "skipped", "detail": "held by another instance"}
 
     started = datetime.now(timezone.utc)
@@ -618,7 +618,7 @@ def run_job(job_id: str, trigger: str = "schedule",
         if cmd is None:
             raise RuntimeError(detail)
         # Popen + its own session, NOT subprocess.run: on timeout, run() kills
-        # only the direct child and then drains its pipes with no timeout —
+        # only the direct child and then drains its pipes with no timeout. 
         # but the CLI spawns model workers that inherit those pipes, so a
         # surviving grandchild wedges the drain (and this thread, and the
         # bookkeeping below) forever. Seen live 2026-09-01: a manual run
@@ -652,7 +652,7 @@ def run_job(job_id: str, trigger: str = "schedule",
         else:
             # Parse the summary from the WHOLE of stdout, never from the
             # stored tail. A 20-symbol summary is 53 lines of indented JSON,
-            # so a 25-line tail cannot contain a parseable object — which is
+            # so a 25-line tail cannot contain a parseable object, which is
             # why every scheduled run mailed "produced no recommendations"
             # while having stored 20 calls and exited zero (2026-08-06).
             summary = _parse_summary(out)
@@ -680,18 +680,18 @@ def run_job(job_id: str, trigger: str = "schedule",
                     job_row.last_status = status
                     job_row.last_detail = detail or None
                     job_row.last_duration_ms = duration_ms
-                    # A back-dated run must not stamp today as done — that
+                    # A back-dated run must not stamp today as done, that
                     # would make catch-up skip the day's own window.
                     if status == "success" and not (overrides or {}).get("target"):
                         # The date must be taken in the JOB's timezone, not
                         # the container's. On a UTC host, a 20:00-ET run is
-                        # already "tomorrow" in UTC — stamping that date made
+                        # already "tomorrow" in UTC, stamping that date made
                         # the watchdog (which asks about today in job tz)
                         # mail a false "overdue" minutes after a success.
                         # This stamp shares a transaction with the run row's
                         # own finalize: an exception here rolls back BOTH,
                         # leaving the run "running" forever and the day
-                        # unstamped — which is how a missing job key turned
+                        # unstamped: which is how a missing job key turned
                         # one good 07:00 run into 28 phantom catch-up reruns
                         # (2026-08-11). The date is best-effort; the row
                         # bookkeeping is not allowed to die for it.
@@ -715,7 +715,7 @@ def run_job(job_id: str, trigger: str = "schedule",
     # killed mid-flight.
     if duration_ms > 0.8 * JOB_TIMEOUT_SECONDS * 1000:
         near = (f"{job_id} took {duration_ms // 1000}s of a "
-                f"{JOB_TIMEOUT_SECONDS}s ceiling — raise the timeout or "
+                f"{JOB_TIMEOUT_SECONDS}s ceiling: raise the timeout or "
                 f"shorten the watchlist before it gets killed mid-run")
         logger.warning(near)
         prog.emit("error", near, feed=False, run_id=job_run_id,
@@ -727,7 +727,7 @@ def run_job(job_id: str, trigger: str = "schedule",
 
 def _notify(job: dict, status: str, summary: dict, log: str, started: datetime,
             duration_ms: int) -> None:
-    """Mail the outcome. Never raises — the run already happened.
+    """Mail the outcome. Never raises: the run already happened.
 
     Takes the parsed summary and the run log separately: the summary decides
     which mail to send, the log is what the mail shows a person.
@@ -737,7 +737,7 @@ def _notify(job: dict, status: str, summary: dict, log: str, started: datetime,
     try:
         if not notify_service.enabled():
             return
-        # A market holiday is not an outcome worth mailing about — the CLI
+        # A market holiday is not an outcome worth mailing about, the CLI
         # no-ops by design when --only-trading-days is set.
         if summary.get("no_session"):
             return
@@ -962,7 +962,7 @@ def _catch_up() -> None:
             continue
         if job["last_success_date"] == today.isoformat():
             continue
-        # Already attempted today — do not retry automatically. A partial run
+        # Already attempted today, do not retry automatically. A partial run
         # deliberately withholds last_success_date so it shows as overdue, and
         # without this a restart loop would re-run an expensive analysis on
         # every boot chasing a completeness it cannot reach on its own.
@@ -970,10 +970,10 @@ def _catch_up() -> None:
         last_run = job.get("last_run_at")
         if last_run and last_run.astimezone(now.tzinfo).date() == today:
             logger.info(f"Catch-up: {job['id']} already attempted today "
-                        f"({job.get('last_status')}) — not retrying automatically")
+                        f"({job.get('last_status')}): not retrying automatically")
             continue
         logger.info(f"Catch-up: {job['id']} missed its {job['hour']:02d}:"
-                    f"{job['minute']:02d} window today — running now")
+                    f"{job['minute']:02d} window today: running now")
         run_job(job["id"], trigger="catchup")
 
     _backfill_missed_sessions()
@@ -990,7 +990,7 @@ def _backfill_missed_sessions() -> None:
 
     Catch-up above only covers *today*; a container that slept through a
     window (Railway app sleep freezes the scheduler thread, and APScheduler
-    drops fires older than its misfire grace) used to lose the day for good —
+    drops fires older than its misfire grace) used to lose the day for good.
     there is no per-date ledger, so a five-day gap looked identical to no gap.
     The ledger here is the predictions table itself: a past session with zero
     rows targeting it was never analysed, so run it with an explicit
@@ -1037,7 +1037,7 @@ def _backfill_missed_sessions() -> None:
     for job in analysis_jobs:
         missing = missing_by_job.get(job["id"], [])
         for d in sorted(missing):
-            logger.warning(f"Backfill: no predictions target {d} — running "
+            logger.warning(f"Backfill: no predictions target {d}: running "
                            f"{job['id']} with --target {d}")
             result = run_job(
                 job["id"], trigger="backfill",
@@ -1047,7 +1047,7 @@ def _backfill_missed_sessions() -> None:
                 # One failure means the rest would likely fail the same way
                 # (quota, vendor outage); stop rather than burn the budget.
                 logger.warning(f"Backfill for {d} did not complete "
-                               f"({result.get('status')}) — stopping sweep")
+                               f"({result.get('status')}): stopping sweep")
                 return
 
 
@@ -1056,7 +1056,7 @@ def scheduling_enabled() -> bool:
 
     Deliberately per-process, and deliberately not the same lever as a job's
     ``enabled`` column: that one means "nobody should run this job" and takes
-    every instance with it. This one means "not on this machine" — the case
+    every instance with it. This one means "not on this machine", the case
     where a laptop is pointed at the production database for UI work and
     should not win the lock and spend money on an analysis.
     """
@@ -1070,7 +1070,7 @@ def health() -> dict:
 
     Catch-up handles the app being DOWN across a window. Nothing handled the
     app being UP and the job failing, being skipped by a stuck lock, or the
-    scheduler thread having died — all of which look identical from outside:
+    scheduler thread having died, all of which look identical from outside:
     no analysis appears and no one is told. This is the signal for that, and
     it is what an uptime monitor should watch rather than "does / return 200".
     """
@@ -1131,7 +1131,7 @@ def _watchdog() -> None:
 
     # Reaping used to happen only at boot, so a run whose thread wedged
     # mid-life stayed "running" until the next deploy (2026-09-01: 6h40m).
-    # A row past the job ceiling is dead by definition — close it here too.
+    # A row past the job ceiling is dead by definition. Close it here too.
     try:
         reaped = reap_abandoned_runs()
         if reaped:
@@ -1148,7 +1148,7 @@ def _watchdog() -> None:
         return
     for job_id in state["overdue"]:
         msg = (f"Scheduled job {job_id} has no successful run today and its "
-               f"window has passed — check /healthz")
+               f"window has passed, check /healthz")
         logger.error(msg)
         prog.emit("error", msg)
 
@@ -1195,7 +1195,7 @@ def start() -> None:
             return
         if not scheduling_enabled():
             logger.info(
-                "SCHEDULER_ENABLED is off — this process will not run jobs. "
+                "SCHEDULER_ENABLED is off, this process will not run jobs. "
                 "Another instance sharing this database still will."
             )
             return
@@ -1213,14 +1213,14 @@ def start() -> None:
             for job in list_jobs():
                 _reschedule(job["id"])
             _sync_from_db()
-            # Catch-up runs on the scheduler thread — inline it would block
+            # Catch-up runs on the scheduler thread. Inline it would block
             # server startup for the length of the job it decides to run.
             _scheduler.add_job(_catch_up, DateTrigger(), id="_catch_up")
             # And again half-hourly: a container thawed from platform sleep
             # never re-enters start(), and cron fires older than the misfire
             # grace are dropped, so the boot-time pass alone cannot recover a
             # slept-through window. misfire_grace_time=None means "run no
-            # matter how late" — being late is this job's entire purpose.
+            # matter how late", being late is this job's entire purpose.
             _scheduler.add_job(
                 _catch_up, IntervalTrigger(minutes=30), id="_catch_up_interval",
                 max_instances=1, coalesce=True, misfire_grace_time=None,
@@ -1261,8 +1261,8 @@ def recent_runs(job_id: str | None = None, limit: int = 20,
 
     The panel that shows these re-polls every 15 seconds, so shipping every
     run's full log would send a quarter of a megabyte a minute to each open
-    tab to redraw a five-row table. The abridgement keeps both ends — the
-    summary the run printed and the tail where a failure shows up — and the
+    tab to redraw a five-row table. The abridgement keeps both ends, the
+    summary the run printed and the tail where a failure shows up, and the
     job card still carries the newest run's log in full.
     """
     from db.models import JobRun

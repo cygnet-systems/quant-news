@@ -3,17 +3,17 @@
 The research report used to be written from whatever blocks the pipeline
 happened to hold, with the prompt telling the model it "has no tools and
 cannot browse". For a stock under a cash takeover that meant a momentum
-SELL written off moving averages while the only question that mattered —
-will the deal close — never entered the prompt (BHF, 2026-09-01).
+SELL written off moving averages while the only question that mattered.
+will the deal close, never entered the prompt (BHF, 2026-09-01).
 
 This stage runs BEFORE the report is written. One tool-using call:
 
   1. classifies the situation the symbol is in (pending acquisition,
      legal/regulatory overhang, earnings event, leadership change,
      distress, momentum only, …) from the supplied evidence;
-  2. investigates it on the open web — deal terms, regulators and dated
+  2. investigates it on the open web. Deal terms, regulators and dated
      milestones, the key figures involved and what their record and
-     affiliations imply for the outcome — citing every finding;
+     affiliations imply for the outcome, citing every finding;
   3. returns structured JSON the report prompt and the synthesis read.
 
 Web access is a run TOOL the frontend switches (``web=True``), on by
@@ -44,14 +44,14 @@ SITUATIONS = (
     "LEADERSHIP_CHANGE",         # CEO/CFO/CAO turnover, board changes
     "DISTRESS",                  # liquidity, covenant, going-concern, dilution
     "PRODUCT_OR_CONTRACT",       # approval, launch, award, loss of a customer
-    "MOMENTUM_ONLY",             # nothing situational — flow and trend
+    "MOMENTUM_ONLY",             # nothing situational: flow and trend
     "OTHER",
 )
 
 _CACHE: dict[tuple, "Investigation"] = {}
 _CACHE_LOCK = threading.Lock()
 # One lock per cache key: a prefetch thread and the in-loop call for the
-# same symbol must never both pay for the search — the second waits.
+# same symbol must never both pay for the search, the second waits.
 _KEY_LOCKS: dict[tuple, threading.Lock] = {}
 
 
@@ -82,7 +82,7 @@ class Investigation:
 
 
 def _system_prompt(web: bool) -> str:
-    base = """You are an investigative equity research analyst preparing the situational brief that a trading desk reads BEFORE it looks at any chart. Your job is to establish what kind of situation the company is in, who the decisive actors are, and what is scheduled — with sources.
+    base = """You are an investigative equity research analyst preparing the situational brief that a trading desk reads BEFORE it looks at any chart. Your job is to establish what kind of situation the company is in, who the decisive actors are, and what is scheduled, with sources.
 
 Discipline:
 - Every finding carries a source: outlet or document, publication date, URL. A claim you cannot source does not go in "findings"; it may go in "open_questions".
@@ -90,6 +90,7 @@ Discipline:
 - Key figures matter only insofar as they bear on the outcome: an acquirer's principals, the regulator who decides, a controlling shareholder, a prosecutor. For each, establish role, relevant track record, and affiliations a source documents (prior firms, political ties, regulatory relationships, litigation). Do not speculate about affiliations no source states.
 - Prefer primary documents (SEC filings, regulator releases, court dockets, company statements) over commentary. Note when reporting is contested.
 - Never invent prices, dates or percentages. If a deal has an offer price, quote it exactly as the source states it.
+- Write every text field in plain sentences: no em dashes or en dashes as punctuation (commas, periods, parentheses instead), no "not just X, it's Y", no "delve", "dive", "landscape", "unlock", no filler.
 - Output ONLY the JSON object described in the user message, inside one ```json fence, nothing after the fence."""
     if web:
         return base + """
@@ -102,7 +103,7 @@ def _user_prompt(symbol: str, as_of: str, target: Optional[str], *,
                  profile: str, headlines: str, filings: str, quality: str,
                  last_close: Optional[float], web: bool) -> str:
     when = (f"The decision is made before the open of {target}; information "
-            f"published up to that moment is usable — state each source's date."
+            f"published up to that moment is usable. State each source's date."
             if target else
             f"The decision is made at the close of {as_of}; use information "
             f"published on or before that date.")
@@ -188,7 +189,7 @@ def investigate(
     model: Optional[str] = None,
 ) -> Investigation:
     """Run the stage. ``web`` is the frontend's tool switch (default off).
-    Raises on provider failure — the caller classes the block (expected
+    Raises on provider failure, the caller classes the block (expected
     evidence) and records the gap."""
     key = (symbol.upper(), str(as_of)[:10], web, model or MODEL.INVESTIGATION_MODEL)
     with _CACHE_LOCK:
@@ -291,7 +292,7 @@ def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
     the scheduled job past its 75-minute ceiling. Started here, the
     investigations overlap the price models' work, and the in-loop call
     finds its symbol in the cache (or waits on that symbol's lock while it
-    finishes). Failures are swallowed here — the in-loop call re-raises
+    finishes). Failures are swallowed here, the in-loop call re-raises
     them into the ledger where they belong. The executor is returned so the
     caller can release it (``shutdown(wait=False)``) when the run ends.
     """
@@ -347,10 +348,10 @@ def default_tools(target_date) -> list[str]:
 def format_investigation_block(inv: Investigation, last_close: Optional[float] = None) -> str:
     """The prompt block. States its own provenance (web vs supplied-only)."""
     src = ("web research + supplied evidence" if inv.web
-           else "supplied evidence only — no web access on a historical as-of")
-    lines = [f"[{inv.symbol} — situation & investigation as of {inv.as_of} ({src})]",
+           else "supplied evidence only, no web access on a historical as-of")
+    lines = [f"[{inv.symbol}: situation & investigation as of {inv.as_of} ({src})]",
              f"Situation: {inv.situation} (confidence {inv.situation_confidence})"
-             + (f" — {inv.one_line}" if inv.one_line else "")]
+             + (f": {inv.one_line}" if inv.one_line else "")]
     d = inv.deal
     if d.get("present"):
         offer = d.get("offer_price")
@@ -362,11 +363,11 @@ def format_investigation_block(inv: Investigation, last_close: Optional[float] =
         lines.append(f"Deal: {terms}")
         if inv.spread_pct is not None and last_close:
             lines.append(f"Gross spread to offer (computed): last close ${last_close:.2f} "
-                         f"vs ${float(offer):.2f} = {inv.spread_pct:+.1f}% — the market is "
+                         f"vs ${float(offer):.2f} = {inv.spread_pct:+.1f}%: the market is "
                          f"pricing meaningful completion risk when this is wide.")
         for a in (d.get("approvals") or [])[:6]:
             if isinstance(a, dict):
-                lines.append(f"- Approval: {a.get('body')} — {a.get('status')}"
+                lines.append(f"- Approval: {a.get('body')}: {a.get('status')}"
                              + (f" ({a['date']})" if a.get("date") else "")
                              + (f" (src: {a['source']})" if a.get("source") else ""))
         if d.get("break_risk"):
@@ -374,7 +375,7 @@ def format_investigation_block(inv: Investigation, last_close: Optional[float] =
     if inv.key_figures:
         lines.append("Key figures:")
         for f in inv.key_figures[:6]:
-            lines.append(f"- {f.get('name')} — {f.get('role')}. {f.get('relevance')}"
+            lines.append(f"- {f.get('name')}: {f.get('role')}. {f.get('relevance')}"
                          + (f" (src: {f['source']})" if f.get("source") else ""))
     if inv.findings:
         lines.append("Findings:")
@@ -388,7 +389,7 @@ def format_investigation_block(inv: Investigation, last_close: Optional[float] =
         lines.append("Open questions: " + " | ".join(inv.open_questions[:5]))
     lines.append("Cite these findings with their src/date exactly as news is "
                  "cited. Findings marked 'inference:' are the investigator's "
-                 "reading, not sourced fact — say so if you lean on one.")
+                 "reading, not sourced fact, say so if you lean on one.")
     if inv.web:
         lines.append(f"({inv.searches} web searches, {len(inv.sources)} sources consulted)")
     return "\n".join(lines)

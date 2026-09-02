@@ -1,4 +1,4 @@
-"""Point-in-time news windowing — lookahead-safe.
+"""Point-in-time news windowing, lookahead-safe.
 
 Ported from TradingAgents v0.3.1 (`dataflows/yfinance_news.py`) invariants,
 adapted to our Alpha Vantage / yfinance article shapes. The three rules:
@@ -10,7 +10,7 @@ adapted to our Alpha Vantage / yfinance article shapes. The three rules:
    (through 23:59:59) but rejects an article stamped exactly midnight-after.
 3. An article with **no publish date** is kept only if the window reaches the
    present (``end >= now - 1 day``). A historical/backtest window *excludes*
-   undated items — you cannot prove they are not future news.
+   undated items: you cannot prove they are not future news.
 
 This is the countermeasure to the coverage-gap/leak class of bug our own
 lookahead audits chase: the previous caller-side guard was a naive string
@@ -26,7 +26,7 @@ from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
 # One default for every entry point (dialog, CLI, seeded job, library
-# fallback) — config.MODEL.NEWS_LOOKBACK_DAYS. The dialog said 7 while the
+# fallback): config.MODEL.NEWS_LOOKBACK_DAYS. The dialog said 7 while the
 # library said 14, and the report footer quoted the library value for a
 # window the dialog had cut in half.
 
@@ -210,7 +210,7 @@ def cap_newest(articles: list, max_articles: int,
     """Keep the newest ``max_articles`` (0 = all) and say what that did.
 
     The stats dict is what makes the cap visible downstream: ``fetched`` vs
-    ``kept``, whether it bit, and the date span actually kept — so a trace
+    ``kept``, whether it bit, and the date span actually kept, so a trace
     can print "requested 30d, effective 6d" instead of implying the model
     saw the whole month.
     """
@@ -278,7 +278,7 @@ def av_time_bounds(
 # every other process on the host. The Run dialog's report callback (server
 # process) and its model stage (background subprocess) need the same
 # window for the same click; without the shared layer each paid the vendor
-# once — two passes per symbol per run. The per-key lock makes the second
+# once: two passes per symbol per run. The per-key lock makes the second
 # process WAIT for the first fetch instead of racing it.
 #
 # A historical window is immutable; a window ending today (or the overnight
@@ -370,7 +370,7 @@ def fetch_point_in_time_news(
     max_articles: int = 0,
     relevance_threshold: float = 0.5,
 ) -> list:
-    """Articles only — see :func:`fetch_point_in_time_news_with_stats`.
+    """Articles only: see :func:`fetch_point_in_time_news_with_stats`.
     ``max_articles`` 0 = everything the window holds (the default for
     library callers; run paths pass the frontend's cap explicitly)."""
     return fetch_point_in_time_news_with_stats(
@@ -430,7 +430,7 @@ def _fetch_point_in_time_uncached(symbol, as_of, lookback_days, max_articles,
 # Every article the vendor returns for a (symbol, day) is kept for
 # NEWS_RETENTION_DAYS; a window is served from the store and only the days
 # with no coverage row are fetched. A day at the live edge (today, and the
-# session before it — the vendor keeps indexing a session's articles for
+# session before it, the vendor keeps indexing a session's articles for
 # hours) is re-fetched when its coverage is older than LIVE_TTL_S.
 
 LIVE_EDGE_DAYS = 2
@@ -483,7 +483,7 @@ def coverage_gaps(days: list, covered: dict, *, now: datetime,
 def _store_window(symbol: str, start_day, end_day, relevance_threshold: float) -> list:
     """Articles for [start_day, end_day] from the store, fetching only the
     uncovered days from the vendor first. Raises NewsUnavailable when a
-    needed day cannot be fetched — an incomplete window is not served as a
+    needed day cannot be fetched. An incomplete window is not served as a
     complete one."""
     from services.cache_service import get_cache
     from services.news_service import fetch_alpha_vantage_news, fetch_yfinance_news
@@ -523,7 +523,7 @@ def _store_window(symbol: str, start_day, end_day, relevance_threshold: float) -
         return articles
     if not articles:
         # The vendor answered with nothing for a freshly fetched window; the
-        # yfinance fallback has no server-side window — fetch then filter.
+        # yfinance fallback has no server-side window, fetch then filter.
         return fetch_yfinance_news(symbol, max_articles=0)
     return articles
 
@@ -584,7 +584,7 @@ def overnight_window_bounds(
     day's intraday news is already in the closing price. Only what breaks
     between the close (16:00 ET) and the next session's open (09:30 ET) is
     new information for the close→open move being predicted. Both boundary
-    times are parameters, not constants — they are a formula the app owner
+    times are parameters, not constants. They are a formula the app owner
     tunes, not a law.
     """
     anchor = _coerce_dt(anchor_date)
@@ -607,7 +607,7 @@ def fetch_overnight_news(
     start_time_et: str = "16:00",
     end_time_et: str = "09:30",
 ) -> list:
-    """Articles only — see :func:`fetch_overnight_news_with_stats`."""
+    """Articles only: see :func:`fetch_overnight_news_with_stats`."""
     return fetch_overnight_news_with_stats(
         symbol, anchor_date, target_date, relevance_threshold, max_articles,
         start_time_et, end_time_et)[0]
@@ -624,7 +624,7 @@ def fetch_overnight_news_with_stats(
 ) -> tuple[list, dict]:
     """Fetch only the articles in the overnight gap before ``target_date``.
 
-    Live, the window is additionally clamped to *now* — a pre-open run simply
+    Live, the window is additionally clamped to *now*. A pre-open run simply
     sees the overnight news that exists so far. The half-open comparison
     excludes an article stamped exactly at the open. ``max_articles`` as in
     :func:`fetch_point_in_time_news_with_stats` (0 = all).
@@ -656,7 +656,7 @@ def _fetch_overnight_uncached(symbol, start_utc, end_utc, now_utc, anchor_date,
                               max_articles, relevance_threshold, cache_key):
     articles = _store_window(symbol, start_utc.date(), end_utc.date(),
                              relevance_threshold)
-    # Strict client-side window — unlike the lookback path an undated
+    # Strict client-side window, unlike the lookback path an undated
     # article can never qualify (its position relative to a 17.5-hour window
     # is unknowable).
     windowed = [
@@ -677,9 +677,9 @@ def _fetch_overnight_uncached(symbol, start_utc, end_utc, now_utc, anchor_date,
 def normalize_lookback(value) -> tuple[bool, int]:
     """(overnight?, lookback_days) from the value the frontend sent.
 
-    Accepts "overnight", an int, or a numeric string. Anything else —
+    Accepts "overnight", an int, or a numeric string. Anything else:
     including None, the value Dash hands a callback whose State component
-    is missing — raises RunParameterMissing. There is deliberately no
+    is missing: raises RunParameterMissing. There is deliberately no
     fallback: the dialog, the job form and the CLI all carry their own
     default (config NEWS_LOOKBACK_DAYS), so a missing value here means the
     wiring broke, and a run on a window the user did not pick is worse than
@@ -698,7 +698,7 @@ def normalize_lookback(value) -> tuple[bool, int]:
 
 
 def normalize_article_cap(value) -> int:
-    """Article cap from the frontend (0 = all). None/blank raises — same
+    """Article cap from the frontend (0 = all). None/blank raises, same
     rule as the window: no number the user did not choose."""
     try:
         cap = int(value)
@@ -726,7 +726,7 @@ def fetch_run_news(
     Returns ``(articles_by_symbol, stats_by_symbol)``. Articles are dicts (the
     store/model/prompt shape). Each stats entry is :func:`cap_newest`'s dict
     plus ``status``: ``ok`` (articles), ``empty`` (the source answered with
-    nothing), or ``unavailable`` (the source failed after ``retries`` — with
+    nothing), or ``unavailable`` (the source failed after ``retries``, with
     ``error``). "The source was down" and "the week was quiet" produce the
     same empty list but mean opposite things; downstream must not conflate
     them.
@@ -837,5 +837,5 @@ def describe_news_window(payload: dict) -> str:
               f"(effective {v.get('effective_days')}d)"
               for s, v in sorted(by_sym.items()) if v.get("capped")]
     if capped:
-        line += ". CAP HIT — oldest articles dropped: " + ", ".join(capped)
+        line += ". CAP HIT: oldest articles dropped: " + ", ".join(capped)
     return line

@@ -1,12 +1,12 @@
 """Multi-sheet XLSX export of everything currently on screen.
 
-The old export wrote a Parquet of the FIRST selected symbol's raw prices —
+The old export wrote a Parquet of the FIRST selected symbol's raw prices,
 not openable by most users and silently ignoring the rest of the screen.
 This builds one workbook that mirrors the display: per-symbol price sheets
 carry OHLCV plus ONLY the indicators the user has toggled on (MACD/RSI are
 always included because their panes always render), and Predictions /
 AI Analysis / Recommendations sheets appear only when those stores hold
-data — the workbook grows with whatever the session has produced.
+data: the workbook grows with whatever the session has produced.
 """
 
 from typing import Optional
@@ -47,7 +47,7 @@ def _autosize(writer: pd.ExcelWriter, sheet: str, df: pd.DataFrame) -> None:
             ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = (
                 min(max(width + 2, 10), 60)
             )
-    except Exception:  # cosmetic only — never fail an export over widths
+    except Exception:  # cosmetic only: never fail an export over widths
         pass
 
 
@@ -278,7 +278,7 @@ def build_model_inputs_xlsx(
     Kronos OHLCV, XGB-LGBM feature vector, the news window (with links and
     the precomputed sentiment fields), the research agent's text blocks, and
     the model signals recorded for that date. Everything is reconstructed
-    with the SAME lookahead-safe builders the models use — sliced to as_of —
+    with the SAME lookahead-safe builders the models use. Sliced to as_of,
     so users can audit the inputs and draw their own conclusions.
     """
     from services.news_window import RunParameterMissing
@@ -419,7 +419,7 @@ def build_model_inputs_xlsx(
                   "historical global feed isn't cached."},
         {"Field": "News",
          "Value": f"{news_lookback_days}d point-in-time window ending as-of. "
-                  "Sentiment/relevance/topics were computed at ingestion — no LLM "
+                  "Sentiment/relevance/topics were computed at ingestion, no LLM "
                   "ran to produce this file."},
         {"Field": "Research Context",
          "Value": "The exact text blocks assembled for the research agent "

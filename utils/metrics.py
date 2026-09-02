@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def wilder_rsi_series(close: pd.Series, n: int = 14) -> pd.Series:
-    """RSI(14) with Wilder smoothing — exact match to ta.RSIIndicator.
+    """RSI(14) with Wilder smoothing. Exact match to ta.RSIIndicator.
 
     The hand-rolled copies this replaces used a simple rolling mean
     (Cutler's RSI) while claiming to be Wilder's; the two disagree by
@@ -45,7 +45,7 @@ def wilder_atr_series(
     """ATR(14) matching ta.AverageTrueRange bar-for-bar.
 
     ta seeds bar n-1 with the SMA of the first n true ranges and then
-    applies the Wilder recursion — a pure ewm(alpha=1/n) does NOT converge
+    applies the Wilder recursion, a pure ewm(alpha=1/n) does NOT converge
     to it even after 120 bars, so the seeding is replicated exactly.
     One deliberate difference: warm-up bars are NaN here, where ta emits
     literal 0.0 (which can leak through .dropna() as fake volatility).
@@ -89,7 +89,7 @@ def compute_trading_metrics(df: pd.DataFrame, lookback: int = 20) -> dict:
         # Per-metric gating below: each metric computes when ITS minimum
         # history exists. The old single len<15 gate meant one short frame
         # deleted the entire "validated" block the prompt tells the LLM to
-        # prefer — support/resistance need far fewer bars than ATR.
+        # prefer: support/resistance need far fewer bars than ATR.
         if len(d) < 2:
             return {}
 
@@ -103,7 +103,7 @@ def compute_trading_metrics(df: pd.DataFrame, lookback: int = 20) -> dict:
             "as_of": str(d.index[-1])[:10],
         }
 
-        # ATR(14) — true Wilder (ta-equivalent seeding + recursion)
+        # ATR(14): true Wilder (ta-equivalent seeding + recursion)
         atr14 = wilder_atr_series(high, low, close).iloc[-1]
         m["atr_14"] = round(float(atr14), 2) if pd.notna(atr14) else None
         m["atr_pct"] = (
@@ -133,7 +133,7 @@ def compute_trading_metrics(df: pd.DataFrame, lookback: int = 20) -> dict:
             reward = resistance - last_close
             m["rr_ratio"] = round(reward / risk, 2) if risk > 0 else None
 
-            # Distances in ATR multiples — precomputed so the LLM interprets
+            # Distances in ATR multiples, precomputed so the LLM interprets
             # instead of doing this arithmetic (wrongly) itself.
             if m["atr_14"]:
                 m["dist_to_support_atr"] = round(risk / m["atr_14"], 1)
@@ -148,7 +148,7 @@ def compute_trading_metrics(df: pd.DataFrame, lookback: int = 20) -> dict:
                 round(m["volume_last"] / vol_avg, 2) if vol_avg else None
             )
 
-        # Drawdown vs the trailing-252-bar close high — a defined window, so
+        # Drawdown vs the trailing-252-bar close high. A defined window, so
         # the >20% hard rule no longer changes with the caller's chart period.
         basis = close.tail(252)
         period_high = float(basis.max())
@@ -170,12 +170,12 @@ def format_metrics_block(symbol: str, m: dict) -> str:
     """Format computed metrics as a prompt block. Empty string if no metrics."""
     if not m or m.get("close") is None:
         return ""
-    # Every key is optional now (per-metric gating upstream) — .get()
+    # Every key is optional now (per-metric gating upstream), .get()
     # throughout so a partial dict renders what it has instead of KeyError.
-    lines = [f"[{symbol} — computed from validated OHLCV through {m.get('as_of', '?')}]"]
+    lines = [f"[{symbol}: computed from validated OHLCV through {m.get('as_of', '?')}]"]
     lines.append(f"Last close: ${m['close']}")
     if m.get("atr_14") is not None and m.get("atr_pct") is not None:
-        lines.append(f"ATR(14): ${m['atr_14']} ({m['atr_pct']}% of price) — expected 1-day move")
+        lines.append(f"ATR(14): ${m['atr_14']} ({m['atr_pct']}% of price), expected 1-day move")
     if m.get("realized_vol_20d") is not None:
         lines.append(f"Realized volatility (20d, annualized): {m['realized_vol_20d']}%")
     if m.get("support_20d") is not None and m.get("resistance_20d") is not None:
@@ -255,10 +255,10 @@ def compute_peer_relative_strength(
 
         own_mo, own_wk = _rets(symbol)
         if own_mo is None:
-            logger.warning(f"Peer RS: no usable OHLCV for {symbol} itself — "
+            logger.warning(f"Peer RS: no usable OHLCV for {symbol} itself: "
                            f"block omitted")
             return ""
-        lines = [f"[Peer relative strength — returns"
+        lines = [f"[Peer relative strength, returns"
                  + (f" through {as_of}" if as_of else "") + "]"]
         lines.append(f"{symbol}: {_fmt_pair(own_mo, own_wk)}")
         peer_rets = []
@@ -269,7 +269,7 @@ def compute_peer_relative_strength(
                 lines.append(f"{p}: {_fmt_pair(mo, wk)}")
         if not peer_rets:
             logger.warning(f"Peer RS: all {len(peers)} peer fetches failed "
-                           f"for {symbol} ({', '.join(peers[:6])}) — "
+                           f"for {symbol} ({', '.join(peers[:6])}): "
                            f"block omitted")
             return ""
         avg = sum(peer_rets) / len(peer_rets)
@@ -282,9 +282,9 @@ def compute_peer_relative_strength(
                     f"{symbol} vs sector: {own_mo - etf_mo:+.1f}pp (1mo)"
                 )
         if own_mo < avg - 5:
-            lines.append("NOTE: material underperformance vs peers — likely company-specific cause.")
+            lines.append("NOTE: material underperformance vs peers, likely company-specific cause.")
         elif abs(own_mo - avg) <= 5:
-            lines.append("NOTE: moves roughly with peers — sector-wide repricing more likely "
+            lines.append("NOTE: moves roughly with peers, sector-wide repricing more likely "
                          "than company-specific mispricing. 'Cheap' may be correct.")
 
         # Peer-relative valuation: "6x forward earnings" is only cheap if the

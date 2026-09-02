@@ -1,18 +1,18 @@
 """SQLAlchemy ORM models for the persistence layer.
 
 Tables:
-    data_snapshots       — content hash of input data per (symbol, date, data_type)
-    report_catalog       — metadata + S3 key for rendered reports
-    recommendation_runs  — cached recommendation synthesis results
-    stock_prices         — cached OHLCV price data
-    stock_info           — cached company fundamentals
-    cache_metadata       — cache freshness tracking per (symbol, data_type)
-    news_articles        — cached real-time news articles
-    model_predictions    — model prediction results with evaluation tracking
-    historical_news      — Alpha Vantage historical news for feature building
-    strategy_evaluations — per-prediction strategy evaluation results
-    strategy_metrics     — aggregate strategy performance metrics
-    trading_agent_reports — TradingAgents research reports
+    data_snapshots: content hash of input data per (symbol, date, data_type)
+    report_catalog: metadata + S3 key for rendered reports
+    recommendation_runs: cached recommendation synthesis results
+    stock_prices: cached OHLCV price data
+    stock_info: cached company fundamentals
+    cache_metadata: cache freshness tracking per (symbol, data_type)
+    news_articles: cached real-time news articles
+    model_predictions: model prediction results with evaluation tracking
+    historical_news: Alpha Vantage historical news for feature building
+    strategy_evaluations: per-prediction strategy evaluation results
+    strategy_metrics: aggregate strategy performance metrics
+    trading_agent_reports. TradingAgents research reports
 """
 
 from datetime import date, datetime
@@ -112,7 +112,7 @@ class ReportCatalog(Base):
 class RecommendationRun(Base):
     """Cached recommendation synthesis from the second-pass LLM.
 
-    Keyed by (trade_date, input_data_hash) — one recommendation per
+    Keyed by (trade_date, input_data_hash), one recommendation per
     Full Analysis run across all symbols in that run.
     """
 
@@ -173,7 +173,7 @@ class StockPrice(Base):
 
 
 class StockInfo(Base):
-    """Cached company fundamentals — one row per symbol."""
+    """Cached company fundamentals, one row per symbol."""
 
     __tablename__ = "stock_info"
 
@@ -297,7 +297,7 @@ class ModelPrediction(Base):
     )
     evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    # Ownership/visibility (default public — pre-auth behavior unchanged)
+    # Ownership/visibility (default public, pre-auth behavior unchanged)
     owner_uid: Mapped[str | None] = mapped_column(String(64))
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
 
@@ -460,7 +460,7 @@ class ActivityLog(Base):
     stage: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     # Structured facts behind the message (counts, windows, hashes) for the
-    # Trace view. Lives ONLY here — the diskcache feed events stay small.
+    # Trace view. Lives ONLY here, the diskcache feed events stay small.
     payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -505,7 +505,7 @@ class ScheduledJob(Base):
     symbols_csv: Mapped[str | None] = mapped_column(Text)
     params_json: Mapped[dict | None] = mapped_column(JSONB)
 
-    # Denormalised outcome of the most recent run — the UI reads these on
+    # Denormalised outcome of the most recent run. The UI reads these on
     # every render, and catch-up needs last_success_date without scanning
     # the history table.
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -526,7 +526,7 @@ class ScheduledJob(Base):
 
 
 class JobRun(Base):
-    """One execution of a scheduled job — the audit trail behind the status."""
+    """One execution of a scheduled job. The audit trail behind the status."""
 
     __tablename__ = "job_runs"
 
@@ -551,7 +551,7 @@ class JobRun(Base):
 class LLMUsage(Base):
     """One row per LLM API call: tokens, cost, and what the call was for.
 
-    Internal telemetry — nothing here is ever fed back into a prompt. Token
+    Internal telemetry: nothing here is ever fed back into a prompt. Token
     counts come from the provider response and are exact. Cost is derived,
     so the RATES USED are stored on the row: a later price change cannot
     silently rewrite the cost of calls already made.
@@ -599,7 +599,7 @@ class LLMUsage(Base):
 class LLMTrace(Base):
     """Full request/response capture for one PHYSICAL LLM API call.
 
-    One row per attempt that reached a provider — retries and failover
+    One row per attempt that reached a provider, retries and failover
     attempts each get their own row with a shared context and an incremented
     ``attempt``. Captured BEFORE any parsing, so an unparseable or truncated
     response is preserved exactly as the provider sent it.

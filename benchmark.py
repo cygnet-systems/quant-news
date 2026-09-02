@@ -1,7 +1,7 @@
 """Walk-forward backtest with strict lookahead prevention.
 
 For each test day T:
-  1. Truncate ALL data to [0..T] — no future data visible
+  1. Truncate ALL data to [0..T]: no future data visible
   2. XGBoost: retrain from scratch on data[:T], predict day T+1
   3. Kronos: feed data[:T], predict day T+1
   4. LLM: feed data[:T], predict day T+1
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-# Prevent HF network calls — weights are cached
+# Prevent HF network calls, weights are cached
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 from models.base import compute_pnl, POSITION_SIZE_USD
@@ -149,7 +149,7 @@ def run_xgboost_backtest(
     min_window = 60
 
     for t in test_indices:
-        # Train on data[:t] only — strictly no future data
+        # Train on data[:t] only: strictly no future data
         rows, labels = [], []
         for i in range(min_window, t):
             close_today = float(ticker_full["Close"].iloc[i])
@@ -425,7 +425,7 @@ def run_llm_backtest(
         return
 
     for t in test_indices:
-        # Truncate to day T — no future data
+        # Truncate to day T, no future data
         df_trunc = ticker_df.iloc[:t + 1]
         as_of = str(ticker_df.index[t])[:10]
 
@@ -526,7 +526,7 @@ def main():
         n = len(ticker_full)
         # Test indices: last `test_days` days (excluding very last day which has no T+1)
         test_start = max(80, n - test_days - 1)  # Need 80+ bars for indicators+training
-        test_end = n - 1  # Exclusive — last index with a T+1 available
+        test_end = n - 1  # Exclusive: last index with a T+1 available
         test_indices = list(range(test_start, test_end))
         actual_test_days = len(test_indices)
 
@@ -537,13 +537,13 @@ def main():
 
         # --all-models already walks Kronos and XGBoost through the registry,
         # so the dedicated arms below would run them a SECOND time and append
-        # both passes under the same model label — doubling their reported
+        # both passes under the same model label, doubling their reported
         # sample counts (20 "days tested" for a 10-day window) and making the
         # results look better powered than they are. The LLM arm was already
         # de-duplicated this way; these two were not.
         dedicated_arms = not args.all_models
 
-        # Kronos FIRST — must load torch before XGBoost pickle (MPS deadlock)
+        # Kronos FIRST: must load torch before XGBoost pickle (MPS deadlock)
         if dedicated_arms and not args.skip_kronos:
             print(f"\n  Running Kronos walk-forward ({actual_test_days} days, "
                   f"{args.mc_samples} MC samples each)...", flush=True)

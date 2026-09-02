@@ -50,7 +50,7 @@ def test_congress_trades_are_visible_only_from_filing_date():
     assert c["by_party"] == {"D": {"buys": 1, "sells": 0}, "R": {"buys": 0, "sells": 1}}
     block = ps.format_congress_block("NVDA", c)
     assert "visible through 2026-07-20" in block
-    assert "2026-07-10 SELL $1K–$15K — Dan Newhouse (R-WA04, HOUSE), spouse; filed 2026-07-17" in block
+    assert "2026-07-10 SELL $1K–$15K: Dan Newhouse (R-WA04, HOUSE), spouse; filed 2026-07-17" in block
     assert "never as a timing signal" in block
 
 

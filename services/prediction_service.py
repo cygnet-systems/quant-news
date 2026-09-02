@@ -1,7 +1,7 @@
 """Prediction service orchestrator.
 
 Wires all models (Kronos, XGBoost, LightGBM, DeBERTa, TradingAgents, Ensemble)
-with per-model isolation. Returns serializable dicts (no Postgres writes —
+with per-model isolation. Returns serializable dicts (no Postgres writes.
 those happen in the server process via the persist_predictions callback).
 
 Parallelism strategy (3-phase):
@@ -9,7 +9,7 @@ Parallelism strategy (3-phase):
            pickle loads first on MPS).
   Phase 2: XGBoost, LightGBM (CPU), DeBERTa (CPU), TradingAgents (network I/O)
            run concurrently via ThreadPoolExecutor.
-  Phase 3: Ensemble runs LAST — depends on all Phase 1+2 results.
+  Phase 3: Ensemble runs LAST, depends on all Phase 1+2 results.
 """
 
 import logging
@@ -50,7 +50,7 @@ class PredictionService:
         before XGBoost's pickle deserialization, which can deadlock
         torch/MPS state if it runs first.
         """
-        # Phase 1: Kronos first (requires torch — must load before XGBoost pickle)
+        # Phase 1: Kronos first (requires torch, must load before XGBoost pickle)
         try:
             from models.kronos_model import KronosModel
             self._registry.register(KronosModel())
@@ -96,7 +96,7 @@ class PredictionService:
 
     @staticmethod
     def _input_summary(ohlcv_df: pd.DataFrame, kwargs: dict) -> dict:
-        """What the model was fed, in numbers — the Trace page's Models rows.
+        """What the model was fed, in numbers. The Trace page's Models rows.
 
         Compact by construction: counts and flags only, never frames or
         article bodies (the payload rides the activity_log, not the feed)."""
@@ -180,7 +180,7 @@ class PredictionService:
             payload = _record(result_dict, elapsed_ms)
             if result.error:
                 # Models catch their own crashes and hand back an
-                # error-carrying HOLD — report the failure (or a deliberate
+                # error-carrying HOLD, report the failure (or a deliberate
                 # abstention), never a "→ HOLD (0%)" that reads like a call.
                 if (result.details or {}).get("abstained"):
                     prog.emit("model", f"{symbol} · {model_name} abstained: "
@@ -230,22 +230,22 @@ class PredictionService:
     ) -> dict[str, dict]:
         """Run selected models on a symbol with 3-phase parallelism.
 
-        Does NOT write to DuckDB — returns serializable dict for dcc.Store.
+        Does NOT write to DuckDB. Returns serializable dict for dcc.Store.
 
         Execution order:
-          Phase 1: Priority models (Kronos) run sequentially — torch/MPS deadlock.
+          Phase 1: Priority models (Kronos) run sequentially, torch/MPS deadlock.
           Phase 2: XGBoost, LightGBM, DeBERTa, TradingAgents run concurrently.
           Phase 3: Ensemble runs last with Phase 1+2 results.
 
         Args:
-            ensemble_config: From UI store — {"enabled_models": [...], "weights": {...}}.
+            ensemble_config: From UI store, {"enabled_models": [...], "weights": {...}}.
                 If None, ensemble model uses config defaults.
             models_to_run: Set of model names to run. If None, runs all.
             run_ensemble: Whether to run the ensemble model.
             historical_av_news: Dict[date_str → list[dict]] for XGBoost/LightGBM training.
             historical_global_news: Dict[date_str → list[dict]] for global news features.
             as_of: Backtest cut-off date (ISO). Models must not use any data
-                after this date — enforced for internally-fetched frames too.
+                after this date, enforced for internally-fetched frames too.
             model_kwargs: Extra per-model options forwarded verbatim (e.g.
                 the Full Analysis flow's ``research_model``/``include_thesis``,
                 which only trading_agents reads). Models ignore what they
@@ -287,19 +287,19 @@ class PredictionService:
 
         results: dict[str, dict] = {}
 
-        # Phase 1: Priority models (sequential — torch must load first)
+        # Phase 1: Priority models (sequential, torch must load first)
         for model_name in priority:
             name, result = self._run_single_model(
                 model_name, symbol, ohlcv_df, **kwargs,
             )
             results[name] = result
 
-        # Phase 2: Remaining individual models (parallel — CPU + I/O don't contend)
+        # Phase 2: Remaining individual models (parallel. CPU + I/O don't contend)
         if parallel:
             # Worker threads start with an EMPTY context, unlike
             # asyncio.to_thread which copies the caller's. Anything the caller
-            # set in a ContextVar — the signed-in identity, the usage/cost
-            # stage label — would be invisible to the model running here, so
+            # set in a ContextVar, the signed-in identity, the usage/cost
+            # stage label: would be invisible to the model running here, so
             # the research model's spend landed under stage "unknown". Copy
             # the context in explicitly at submit time.
             with ThreadPoolExecutor(max_workers=len(parallel)) as executor:
@@ -315,7 +315,7 @@ class PredictionService:
                     name, result = future.result()
                     results[name] = result
 
-        # Phase 3: Ensemble (sequential — depends on all Phase 1+2 results)
+        # Phase 3: Ensemble (sequential: depends on all Phase 1+2 results)
         for model_name in ensemble:
             ensemble_kwargs = {
                 **kwargs,
