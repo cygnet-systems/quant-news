@@ -1390,8 +1390,15 @@ Respond with ONLY valid JSON matching this schema:
                     f"Situation ({'web-researched' if inv.get('web') else 'classified from supplied evidence'}): "
                     f"{inv['situation']} ({inv.get('situation_confidence', 'n/a')}): "
                     f"{str(inv.get('one_line') or '')[:220]}{deal_str}")
-            gaps = [g for g in ((research.get("evidence") or {}).get("gaps") or [])
-                    if g.get("severity") == "expected"]
+            # "evidence" carries two shapes: the ledger dict ({"gaps": [...]})
+            # from the evidence contract, and the plain list of evidence names
+            # the runner stores on older/merged research entries. The list
+            # shape crashed every synthesis on 2026-09-02 (AttributeError
+            # before the LLM call, so even the fallback never ran).
+            _ev = research.get("evidence")
+            gaps = [g for g in ((_ev.get("gaps") if isinstance(_ev, dict)
+                                 else None) or [])
+                    if isinstance(g, dict) and g.get("severity") == "expected"]
             if gaps:
                 lines.append("Research report WRITTEN WITHOUT expected evidence: "
                              + "; ".join(f"{g.get('label')} ({g.get('reason')})"
