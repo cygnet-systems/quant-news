@@ -327,13 +327,17 @@ class ModelConfig:
     # Investigation stage (services/investigation_service.py): one
     # tool-using LLM call per symbol that classifies the situation
     # (pending acquisition, legal overhang, earnings event, momentum only…)
-    # and researches it on the open web with citations. Anthropic only —
-    # the web_search server tool does the browsing.
+    # and researches it on the open web with citations. gpt-* models run on
+    # OpenAI's Responses API + hosted web_search; anything else on
+    # Anthropic's web_search server tool (opus-5 measured at ~$1.1/symbol,
+    # too dear for a 20-name daily run).
     #   mode: "auto" = web research on live runs, classification-only on
     #         backtests (web results cannot be bounded to a past as-of);
     #         "off" = classification-only everywhere; "always" = web
     #         research even on backtests (experiments only: lookahead).
-    INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "claude-opus-5")
+    INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "gpt-5.6-luna")
+    # Reasoning effort for gpt-* investigators (OpenAI Responses API).
+    INVESTIGATION_OPENAI_EFFORT: str = os.getenv("INVESTIGATION_OPENAI_EFFORT", "medium")
     INVESTIGATION_MODE: str = os.getenv("INVESTIGATION_MODE", "auto")
     INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "6"))
     # Investigations run concurrently ahead of the model loop; each takes
@@ -452,7 +456,12 @@ MODEL: Final = ModelConfig()
 # Luna $1/$6 per M, Sonnet $3/$15 per M — see ModelConfig above). VERIFY
 # against current provider pricing before treating spend reports as exact.
 LLM_PRICING: Final[dict[str, dict[str, float]]] = {
-    "gpt-5.6-luna":     {"input": 1.00, "output": 6.00},
+    # GPT-5.6 tiers after OpenAI's 2026-07-30 cut (Luna -80%): Sol $5/$30,
+    # Terra $2/$12, Luna $0.20/$1.20. Hosted web_search calls are billed
+    # separately per call by OpenAI and are NOT in these token rates.
+    "gpt-5.6-luna":     {"input": 0.20, "output": 1.20},
+    "gpt-5.6-terra":    {"input": 2.00, "output": 12.00},
+    "gpt-5.6-sol":      {"input": 5.00, "output": 30.00},
     # Anthropic list rates (2026-09-02): Opus 5 $5/$25, Sonnet 5 $2/$10,
     # Sonnet 4.6 $3/$15. The investigation stage runs on one of the first
     # two; unpriced rows were hiding its spend.

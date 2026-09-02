@@ -240,9 +240,11 @@ def _investigate_uncached(key, symbol, as_of, *, web, target, profile, headlines
         inv.model = out["model"]
     else:
         use_model = model or MODEL.INVESTIGATION_MODEL
+        provider = "openai" if use_model.startswith("gpt-") else "anthropic"
+        gen_kwargs = {"reasoning_effort": "low"} if provider == "openai" else {}
         text = llm.generate(prompt, system, max_tokens=MODEL.INVESTIGATION_MAX_TOKENS,
                             temperature=0.2, model=use_model,
-                            provider="anthropic", usage_out=usage)
+                            provider=provider, usage_out=usage, **gen_kwargs)
         inv.model = usage.get("model") or use_model
         if not text:
             raise RuntimeError("investigation model returned no text")

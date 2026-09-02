@@ -569,14 +569,19 @@ class LLMService:
 
         Returns {"text", "searches", "sources": [{url, title}], "stop_reason",
         "model"}; raises on provider errors (the caller decides whether the
-        block is required, expected or optional). Anthropic only: the
-        browsing happens on the provider's side, so there is no
-        OpenAI-compatible route to fall back to.
+        block is required, expected or optional). The provider follows the
+        model name: gpt-* runs on OpenAI's Responses API with its hosted
+        web_search tool, anything else on Anthropic's web_search server
+        tool. Both do the browsing on the provider's side.
         """
+        use_model = model or MODEL.INVESTIGATION_MODEL
+        if use_model.startswith("gpt-"):
+            return self._web_search_openai(
+                prompt, system_prompt, model=use_model, max_tokens=max_tokens,
+                max_searches=max_searches, usage_out=usage_out)
         client, use_provider = self._get_client_for_provider("anthropic")
         if client is None:
             raise RuntimeError("web research needs an Anthropic API key")
-        use_model = model or MODEL.INVESTIGATION_MODEL
 
         tools = [{"type": "web_search_20260209", "name": "web_search",
                   "max_uses": int(max_searches)}]
@@ -706,6 +711,105 @@ class LLMService:
             "stop_reason": stop_reason,
             "model": use_model,
         }
+
+    def _web_search_openai(
+        self,
+        prompt: str,
+        system_prompt: Optional[str],
+        *,
+        model: str,
+        max_tokens: int,
+        max_searches: int,
+        usage_out: Optional[dict] = None,
+    ) -> dict:
+        """OpenAI Responses API with the hosted ``web_search`` tool.
+
+        One request; the model searches as it sees fit (there is no per-call
+        search cap in the tool, so the prompt's own discipline and
+        ``max_tool_calls`` bound it). Citations arrive as ``url_citation``
+        annotations on the message; search calls as ``web_search_call``
+        output items. Recorded in llm_usage/llm_traces like every call.
+        """
+        client, _ = self._get_client_for_provider("openai")
+        if client is None:
+            raise RuntimeError("web research on a gpt-* model needs an OpenAI API key")
+        import time as _time
+        api_kwargs: dict = {
+            "model": model,
+            "input": prompt,
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": int(max_searches),
+            "max_output_tokens": max_tokens,
+            "reasoning": {"effort": MODEL.INVESTIGATION_OPENAI_EFFORT},
+        }
+        if system_prompt:
+            api_kwargs["instructions"] = system_prompt
+        t0 = _time.time()
+        try:
+            response = client.with_options(
+                timeout=API.INVESTIGATION_TIMEOUT).responses.create(**api_kwargs)
+        except Exception as e:
+            try:
+                from services.trace_service import record_llm_call
+                record_llm_call(
+                    provider="openai", model=model, system_prompt=system_prompt,
+                    prompt=prompt, response=None,
+                    params={k: v for k, v in api_kwargs.items()
+                            if k not in ("input", "instructions", "model")},
+                    attempt=1, ok=False, error=str(e),
+                    duration_ms=int((_time.time() - t0) * 1000))
+            except Exception:
+                pass
+            raise
+
+        searches = 0
+        sources: dict[str, str] = {}
+        text_parts: list[str] = []
+        for item in response.output:
+            itype = getattr(item, "type", "")
+            if itype == "web_search_call":
+                searches += 1
+            elif itype == "message":
+                for part in getattr(item, "content", None) or []:
+                    if getattr(part, "type", "") == "output_text":
+                        text_parts.append(part.text)
+                        for ann in getattr(part, "annotations", None) or []:
+                            url = getattr(ann, "url", None)
+                            if url:
+                                sources.setdefault(url, getattr(ann, "title", "") or "")
+        status = getattr(response, "status", None)
+        incomplete = getattr(response, "incomplete_details", None)
+        stop_reason = (getattr(incomplete, "reason", None) if incomplete
+                       else ("end_turn" if status == "completed" else status))
+        usage = getattr(response, "usage", None)
+        in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+        out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+        duration_ms = int((_time.time() - t0) * 1000)
+        from services import usage_service
+        usage_id = usage_service.record(model=model, provider="openai",
+                                        input_tokens=in_tok, output_tokens=out_tok,
+                                        duration_ms=duration_ms)
+        try:
+            from services.trace_service import record_llm_call
+            record_llm_call(
+                provider="openai", model=model, system_prompt=system_prompt,
+                prompt=prompt, response="\n".join(text_parts) or None,
+                params={k: v for k, v in api_kwargs.items()
+                        if k not in ("input", "instructions", "model")}
+                | {"searches": searches, "stop_reason": stop_reason},
+                attempt=1, ok=bool(text_parts), duration_ms=duration_ms,
+                usage_id=usage_id)
+        except Exception as trace_err:  # pragma: no cover
+            logger.debug("web-search trace failed: %s", trace_err)
+        if usage_out is not None:
+            usage_out.update({"input_tokens": in_tok, "output_tokens": out_tok,
+                              "model": model, "provider": "openai"})
+        if stop_reason == "max_output_tokens":
+            logger.warning(f"web research truncated at max_output_tokens={max_tokens} "
+                           f"(model={model})")
+        return {"text": "\n".join(text_parts), "searches": searches,
+                "sources": [{"url": u, "title": t} for u, t in sources.items()],
+                "stop_reason": stop_reason, "model": model}
 
     def _generate_anthropic(
         self,
