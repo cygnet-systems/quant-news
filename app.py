@@ -1791,12 +1791,13 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     State("run-recs", "value"),
     State("run-recs-model", "value"),
     State("run-evidence", "value"),
+    State("run-tools", "value"),
     prevent_initial_call=True,
 )
 async def generate_ai_analysis(n_clicks, retry_clicks, scope,
                                run_symbols, stock_data, run_date, lookback,
                                max_articles_val, model, depth, recs,
-                               recs_model, run_evidence):
+                               recs_model, run_evidence, run_tools):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1867,6 +1868,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     # the modal has rendered once — treat as the default, both on.
     evidence_sel = (sorted(run_evidence) if run_evidence is not None
                     else sorted(MODEL.DEFAULT_EVIDENCE))
+    # Tools are opt-in: absent means none (the backend never switches one on).
+    tools_sel = sorted(set(run_tools or []))
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
     # Per-symbol analysis is always the full research agent now — the shallow
     # summarize_news_structured pass produced a thinner second opinion on the
@@ -1960,7 +1963,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
         articles_by_symbol, symbols or [], as_of_str, report_model,
         lookback_days, include_thesis_flag, evidence=evidence_sel,
         max_articles=max_articles, overnight=overnight_news,
-        include_research=include_research, recs_mode=recs_mode)
+        include_research=include_research, recs_mode=recs_mode,
+        tools=tools_sel)
 
     # Check persistent cache (Postgres + S3) before running LLM
     if _s3_available and ctx.triggered_id != "ai-retry-btn":
@@ -2171,7 +2175,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
                                     # Source failure vs quiet week: the
                                     # research arm refuses to write blind.
                                     news_status=(news_stats.get(sym) or {}).get("status"),
-                                    target_date=target_str)
+                                    target_date=target_str,
+                                    tools=tools_sel)
         return res
 
     # Async fan-out: each task holds a worker thread only while its blocking
@@ -2882,6 +2887,7 @@ def update_period(clicks, current_period):
     State("run-model", "value"),
     State("run-type", "value"),
     State("run-evidence", "value"),
+    State("run-tools", "value"),
     background=True,
     running=[
         (Output("prediction-running-indicator", "style"), {"display": "block"}, {"display": "none"}),
@@ -2893,7 +2899,7 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
                            run_ensemble, ens_members, ens_weights, ens_method,
                            ens_min_agree, predict_date_str, lookback,
                            max_articles_val, research_model,
-                           research_depth, run_evidence):
+                           research_depth, run_evidence, run_tools):
     """Generate model predictions in a background subprocess.
 
     Supports backtesting: when the selected as-of date is in the past, OHLCV
@@ -2977,6 +2983,7 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
                 # Modal checklist; None only before the modal rendered once.
                 "evidence": sorted(run_evidence) if run_evidence is not None
                             else sorted(MODEL.DEFAULT_EVIDENCE),
+                "tools": sorted(set(run_tools or [])),
             })
 
         # Module-level os — a function-local `import os` here once shadowed
@@ -4652,6 +4659,26 @@ def download_ai_json(n_clicks, ai_analysis):
 
 
 @callback(
+    Output("run-tools", "value"),
+    Input("run-date-picker", "date"),
+    Input("run-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def default_run_tools(ai_date, is_open):
+    """Web research is on for a next-day (forward-testing) run and off for a
+    backtest date, where the open web would leak the future. The user can
+    still flip the box after the date is chosen; this only sets the default
+    each time the date changes or the dialog opens."""
+    if not is_open:
+        raise PreventUpdate
+    from services.investigation_service import default_tools
+    from utils.trading_calendar import resolve_target_and_cutoff
+    picked = str(ai_date)[:10] if ai_date else None
+    target_d, _ = resolve_target_and_cutoff(picked)
+    return default_tools(target_d)
+
+
+@callback(
     Output("run-article-preview", "children"),
     Input("run-modal", "is_open"),
     Input("run-lookback", "value"),
@@ -5031,9 +5058,10 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     Input("model-info-close-btn", "n_clicks"),
     State("run-evidence", "value"),
     State("run-type", "value"),
+    State("run-tools", "value"),
     prevent_initial_call=True,
 )
-def toggle_model_info(info_clicks, close_click, run_evidence, depth):
+def toggle_model_info(info_clicks, close_click, run_evidence, depth, run_tools):
     """Model explainer for researchers, opened from the ⓘ icons in the Run
     dialog. TradingAgents' body embeds the verbatim research prompt with the
     context-block list reflecting the Evidence checkboxes AS SELECTED NOW —
@@ -5052,6 +5080,7 @@ def toggle_model_info(info_clicks, close_click, run_evidence, depth):
         evidence=run_evidence if run_evidence is not None
                  else list(MODEL.DEFAULT_EVIDENCE),
         include_thesis=(depth or "thesis") != "standard",
+        tools=run_tools or [],
     )
     return True, title, body
 

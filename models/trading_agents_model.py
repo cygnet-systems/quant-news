@@ -33,6 +33,7 @@ from models.base import BaseModel, PredictionResult
 from services.evidence_contract import (
     OPTIONAL, EvidenceLedger, MissingRequiredEvidence,
 )
+from services.investigation_service import WEB_RESEARCH_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +148,10 @@ class TradingAgentsModel(BaseModel):
         # OHLCV, the event-calendar gate, peer relative strength, a computed
         # SPY regime, and the selected evidence blocks. Computed here — not
         # asserted by the LLM — and all lookahead-safe.
+        tools = sorted(set(kwargs.get("tools") or []))
         extra_blocks, investigation = self._build_extra_context(
             symbol, ohlcv_df, as_of, evidence=evidence, ledger=ledger,
-            news=news, target=kwargs.get("target_date"))
+            news=news, target=kwargs.get("target_date"), tools=tools)
 
         # Deferred reflection: resolve any past decisions whose outcome is now
         # known (lookahead-safe — only outcomes on/before as_of) and inject the
@@ -253,6 +255,7 @@ class TradingAgentsModel(BaseModel):
             "sector_etf": result.get("sector_etf", ""),
             "used_news": use_news,
             "evidence": ledger.to_dict(),
+            "tools": tools,
             # Token cost of the report, summed over retries. Persisted so
             # cost per report is measurable instead of being stored as 0.
             "input_tokens": result.get("input_tokens", 0),
@@ -339,29 +342,21 @@ class TradingAgentsModel(BaseModel):
             up_probability = 0.5
         return confidence, up_probability, source, emp_n
 
-    @staticmethod
-    def _is_live(as_of: str) -> bool:
-        """True when as_of is the latest completed session — the only case
-        in which open-web research cannot see past the data cutoff by more
-        than the overnight gap."""
-        try:
-            from utils.trading_calendar import get_last_completed_trading_day
-            return str(as_of)[:10] >= get_last_completed_trading_day().isoformat()
-        except Exception:
-            return False
-
     def _build_extra_context(
         self, symbol: str, ohlcv_df: pd.DataFrame, as_of: str,
         evidence: "set[str] | list[str] | None" = None,
         ledger: EvidenceLedger | None = None,
         news: list | None = None,
         target: str | None = None,
+        tools: "set[str] | list[str] | None" = None,
     ) -> "tuple[list[str], object | None]":
         """Assemble validated, lookahead-safe context blocks for the prompt.
 
         ``evidence`` gates the optional blocks per run (Run-Analysis modal
         checklist): "options", "quality", "investigation", "political".
-        None means the configured default set.
+        None means the configured default set. ``tools`` is the run's tool
+        switches from the same dialog — "web_research" lets the
+        investigation search the open web; absent means off.
 
         Returns (blocks, investigation). Every block records itself on the
         ledger as present or as a gap with the reason; required blocks
@@ -551,7 +546,7 @@ class TradingAgentsModel(BaseModel):
         # Placed FIRST in the prompt's precomputed section: the situation
         # decides how every other block is read.
         if "investigation" in evidence:
-            live = self._is_live(as_of)
+            web = WEB_RESEARCH_TOOL in set(tools or [])
             try:
                 from services.investigation_service import (
                     investigate, format_investigation_block, headlines_for_prompt,
@@ -559,13 +554,13 @@ class TradingAgentsModel(BaseModel):
                 from services.stock_data import get_company_profile
                 from services import usage_service as _usage
                 _emit("ta", f"Research {symbol}: investigating the situation "
-                            f"({'web research' if live and MODEL.INVESTIGATION_MODE != 'off' else 'classification only'})")
+                            f"({'web research' if web else 'classification from supplied evidence only'})")
                 ctx = _usage.current()
                 with _usage.track("investigation", symbol=symbol,
                                   trade_date=ctx.trade_date or as_of,
                                   section=f"investigation:{symbol}"):
                     investigation = investigate(
-                        symbol, as_of, live=live, target=target,
+                        symbol, as_of, web=web, target=target,
                         profile=get_company_profile(symbol) or "",
                         headlines=headlines_for_prompt(news or []),
                         filings=filings_text, quality=quality_text,

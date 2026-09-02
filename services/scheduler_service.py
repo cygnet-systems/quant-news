@@ -116,6 +116,9 @@ JOB_TYPES: dict[str, JobType] = {
              "Point-in-time news window ending at the data cutoff"),
             ("max_articles", "Article cap per symbol", MODEL.NEWS_MAX_ARTICLES,
              "Keep the newest N of the window; 0 = all"),
+            ("web_research", "Web research tool (1 = on, 0 = off)", 1,
+             "Lets the situation investigation search the open web. On for "
+             "the scheduled next-day run; keep off for backtest dates"),
         ),
     ),
     "evaluation": JobType(
@@ -538,6 +541,10 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
             f"and save this job once to set them")
     cmd += ["--lookback", str(int(params["lookback"]))]
     cmd += ["--max-articles", str(int(params["max_articles"]))]
+    # Tools are opt-in per run; the job form defaults this to on for the
+    # forward-testing job, the CLI/backend default is off.
+    if int(params.get("web_research") or 0):
+        cmd += ["--tools", "web_research"]
     if params.get("report_model"):
         cmd += ["--report-model", params["report_model"]]
     if params.get("recs_model"):

@@ -841,6 +841,32 @@ def create_run_modal() -> dbc.Modal:
                     id="run-report-section",
                 ),
 
+                # --- Tools ---
+                # Run tools are opt-in switches the backend never flips on
+                # its own. Web research defaults ON here for a next-day run
+                # and is switched off by the date callback for a backtest
+                # date (the open web cannot be bounded to a past as-of).
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("Tools", className="mb-2"),
+                        dbc.Checklist(
+                            id="run-tools",
+                            options=[
+                                {"label": "Web research — the situation "
+                                          "investigation searches the open "
+                                          "web with citations (on for "
+                                          "next-day runs, off for backtests)",
+                                 "value": "web_research"},
+                            ],
+                            value=["web_research"],
+                            inline=True,
+                            className="run-evidence-checklist",
+                        ),
+                    ],
+                    id="run-tools-section",
+                ),
+
                 # --- Recommendations ---
                 html.Div(
                     [

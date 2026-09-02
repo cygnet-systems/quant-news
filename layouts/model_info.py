@@ -190,7 +190,8 @@ _EVIDENCE_BLOCK_ROWS = [
 
 
 def build_model_info_body(model_id: str, evidence: list | None = None,
-                          include_thesis: bool = True) -> list:
+                          include_thesis: bool = True,
+                          tools: list | None = None) -> list:
     """Explainer content for one model; TradingAgents also gets the live
     block list (reflecting the Evidence checkboxes) and the actual prompt."""
     info = MODEL_EXPLAINERS.get(model_id)
@@ -224,6 +225,23 @@ def build_model_info_body(model_id: str, evidence: list | None = None,
             ],
             style={} if included else {"opacity": 0.6},
         ))
+    web_on = "web_research" in set(tools or [])
+    rows.append(html.Li(
+        [
+            html.Span(("✓ " if web_on else "✗ "),
+                      style={"color": ("var(--positive)" if web_on
+                                       else "var(--text-muted)"),
+                             "fontWeight": "700"}),
+            html.Strong("Tool — web research: "),
+            html.Span("the investigation searches the open web with "
+                      "citations (on by default for next-day runs)"
+                      if web_on else
+                      "off — the investigation classifies from the supplied "
+                      "evidence only (the default for backtest dates, where "
+                      "the open web would leak the future)."),
+        ],
+        style={} if web_on else {"opacity": 0.6},
+    ))
     children.append(html.Hr())
     children.append(html.H6("Context blocks in THIS run"))
     children.append(html.P(

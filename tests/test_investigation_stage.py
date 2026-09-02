@@ -81,8 +81,8 @@ def test_extract_json_takes_the_last_fence_and_tolerates_prose():
 def test_live_run_uses_web_and_computes_spread():
     fake = _FakeLLM(_wrapped(BHF_JSON))
     with patch("services.llm_service.get_llm", return_value=fake):
-        inv = investigate("bhf", "2026-09-01", live=True, target="2026-09-02",
-                          last_close=52.99, mode="auto")
+        inv = investigate("bhf", "2026-09-01", web=True, target="2026-09-02",
+                          last_close=52.99)
     assert fake.web_calls == 1 and fake.plain_calls == 0
     assert inv.web is True
     assert inv.situation == "PENDING_ACQUISITION"
@@ -91,14 +91,14 @@ def test_live_run_uses_web_and_computes_spread():
     assert inv.input_tokens == 1000
     # Cached per (symbol, as_of, web, model): a retry does not re-search.
     with patch("services.llm_service.get_llm", return_value=fake):
-        again = investigate("BHF", "2026-09-01", live=True, last_close=52.99, mode="auto")
+        again = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
     assert again is inv and fake.web_calls == 1
 
 
 def test_backtest_never_touches_the_web():
     fake = _FakeLLM(_wrapped({**BHF_JSON, "deal": {"present": False}}))
     with patch("services.llm_service.get_llm", return_value=fake):
-        inv = investigate("BHF", "2026-06-01", live=False, last_close=60.0, mode="auto")
+        inv = investigate("BHF", "2026-06-01", web=False, last_close=60.0)
     assert fake.web_calls == 0 and fake.plain_calls == 1
     assert inv.web is False
     assert inv.spread_pct is None
@@ -106,12 +106,12 @@ def test_backtest_never_touches_the_web():
     assert "no web access on a historical as-of" in block
 
 
-def test_mode_off_and_always_override_liveness():
+def test_web_is_off_unless_the_run_asked_for_the_tool():
     fake = _FakeLLM(_wrapped(BHF_JSON))
     with patch("services.llm_service.get_llm", return_value=fake):
-        investigate("BHF", "2026-09-01", live=True, mode="off")
+        investigate("BHF", "2026-09-01", web=False)
         assert fake.web_calls == 0
-        investigate("BHF", "2026-06-01", live=False, mode="always")
+        investigate("BHF", "2026-06-01", web=True)
         assert fake.web_calls == 1
 
 
@@ -119,7 +119,7 @@ def test_unparseable_response_raises_instead_of_a_blank_block():
     fake = _FakeLLM("I could not determine anything.")
     with patch("services.llm_service.get_llm", return_value=fake):
         with pytest.raises(RuntimeError, match="not parseable"):
-            investigate("BHF", "2026-09-01", live=True, mode="auto")
+            investigate("BHF", "2026-09-01", web=True)
 
 
 def test_failed_investigation_is_cached_so_the_search_is_not_paid_twice():
@@ -127,7 +127,7 @@ def test_failed_investigation_is_cached_so_the_search_is_not_paid_twice():
     with patch("services.llm_service.get_llm", return_value=fake):
         for _ in range(2):
             with pytest.raises(RuntimeError, match="not parseable"):
-                investigate("BHF", "2026-09-01", live=True, mode="auto")
+                investigate("BHF", "2026-09-01", web=True)
     assert fake.web_calls == 1
 
 
@@ -137,18 +137,36 @@ def test_prefetch_warms_the_cache_for_the_in_loop_call():
     with patch("services.llm_service.get_llm", return_value=fake), \
          patch("services.stock_data.get_company_profile", return_value="BHF"), \
          patch("services.bad_apples_service.analyze_symbol", side_effect=RuntimeError("no yf")):
-        pool = prefetch_many(["BHF"], "2026-09-01", live=True, target="2026-09-02",
+        pool = prefetch_many(["BHF"], "2026-09-01", web=True, target="2026-09-02",
                              news_by_symbol={"BHF": []}, workers=2)
         pool.shutdown(wait=True)
-        inv = investigate("BHF", "2026-09-01", live=True, mode="auto", last_close=52.99)
+        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
     assert fake.web_calls == 1
     assert inv.situation == "PENDING_ACQUISITION"
+
+
+def test_backend_default_is_no_web():
+    fake = _FakeLLM(_wrapped(BHF_JSON))
+    with patch("services.llm_service.get_llm", return_value=fake):
+        investigate("BHF", "2026-09-01")
+    assert fake.web_calls == 0 and fake.plain_calls == 1
+
+
+def test_default_tools_follow_the_target_date():
+    from datetime import date, timedelta
+    from services.investigation_service import default_tools
+    today = date.today()
+    assert default_tools(today) == ["web_research"]
+    assert default_tools(today + timedelta(days=1)) == ["web_research"]
+    assert default_tools(today - timedelta(days=1)) == []
+    assert default_tools("2026-01-05") == []
+    assert default_tools(None) == ["web_research"]
 
 
 def test_unknown_situation_label_falls_back_to_other():
     fake = _FakeLLM(_wrapped({**BHF_JSON, "situation": "TAKEOVER_TARGET"}))
     with patch("services.llm_service.get_llm", return_value=fake):
-        inv = investigate("BHF", "2026-09-01", live=True, mode="auto")
+        inv = investigate("BHF", "2026-09-01", web=True)
     assert inv.situation == "OTHER"
 
 
@@ -190,12 +208,12 @@ def test_research_model_records_gap_when_investigation_fails():
 
     model = TradingAgentsModel()
     with patch("services.investigation_service.investigate", side_effect=boom), \
-         patch.object(TradingAgentsModel, "_is_live", return_value=True), \
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df), \
          patch("services.stock_data.get_company_profile", return_value="BHF — insurer"):
         blocks, inv = model._build_extra_context(
-            "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger)
+            "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger,
+            tools=["web_research"])
     assert inv is None
     gap = next(g for g in ledger.expected_gaps() if g.block == "investigation")
     assert "provider down" in gap.reason

@@ -89,6 +89,11 @@ def main() -> int:
                              "NEWS_FILTER_MODE")
     parser.add_argument("--models", default=None,
                         help="Comma-separated model ids to run (default: all)")
+    parser.add_argument("--tools", default="",
+                        help="Comma-separated run tools, e.g. web_research "
+                             "(lets the investigation search the open web). "
+                             "Default: none — the scheduled job's form and the "
+                             "Run dialog switch this on for next-day runs")
     parser.add_argument("--force", action="store_true",
                         help="Re-run symbols even when an identical analysis "
                              "for this cutoff is already stored")
@@ -236,6 +241,7 @@ def main() -> int:
         models=models,
         force=args.force,
         news_filter=args.news_filter,
+        tools=[t.strip() for t in args.tools.split(",") if t.strip()],
     )
 
     if args.json:

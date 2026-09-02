@@ -16,10 +16,13 @@ This stage runs BEFORE the report is written. One tool-using call:
      affiliations imply for the outcome — citing every finding;
   3. returns structured JSON the report prompt and the synthesis read.
 
-Point-in-time: web search cannot be bounded to a past date, so on a
-backtest (``live=False``) the classifier runs WITHOUT tools and says so;
-only live runs research the web. The investigator is told the decision
-moment (before the target session's open) and to date every source.
+Web access is a run TOOL the frontend switches (``web=True``), on by
+default for next-day runs and off for backtest dates, because web search
+cannot be bounded to a past date. Without it the classifier runs from the
+supplied evidence only and says so. The backend default is off: a caller
+that does not ask for the tool never pays for a search. The investigator is
+told the decision moment (before the target session's open) and to date
+every source.
 """
 
 import json
@@ -175,20 +178,18 @@ def investigate(
     symbol: str,
     as_of: str,
     *,
-    live: bool,
+    web: bool = False,
     target: Optional[str] = None,
     profile: str = "",
     headlines: str = "",
     filings: str = "",
     quality: str = "",
     last_close: Optional[float] = None,
-    mode: Optional[str] = None,
     model: Optional[str] = None,
 ) -> Investigation:
-    """Run the stage. Raises on provider failure — the caller classes the
-    block (expected evidence on a live run) and records the gap."""
-    mode = (mode or MODEL.INVESTIGATION_MODE).lower()
-    web = mode == "always" or (mode == "auto" and live)
+    """Run the stage. ``web`` is the frontend's tool switch (default off).
+    Raises on provider failure — the caller classes the block (expected
+    evidence) and records the gap."""
     key = (symbol.upper(), str(as_of)[:10], web, model or MODEL.INVESTIGATION_MODEL)
     with _CACHE_LOCK:
         if key in _CACHE:
@@ -280,7 +281,7 @@ def _investigate_uncached(key, symbol, as_of, *, web, target, profile, headlines
     return inv
 
 
-def prefetch_many(symbols: list[str], as_of: str, *, live: bool,
+def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
                   target: Optional[str], news_by_symbol: dict,
                   workers: int = 4) -> "concurrent.futures.ThreadPoolExecutor":
     """Start the investigations for a run's symbols in the background.
@@ -314,7 +315,7 @@ def prefetch_many(symbols: list[str], as_of: str, *, live: bool,
                 pass
             with _usage.track("investigation", symbol=symbol, trade_date=as_of,
                               section=f"investigation:{symbol}"):
-                investigate(symbol, as_of, live=live, target=target,
+                investigate(symbol, as_of, web=web, target=target,
                             profile=get_company_profile(symbol) or "",
                             headlines=headlines_for_prompt(news_by_symbol.get(symbol) or []),
                             filings=filings, quality=quality)
@@ -326,6 +327,21 @@ def prefetch_many(symbols: list[str], as_of: str, *, live: bool,
     for symbol in symbols:
         pool.submit(_one, symbol)
     return pool
+
+
+WEB_RESEARCH_TOOL = "web_research"
+
+
+def default_tools(target_date) -> list[str]:
+    """The frontend's default tool set for a run whose target session is
+    ``target_date``: web research on for a next-day (forward-testing) run,
+    off for a backtest, where the open web would leak the future."""
+    from datetime import date
+    try:
+        t = date.fromisoformat(str(target_date)[:10])
+    except (TypeError, ValueError):
+        return [WEB_RESEARCH_TOOL]
+    return [WEB_RESEARCH_TOOL] if t >= date.today() else []
 
 
 def format_investigation_block(inv: Investigation, last_close: Optional[float] = None) -> str:

@@ -337,6 +337,7 @@ def run_predictions(
     news_lookback_days: Optional[int] = None,
     ensemble_config: Optional[dict] = None,
     run_ensemble: bool = True,
+    tools: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run every model for each symbol as of ``cutoff_date``.
 
@@ -351,6 +352,9 @@ def run_predictions(
 
     ``evidence`` selects the optional Terminal-derived context blocks
     ("options", "quality") from the Run-Analysis modal; None means both.
+    ``tools`` is the dialog's Tools section ("web_research" lets the
+    investigation search the open web); None means none — the backend
+    never switches a tool on by itself.
     """
     from services import progress_service as prog
     from services import usage_service as usage
@@ -362,6 +366,7 @@ def run_predictions(
     selected = set(models or ALL_MODELS)
     evidence_set = (sorted(evidence) if evidence is not None
                     else sorted(MODEL.DEFAULT_EVIDENCE))
+    tools_set = sorted(set(tools or []))
     service = get_prediction_service()
     is_backtest = target_date < date_cls.today()
 
@@ -415,15 +420,16 @@ def run_predictions(
     investigation_pool = None
     if "investigation" in evidence_set and "trading_agents" in selected:
         try:
-            from services.investigation_service import prefetch_many
-            from models.trading_agents_model import TradingAgentsModel
+            from services.investigation_service import (
+                WEB_RESEARCH_TOOL, prefetch_many)
+            web = WEB_RESEARCH_TOOL in tools_set
             investigation_pool = prefetch_many(
-                list(symbols), str(cutoff_date),
-                live=TradingAgentsModel._is_live(str(cutoff_date)),
+                list(symbols), str(cutoff_date), web=web,
                 target=str(target_date), news_by_symbol=news_by_symbol,
                 workers=MODEL.INVESTIGATION_WORKERS)
             prog.emit("ta", f"Investigating {len(symbols)} symbols in the "
-                            f"background ({MODEL.INVESTIGATION_WORKERS} at a time)")
+                            f"background ({MODEL.INVESTIGATION_WORKERS} at a time; "
+                            f"web research {'ON' if web else 'off'})")
         except Exception as e:
             logger.warning(f"investigation prefetch not started: {e}")
 
@@ -464,7 +470,7 @@ def run_predictions(
                 symbol, cutoff_date, selected, df,
                 research_model=research_model, news_count=len(sym_news),
                 evidence=evidence_set, news_lookback_days=news_lookback_days,
-                include_thesis=include_thesis)
+                include_thesis=include_thesis, tools=tools_set)
             if reused:
                 results[symbol] = reused
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
@@ -522,6 +528,7 @@ def run_predictions(
                 news_lookback_days=news_lookback_days,
                 news_status=sym_status,
                 target_date=str(target_date),
+                tools=tools_set,
             )
         # Stamp what these were produced under, so a later run can tell
         # whether they are still valid rather than assuming they are.
@@ -554,6 +561,7 @@ def run_predictions(
                 if isinstance(entry["details"], dict):
                     entry["details"]["pipeline_epoch"] = PIPELINE_EPOCH
                     entry["details"]["evidence"] = evidence_set
+                    entry["details"]["tools"] = tools_set
                     entry["details"].setdefault("news_count", len(sym_news))
                     entry["details"].setdefault("news_status", sym_status)
                     # What the research model was FED, so reuse can tell a
@@ -605,6 +613,7 @@ def _reusable_predictions(
     evidence: Optional[list[str]] = None,
     news_lookback_days: Optional[int] = None,
     include_thesis: Optional[bool] = None,
+    tools: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """Stored predictions for this exact analysis, or None to re-run.
 
@@ -671,6 +680,14 @@ def _reusable_predictions(
             logger.info(f"{symbol}: stored research evidence "
                         f"{stored_evidence} != requested {sorted(evidence)} "
                         f"— re-running")
+            return None
+    # Same for the tools: a report investigated with web access is not the
+    # report a run without it would have produced (and vice versa).
+    if tools is not None and "trading_agents" in stored:
+        stored_tools = research.get("tools") or []
+        if sorted(stored_tools) != sorted(tools):
+            logger.info(f"{symbol}: stored research tools {stored_tools} != "
+                        f"requested {sorted(tools)} — re-running")
             return None
 
     # A blind prediction must not be cached indefinitely: if the source was
@@ -916,7 +933,8 @@ def report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
                      max_articles: Optional[int] = None,
                      overnight: bool = False,
                      include_research: bool = False,
-                     recs_mode: str = "auto") -> dict:
+                     recs_mode: str = "auto",
+                     tools: Optional[Iterable[str]] = None) -> dict:
     """The ONE set of AI-report cache inputs. The Run dialog and the
     scheduled run both build their key here; when each had its own copy an
     overnight run or a non-default recommendations basis could never share
@@ -935,6 +953,7 @@ def report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
         "recs": recs_mode,
         "evidence": (sorted(evidence) if evidence is not None
                      else sorted(MODEL.DEFAULT_EVIDENCE)),
+        "tools": sorted(set(tools or [])),
     }
 
 
@@ -1157,6 +1176,7 @@ def run_full_analysis(
     news_filter: Optional[str] = None,
     evidence: Optional[Iterable[str]] = None,
     max_articles: Optional[int] = None,
+    tools: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
 
@@ -1266,6 +1286,7 @@ def run_full_analysis(
         news_status_by_symbol=news_status_by_symbol,
         evidence=evidence,
         news_lookback_days=lookback_days,
+        tools=tools,
     )
     stored, evaluated = persist_predictions(signals)
 
@@ -1312,7 +1333,7 @@ def run_full_analysis(
                 news_by_symbol, priced, as_of, report_model,
                 lookback_days, include_thesis, evidence=evidence,
                 max_articles=max_articles,
-                overnight=(news_filter == "overnight"))),
+                overnight=(news_filter == "overnight"), tools=tools)),
             content=json.dumps(merged, default=str, indent=2),
             file_format="json",
         )

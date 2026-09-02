@@ -331,14 +331,12 @@ class ModelConfig:
     # OpenAI's Responses API + hosted web_search; anything else on
     # Anthropic's web_search server tool (opus-5 measured at ~$1.1/symbol,
     # too dear for a 20-name daily run).
-    #   mode: "auto" = web research on live runs, classification-only on
-    #         backtests (web results cannot be bounded to a past as-of);
-    #         "off" = classification-only everywhere; "always" = web
-    #         research even on backtests (experiments only: lookahead).
+    # Web access is a run TOOL, not an env switch: the Run dialog's Tools
+    # section (and the scheduled job's web_research param) turn it on; the
+    # backend default is off, so nothing searches unless a run asked.
     INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "gpt-5.6-luna")
     # Reasoning effort for gpt-* investigators (OpenAI Responses API).
     INVESTIGATION_OPENAI_EFFORT: str = os.getenv("INVESTIGATION_OPENAI_EFFORT", "medium")
-    INVESTIGATION_MODE: str = os.getenv("INVESTIGATION_MODE", "auto")
     INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "6"))
     # Investigations run concurrently ahead of the model loop; each takes
     # minutes, and the scheduled job has a 75-minute ceiling.
