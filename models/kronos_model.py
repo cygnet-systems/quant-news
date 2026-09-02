@@ -39,6 +39,8 @@ def _get_predictor() -> "KronosPredictor":
         return _predictor
 
     logger.info(f"Loading Kronos-{MODEL.KRONOS_MODEL_SIZE} (first call downloads weights)...")
+    from models.base import apply_torch_thread_cap
+    apply_torch_thread_cap()
 
     tokenizer = KronosTokenizer.from_pretrained(_TOKENIZER_REPO)
     model = Kronos.from_pretrained(_MODEL_REPO)

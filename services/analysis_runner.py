@@ -185,6 +185,7 @@ def attach_positioning_quality(
     symbols: list | None,
     as_of: str,
     evidence: Optional[Iterable[str]] = None,
+    news_by_symbol: Optional[dict] = None,
 ) -> dict:
     """Stash options positioning and the Bad Apples quality screen into
     ``ai_analysis["by_symbol"]`` so the synthesis prompt, the on-screen
@@ -221,7 +222,9 @@ def attach_positioning_quality(
         if "quality" in evidence and ("quality" not in entry or stale_quality):
             try:
                 from services.bad_apples_service import analyze_symbol, summarize
-                entry["quality"] = summarize(analyze_symbol(sym, as_of))
+                entry["quality"] = summarize(analyze_symbol(
+                    sym, as_of,
+                    articles=((news_by_symbol or {}).get(sym) or None)))
             except Exception as e:
                 logger.warning(f"{sym}: quality screen failed: {e}")
                 entry["quality"] = entry.get("quality") or None
@@ -415,27 +418,43 @@ def run_predictions(
             training_news_failures.append("_GLOBAL")
 
     # Web investigations overlap the model loop instead of extending it
-    # (see investigation_service.prefetch_many). last_close is supplied by
-    # the in-loop call; the cache key does not depend on it.
+    # (see investigation_service.prefetch_many), but NOT its first symbol.
+    # The first symbol that runs is where every lazy model loads (torch,
+    # transformers, the DeBERTa weights) while XGBoost and LightGBM train
+    # beside it; starting N investigation workers, each pulling yfinance
+    # histories and statements, on top of that spike is what took the
+    # container down three times on 2026-09-02. The pool starts once that
+    # symbol is through and covers the rest; symbol one investigates
+    # in-loop, one thread wide, as it did before the prefetch existed.
+    from services.investigation_service import WEB_RESEARCH_TOOL
     investigation_pool = None
-    if "investigation" in evidence_set and "trading_agents" in selected:
+    prefetch_pending = ("investigation" in evidence_set
+                        and "trading_agents" in selected)
+    web = WEB_RESEARCH_TOOL in tools_set
+
+    def _start_prefetch(remaining: list[str]) -> None:
+        nonlocal investigation_pool, prefetch_pending
+        prefetch_pending = False
+        if not remaining:
+            return
         try:
-            from services.investigation_service import (
-                WEB_RESEARCH_TOOL, prefetch_many)
-            web = WEB_RESEARCH_TOOL in tools_set
+            from services.investigation_service import prefetch_many
             investigation_pool = prefetch_many(
-                list(symbols), str(cutoff_date), web=web,
+                remaining, str(cutoff_date), web=web,
                 target=str(target_date), news_by_symbol=news_by_symbol,
                 workers=MODEL.INVESTIGATION_WORKERS)
-            prog.emit("ta", f"Investigating {len(symbols)} symbols in the "
-                            f"background ({MODEL.INVESTIGATION_WORKERS} at a time; "
+            prog.emit("ta", f"Investigating the remaining {len(remaining)} "
+                            f"symbols in the background "
+                            f"({MODEL.INVESTIGATION_WORKERS} at a time; "
                             f"web research {'ON' if web else 'off'})")
         except Exception as e:
             logger.warning(f"investigation prefetch not started: {e}")
 
+    prog.emit_memory("model stage setup", symbols=len(symbols))
+    sym_list = list(symbols)
     results: dict = {}
     skipped: dict[str, str] = {}
-    for symbol in symbols:
+    for i, symbol in enumerate(sym_list):
         prices_json = (stock_data.get(symbol) or {}).get("prices")
         if not prices_json:
             logger.warning(f"{symbol}: no price data, skipping")
@@ -530,6 +549,10 @@ def run_predictions(
                 target_date=str(target_date),
                 tools=tools_set,
             )
+        if prefetch_pending:
+            prog.emit_memory("first symbol's models (weights loaded)",
+                             symbol=symbol)
+            _start_prefetch(sym_list[i + 1:])
         # Stamp what these were produced under, so a later run can tell
         # whether they are still valid rather than assuming they are.
 
@@ -593,6 +616,7 @@ def run_predictions(
 
     if investigation_pool is not None:
         investigation_pool.shutdown(wait=False)
+    prog.emit_memory("model loop", symbols=len(results))
     results["_meta"] = {
         "predict_date": cutoff_date.isoformat(),
         "target_date": target_date.isoformat(),
@@ -1216,7 +1240,9 @@ def run_full_analysis(
     prog.start_run(f"Full Analysis (scheduled), {len(symbols)} symbols, "
                    f"target {target_date} (data through {as_of})")
 
+    prog.emit_memory("run start", symbols=len(symbols))
     stock_data = load_market_data(symbols, period=period, force_refresh=force_refresh)
+    prog.emit_memory("market data")
     priced = [s for s in symbols if s in stock_data]
     if not priced:
         prog.finish_run("Full Analysis aborted, no price data")
@@ -1284,6 +1310,8 @@ def run_full_analysis(
         logger.warning(f"news snapshot not archived: {e}")
 
     news_status_by_symbol = {sym: news_stats[sym]["status"] for sym in priced}
+    prog.emit_memory("news fetch", articles=sum(
+        len(v) for v in news_by_symbol.values()))
 
     signals = run_predictions(
         priced, stock_data, news_by_symbol,
@@ -1298,6 +1326,7 @@ def run_full_analysis(
         tools=tools,
     )
     stored, evaluated = persist_predictions(signals)
+    prog.emit_memory("predictions persisted")
 
     ai_analysis = build_ai_report(
         priced, news_by_symbol, cutoff_date,
@@ -1308,8 +1337,10 @@ def run_full_analysis(
     )
     # After the cache check on purpose: a restored report predating these
     # sections gets them attached instead of silently lacking them.
+    prog.emit_memory("report")
     ai_analysis = attach_positioning_quality(ai_analysis, priced, as_of,
-                                             evidence=evidence)
+                                             evidence=evidence,
+                                             news_by_symbol=news_by_symbol)
 
     # The basis the dialog offers: text analysis + predictions, predictions
     # only, or no synthesis at all.
@@ -1320,6 +1351,7 @@ def run_full_analysis(
         recommendations = None
     else:
         recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
+    prog.emit_memory("synthesis")
 
     # Synthesis rows are written AFTER persist_predictions' auto-evaluate, so
     # on a backtest they used to stay "pending" until the next scheduled

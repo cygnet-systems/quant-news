@@ -244,6 +244,29 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def rss_mb() -> float | None:
+    """This process's resident set in MB, None when psutil cannot say."""
+    try:
+        import psutil
+        return round(psutil.Process().memory_info().rss / 1e6, 1)
+    except Exception:
+        return None
+
+
+def emit_memory(stage: str, **extra) -> None:
+    """One ``memory`` event: RSS at a stage boundary.
+
+    Three container deaths on 2026-09-02 left nothing behind but the phase
+    they died in; the footprint had to be inferred from imports and
+    weights. This is the instrument the next incident reads instead.
+    """
+    mb = rss_mb()
+    if mb is None:
+        return
+    emit("action", f"Memory: {mb:,.0f} MB RSS after {stage}",
+         payload={"event": "memory", "stage": stage, "rss_mb": mb, **extra})
+
+
 def watchdog_check() -> bool:
     """Close a run whose worker died (or that stopped emitting) as a failure.
 

@@ -520,7 +520,8 @@ class TradingAgentsModel(BaseModel):
                 from services.bad_apples_service import (
                     analyze_symbol as _ba_analyze, format_bad_apples_block,
                 )
-                quality_text = format_bad_apples_block(symbol, _ba_analyze(symbol, as_of))
+                quality_text = format_bad_apples_block(
+                    symbol, _ba_analyze(symbol, as_of, articles=(news or None)))
             except Exception as e:
                 logger.warning(f"{symbol}: quality screen failed: {e}")
             if quality_text:

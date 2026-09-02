@@ -570,54 +570,72 @@ _SERIOUS_FLAGS = {"leadership", "investigation", "accounting", "guidance",
                   "short_seller"}
 
 
+def _article_field(a, name: str):
+    """An article field from either shape the pipeline carries: the
+    NewsArticle dataclass or its dict form (``article_to_dict``)."""
+    if isinstance(a, dict):
+        return a.get(name)
+    return getattr(a, name, None)
+
+
 def scan_news_red_flags(symbol: str, as_of: str,
-                        lookback_days: int = RED_FLAG_LOOKBACK_DAYS) -> list[dict] | None:
-    """Scan the point-in-time news window for red-flag headlines.
+                        lookback_days: int = RED_FLAG_LOOKBACK_DAYS,
+                        articles: list | None = None) -> list[dict] | None:
+    """Scan a news window for red-flag headlines.
+
+    ``articles`` is the run's own point-in-time window when the caller has
+    one (the capped list every model already reads). Without it the scan
+    fetches its own uncapped ``lookback_days`` window, which used to happen
+    for every symbol of every run on top of the run's fetch: two copies of
+    each window held in memory for the life of the process, for a keyword
+    match the capped list serves just as well.
 
     Returns a list of {category, headline, date, url} (empty when clean),
     or None when the news source is unavailable, "no news access" must not
     render as "no red flags".
     """
-    try:
-        from services.news_window import fetch_point_in_time_news
-        articles = fetch_point_in_time_news(symbol, str(as_of)[:10],
-                                            lookback_days=lookback_days)
-    except Exception as e:
-        logger.warning(f"{symbol}: red-flag news scan unavailable: {e}")
-        return None
+    if articles is None:
+        try:
+            from services.news_window import fetch_point_in_time_news
+            articles = fetch_point_in_time_news(symbol, str(as_of)[:10],
+                                                lookback_days=lookback_days)
+        except Exception as e:
+            logger.warning(f"{symbol}: red-flag news scan unavailable: {e}")
+            return None
 
     hits: list[dict] = []
     seen: set[tuple] = set()
     for a in articles or []:
-        text = f"{getattr(a, 'title', '') or ''}. {getattr(a, 'summary', '') or ''}"
+        title = _article_field(a, "title") or ""
+        text = f"{title}. {_article_field(a, 'summary') or ''}"
         for category, pat in _RED_FLAG_PATTERNS:
             if not pat.search(text):
                 continue
-            headline = (getattr(a, "title", "") or "")[:160]
+            headline = title[:160]
             key = (category, headline)
             if key in seen:
                 continue
             seen.add(key)
-            pub = getattr(a, "published_at", None)
+            pub = _article_field(a, "published_at")
             hits.append({
                 "category": category,
                 "headline": headline,
                 "date": str(pub)[:10] if pub else None,
-                "url": getattr(a, "url", None),
+                "url": _article_field(a, "url"),
             })
     hits.sort(key=lambda h: (h["category"] not in _SERIOUS_FLAGS,
                              h["category"], h["date"] or ""))
     return hits
 
 
-def check_news_red_flags(red_flags: list[dict] | None):
+def check_news_red_flags(red_flags: list[dict] | None,
+                         scope: str = f"{RED_FLAG_LOOKBACK_DAYS}d window"):
     if red_flags is None:
         return ("n/a", None, None, "News source unavailable")
     serious = [h for h in red_flags if h["category"] in _SERIOUS_FLAGS]
     cats = sorted({h["category"] for h in red_flags})
     if not red_flags:
-        return ("pass", "No red-flag headlines",
-                "0 serious hits", f"{RED_FLAG_LOOKBACK_DAYS}d window")
+        return ("pass", "No red-flag headlines", "0 serious hits", scope)
     return ("fail" if serious else "pass",
             f"{len(red_flags)} hit(s): {', '.join(cats)}",
             "0 serious hits",
@@ -679,7 +697,7 @@ _CHECK_SPEC = [
     ("Qualitative", "Insider net selling (90d)",
         lambda ctx: check_insider_selling(ctx["tk"], ctx["as_of"])),
     ("Qualitative", "News red flags (leadership/legal/guidance)",
-        lambda ctx: check_news_red_flags(ctx["red_flags"])),
+        lambda ctx: check_news_red_flags(ctx["red_flags"], ctx["red_flag_scope"])),
 ]
 
 
@@ -713,9 +731,15 @@ def _pit_quarters(frame, as_of):
         return frame
 
 
-def analyze_symbol(symbol: str, as_of: str) -> dict:
+def analyze_symbol(symbol: str, as_of: str,
+                   articles: list | None = None) -> dict:
     """Run the full scorecard for one symbol as of a date. Cached per
-    (symbol, as_of); never raises: a failed fetch yields n/a checks."""
+    (symbol, as_of); never raises: a failed fetch yields n/a checks.
+
+    ``articles`` is the run's point-in-time news for the symbol, scanned for
+    red flags in place of a second fetch (see ``scan_news_red_flags``).
+    The first computation for a (symbol, as_of) is the one every later
+    caller reads."""
     from services.stock_data import get_ticker
 
     sym = symbol.strip().upper()
@@ -772,14 +796,18 @@ def analyze_symbol(symbol: str, as_of: str) -> dict:
             logger.warning("statement %r unavailable: %s", attr, e)
             return None
 
-    red_flags = scan_news_red_flags(sym, as_of)
+    red_flag_scope = (f"run news window ({len(articles)} articles)"
+                      if articles is not None else f"{RED_FLAG_LOOKBACK_DAYS}d window")
+    red_flags = scan_news_red_flags(sym, as_of, articles=articles)
     out["red_flags"] = red_flags or []
+    out["red_flag_scope"] = red_flag_scope
     out["headcount"] = info.get("fullTimeEmployees")
 
     ctx = {"tk": tk, "info": info, "as_of": as_of, "price": price,
            "symbol": sym,
            "stock": stock_prices, "bench": bench_prices,
            "red_flags": red_flags,
+           "red_flag_scope": red_flag_scope,
            "q_inc": _frame("quarterly_financials"),
            "q_cf": _frame("quarterly_cashflow"),
            "q_bs": _frame("quarterly_balance_sheet")}
@@ -819,6 +847,7 @@ def summarize(result: dict) -> dict:
             for c in result["checks"] if c["status"] == "fail"
         ],
         "red_flags": (result.get("red_flags") or [])[:8],
+        "red_flag_scope": result.get("red_flag_scope"),
     }
 
 
@@ -845,7 +874,8 @@ def format_bad_apples_block(symbol: str, result: dict) -> str:
         lines.append(f"FAIL {c['category']}: {c['check']} = {c['value']}{detail}")
     red_flags = result.get("red_flags") or []
     if red_flags:
-        lines.append(f"News red-flag mentions ({RED_FLAG_LOOKBACK_DAYS}d window, "
+        scope = result.get("red_flag_scope") or f"{RED_FLAG_LOOKBACK_DAYS}d window"
+        lines.append(f"News red-flag mentions ({scope}, "
                      f"keyword-matched: judge each against its headline):")
         for h in red_flags[:6]:
             when = f" ({h['date']})" if h.get("date") else ""

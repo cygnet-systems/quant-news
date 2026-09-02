@@ -26,6 +26,8 @@ def _get_pipeline():
     """Lazy-load the HuggingFace sentiment pipeline."""
     global _pipeline
     if _pipeline is None:
+        from models.base import apply_torch_thread_cap
+        apply_torch_thread_cap()
         from transformers import pipeline
         _pipeline = pipeline(
             "sentiment-analysis",

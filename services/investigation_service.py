@@ -330,7 +330,12 @@ def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
             filings = ""
             try:
                 from services.bad_apples_service import analyze_symbol, format_bad_apples_block
-                quality = format_bad_apples_block(symbol, analyze_symbol(symbol, as_of))
+                # The run's own capped window; an empty list means "quiet or
+                # source down", which the scan must fetch to tell apart.
+                quality = format_bad_apples_block(
+                    symbol, analyze_symbol(
+                        symbol, as_of,
+                        articles=(news_by_symbol.get(symbol) or None)))
             except Exception:
                 pass
             try:

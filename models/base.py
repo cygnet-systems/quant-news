@@ -98,6 +98,29 @@ def compute_pnl(
     return shares * (actual_close - previous_close) * sign
 
 
+def apply_torch_thread_cap() -> None:
+    """Honour ``TORCH_NUM_THREADS`` before the first torch model loads.
+
+    In a container torch sizes its intra-op pool to the HOST's cores, and
+    it shares the box with xgboost's and lightgbm's OpenMP pools; the env
+    var lets ops pin it next to OMP_NUM_THREADS without a code change.
+    Unset means torch's own default. Never raises.
+    """
+    import logging
+    import os
+    raw = os.getenv("TORCH_NUM_THREADS")
+    if not raw:
+        return
+    try:
+        import torch
+        n = max(1, int(raw))
+        if torch.get_num_threads() != n:
+            torch.set_num_threads(n)
+            logging.getLogger(__name__).info(f"torch intra-op threads capped at {n}")
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).debug(f"torch thread cap skipped: {e}")
+
+
 class BaseModel(ABC):
     """Abstract base class for all prediction models."""
 
