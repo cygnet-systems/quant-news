@@ -147,9 +147,26 @@ def format_congress_block(symbol: str, c: dict | None) -> str:
                 f"Absence is uninformative for a small/mid cap.")
     party = ", ".join(f"{p}: {v['buys']} buy / {v['sells']} sell"
                       for p, v in c["by_party"].items())
+    # The skew is computed here so the model reads a number, not a story:
+    # 6 sells against 4 buys inside one party is balance, not a stance.
+    total = c["buys"] + c["sells"]
+    sell_share = c["sells"] / total if total else 0.5
+    skew = ("sell-skewed" if sell_share >= 0.7 else
+            "buy-skewed" if sell_share <= 0.3 else "balanced")
+    party_skews = []
+    for p, v in c["by_party"].items():
+        n = v["buys"] + v["sells"]
+        if n >= 4:
+            share = v["sells"] / n
+            party_skews.append(f"{p} {'sell-skewed' if share >= 0.7 else 'buy-skewed' if share <= 0.3 else 'balanced'}")
     lines = [head,
              f"{c['n']} trades: {c['buys']} buys, {c['sells']} sells"
-             + (f" ({party})" if party else "")]
+             + (f" ({party})" if party else ""),
+             f"Skew: {skew} overall"
+             + (f"; by party: {', '.join(party_skews)}" if party_skews else
+                "; no party has enough trades to read a stance")
+             + ". Sells are the common side for members trimming winners; only a "
+               "lopsided count is a signal, and never on its own."]
     for t in c["trades"][:6]:
         who = f"{t['politician']} ({t['party'] or '?'}-{t['state'] or '?'}, {t['chamber']})"
         owner = f", {t['owner'].lower()}" if t.get("owner") and t["owner"] != "SELF" else ""

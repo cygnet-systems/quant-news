@@ -88,7 +88,7 @@ Every number you cite must be traceable to the data below:
   "as instructed", or "per the rules". State conclusions about the market, never
   conclusions about your own instructions.
 - The ALL-CAPS names in the verdict format below (REASSESS_TO_BUY, MOVE_TO_SELL,
-  SINCE LAST REPORT, and the rest) are field labels for that block ONLY. They are
+  and the rest) are field labels for that block ONLY. They are
   machine keys, not words. Never write one inside a sentence anywhere else in the
   report: in prose, say "turn bullish"/"turn bearish" or name the price level.
 
@@ -96,9 +96,6 @@ Analyze ALL of the following data carefully before deciding.
 
 == HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY ==
 {track_record_block}
-
-== PRIOR STANCE ON {ticker} ==
-{continuity_block}
 
 == {ticker} BUSINESS PROFILE ==
 {business_block}
@@ -153,6 +150,15 @@ Bearish: price below 50 AND 200 SMA; RSI > 75 with declining volume; MACD bearis
 divergence; negative revision/guidance cut; deteriorating margins or rising debt.
 Neutral: RSI 45-55 with flat MACD; no material catalyst; tight range (<1% moves).
 
+**Step 2b: Positioning and flows (who is already positioned, and which way)**
+Read the options, congressional-trade, institutional (13F) and short-interest
+blocks as a group. Quantify before you characterise: "6 Democratic sells vs 4
+Democratic buys" is balanced, not a party stance, and a filing lags its trade by
+weeks. A put skew concentrated in the front month is event hedging; a skew spread
+across expiries is a stance. Large 13F cuts by a named holder are a fact about
+last quarter, not about tomorrow. Positioning tells you who would be squeezed or
+relieved by each outcome; it does not tell you the direction on its own.
+
 **Step 3: Combine Systematic + Idiosyncratic**
 - BULL + bullish ticker = strong BUY; BULL + bearish = HOLD (support limits downside)
 - BEAR + bullish = HOLD (headwinds cap upside); BEAR + bearish = strong SELL
@@ -167,6 +173,15 @@ Neutral: RSI 45-55 with flat MACD; no material catalyst; tight range (<1% moves)
   "cause unknown: elevated risk" and treat it as bearish.
 - Any risk/reward claim must use the support/resistance and ATR arithmetic from
   the PRECOMPUTED METRICS block (when present) rather than your own arithmetic.
+
+**Step 3b: Map the outcomes before you pick one**
+The reader wants to know what could happen over the next 1-5 sessions and how
+likely each path is, not only which way you lean. Lay out 2-4 mutually exclusive
+scenarios that together cover the realistic space, each with: what happens, what
+in the data would confirm it early, the price implication against the levels in
+the blocks, and your probability. Probabilities are your judgement (say so once),
+must sum to about 100%, and must not all cluster at 25%: name the most likely
+path and the least likely one. The Verdict is the trade you take given that map.
 
 DECISIVENESS: commit to a clear BUY or SELL whenever the strongest evidence warrants
 one. Reserve HOLD for when the evidence is genuinely balanced. Do not hedge by default.
@@ -208,7 +223,6 @@ You MUST BEGIN your response with exactly this block:
 FINAL TRANSACTION PROPOSAL: **BUY** (or **SELL** or **HOLD**)
 CONVICTION: **0.X** (this report's own probability that the direction is right, not a measured hit rate)
 MEASURED ACCURACY: <copy the single line under "HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY" above, word for word and digit for digit; do not paraphrase it, do not round it, and do not substitute a number of your own>
-SINCE LAST REPORT: <one line. If there is a prior stance above: name its date and call, say whether either trigger it stated was actually met by the price action shown, and if your call differs from it while no trigger was met, say so plainly in this same line. If that prior report used the same data cutoff as this run, no new price exists, so a different call is a change of interpretation on identical evidence and must be labelled that way. If there is no prior stance above, write exactly "no prior report on record">
 REASSESS_TO_BUY: <one concrete single-line trigger with a rounded level from the data, e.g. "close above 50-day SMA (~$X.XX) on >1.2x avg volume">
 MOVE_TO_SELL: <one concrete single-line trigger with a rounded level from the data, e.g. "close below 20-day support (~$X.XX)">
 - <the single strongest reason for this call>
@@ -252,28 +266,38 @@ Then the analysis, as sections in this order. Formatting rules:
    claim carries its outlet and date inline; is anything actually new?
 4. Fundamentals: valuation and quality, only as they bear on the 1-5 day window
    (in a PENDING_ACQUISITION, only as they bear on completion or break value)
-5. Peer Comparison: {ticker} vs the peer set in the data; company-specific move
+5. Positioning & Flows: who is positioned which way. Options (put/call, by
+   expiry when given), congressional trades (counts, party split, sizes, filing
+   lag), institutional 13F adds and cuts, short interest. Quote the counts and
+   the named holders or members from the blocks; say what each group would need
+   to see to change position, and which scenario below each one is exposed to.
+   If a block was not gathered, say so in one line rather than skipping it.
+6. Peer Comparison: {ticker} vs the peer set in the data; company-specific move
    or sector-wide repricing? (omit this section only if no peer block was provided)
-6. Business Context: what the company actually does, and which of tomorrow's
+7. Business Context: what the company actually does, and which of tomorrow's
    drivers (sector beta, own catalysts, liquidity) dominate for a name this size
-7. Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
+8. Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
    three sentences. This context is identical for every symbol analysed today, so
    it earns no more space than that; spend the words on what it changes for
    {ticker} specifically
-8. Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
+9. Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
    strongest arguments FOR upside, each anchored to a specific number or article
    in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
    same standard. Argue each side at full strength. Do not soften the side you
    disagree with. The Read line states which side wins over 1-5 sessions and on
    what evidence the loser's case would take over.
-9. Risk: systematic / sector / idiosyncratic; name the single biggest risk to
+10. Scenarios: what is more and less likely over the next 1-5 sessions. One
+   short paragraph per scenario, in descending probability, each opening with
+   "**<name> (p≈X%):**" and covering what happens, the early confirmation in the
+   data, and the price implication against the levels in the blocks. Say once
+   that the probabilities are this report's judgement. The Read line names the
+   most likely path and what would make the least likely one take over.
+11. Risk: systematic / sector / idiosyncratic; name the single biggest risk to
    THIS call and the falsification conditions that would flip it. Name any
    evidence this run could not gather and what it would have changed.
-10. Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
+12. Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
    described above and stamped "as of {date}"; invalidation (which close, level
-   or event kills the thesis); what to watch next session. If a prior stance is
-   shown above, this section must also say in one sentence what changed since
-   it, or that nothing did
+   or event kills the thesis); what to watch next session
 """
 
 
@@ -290,13 +314,15 @@ JSON, double quotes, no comments, and NOTHING after the closing fence:
 ```json
 {"stance": "BULLISH|CAUTIOUS_BULLISH|NEUTRAL|CAUTIOUS_BEARISH|BEARISH",
  "sentiment_alignment": "<one sentence: does the news sentiment confirm or conflict with the technical picture, and which should the reader weight here>",
- "watch_items": ["<2-3 short, concrete, checkable items. A level, a date, a metric>"]%(thesis)s}
+ "watch_items": ["<2-3 short, concrete, checkable items. A level, a date, a metric>"],
+ "scenarios": [{"name": "<short label>", "probability": 0.0, "trigger": "<the early confirmation in the data>", "implication": "<price path against a level in the blocks>"}]%(thesis)s}
 ```
 
 The stance MUST be consistent with your Verdict: BUY maps to BULLISH
 (CAUTIOUS_BULLISH if CONVICTION < 0.6), SELL to BEARISH (CAUTIOUS_BEARISH if
 CONVICTION < 0.6), HOLD to NEUTRAL. watch_items must reuse levels/dates already
-cited in your report. Do not introduce new numbers here.
+cited in your report. Do not introduce new numbers here. scenarios must match
+section 10: same names, same probabilities (as decimals summing to about 1.0).
 Text inside the JSON follows the same voice rules as the report: no em dashes,
 no "not just X, it's Y", no filler.
 """
@@ -663,9 +689,12 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
                       as_of: str = "") -> str:
     """The previous stance on this symbol, its triggers, and what price did.
 
-    Without this the model has no memory across days and a stance can flip
-    overnight while every invalidation level it published went untouched, the
-    defect this block exists to make visible.
+    This block feeds the POST-HOC continuity writer only, never the research
+    prompt. The research call must form its stance from the data alone; showing
+    it its own prior call would anchor the new prediction to the old one
+    (consistency pressure), which is exactly the bias the cross-day memory was
+    never meant to introduce. Accountability survives because the SINCE LAST
+    REPORT line is written afterwards, once the new call is already fixed.
 
     A predecessor written against the SAME data cutoff is called out as such:
     no new price exists between the two, so a different call there is a change
@@ -708,6 +737,83 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     else:
         lines.append("  " + _price_since(df, prior_date))
     return "\n".join(lines)
+
+
+_SINCE_LINE_PROMPT = """A research report on {ticker} was just finalized. Its call: {decision}, conviction {conviction}.
+
+The previous report on {ticker} and what price actually did since:
+{continuity}
+
+Write the finalized report's "SINCE LAST REPORT" line. One sentence of plain text, no markdown, no label. Name the prior report's date and call. Say whether either trigger it published was met by the price action shown. If today's call differs from the prior one and neither trigger was met, say so plainly.{same_cutoff_clause}
+Do not use an em dash or en dash; use a comma, a period, or a colon after a label. Do not argue for or against either call; this line records what changed, nothing else. Output only the line."""
+
+_SAME_CUTOFF_CLAUSE = (" That prior report used the SAME data cutoff as this"
+                       " run, so no new price exists between them; if the calls"
+                       " differ, label it a change of interpretation on"
+                       " identical evidence.")
+
+
+def _since_last_report_line(llm, prior: Optional[dict], continuity: str,
+                            symbol: str, as_of: str, decision: str,
+                            confidence, model: str, provider: str,
+                            usage_total: dict) -> tuple[str, str]:
+    """The SINCE LAST REPORT line, written AFTER the call is fixed.
+
+    A separate small call on purpose: the research prompt never sees the prior
+    stance, so the new prediction cannot anchor to it; this writer sees both
+    reports but cannot change the decision, which is already extracted.
+    Returns (line, source) where source is "model", "fallback" or "none".
+    """
+    if not prior:
+        return "no prior report on record", "none"
+    prior_date = str(prior.get("trade_date") or "")[:10]
+    prior_call = (prior.get("decision") or "?").upper()
+    same_cutoff = bool(as_of) and prior_date == str(as_of)[:10]
+    try:
+        usage: dict = {}
+        line = llm.generate(
+            _SINCE_LINE_PROMPT.format(
+                ticker=symbol, decision=decision,
+                conviction=f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "n/a",
+                continuity=continuity,
+                same_cutoff_clause=_SAME_CUTOFF_CLAUSE if same_cutoff else ""),
+            max_tokens=200, temperature=0.0, model=model, provider=provider,
+            usage_out=usage)
+        usage_total["input_tokens"] += usage.get("input_tokens", 0)
+        usage_total["output_tokens"] += usage.get("output_tokens", 0)
+        line = " ".join((line or "").split())
+        # A usable line is one sentence-ish and names the prior somehow; an
+        # empty or rambling answer falls back to the deterministic record.
+        if line and len(line) < 400:
+            return line, "model"
+    except Exception as e:
+        logger.debug(f"{symbol}: since-last-report writer failed: {e}")
+    line = (f"prior report {prior_date} called {prior_call}; this run calls "
+            f"{decision}" + (", on the same data cutoff, a change of "
+                             "interpretation on identical evidence"
+                             if same_cutoff and prior_call != decision else "")
+            + " (trigger check unavailable)")
+    return line, "fallback"
+
+
+def _insert_since_line(text: str, line: str) -> str:
+    """Insert the SINCE LAST REPORT line into the Verdict block.
+
+    After MEASURED ACCURACY when present, else after CONVICTION, else after
+    the proposal line; a report with no verdict anchors is left untouched
+    (its decision already came from fallbacks and the parsers tolerate the
+    missing field)."""
+    if "SINCE LAST REPORT" in (text or ""):
+        return text
+    for anchor in ("MEASURED ACCURACY", "CONVICTION", "FINAL TRANSACTION PROPOSAL"):
+        i = text.find(anchor)
+        if i == -1:
+            continue
+        j = text.find("\n", i)
+        if j == -1:
+            j = len(text)
+        return text[:j] + f"\nSINCE LAST REPORT: {line}" + text[j:]
+    return text
 
 
 # ---- decision extraction (ported from the old signal_processing helpers) ----
@@ -1023,6 +1129,10 @@ class SingleAgentResearch:
             ledger.missing("business", "company profile lookup failed")
 
         # --- prior stance (cross-day continuity) ---
+        # Gathered here, used ONLY after generation: the research prompt never
+        # carries the prior stance, so the fresh call cannot anchor to it. The
+        # SINCE LAST REPORT line is written by a separate post-hoc call once
+        # the decision is already extracted (see _since_last_report_line).
         # trade_date <= as_of is the lookahead guard (a later session's report
         # is never visible); `started_at` excludes anything written after this
         # call began, which is what lets a same-cutoff re-run see this
@@ -1081,7 +1191,6 @@ class SingleAgentResearch:
             sector_etf=sector_etf,
             situation_line=situation_line,
             track_record_block=track_record or NO_TRACK_RECORD_LINE,
-            continuity_block=_smart_truncate(continuity, 1500),
             business_block=_smart_truncate(business, 1200),
             spy_block=_smart_truncate(spy_block, 2000),
             sector_block=_smart_truncate(sector_block, 2000),
@@ -1147,6 +1256,15 @@ class SingleAgentResearch:
         confidence = extract_confidence(raw_text)
         triggers = _extract_triggers(raw_text)
 
+        # Continuity is written AFTER the decision is extracted, by a call
+        # that can see both reports but can no longer change the call. The
+        # research prompt above never saw the prior stance.
+        since_line, since_source = _since_last_report_line(
+            llm, prior_report, continuity, symbol, as_of, decision, confidence,
+            self.model, self.provider, usage_total)
+        # Inserted after the figure audit below: the line cites the PRIOR
+        # report's levels, which this run's prompt legitimately never held.
+
         # Structured epilogue: the model's own stance/watch fields, with a
         # deterministic fallback so downstream consumers ALWAYS get them. A
         # stance that contradicts the Verdict is overridden (the Verdict is the
@@ -1201,6 +1319,10 @@ class SingleAgentResearch:
             "track_record_stated": bool(track_record),
             "prior_report_date": (prior_report or {}).get("trade_date"),
             "prior_decision": (prior_report or {}).get("decision"),
+            # "model" = the post-hoc writer produced the line, "fallback" =
+            # deterministic record, "none" = first report. The research call
+            # itself never sees the prior stance.
+            "since_last_source": since_source,
             "situation": situation,
             "evidence": ledger.to_dict(),
         }
@@ -1264,6 +1386,8 @@ class SingleAgentResearch:
                            f"model: treat unverified numbers as suspect")
         except Exception as e:
             logger.debug(f"figure check skipped: {e}")
+
+        raw_text = _insert_since_line(raw_text, since_line)
 
         return {
             "decision": decision,

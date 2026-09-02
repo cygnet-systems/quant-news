@@ -1251,7 +1251,8 @@ Respond with this exact JSON structure (no markdown, no extra text):
         verdict = parts[0].strip()
         remaining = budget - len(verdict)
 
-        priority = ("situation", "bull", "risk", "trade plan", "news", "technical")
+        priority = ("situation", "scenario", "bull", "risk", "trade plan",
+                    "positioning", "news", "technical")
 
         def rank(section: str) -> int:
             heading = section.split("\n", 1)[0].lower()
@@ -1323,6 +1324,7 @@ YOUR ROLE:
 - Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa). They are context that shades conviction, never a standalone reason to flip a direction
 - Where a "Situation" line is present, the call is about how that situation resolves (a pending deal's completion odds and spread to the offer, a regulator's decision, an earnings print), not about trend. Models that only read price are less relevant there; say so in model_notes, and let key_level/change_trigger reference the offer price or the dated event rather than a moving average
 - Where a report says it was WRITTEN WITHOUT expected evidence, lower p_correct for that symbol and name the missing evidence in conflicts; do not treat the absence as neutral
+- Where a report carries a Scenarios section, reason from its outcome map: your p_correct for the ACTION should be consistent with the probability the report gave the scenarios that action wins in, and the reasoning should name the most likely path. Where it carries Positioning & Flows, say which positioned group is exposed if the call is wrong
 - "p_correct" is a probability, not a mood: your estimate that the ACTION direction is right for the next session's close, on the 0.50-0.75 scale where 0.50 means "no edge over a coin flip". You will be scored against realized outcomes. A persistent gap between your stated p_correct and your hit rate is a defect. State 0.50-0.55 freely; earn anything above 0.65.
 - Explain which models are most relevant for each symbol's situation
 - Provide an overall portfolio-level summary

@@ -49,3 +49,23 @@ def test_options_block_shows_by_expiry_skew():
     # Without the by-expiry data the block is unchanged in shape.
     assert "by expiration" not in format_options_block("BHF", m)
     assert format_options_block("BHF", None) == ""
+
+
+def test_research_prompt_maps_outcomes_and_positioning():
+    from models.single_agent import EPILOGUE_INSTRUCTIONS, SINGLE_AGENT_PROMPT
+    assert "5. Positioning & Flows" in SINGLE_AGENT_PROMPT
+    assert "10. Scenarios" in SINGLE_AGENT_PROMPT
+    assert "12. Trade Plan" in SINGLE_AGENT_PROMPT
+    assert "Step 3b: Map the outcomes" in SINGLE_AGENT_PROMPT
+    assert '"scenarios"' in EPILOGUE_INSTRUCTIONS
+
+
+def test_congress_block_states_the_skew_as_a_number():
+    from services.political_service import format_congress_block
+    c = {"as_of": "2026-09-02", "window_days": 180, "n": 22, "buys": 9, "sells": 13,
+         "by_party": {"D": {"buys": 4, "sells": 6}, "R": {"buys": 5, "sells": 6}},
+         "trades": [], "total_disclosed_all_time": 405}
+    block = format_congress_block("NVDA", c)
+    assert "Skew: balanced overall; by party: D balanced, R balanced" in block
+    c2 = {**c, "buys": 2, "sells": 20, "by_party": {"D": {"buys": 0, "sells": 12}}}
+    assert "Skew: sell-skewed overall; by party: D sell-skewed" in format_congress_block("X", c2)
