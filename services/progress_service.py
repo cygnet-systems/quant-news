@@ -201,6 +201,13 @@ def is_active(run_id: str | None) -> bool:
     return bool(run_id) and run_id in _active_runs()
 
 
+def active_run_ids() -> list[str]:
+    """The runs the feed lists as in flight, oldest first. A diskcache
+    read, not a query: the panel decides which run to pin from it before
+    spending its one row read."""
+    return _active_runs()
+
+
 def _resolve_run_id(run_id: str | None = None) -> str:
     """Which run an unnamed feed write belongs to.
 
@@ -972,8 +979,11 @@ def emit(stage: str, message: str, payload: dict | None = None, *,
     _write_audit(stage, message, payload, run_id=target, run_title=run_title)
 
 
-def _progress_message(stage: str, done, total, state, counters: dict) -> str:
+def _progress_message(stage: str, done, total, state, counters: dict,
+                      symbol: str | None = None, error: str | None = None) -> str:
     parts = [stage]
+    if symbol:
+        parts.append(symbol)
     if done is not None or total is not None:
         parts.append(f"{'?' if done is None else done}/"
                      f"{'?' if total is None else total}")
@@ -981,11 +991,13 @@ def _progress_message(stage: str, done, total, state, counters: dict) -> str:
         parts.append(state)
     if counters:
         parts.append(", ".join(f"{k}={v}" for k, v in counters.items()))
-    return " ".join(parts)
+    text = " ".join(parts)
+    return f"{text}: {error}" if error else text
 
 
 def emit_progress(stage: str, done: int | None = None, total: int | None = None,
                   state: str | None = None, run_id: str | None = None,
+                  symbol: str | None = None, error=None,
                   **counters) -> None:
     """One structured progress event: where a stage stands, in numbers.
 
@@ -996,21 +1008,34 @@ def emit_progress(stage: str, done: int | None = None, total: int | None = None,
     run page read. Counters are running TOTALS keyed by name, not
     increments. Never raises; a run with no row (headless, or a UI run
     before the dispatcher created one) still gets the feed event.
+
+    With ``symbol`` the ``state`` is that one symbol's within the stage
+    (the stepper's per-symbol glyph); ``error`` is the reason a symbol or
+    a stage failed, kept to its first line.
     """
     target = _resolve_run_id(run_id)
     counters = {k: v for k, v in counters.items() if v is not None}
+    if error is not None:
+        from services.run_service import first_line
+        error = first_line(error) or None
     if _enabled():
         event = _new_event(stage, _progress_message(stage, done, total, state,
-                                                    counters))
+                                                    counters, symbol, error))
         event.update({"event": "progress", "done": done, "total": total,
                       "state": state, "counters": counters})
+        # Older events carry neither key; readers treat absence as None.
+        if symbol is not None:
+            event["symbol"] = symbol
+        if error is not None:
+            event["error"] = error
         _append_feed(target, event)
     if target == ADHOC_RUN_ID:
         return
     try:
         from services import run_service
         run_service.update_progress(target, stage, state=state, done=done,
-                                    total=total, **counters)
+                                    total=total, symbol=symbol, error=error,
+                                    **counters)
     except Exception as e:
         logger.debug(f"run progress update skipped for {target}: {e}")
 

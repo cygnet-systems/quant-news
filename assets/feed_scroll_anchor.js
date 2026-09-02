@@ -91,7 +91,10 @@
   }
 
   function scan() {
-    var feed = document.getElementById("progress-feed-scroll");
+    // The log lives in its own scroller under the stepper (or alone when
+    // the panel shows the rolling log); the outer container only holds it.
+    var host = document.getElementById("progress-feed-scroll");
+    var feed = host && (host.querySelector(".progress-feed-lines") || host);
     if (feed) attach(feed);
   }
 

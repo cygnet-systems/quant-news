@@ -228,12 +228,23 @@ def _get_text(url: str) -> str:
 
 
 def fetch_sp500() -> list[dict]:
-    """S&P 500 constituents from the Wikipedia table (Symbol, Security)."""
+    """S&P 500 constituents from the Wikipedia table (Symbol, Security).
+
+    read_html has no parser of its own (lxml, or bs4 + html5lib): on a
+    deployment without one it raises ImportError, which used to take the
+    whole refresh down before the Russell list was even tried. That is a
+    missing package, not a dead source, so it is logged and the list is
+    simply empty this week."""
     import io
     import pandas as pd
 
     html = _get_text(SP500_URL)
-    table = pd.read_html(io.StringIO(html), match="Symbol")[0]
+    try:
+        table = pd.read_html(io.StringIO(html), match="Symbol")[0]
+    except ImportError as e:
+        logger.warning("ticker refresh: sp500 table not parsed, no HTML "
+                       "parser installed (pip install lxml): %s", e)
+        return []
     out = []
     for sym, name in zip(table["Symbol"], table["Security"]):
         if normalize_symbol(str(sym)):

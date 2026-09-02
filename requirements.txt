@@ -16,6 +16,9 @@ requests>=2.31.0
 # Data Processing
 pandas>=2.0.0
 numpy>=1.24.0
+# pandas.read_html backend: the weekly S&P 500 refresh (ticker_service)
+# parses a Wikipedia table and read_html has no parser of its own
+lxml>=4.9.0
 
 # Parquet export
 pyarrow>=15.0.0

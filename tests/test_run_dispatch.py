@@ -239,6 +239,17 @@ class TestConfirmDispatch:
         assert out[RUN_STORE]["preset"] == "quick"
         assert out[PREFS]["preset"] == "quick"
 
+    def test_unmounted_recs_keeps_the_preset_name(self, confirm):
+        # The confirm branch reads the same raw values run_preflight does:
+        # a run-recs that never rendered (None) is not a divergence, so
+        # the row is "standard", the way the dialog's hint called it.
+        out = confirm(["NVDA"], scope="full", preset="standard",
+                      model_checks=[True] * 5, recs=None, run_tools=[])
+        row = rs.get_run(out[RUN_STORE]["run_id"])
+        assert row["preset"] == "standard"
+        assert row["config"]["customized"] == []
+        assert row["config"]["recs"] is None
+
     def test_symbol_cache_failure_never_blocks_a_run(self, confirm, monkeypatch):
         from services import ticker_service as ts
 
@@ -477,6 +488,46 @@ class TestReportStageProgress:
         assert row["stages"]["report"] == {"state": "failed", "done": 0, "total": 1}
         assert run_id not in feed._active_runs()
 
+    def test_row_is_running_before_the_price_fill(self, db, feed, monkeypatch):
+        # The server-side price fill is the first slow thing the report
+        # stage does; a row still queued through it is what the watchdog
+        # reaps as a run that never started. So the flip to running must
+        # come first, and the fill observes it.
+        from sqlalchemy.pool import StaticPool
+
+        # The fill runs in a worker thread (asyncio.to_thread), where a
+        # per-thread in-memory SQLite is empty: one shared connection.
+        eng = create_engine("sqlite://", poolclass=StaticPool,
+                            connect_args={"check_same_thread": False})
+        Base.metadata.create_all(eng, tables=[AnalysisRun.__table__])
+        monkeypatch.setattr(db, "_engine", eng)
+        monkeypatch.setattr(
+            db, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
+        run_id = rs.create_run(
+            "manual", ["NVDA"], "u1", preset="report",
+            config={"scope": "report", "target_date": "2026-09-03",
+                    "lookback": 7, "max_articles": 10})
+        feed.mark_run_pending(run_id)
+        monkeypatch.setattr(app_module, "ctx",
+                            SimpleNamespace(triggered_id="run-dispatch"))
+        seen = {}
+
+        class _Stop(Exception):
+            """Ends the stage once the fill has looked at the row."""
+
+        def _fill(symbols, stock_data, news_data=None):
+            seen["status"] = rs.get_run(run_id)["status"]
+            seen["symbols"] = list(symbols)
+            raise _Stop()
+        monkeypatch.setattr(app_module, "_fill_run_inputs", _fill)
+        store = {"run_id": run_id, "scope": "report", "symbols": ["NVDA"],
+                 "owner_uid": "u1", "kind": "manual"}
+
+        with pytest.raises(_Stop):
+            asyncio.run(app_module.generate_ai_analysis(store, {}, None))
+        assert seen == {"status": "running", "symbols": ["NVDA"]}
+        assert rs.get_run(run_id)["stages"]["report"]["state"] == "running"
+
 
 class TestOrphanEscape:
     """A row whose process is provably gone must not lock its owner out."""
@@ -527,7 +578,7 @@ class TestOrphanEscape:
 
 class TestPanelFollowsOwnRun:
     def _fp(self, out):
-        return out[5]
+        return out[4]
 
     def test_panel_pins_the_viewers_run(self, db, feed):
         mine = rs.create_run("manual", ["NVDA"], "u1")
@@ -538,17 +589,17 @@ class TestPanelFollowsOwnRun:
         feed.emit("news", "theirs: fetching", run_id=theirs)
 
         pinned = app_module.render_progress_panel(
-            1, 1500, None, None, {"run_id": mine})
+            1, None, None, {"run_id": mine})
         assert self._fp(pinned)[-1] == mine
         assert self._fp(pinned)[3] == "mine: fetching"
 
         # No run of my own (or one that already finished): the newest run
         # in flight, as before.
-        unpinned = app_module.render_progress_panel(1, 1500, None, None, None)
+        unpinned = app_module.render_progress_panel(1, None, None, None)
         assert self._fp(unpinned)[-1] == theirs
         feed.finish_run("done", run_id=mine)
         after = app_module.render_progress_panel(
-            1, 1500, None, None, {"run_id": mine})
+            1, None, None, {"run_id": mine})
         assert self._fp(after)[-1] == theirs
 
     def test_panel_state_is_wired(self):

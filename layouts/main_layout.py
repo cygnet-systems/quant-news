@@ -44,6 +44,12 @@ def create_layout() -> html.Div:
             # visit; the symbols stand in for "+ Last run" when no run of
             # this owner's is on record yet.
             dcc.Store(id="run-prefs-store", data=None, storage_type="local"),
+            # The divergence set Customize last unfolded for, {"diverged":
+            # [...]}: the preflight callback opens the collapse when the
+            # set is new, not on every keystroke while a field differs, so
+            # a user can fold it on the report shortcuts (whose scope
+            # always diverges). Memory scoped: the modal opening resets it.
+            dcc.Store(id="run-customize-auto", data=None),
             # The run the confirm dispatcher last created, shape {"run_id",
             # "started", "scope", "symbols", "owner_uid", "kind"}. Session
             # scoped so the panel can keep following the viewer's own run
@@ -58,6 +64,18 @@ def create_layout() -> html.Div:
             # last run_id the stages picked up, the guard behind the guard.
             dcc.Store(id="run-dispatch", data=None),
             dcc.Store(id="run-dispatched", data=None, storage_type="session"),
+            # The last run page this browser visited, {"run_id"}: the pill's
+            # Ready/Failed state clears once the run has been looked at.
+            # Local so it stays cleared across reloads.
+            dcc.Store(id="run-seen-store", data=None, storage_type="local"),
+            # The pill's last render: {"fp": [...], "pin": {run-store dict}}.
+            # The poll rewrites the pill only when fp moves; pin is what a
+            # click on the pill hands to run-store without another query.
+            dcc.Store(id="run-pill-fp", data=None),
+            # The run the completion toast last announced, {"run_id"}. Local
+            # so a reload (or the next tick) never re-announces a run this
+            # browser was already told about.
+            dcc.Store(id="run-notified-store", data=None, storage_type="local"),
             # Home prediction-board symbol narrow. Session-scoped on purpose:
             # "show me AAPL" answers a question you are asking now, not one
             # you want still applied tomorrow.
@@ -211,6 +229,10 @@ def create_layout() -> html.Div:
                             ],
                             className="progress-header",
                         ),
+                        # Children: the stepper over a folded log while a run
+                        # is followed, the bare log otherwise. The log's own
+                        # wrapper (.progress-feed-lines) is the scroller the
+                        # reading-position script anchors on.
                         html.Div(id="progress-feed-scroll", className="progress-feed"),
                     ],
                     id="progress-panel",
@@ -232,6 +254,13 @@ def create_layout() -> html.Div:
             # rendered anywhere.
             html.Div(
                 [
+                    # Completion: persistent (duration None) until dismissed,
+                    # the result may be minutes old by the time it is read.
+                    # First in the column, so it stacks above the started
+                    # toast when both are up.
+                    dbc.Toast(id="run-done-toast", header="Report ready",
+                              icon="success", is_open=False,
+                              dismissable=True, duration=None),
                     dbc.Toast(id="run-started-toast", header="Run started",
                               icon="success", is_open=False,
                               dismissable=True, duration=6000),

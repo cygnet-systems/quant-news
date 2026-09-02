@@ -169,8 +169,16 @@ def set_status(run_id: str, status: str, error: str | None = None) -> dict | Non
         return _to_dict(row)
 
 
+def first_line(text, limit: int = 200) -> str:
+    """The first non-empty line of an error, cut to ``limit``: what a row,
+    a pill or a stepper cell has room for."""
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    return (lines[0] if lines else "")[:limit]
+
+
 def update_progress(run_id: str, stage: str, state: str | None = None,
                     done: int | None = None, total: int | None = None,
+                    symbol: str | None = None, error=None,
                     **counters) -> dict | None:
     """Merge one stage's progress and any counters into the run row.
 
@@ -178,6 +186,12 @@ def update_progress(run_id: str, stage: str, state: str | None = None,
     stage's earlier ``total`` and ``state``. Counters are totals, not
     increments; a caller reporting per-symbol work keeps its own running
     sum. The first call flips a queued run to running.
+
+    With ``symbol`` the ``state`` is that symbol's, recorded under
+    ``stages_json[stage]["symbols"][symbol]``; the stage's own state is
+    left alone (one symbol failing does not fail the stage). ``error`` is
+    kept as its first line under ``["errors"][symbol]`` (or the stage's
+    ``"error"`` without a symbol), which is what the stepper prints.
     """
     from db.models import AnalysisRun
 
@@ -192,8 +206,25 @@ def update_progress(run_id: str, stage: str, state: str | None = None,
 
         stages = dict(row.stages_json or {})
         entry = dict(stages.get(stage) or {})
-        if state is not None:
-            entry["state"] = state
+        if symbol is not None:
+            errors = dict(entry.get("errors") or {})
+            if state is not None:
+                symbols = dict(entry.get("symbols") or {})
+                symbols[symbol] = state
+                entry["symbols"] = symbols
+                # A symbol that comes back from failed (a retry within the
+                # stage) drops the reason it carried.
+                if state != "failed":
+                    errors.pop(symbol, None)
+            if error is not None:
+                errors[symbol] = first_line(error)
+            if errors or "errors" in entry:
+                entry["errors"] = errors
+        else:
+            if state is not None:
+                entry["state"] = state
+            if error is not None:
+                entry["error"] = first_line(error)
         if done is not None:
             entry["done"] = int(done)
         if total is not None:

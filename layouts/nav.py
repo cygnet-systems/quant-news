@@ -95,6 +95,11 @@ def create_topbar() -> html.Div:
     run-analysis-btn must stay mounted on every route. Toggle_run_modal takes
     it as a fixed-id Input, and it is the single entry point to the run dialog
     (page-local shortcuts use the {"type": "new-report-btn"} pattern instead).
+
+    run-pill is the run's one-line status (layouts/run_pill.py decides what
+    it says); it lives here so it survives navigation while a run is in
+    flight. Its children are rebuilt by the poll callback, so the shell
+    mounts empty and hidden.
     """
     return html.Div(
         [
@@ -107,19 +112,8 @@ def create_topbar() -> html.Div:
 
             html.Div(
                 [
-                    # Background prediction running indicator. It lives in the
-                    # always-mounted topbar (not a page) because the running=
-                    # spec on generate_model_signals targets it, and the badge
-                    # must be visible whatever route the run was started from.
-                    html.Span(
-                        [
-                            html.I(className="bi bi-gear-fill spinning-icon"),
-                            " Predicting...",
-                        ],
-                        id="prediction-running-indicator",
-                        className="prediction-running-badge",
-                        style={"display": "none"},
-                    ),
+                    html.Div(id="run-pill", className="run-pill", hidden=True,
+                             n_clicks=0, role="status"),
                     dbc.Button(
                         [html.I(className="bi bi-play-fill me-1"), "Run analysis"],
                         id="run-analysis-btn",

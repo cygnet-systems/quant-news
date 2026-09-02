@@ -212,6 +212,23 @@ class TestSeeders:
         with pytest.raises(ValueError):
             ts.parse_iwm_holdings("<!DOCTYPE html><html></html>")
 
+    def test_sp500_without_an_html_parser_is_empty_and_logged(
+            self, db, monkeypatch, caplog):
+        import logging
+        import pandas as pd
+
+        def _no_parser(*a, **kw):
+            raise ImportError("lxml not found, please install it")
+        monkeypatch.setattr(ts, "_get_text", lambda url: "<table></table>")
+        monkeypatch.setattr(pd, "read_html", _no_parser)
+        with caplog.at_level(logging.WARNING, logger=ts.logger.name):
+            assert ts.fetch_sp500() == []
+        assert any("lxml" in r.getMessage() for r in caplog.records)
+        # The refresh goes on to the Russell list instead of dying here.
+        monkeypatch.setattr(ts, "fetch_r2000",
+                            lambda: ts.parse_iwm_holdings(IWM_SAMPLE))
+        assert ts.seed_from_indexes() == 2
+
     def test_seed_from_indexes_survives_a_dead_source(self, db, monkeypatch):
         def down():
             raise ConnectionError("offline")

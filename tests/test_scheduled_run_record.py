@@ -149,7 +149,9 @@ def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatc
     assert run["prediction_date"] == summary["as_of"]
     assert run["target_date"] == summary["target_date"]
     assert run["config"]["lookback_days"] == 7
-    assert run["stages"]["news"] == {"state": "done", "done": 2, "total": 2}
+    # The stage's counts plus one state per symbol (the stepper's glyphs).
+    assert run["stages"]["news"] == {"state": "done", "done": 2, "total": 2,
+                                     "symbols": {"NVDA": "done", "AMD": "done"}}
     assert run["stages"]["models"]["state"] == "done"
     assert run["stages"]["report"]["state"] == "done"
     assert run["stages"]["synthesis"]["state"] == "done"
@@ -172,6 +174,44 @@ def test_cli_run_without_a_job_has_no_link(db, feed, stages, monkeypatch):
     assert run["is_public"] is True
     assert run["status"] == "done"
     assert run["stages"]["synthesis"] == {"state": "skipped"}
+
+
+def test_row_is_running_before_the_price_load(db, feed, stages, monkeypatch):
+    # A cold price load can outlast the stall window, and a row still
+    # queued past it is reaped as a run that never started: the flip to
+    # running has to land before the load, and the load observes it.
+    seen = {}
+
+    def _market(symbols, period="2y", force_refresh=False):
+        seen["status"] = _only_run()["status"]
+        return {s: {"prices": "{}"} for s in symbols}
+    monkeypatch.setattr(ar, "load_market_data", _market)
+    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0,
+                         recs_mode="off")
+    assert seen["status"] == "running"
+    assert _only_run()["status"] == "done"
+
+
+def test_symbols_join_the_lookup_cache(db, feed, stages, monkeypatch):
+    from services import ticker_service as ts
+    calls = []
+    monkeypatch.setattr(ts, "ensure_symbols",
+                        lambda symbols, source="run": calls.append(
+                            (list(symbols), source)))
+    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=3, max_articles=0,
+                         recs_mode="off")
+    assert calls == [(["NVDA", "AMD"], "run")]
+
+
+def test_symbol_cache_failure_never_stops_a_run(db, feed, stages, monkeypatch):
+    from services import ticker_service as ts
+
+    def _boom(*a, **kw):
+        raise RuntimeError("tickers table missing")
+    monkeypatch.setattr(ts, "ensure_symbols", _boom)
+    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0,
+                         recs_mode="off")
+    assert _only_run()["status"] == "done"
 
 
 def test_early_abort_fails_the_row(db, feed, stages):

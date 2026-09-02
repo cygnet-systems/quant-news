@@ -13,7 +13,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -2186,6 +2186,12 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     def _news_progress(sym: str, articles: list, stats: dict) -> None:
         news_seen["symbols"] += 1
         news_seen["articles"] += len(articles)
+        # Same verdict the scheduled runner records: the source failing
+        # for this symbol is a per-symbol failure, a quiet window is not.
+        unavailable = stats.get("status") == "unavailable"
+        progress("news", symbol=sym, state="failed" if unavailable else "done",
+                 error=(stats.get("error") or "news source unavailable")
+                 if unavailable else None)
         progress("news", done=news_seen["symbols"], total=n_symbols,
                  state="done" if news_seen["symbols"] == n_symbols else "running",
                  articles=news_seen["articles"])
@@ -2448,9 +2454,13 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     # not; the reports counter is what actually landed.
     research_seen = {"done": 0, "written": 0}
 
-    def _research_step(written: bool) -> None:
+    def _research_step(symbol: str, written: bool, error=None) -> None:
         research_seen["done"] += 1
         research_seen["written"] += 1 if written else 0
+        # The symbol's own glyph first, then the stage's running count.
+        progress("research", symbol=symbol,
+                 state="done" if written else "failed",
+                 error=None if written else (error or "no report written"))
         progress("research", done=research_seen["done"],
                  total=len(symbol_tasks),
                  research_reports=research_seen["written"])
@@ -2458,12 +2468,14 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     async def _run_task(task_type, symbol, fn, *args, **kw):
         try:
             async with sem:
+                if task_type == "research":
+                    progress("research", symbol=symbol, state="running")
                 analysis = await asyncio.to_thread(fn, *args, **kw)
         except Exception as e:
             logger.warning(f"Error in LLM analysis for {task_type} {symbol}: {e}")
             emit("error", f"AI analysis failed for {symbol or 'overall'}: {str(e)[:80]}")
             if task_type == "research":
-                _research_step(False)
+                _research_step(symbol, False, str(e))
             return
 
         if task_type == "research":
@@ -2471,7 +2483,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
             if r is None or r.error:
                 emit("error", f"{symbol}: research report failed: "
                                    f"{(r.error if r else 'no result')[:80]}")
-                _research_step(False)
+                _research_step(symbol, False, r.error if r else "no result")
                 return
             details = r.details or {}
             raw = details.get("raw_response", "")
@@ -2506,7 +2518,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
                 logger.warning(f"research report persist failed for {symbol}: {e}")
             emit("ta", f"{symbol}: research → {r.decision} "
                             f"({r.confidence:.0%})")
-            _research_step(True)
+            _research_step(symbol, True)
             return
         if analysis:
             if task_type == "symbol":
@@ -3165,9 +3177,8 @@ def update_period(clicks, current_period):
     # serialised into the subprocess (the price store was never read).
     State("run-dispatched", "data"),
     background=True,
-    running=[
-        (Output("prediction-running-indicator", "style"), {"display": "block"}, {"display": "none"}),
-    ],
+    # No running= spec: the topbar pill reads the run row on the poll and
+    # covers every stage, not just this subprocess.
     prevent_initial_call=True,
 )
 def generate_model_signals(run_store, dispatched):
@@ -3665,22 +3676,11 @@ def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
 # =============================================================================
 
 
-_STAGE_ICONS = {
-    "run": "bi-play-circle",
-    "news": "bi-newspaper",
-    "ai": "bi-file-text",
-    "models": "bi-cpu",
-    "ta": "bi-robot",
-    "luna": "bi-stars",
-    "store": "bi-database",
-    "done": "bi-check-circle-fill",
-    "error": "bi-x-circle-fill",
-}
-
-
 # Poll fast enough to feel live during a run, slowly enough the rest of the
 # time that an idle tab is not making 40 requests a minute forever. A
-# scheduled 08:00 job is still picked up within the idle interval.
+# scheduled 08:00 job is still picked up within the idle interval. The rate
+# is owned by render_run_pill (it already reads the active runs); the
+# confirm and retry acknowledgements snap it with allow_duplicate.
 _PROGRESS_POLL_ACTIVE_MS = 1500
 _PROGRESS_POLL_IDLE_MS = 10_000
 
@@ -3689,24 +3689,26 @@ _PROGRESS_POLL_IDLE_MS = 10_000
     Output("progress-feed-scroll", "children"),
     Output("progress-count", "children"),
     Output("progress-header-icon", "children"),
-    Output("progress-interval", "interval"),
     Output("progress-snap-store", "data"),
     Output("progress-fp-store", "data"),
     Input("progress-interval", "n_intervals"),
-    State("progress-interval", "interval"),
     State("progress-snap-store", "data"),
     State("progress-fp-store", "data"),
     State("run-store", "data"),
 )
-def render_progress_panel(_n, _current_interval, last_snap, last_fp,
-                          run_store=None):
-    """Live activity feed for pipeline runs.
+def render_progress_panel(_n, last_snap, last_fp, run_store=None):
+    """Live activity panel: a stepper over the run it follows, the log
+    beneath it (layouts/progress_panel.py draws both).
 
     Streams events emitted by every stage (including the background model
     subprocess). Visible on every route: this is the live view, and the
-    Activity section is the filtered archive on top of it.
+    Activity section is the filtered archive on top of it. Runs on every
+    poll tick, so it is one row read (get_run) and one feed read, nothing
+    else, and it rewrites nothing while its fingerprint stands still.
     """
+    from layouts import progress_panel as pp
     from services import progress_service as prog
+    from services import run_service
 
     # Watchdog first: a run whose worker process died (observed: torch/MPS
     # native crash with no traceback) or that stopped emitting must become a
@@ -3714,19 +3716,27 @@ def render_progress_panel(_n, _current_interval, last_snap, last_fp,
     # idle (one diskcache read); emits + closes the run at most once.
     prog.watchdog_check()
 
-    # This viewer's own run while it is in flight; otherwise the feed's
-    # default (the newest run in flight, or the rolling log when idle).
+    # Which run to follow is decided from the feed's active list and the
+    # session's pin BEFORE the row read, so there is exactly one: this
+    # viewer's own run while it is in flight or for an hour after it ended
+    # (its result stays in front of them), else the newest run in flight
+    # (a scheduled job, another session's run), else the rolling log.
     # Without the pin, confirming a run in another session (or a scheduled
     # job starting) switched every open panel to that run's feed.
-    own_run = (run_store or {}).get("run_id")
-    feed = prog.get_feed(own_run if prog.is_active(own_run) else None)
+    now = pp.now_utc()
+    active_ids = prog.active_run_ids()
+    target = pp.pin_target(run_store, active_ids, now)
+    run = None
+    if target:
+        try:
+            run = run_service.get_run(target)
+        except Exception as e:
+            logger.warning("activity panel: run %s unreadable: %s", target, e)
+        if run is not None and not pp.pin_holds(run, active_ids, now):
+            run = None
+    feed = prog.get_feed(run["run_id"] if run else None)
     events = feed.get("events") or []
     active = bool(feed.get("active"))
-    poll = (_PROGRESS_POLL_ACTIVE_MS if active
-            else _PROGRESS_POLL_IDLE_MS)
-    # Writing interval on every tick restarts the timer and costs a DOM update
-    # for no change; only send it when the rate actually changes.
-    poll_out = poll if poll != _current_interval else dash.no_update
     # Newest run boundary. Written only when a NEW run appears, so the
     # clientside snap-to-newest fires once per run. A scroll offset parked
     # on the previous run's lines otherwise hides the new run entirely.
@@ -3734,56 +3744,30 @@ def render_progress_panel(_n, _current_interval, last_snap, last_fp,
                  if e.get("stage") == "run"), None)
     snap_out = snap if (snap is not None and snap != last_snap) \
         else dash.no_update
-    if not events:
-        return (dash.no_update, dash.no_update, dash.no_update, poll_out,
+    if not events and run is None:
+        return (dash.no_update, dash.no_update, dash.no_update,
                 dash.no_update, dash.no_update)
 
     # What this tick would render: the visible window's newest edge and
-    # size, the run boundary, and the active flag (drives the header icon).
-    # If none of it moved, rewrite nothing. Rebuilding the ~45 row nodes
-    # every tick destroyed and recreated them all, which reset the feed's
-    # scroll position on every poll, idle included. Count + newest
-    # timestamp + boundary also cover the feed being swapped underneath us
-    # (cold-start rehydrate, another publisher process).
-    newest = events[-1]
+    # size, the run boundary, the active flag (drives the header icon) and
+    # the run row's stepper facts. If none of it moved, rewrite nothing.
+    # Rebuilding the ~45 row nodes every tick destroyed and recreated them
+    # all, which reset the feed's scroll position on every poll, idle
+    # included. Count + newest timestamp + boundary also cover the feed
+    # being swapped underneath us (cold-start rehydrate, another publisher
+    # process). The feed's run id stays last: readers index it from the end.
+    newest = events[-1] if events else {}
     fp = [len(events), newest.get("t"), newest.get("stage"),
-          newest.get("message"), snap, active, feed.get("run_id")]
+          newest.get("message"), snap, active, pp.run_fingerprint(run),
+          feed.get("run_id")]
     if fp == last_fp:
-        return (dash.no_update, dash.no_update, dash.no_update, poll_out,
-                snap_out, dash.no_update)
+        return (dash.no_update, dash.no_update, dash.no_update, snap_out,
+                dash.no_update)
 
     # No auto-hide: the panel is an audit log now, so it stays up until the
     # user closes it. (It previously vanished 5 minutes after a run finished.)
-    rows = []
-    for e in events[-45:]:
-        stage = e.get("stage", "")
-        icon = _STAGE_ICONS.get(stage, "bi-dot")
-        cls = "progress-line-error" if stage == "error" else (
-            "progress-line-done" if stage == "done" else "")
-        # Rendered from the event's epoch, not its pre-formatted string: rows
-        # written by an older process carried a naive local clock while rows
-        # restored from Postgres carried UTC, so the same panel showed both.
-        rows.append(html.Div(
-            [
-                html.Span(prog.event_clock(e), className="progress-ts",
-                          title=f"{prog.DISPLAY_TZ_LABEL} "
-                                f"({prog.DISPLAY_TZ.key})"),
-                html.I(className=f"bi {icon} progress-icon progress-icon-{stage}"),
-                html.Span(e.get("message", ""), className="progress-msg"),
-            ],
-            className=f"progress-line {cls}",
-        ))
-    # No `key` props: dash-renderer keys child wrappers by tree path, not by
-    # the component's key, so re-rendered rows are recreated wholesale
-    # whatever we stamp on them. assets/feed_scroll_anchor.js preserves the
-    # reading position across those rewrites instead.
-
-    header_icon = (html.Div(className="progress-spinner")
-                   if active
-                   else html.I(className="bi bi-check-circle-fill progress-header-done"))
-
-    return (rows, f"{len(events)} events", header_icon, poll_out, snap_out,
-            fp)
+    return (pp.body(run, events), f"{len(events)} events",
+            pp.header_icon(active, run), snap_out, fp)
 
 
 # Scroll the feed to the newest lines when a new run starts. Clientside:
@@ -3846,17 +3830,14 @@ def update_progress_panel_state(_e, _m, _c, _r, state):
     Output("progress-reopen-btn", "style"),
     Output("progress-expand-icon", "className"),
     Output("progress-min-icon", "className"),
-    Output("progress-interval", "disabled"),
     Input("progress-panel-state", "data"),
 )
 def apply_progress_panel_state(state):
     """Translate panel state into layout. Sizing lives in CSS classes.
 
-    Closing the panel also stops the poll. The feed is written by a background
-    subprocess (and possibly by another instance running the scheduler), so
-    the browser has no way to be notified and has to ask; but there is nothing
-    to ask for while the panel is shut. Reopening rehydrates from the stored
-    feed, so nothing is lost by not having polled meanwhile.
+    The poll keeps running with the panel shut: the topbar pill reads the
+    same interval, and a closed panel used to silence the app for the rest
+    of the run (no pill update, no completion, no watchdog tick).
     """
     state = state or {}
     closed = bool(state.get("closed"))
@@ -3875,8 +3856,175 @@ def apply_progress_panel_state(state):
         "bi bi-arrows-angle-contract" if mode == "expanded"
         else "bi bi-arrows-angle-expand",
         "bi bi-plus-lg" if mode == "minimised" else "bi bi-dash-lg",
-        closed,
     )
+
+
+# =============================================================================
+# TOPBAR RUN PILL
+# =============================================================================
+
+
+def _read_pill_runs(owner_uid, run_store) -> tuple:
+    """The two reads behind the pill: every run in flight, and, only when
+    none of them is this viewer's, the viewer's newest manual run (its
+    Ready/Failed state). One indexed select each.
+
+    A scheduled run in flight does not skip the second read: the daily job
+    runs for tens of minutes, and a manual run that finishes inside that
+    window must still be announced (and could be replaced by a newer one
+    before the job ends, losing its completion for good).
+    """
+    from layouts.run_pill import is_own
+    from services import run_service
+
+    active = run_service.active_runs()
+    latest = None
+    if not any(is_own(r, owner_uid, run_store) for r in active):
+        rows = run_service.list_runs(limit=1, kind="manual",
+                                     owner_uid=owner_uid or "")
+        latest = rows[0] if rows else None
+    return active, latest
+
+
+@callback(
+    Output("run-pill", "hidden"),
+    Output("run-pill", "className"),
+    Output("run-pill", "children"),
+    Output("run-pill-fp", "data"),
+    Output("progress-interval", "interval"),
+    Output("run-done-toast", "is_open"),
+    Output("run-done-toast", "header"),
+    Output("run-done-toast", "children"),
+    Output("run-done-toast", "icon"),
+    Output("run-notified-store", "data"),
+    Input("progress-interval", "n_intervals"),
+    State("run-store", "data"),
+    State("run-seen-store", "data"),
+    State("run-pill-fp", "data"),
+    State("progress-interval", "interval"),
+    State("run-notified-store", "data"),
+)
+async def render_run_pill(_n, run_store, seen, last_fp, current_interval,
+                          notified=None):
+    """The topbar pill, the poll rate and the completion toast, from the
+    run rows.
+
+    Runs every tick, so it is one or two indexed selects in a worker thread
+    and nothing else; the pill is rewritten only when its fingerprint
+    moves (layouts/run_pill.py). The poll rate follows the rows, not the
+    feed or the panel: fast while any run is in flight, idle otherwise.
+
+    The toast is the viewer's own run announced once: the tick that first
+    sees it finished opens it and records the run in run-notified-store,
+    and no later tick (fingerprint moved or not) opens it again for that
+    run. It stays until dismissed. It is decided from the finished run,
+    not from the pill's choice, so a scheduled run in flight never
+    swallows it.
+    """
+    from layouts.run_pill import (done_toast, finished_view, pill_children,
+                                  pill_view)
+
+    owner_uid = _run_owner_uid()
+    try:
+        active, latest = await asyncio.to_thread(
+            _read_pill_runs, owner_uid, run_store)
+    except Exception as e:
+        # Leave the pill as it was rather than blanking it on a DB hiccup.
+        logger.warning("run pill: runs unreadable: %s", e)
+        raise PreventUpdate
+    poll = _PROGRESS_POLL_ACTIVE_MS if active else _PROGRESS_POLL_IDLE_MS
+    # Writing interval on every tick restarts the timer and costs a DOM
+    # update for no change; only send it when the rate actually changes.
+    poll_out = poll if poll != current_interval else dash.no_update
+
+    view = pill_view(active, latest, owner_uid, run_store, seen)
+    toast = done_toast(finished_view(latest, owner_uid, run_store, seen),
+                       notified)
+    toast_out = ((True, toast["header"], toast["body"], toast["icon"],
+                  {"run_id": toast["run_id"]}) if toast
+                 else (dash.no_update,) * 5)
+    fp = view["fp"] if view else None
+    last = last_fp.get("fp") if isinstance(last_fp, dict) else None
+    if fp == last:
+        return (dash.no_update, dash.no_update, dash.no_update,
+                dash.no_update, poll_out) + toast_out
+    if view is None:
+        return (True, "run-pill", [], None, poll_out) + toast_out
+    return (False, view["className"], pill_children(view),
+            {"fp": fp, "pin": view["pin"]}, poll_out) + toast_out
+
+
+@callback(
+    Output("progress-panel-state", "data", allow_duplicate=True),
+    Output("run-store", "data", allow_duplicate=True),
+    Input("run-pill", "n_clicks"),
+    State("run-pill-fp", "data"),
+    State("run-store", "data"),
+    State("progress-panel-state", "data"),
+    prevent_initial_call=True,
+)
+def open_run_from_pill(n_clicks, fp, run_store, panel_state):
+    """A click on the pill opens the activity panel on that run.
+
+    The panel pins its feed to run-store, so a pill showing a run this
+    session did not confirm (a scheduled job, or the viewer's run from
+    another tab) hands the panel that run's dict. The pin was written by
+    the poll with the pill, so no query here.
+    """
+    if not n_clicks:
+        raise PreventUpdate
+    panel = dict(panel_state or {})
+    panel.setdefault("mode", "normal")
+    panel["closed"] = False
+    pin = (fp or {}).get("pin") or {}
+    if not pin.get("run_id") or pin["run_id"] == (run_store or {}).get("run_id"):
+        return panel, dash.no_update
+    return panel, pin
+
+
+@callback(
+    Output("run-pill", "hidden", allow_duplicate=True),
+    Output("run-pill-fp", "data", allow_duplicate=True),
+    # A cancelled full run leaves the synthesis flag armed (see
+    # cancel_active_run); the pill's cancel must disarm it the same way.
+    Output("full-analysis-requested", "data", allow_duplicate=True),
+    # The button is only rendered while the pill shows the viewer's own run.
+    Input("run-pill-cancel", "n_clicks", allow_optional=True),
+    prevent_initial_call=True,
+)
+def cancel_run_from_pill(n_clicks):
+    """The pill's cancel: the same cancel the dialog offers, then the pill
+    goes away (a cancelled run is never shown; the next tick brings back
+    whatever else is in flight)."""
+    if not n_clicks:
+        raise PreventUpdate
+    _message, run_id = _cancel_own_run()
+    if run_id is None:
+        # Already gone; the poll hides the pill on its own.
+        raise PreventUpdate
+    return True, None, False
+
+
+# Visiting a run's page marks it seen, so the Ready/Failed pill clears.
+# Clientside on the URL rather than on the View link: dcc.Link has no
+# n_clicks, and a direct visit should count the same as a click.
+clientside_callback(
+    """
+    function(pathname, seen) {
+        var m = /^[/]runs[/]([0-9a-fA-F-]{36})(?:[/?#]|$)/.exec(pathname || "");
+        if (!m) {
+            return window.dash_clientside.no_update;
+        }
+        if (seen && seen.run_id === m[1]) {
+            return window.dash_clientside.no_update;
+        }
+        return {run_id: m[1]};
+    }
+    """,
+    Output("run-seen-store", "data"),
+    Input("url", "pathname"),
+    State("run-seen-store", "data"),
+)
 
 
 # =============================================================================
@@ -5589,10 +5737,13 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         # it; anything the user touched makes it "custom", so a later
         # median-duration estimate keyed on preset never mixes the two.
         preset_name = preset if preset in RUN_PRESETS else DEFAULT_RUN_PRESET
+        # The raw values, as run_preflight passes them: a None (unmounted)
+        # control is not a divergence there, and a recs defaulted to
+        # "auto" here would call an untouched Standard run "custom".
         customized = preset_divergence(preset_name, {
             "scope": scope,
             "models": selected_models if model_checks else None,
-            "recs": recs or "auto",
+            "recs": recs,
             "evidence": run_evidence,
             "tools": run_tools,
         })
@@ -5665,7 +5816,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
 
         run_data = {
             "run_id": run_id,
-            "started": datetime.now().isoformat(),
+            "started": datetime.now(timezone.utc).isoformat(),
             "scope": scope,
             "preset": row_preset,
             "symbols": list(symbols),
@@ -5744,23 +5895,31 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     prevent_initial_call=True,
 )
 def cancel_active_run(n_clicks):
-    """Cancel this owner's run in flight so a new confirm can go through.
+    """Cancel this owner's run in flight so a new confirm can go through
+    (the dialog's button; the topbar pill's cancel shares the body)."""
+    if not n_clicks:
+        raise PreventUpdate
+    message, run_id = _cancel_own_run()
+    return message, (False if run_id else dash.no_update)
+
+
+def _cancel_own_run() -> tuple:
+    """Cancel this owner's manual run in flight; ``(message, run_id)``,
+    run_id None when there was nothing to cancel.
 
     The worker pid the model stage recorded is terminated; the row is
     marked cancelled (sticky, so a stage finishing late cannot flip it to
     done) and its feed closed. A stage still running in the server process
     (the report) finishes on its own; its late close is ignored by the row.
+    Manual runs only: a scheduled run belongs to the scheduler, never locks
+    this owner, and cannot be cancelled from the UI.
     """
-    if not n_clicks:
-        raise PreventUpdate
     from services import progress_service as prog
     from services import run_service
 
-    # Manual runs only: a scheduled run belongs to the scheduler, never
-    # locks this owner, and cannot be cancelled from here.
     active = run_service.active_run_for(_run_owner_uid())
     if active is None:
-        return "No run in progress. You can start one.", dash.no_update
+        return "No run in progress. You can start one.", None
     run_id = active["run_id"]
     pid = prog.terminate_run_worker(run_id)
     run_service.cancel_run(run_id)
@@ -5768,7 +5927,7 @@ def cancel_active_run(n_clicks):
               + (f" (worker pid {pid} terminated)" if pid else ""),
               run_id=run_id)
     prog.finish_run("Cancelled", run_id=run_id)
-    return "Run cancelled. You can start another.", False
+    return "Run cancelled. You can start another.", run_id
 
 
 @callback(
@@ -5826,6 +5985,10 @@ def retry_run(n_clicks, run_store, panel_state=None):
     if prev is None:
         logger.warning("Retry: run %s has no row to retry from", prev_id[:8])
         return refuse("The last run's record is gone. Start it again from here.")
+    if prev.get("kind") != "manual":
+        # run-store can point at a scheduled run after a click on its pill;
+        # its config is the scheduler's vocabulary, not the dialog's.
+        return refuse("That was a scheduled run. Start yours from Run analysis.")
     owner_uid = _run_owner_uid()
     try:
         run_id = run_service.create_run(
@@ -5840,7 +6003,7 @@ def retry_run(n_clicks, run_store, panel_state=None):
     scope = _run_scope_of(prev, run_store)
     run_data = {
         "run_id": run_id,
-        "started": datetime.now().isoformat(),
+        "started": datetime.now(timezone.utc).isoformat(),
         "scope": scope,
         "preset": prev["preset"],
         "symbols": list(prev["symbols"]),
@@ -6133,6 +6296,7 @@ def apply_run_scope(scope):
     Output("run-preflight", "children"),
     Output("run-preset-hint", "children"),
     Output("run-customize-collapse", "is_open", allow_duplicate=True),
+    Output("run-customize-auto", "data"),
     Input("run-modal", "is_open"),
     Input("run-preset", "value"),
     Input("run-scope", "value"),
@@ -6143,11 +6307,13 @@ def apply_run_scope(scope):
     Input("run-recs-model", "value"),
     Input("run-evidence", "value"),
     Input("run-tools", "value"),
+    State("run-customize-collapse", "is_open"),
+    State("run-customize-auto", "data"),
     prevent_initial_call=True,
 )
 def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
                   report_model, recs_basis, recs_model, run_evidence,
-                  run_tools):
+                  run_tools, customize_open=False, auto=None):
     """Name what this run needs and cannot reach, before it is started,
     and say where the controls have left the preset.
 
@@ -6156,12 +6322,18 @@ def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
     check lives here because this callback already sees every field a
     preset fixes: when a value no longer matches, Customize unfolds so the
     difference is on screen; it never folds a section the user opened.
+
+    It unfolds once per divergence set, not on every input change while a
+    field differs: on the report shortcuts the scope always diverges, and
+    a collapse that reopened on each keystroke could never be folded. The
+    set it last opened for is kept in run-customize-auto; the modal
+    opening starts over, so the next open shows the difference again.
     """
     from layouts.modals import (DEFAULT_RUN_PRESET, RUN_PRESETS,
                                 preset_divergence, run_preflight_children)
 
     if not is_open:
-        return dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 4
     # Read the ids alongside the values instead of zipping against a
     # hand-maintained order, a pattern-matching Input's ordering is Dash's to
     # decide, and a silent mis-zip here would name the wrong models.
@@ -6194,7 +6366,19 @@ def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
         hint.append(html.Span(
             " Customized: " + ", ".join(labels[f] for f in customized) + ".",
             className="run-preset-customized"))
-    return preflight, hint, (True if customized else dash.no_update)
+    # The modal's is_open among the triggers is the dialog opening (a
+    # close returned above): what it unfolded for last time is forgotten.
+    # Otherwise only a field that was not diverging before is news worth
+    # unfolding a folded section for; a difference the user removed is
+    # not, and a section already open needs nothing.
+    just_opened = any(t.get("prop_id") == "run-modal.is_open"
+                      for t in (ctx.triggered or []))
+    last = [] if just_opened else list((auto or {}).get("diverged") or [])
+    news = [f for f in customized if f not in last]
+    unfold = bool(news) and (just_opened or not customize_open)
+    auto_out = ({"diverged": customized}
+                if just_opened or customized != last else dash.no_update)
+    return preflight, hint, (True if unfold else dash.no_update), auto_out
 
 
 @callback(

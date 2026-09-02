@@ -467,6 +467,26 @@ def run_predictions(
         entry = entries.get("trading_agents")
         return isinstance(entry, dict) and not entry.get("error")
 
+    def _symbol_state(stage: str, symbol: str, state: str, error=None) -> None:
+        # The stepper's per-symbol glyph; the stage's own state is untouched.
+        prog.emit_progress(stage, symbol=symbol, state=state, error=error)
+
+    def _symbol_skipped(symbol: str, reason: str) -> None:
+        _symbol_state("models", symbol, "failed", reason)
+        if research_on:
+            _symbol_state("research", symbol, "failed", reason)
+
+    def _research_state(symbol: str, entries: dict) -> None:
+        if not research_on:
+            return
+        entry = entries.get("trading_agents")
+        if _has_research(entries):
+            _symbol_state("research", symbol, "done")
+        else:
+            reason = (entry.get("error") if isinstance(entry, dict) else None) \
+                or "no research verdict"
+            _symbol_state("research", symbol, "failed", reason)
+
     prog.emit_progress("models", done=0, total=len(sym_list), state="running")
     if research_on:
         prog.emit_progress("research", done=0, total=len(sym_list),
@@ -477,20 +497,26 @@ def run_predictions(
             if research_on:
                 prog.emit_progress("research", done=research_done,
                                    total=len(sym_list))
+        _symbol_state("models", symbol, "running")
+        if research_on:
+            _symbol_state("research", symbol, "running")
         prices_json = (stock_data.get(symbol) or {}).get("prices")
         if not prices_json:
             logger.warning(f"{symbol}: no price data, skipping")
             skipped[symbol] = "no price data"
+            _symbol_skipped(symbol, skipped[symbol])
             continue
         try:
             df = pd.read_json(StringIO(prices_json))
         except Exception as e:
             logger.warning(f"{symbol}: price frame unreadable: {e}")
             skipped[symbol] = "price frame unreadable"
+            _symbol_skipped(symbol, skipped[symbol])
             continue
         if df.empty:
             logger.warning(f"{symbol}: empty price frame, skipping")
             skipped[symbol] = "empty price frame"
+            _symbol_skipped(symbol, skipped[symbol])
             continue
 
         # The target session's own bar must never be visible, live, that bar
@@ -502,6 +528,7 @@ def run_predictions(
         if df.empty:
             logger.warning(f"{symbol}: no data available as of {cutoff_date}")
             skipped[symbol] = f"no data as of {cutoff_date}"
+            _symbol_skipped(symbol, skipped[symbol])
             continue
 
         sym_news = news_by_symbol.get(symbol) or []
@@ -515,6 +542,8 @@ def run_predictions(
             if reused:
                 results[symbol] = reused
                 research_done += 1 if _has_research(reused) else 0
+                _symbol_state("models", symbol, "done")
+                _research_state(symbol, reused)
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
                                     f"predictions for {cutoff_date} (unchanged data)",
                           payload={
@@ -553,25 +582,33 @@ def run_predictions(
                             f"({mode}, as-of {cutoff_date})")
         # The only LLM call under here is the research report, so its spend
         # lands against this symbol.
-        with usage.track("research", symbol=symbol, trade_date=str(cutoff_date),
-                         section=f"research:{symbol}"):
-            results[symbol] = service.predict_symbol_no_store(
-                symbol, df, spy_df=spy_df,
-                news=sym_news,
-                ensemble_config=ensemble_config,
-                models_to_run=selected,
-                run_ensemble=run_ensemble,
-                historical_av_news=historical_av_news,
-                historical_global_news=historical_global_news,
-                as_of=str(cutoff_date),
-                research_model=research_model,
-                include_thesis=include_thesis,
-                evidence=evidence_set,
-                news_lookback_days=news_lookback_days,
-                news_status=sym_status,
-                target_date=str(target_date),
-                tools=tools_set,
-            )
+        try:
+            with usage.track("research", symbol=symbol, trade_date=str(cutoff_date),
+                             section=f"research:{symbol}"):
+                results[symbol] = service.predict_symbol_no_store(
+                    symbol, df, spy_df=spy_df,
+                    news=sym_news,
+                    ensemble_config=ensemble_config,
+                    models_to_run=selected,
+                    run_ensemble=run_ensemble,
+                    historical_av_news=historical_av_news,
+                    historical_global_news=historical_global_news,
+                    as_of=str(cutoff_date),
+                    research_model=research_model,
+                    include_thesis=include_thesis,
+                    evidence=evidence_set,
+                    news_lookback_days=news_lookback_days,
+                    news_status=sym_status,
+                    target_date=str(target_date),
+                    tools=tools_set,
+                )
+        except Exception as e:
+            # Per-model errors come back inside the result; an exception
+            # here is the stage itself breaking (a model load, the MPS
+            # bridge). The row names the symbol it broke on, then the run
+            # fails as it always did.
+            _symbol_skipped(symbol, str(e))
+            raise
         if prefetch_pending:
             prog.emit_memory("first symbol's models (weights loaded)",
                              symbol=symbol)
@@ -637,6 +674,15 @@ def run_predictions(
                       f"{symbol}: {ran} of {len(results[symbol])} models ran: "
                       + ", ".join(f"{m} failed ({err[:60]})"
                                   for m, err in failed.items()))
+        # A symbol with at least one call is done; one with none failed,
+        # and the reason is the first model's.
+        if failed and len(failed) == len(results[symbol]):
+            first_model, first_err = next(iter(failed.items()))
+            _symbol_state("models", symbol, "failed",
+                          f"{first_model}: {first_err or 'failed'}")
+        else:
+            _symbol_state("models", symbol, "done")
+        _research_state(symbol, results[symbol])
 
     if investigation_pool is not None:
         investigation_pool.shutdown(wait=False)
@@ -1104,6 +1150,17 @@ def run_recommendations(
     prog.emit_progress("synthesis", state="running", done=0, total=len(symbols),
                        run_id=run_id)
 
+    def _symbol_states(covered, reason: str) -> None:
+        # One synthesis call answers for every symbol at once; the stepper
+        # still wants a glyph per name, so each is closed here.
+        for sym in symbols:
+            if sym in covered:
+                prog.emit_progress("synthesis", symbol=sym, state="done",
+                                   run_id=run_id)
+            else:
+                prog.emit_progress("synthesis", symbol=sym, state="failed",
+                                   error=reason, run_id=run_id)
+
     basis = ai_analysis.get("recs_request") or "news+signals"
     if basis != "signals":
         ai_analysis, backfilled = merge_research_into_analysis(
@@ -1148,6 +1205,8 @@ def run_recommendations(
                       payload={**rec_cache_payload, "outcome": "hit"},
                       run_id=run_id)
             cached["from_cache"] = True
+            _symbol_states(cached.get("by_symbol") or {},
+                           "not in the cached synthesis")
             prog.emit_progress("synthesis", state="done",
                                done=len(cached.get("by_symbol") or {}),
                                total=len(symbols), run_id=run_id)
@@ -1172,7 +1231,10 @@ def run_recommendations(
     if not result:
         prog.emit("error", "Synthesis model returned empty response, "
                            "synthesis failed", run_id=run_id)
-        prog.emit_progress("synthesis", state="failed", run_id=run_id)
+        _symbol_states((), "synthesis model returned an empty response")
+        prog.emit_progress("synthesis", state="failed",
+                           error="synthesis model returned an empty response",
+                           run_id=run_id)
         return None
 
     result["generated_at"] = datetime.now().isoformat()
@@ -1254,6 +1316,7 @@ def run_recommendations(
     actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
     prog.emit("luna", "Synthesis finished, " + (", ".join(
         f"{s}={a}" for s, a in actions.items()) or "done"), run_id=run_id)
+    _symbol_states(actions, "no action in the synthesis")
     prog.emit_progress("synthesis", state="done", done=len(actions),
                        total=len(symbols), run_id=run_id)
     return result
@@ -1430,6 +1493,14 @@ def _run_stages(
     # and a row still queued past it is reaped as a run that never started.
     prog.emit_progress("news", state="running", done=0, total=len(symbols),
                        run_id=run_id)
+    # Every symbol that runs joins the lookup cache, the same as a confirm
+    # from the dialog does, so the typeahead knows a watchlist name the
+    # index lists never carried. Never worth failing a run over.
+    try:
+        from services import ticker_service
+        ticker_service.ensure_symbols(symbols, source="run")
+    except Exception as e:
+        logger.warning(f"symbol cache not updated: {e}")
     stock_data = load_market_data(symbols, period=period, force_refresh=force_refresh)
     prog.emit_memory("market data")
     priced = [s for s in symbols if s in stock_data]
@@ -1444,6 +1515,13 @@ def _run_stages(
     def _news_progress(sym: str, articles: list, stats: dict) -> None:
         news_seen["symbols"] += 1
         news_seen["articles"] += len(articles)
+        # "Unavailable" is the source failing for this symbol (its models
+        # run blind); an empty window is a fetched, quiet week.
+        unavailable = stats.get("status") == "unavailable"
+        prog.emit_progress(
+            "news", symbol=sym, state="failed" if unavailable else "done",
+            error=(stats.get("error") or "news source unavailable")
+            if unavailable else None, run_id=run_id)
         prog.emit_progress(
             "news", done=news_seen["symbols"], total=len(priced),
             state="done" if news_seen["symbols"] == len(priced) else "running",
