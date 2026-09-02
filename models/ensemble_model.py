@@ -142,7 +142,14 @@ class EnsembleModel(BaseModel):
         # The probability aggregation below stays config-weight-only: that
         # formula is Brier-validated as-is and is not re-weighted lightly.
         try:
-            from services.calibration_service import calibrate, rolling_hit_rate
+            from functools import partial
+
+            from services.calibration_service import (
+                calibrate as _calibrate, rolling_hit_rate as _rolling_hit_rate)
+            # Bounded by the run's cutoff: on a backtest the fits and the
+            # decay factor used to read outcomes from after the as-of date.
+            calibrate = partial(_calibrate, as_of=kwargs.get("as_of"))
+            rolling_hit_rate = partial(_rolling_hit_rate, as_of=kwargs.get("as_of"))
         except Exception:
             calibrate = rolling_hit_rate = None  # type: ignore
 

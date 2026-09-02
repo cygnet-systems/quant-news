@@ -22,9 +22,12 @@ MAX_SYMBOLS_PER_GROUP = 50
 
 
 def _current_uid() -> str | None:
+    """auth_service.effective_uid: the signed-in user, else the owner a
+    scheduled subprocess runs as — the same rule predictions use, so a job's
+    watchlist use lands under its owner instead of anonymous."""
     try:
-        from services.auth_service import current_uid
-        return current_uid()
+        from services.auth_service import effective_uid
+        return effective_uid()
     except Exception:
         return None
 

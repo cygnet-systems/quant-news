@@ -125,9 +125,14 @@ def current_run_id() -> str:
     return _run_identity()[0]
 
 
-def _write_audit(stage: str, message: str, payload: dict | None = None) -> None:
+def _write_audit(stage: str, message: str, payload: dict | None = None,
+                 run_id: str | None = None, run_title: str | None = None) -> None:
     """Append to the durable audit trail. Best-effort: the DB being down must
-    never break a pipeline, and the diskcache feed still drives the panel."""
+    never break a pipeline, and the diskcache feed still drives the panel.
+
+    ``run_id`` overrides the ambient run for events that belong to something
+    other than the run this process is publishing (a scheduled job's
+    start/finish lines written from the server process)."""
     try:
         import json
 
@@ -142,7 +147,8 @@ def _write_audit(stage: str, message: str, payload: dict | None = None) -> None:
             except (TypeError, ValueError):
                 payload = {"unserializable": str(payload)[:500]}
 
-        run_id, run_title = _run_identity()
+        if run_id is None:
+            run_id, run_title = _run_identity()
         with get_session() as session:
             session.add(ActivityLog(
                 user_id=_user_id(),
@@ -404,9 +410,13 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all",
                 "ended": stamp,
                 "events": [],
                 "errors": 0,
+                "gaps": 0,
             })
             run["ended"] = stamp
             run["errors"] += 1 if r.stage == "error" else 0
+            # A report written without expected evidence: not a crash, but
+            # a run that carries one is not whole either.
+            run["gaps"] += 1 if r.stage == "gap" else 0
             run["events"].append({
                 "ts": format_clock(r.created_at),
                 "t": stamp.timestamp(),
@@ -524,8 +534,16 @@ def hydrate_from_db(limit: int = _MAX_EVENTS) -> int:
         return 0
 
 
-def emit(stage: str, message: str, payload: dict | None = None) -> None:
+def emit(stage: str, message: str, payload: dict | None = None, *,
+         feed: bool = True, run_id: str | None = None,
+         run_title: str | None = None) -> None:
     """Append an event. Never raises — progress must not break the pipeline.
+
+    ``feed=False`` writes the audit trail only. The scheduler's own status
+    lines are emitted from the server process, where the live feed belongs
+    to whatever run the browser has open — they used to land inside it and
+    a "done" event from a scheduled job closed the user's in-flight run on
+    the Trace page. Pass ``run_id`` to file them under the job run instead.
 
     The two sinks are gated separately. The diskcache feed is the live UI
     panel and stays publisher-only, so headless tools never interleave with a
@@ -537,7 +555,7 @@ def emit(stage: str, message: str, payload: dict | None = None) -> None:
     diskcache feed is read whole on every panel tick under a transact lock,
     so feed events must stay small; they carry at most a has_payload flag.
     """
-    if _enabled():
+    if feed and _enabled():
         try:
             c = _get_cache()
             # transact() serializes the read-modify-write across threads AND
@@ -563,7 +581,7 @@ def emit(stage: str, message: str, payload: dict | None = None) -> None:
         except Exception as e:
             logger.debug(f"progress emit failed: {e}")
 
-    _write_audit(stage, message, payload)
+    _write_audit(stage, message, payload, run_id=run_id, run_title=run_title)
 
 
 def finish_run(message: str = "Pipeline complete") -> None:

@@ -105,6 +105,9 @@ class XGBoostModel(BaseModel):
             except Exception as e:
                 logger.warning(f"Sector ETF {sector_etf} fetch failed: {e}")
                 sector_df = spy_df  # Fallback to SPY
+                # Part of the cache key on purpose: a model trained on the
+                # SPY stand-in must not be served once the ETF resolves.
+                sector_etf = f"{sector_etf}->SPY-fallback"
 
         # No lookahead: internally-fetched frames include data past a backtest
         # cut-off — truncate everything to the as-of date.
@@ -168,6 +171,11 @@ class XGBoostModel(BaseModel):
         # so a model trained on a frozen/partial news window would be served
         # unchanged after the window was repaired.
         news_end = max(historical_av_news) if historical_av_news else ""
+        # The frame's depth and start are inputs too: the same data_end with
+        # 126 bars (SMA-200 blank) vs 500 bars is a different model, and the
+        # hyperparameters must invalidate on edit, not on the next calendar
+        # day. Hashed together so the meta file stays one flat record.
+        train_key = _training_key(ticker_df)
 
         # Check disk cache
         if cache_path.exists() and meta_path.exists():
@@ -180,7 +188,8 @@ class XGBoostModel(BaseModel):
                         and meta.get("data_end") == data_end
                         and meta.get("feature_version") == FEATURE_VERSION
                         and meta.get("sector_etf") == sector_etf
-                        and meta.get("news_end") == news_end):
+                        and meta.get("news_end") == news_end
+                        and meta.get("train_key") == train_key):
                     clf = pickle.loads(cache_path.read_bytes())
                     self._last_training_samples = meta.get("n_samples", 0)
                     logger.info(f"XGBoost cache hit: {symbol} (data through {data_end})")
@@ -205,6 +214,7 @@ class XGBoostModel(BaseModel):
             "feature_version": FEATURE_VERSION,
             "sector_etf": sector_etf,
             "news_end": news_end,
+            "train_key": train_key,
         }))
 
         self._last_training_samples = n_samples
@@ -339,3 +349,19 @@ class XGBoostModel(BaseModel):
                 "training_samples": self._last_training_samples,
             },
         )
+
+
+def _training_key(ticker_df) -> str:
+    """Bar count + start date + the hyperparameters, as one short hash."""
+    import hashlib
+
+    from config import MODEL as _M
+    parts = {
+        "bars": int(len(ticker_df)),
+        "start": str(ticker_df.index[0].date()) if len(ticker_df) else "",
+        "min_samples": _M.MIN_TRAINING_SAMPLES,
+        "label_ambiguity": _M.LABEL_AMBIGUITY_THRESHOLD,
+        "hparams": sorted((k, v) for k, v in vars(_M).items()
+                          if k.startswith(("XGBOOST_", "LIGHTGBM_"))),
+    }
+    return hashlib.sha1(repr(parts).encode()).hexdigest()[:12]

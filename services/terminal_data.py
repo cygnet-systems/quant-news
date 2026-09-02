@@ -70,13 +70,14 @@ def _rows(sql: str, params: dict) -> list:
 
 def filings_block(symbol: str, as_of: str, days: int = 45) -> str:
     """Recent 8-Ks + insider transaction summary, filed on or before as_of."""
-    eights = _rows("""
+    eights_all = _rows("""
         SELECT filed_date::text, url FROM edgar_events
         WHERE ticker = :sym AND form = '8-K'
           AND filed_date <= :as_of
           AND filed_date > (CAST(:as_of AS date) - :days)
-        ORDER BY filed_date DESC LIMIT 6
+        ORDER BY filed_date DESC
     """, {"sym": symbol.upper(), "as_of": as_of, "days": days})
+    eights = eights_all[:6]
 
     tx = _rows("""
         SELECT code, count(*), sum(value_usd), bool_or(is_officer)
@@ -92,7 +93,9 @@ def filings_block(symbol: str, as_of: str, days: int = 45) -> str:
 
     lines = [f"[SEC filings — point-in-time through {as_of}]"]
     if eights:
-        lines.append(f"8-K filings (last {days}d): "
+        shown = (f"{len(eights)} most recent of {len(eights_all)} "
+                 if len(eights_all) > len(eights) else "")
+        lines.append(f"8-K filings (last {days}d, {shown}newest first): "
                      + "; ".join(f"{d}" for d, _ in eights)
                      + " — an 8-K is a material corporate event; a price gap "
                        "near one of these dates likely has a filed cause.")

@@ -90,10 +90,6 @@ class LiveFeatureBuilder:
     def __init__(self) -> None:
         self._selected_features = SELECTED_FEATURES
 
-    @property
-    def feature_names(self) -> list[str]:
-        return list(self._selected_features)
-
     def _ensure_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add indicator columns if not already present.
 

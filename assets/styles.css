@@ -3320,6 +3320,9 @@ body {
 }
 
 .progress-line-error .progress-msg { color: var(--negative, #ef4444); }
+/* A report written without evidence the run was configured to gather:
+   not a crash, but not a whole run either. */
+.progress-line-gap .progress-msg { color: var(--warning, #f59e0b); }
 
 .progress-line-done .progress-msg {
     color: var(--positive, #22c55e);

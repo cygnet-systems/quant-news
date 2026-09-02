@@ -97,6 +97,10 @@ def _pred_to_dict(r, include_details: bool = False) -> dict:
         # made while the news source was down is not comparable to one made on
         # a full window, so the UI marks it rather than averaging it in.
         "news_status": r.news_status,
+        # The window the run was made with, so the input-data export can
+        # rebuild exactly those inputs (None = predates the stamp).
+        "news_window_days": ((r.details_json or {}).get("news_window_days")
+                             if isinstance(r.details_json, dict) else None),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
     }
@@ -163,12 +167,14 @@ class CacheService:
             # Floor of a week so early-January YTD still loads a usable window.
             return max((datetime.now() - jan1).days, 7)
         period_map = {
-            "1mo": 30, "3mo": 90, "6mo": 180,
-            "1y": 365, "2y": 730, "5y": 1825,
+            "5d": 7, "1mo": 30, "3mo": 90, "6mo": 180,
+            "1y": 365, "2y": 730, "5y": 1825, "10y": 3650, "max": 7300,
         }
+        if period not in period_map:
+            logger.warning(f"unknown price period {period!r} — treating as 1y")
         return period_map.get(period, 365)
 
-    def is_cached(self, symbol: str, data_type: str = "prices", period: Optional[str] = None) -> bool:
+    def is_cached(self, symbol: str, data_type: str = "prices") -> bool:
         from db.models import CacheMetadata
         with get_session() as session:
             stmt = select(func.count()).select_from(CacheMetadata).where(
@@ -302,11 +308,20 @@ class CacheService:
 
         if not force_refresh and self.is_cached(symbol, "prices"):
             with get_session() as session:
-                oldest = session.execute(
-                    select(func.min(StockPrice.date)).where(StockPrice.symbol == symbol)
-                ).scalar()
+                oldest, newest = session.execute(
+                    select(func.min(StockPrice.date), func.max(StockPrice.date))
+                    .where(StockPrice.symbol == symbol)
+                ).one()
 
-            if oldest:
+            # Coverage at BOTH ends. The old check only tested the oldest
+            # bar, so a cache whose newest bar was a week old was served as
+            # fresh (from_cache=True, no api_error) — every metric block and
+            # feature vector then ran on stale prices. 4 calendar days
+            # allows a long weekend.
+            reaches_present = (
+                newest is not None
+                and pd.to_datetime(newest) >= datetime.now() - pd.Timedelta(days=4))
+            if oldest and reaches_present:
                 oldest_dt = pd.to_datetime(oldest)
                 if oldest_dt <= (start_date + pd.Timedelta(days=7)):
                     df = pd.read_sql(
@@ -332,6 +347,8 @@ class CacheService:
                         metadata["from_cache"] = True
                         metadata["cache_time"] = cache_info.get("last_updated") if cache_info else None
                         return df, metadata
+            elif oldest and not reaches_present:
+                logger.info(f"{symbol}: cached prices end {newest} — refetching")
 
         from services.stock_data import fetch_stock_data
         try:
@@ -677,6 +694,15 @@ class CacheService:
             prev_close_row = next(
                 (c for c in recent_closes if _usable_price(c)), None)
 
+            # Re-storing an existing id keeps its owner and visibility. The
+            # merge used to take them from the CURRENT writer, so a private
+            # job re-running a symbol hid a public UI prediction (and vice
+            # versa) — the row changed hands as a side effect of a rerun.
+            existing = session.get(ModelPrediction, pred_id)
+            owner_uid = existing.owner_uid if existing else _current_uid()
+            is_public = (bool(existing.is_public) if existing
+                         else _default_public())
+
             session.merge(ModelPrediction(
                 id=pred_id,
                 symbol=symbol,
@@ -712,10 +738,8 @@ class CacheService:
                 was_correct=None,
                 pnl_dollars=None,
                 evaluated_at=None,
-                # Ownership: the signed-in user or the scheduled run's
-                # owner; private only for private scheduled runs.
-                owner_uid=_current_uid(),
-                is_public=_default_public(),
+                owner_uid=owner_uid,
+                is_public=is_public,
             ))
 
     def has_predictions_for_today(self, symbol: str) -> bool:
@@ -898,12 +922,30 @@ class CacheService:
                 .where(
                     ModelPrediction.actual_close.is_(None),
                     ModelPrediction.target_date <= cutoff,
+                    # A row with no usable previous_close can never score
+                    # (the evaluator skips it every night). Counting it made
+                    # the evaluation job "partial" forever, which unstamped
+                    # its success date, flagged it overdue and mailed daily.
+                    ModelPrediction.previous_close.isnot(None),
+                    ModelPrediction.previous_close > 0,
+                    ModelPrediction.previous_close != float("nan"),
                 )
                 .group_by(ModelPrediction.target_date)
             ).all()
+            unscorable = session.execute(
+                select(func.count()).select_from(ModelPrediction).where(
+                    ModelPrediction.actual_close.is_(None),
+                    ModelPrediction.target_date <= cutoff,
+                    (ModelPrediction.previous_close.is_(None))
+                    | (ModelPrediction.previous_close <= 0)
+                    | (ModelPrediction.previous_close == float("nan")),
+                )
+            ).scalar() or 0
         return {
             "pending_mature": sum(n for _, n in rows),
             "by_target_date": {str(d)[:10]: n for d, n in sorted(rows)},
+            # Reported, not counted: nothing will ever score these.
+            "unscorable": int(unscorable),
         }
 
     def _hold_band(self, session, symbol: str, _cache: dict,
@@ -998,43 +1040,6 @@ class CacheService:
 
         if updated:
             logger.info(f"Backfilled {updated} HOLD scores across "
-                        f"{len(bands)} symbol bands")
-        return updated
-
-    def rescore_hold_predictions(self) -> int:
-        """Clear and recompute every HOLD verdict under the current band.
-
-        Separate from `backfill_hold_scores`, which only fills gaps. Use this
-        after changing HOLD_BAND_* so history reflects one consistent rule
-        rather than a mix of whatever was configured when each row resolved.
-        """
-        from db.models import ModelPrediction
-
-        updated = 0
-        bands: dict = {}
-        with get_session() as session:
-            rows = session.execute(
-                select(ModelPrediction).where(
-                    ModelPrediction.decision == "HOLD",
-                    ModelPrediction.actual_close.isnot(None),
-                )
-            ).scalars().all()
-            for pred in rows:
-                if not _usable_price(pred.previous_close) \
-                        or not _usable_price(pred.actual_close):
-                    continue
-                move = abs(pred.actual_close - pred.previous_close) / pred.previous_close
-                band = self._hold_band(session, pred.symbol, bands, pred.target_date)
-                pred.was_correct = move <= band
-                pred.details_json = _sanitize_json({
-                    **(pred.details_json or {}),
-                    "hold_eval": {"band": band, "move": move},
-                })
-                pred.evaluated_at = datetime.now(timezone.utc)
-                updated += 1
-
-        if updated:
-            logger.info(f"Rescored {updated} HOLD predictions across "
                         f"{len(bands)} symbol bands")
         return updated
 
@@ -1200,15 +1205,15 @@ class CacheService:
                 for r in session.execute(stmt)
             }
 
-    def get_all_trading_agent_reports(self, limit: int = 50) -> list[dict]:
+    def get_all_trading_agent_reports(self, limit: int | None = 50) -> list[dict]:
         from db.models import TradingAgentReport
         with get_session() as session:
-            rows = session.execute(
-                select(TradingAgentReport)
+            q = (select(TradingAgentReport)
                 .where(_visible(TradingAgentReport))
-                .order_by(TradingAgentReport.created_at.desc())
-                .limit(limit)
-            ).scalars().all()
+                .order_by(TradingAgentReport.created_at.desc()))
+            if limit:
+                q = q.limit(limit)
+            rows = session.execute(q).scalars().all()
             return [
                 {
                     "id": r.id, "symbol": r.symbol,
@@ -1550,15 +1555,15 @@ class CacheService:
     # Historical Data Queries
     # =========================================================================
 
-    def list_report_catalog(self, limit: int = 50) -> list[dict]:
+    def list_report_catalog(self, limit: int | None = 50) -> list[dict]:
         from db.models import ReportCatalog
         with get_session() as session:
-            rows = session.execute(
-                select(ReportCatalog)
+            q = (select(ReportCatalog)
                 .where(_visible(ReportCatalog))
-                .order_by(ReportCatalog.created_at.desc())
-                .limit(limit)
-            ).scalars().all()
+                .order_by(ReportCatalog.created_at.desc()))
+            if limit:
+                q = q.limit(limit)
+            rows = session.execute(q).scalars().all()
             return [
                 {
                     "id": r.id,
@@ -1573,15 +1578,15 @@ class CacheService:
                 for r in rows
             ]
 
-    def list_recommendation_runs(self, limit: int = 50) -> list[dict]:
+    def list_recommendation_runs(self, limit: int | None = 50) -> list[dict]:
         from db.models import RecommendationRun
         with get_session() as session:
-            rows = session.execute(
-                select(RecommendationRun)
+            q = (select(RecommendationRun)
                 .where(_visible(RecommendationRun))
-                .order_by(RecommendationRun.created_at.desc())
-                .limit(limit)
-            ).scalars().all()
+                .order_by(RecommendationRun.created_at.desc()))
+            if limit:
+                q = q.limit(limit)
+            rows = session.execute(q).scalars().all()
             return [
                 {
                     "id": r.id,
@@ -1697,6 +1702,44 @@ class CacheService:
                 q = q.where(ModelPrediction.symbol.in_([s.upper() for s in symbols]))
             return [_pred_to_dict(r, include_details) for r in
                     session.execute(q).scalars().all()]
+
+    def query_predictions(
+        self,
+        symbols: list[str] | None = None,
+        start: "date | None" = None,
+        end: "date | None" = None,
+        model: str | None = None,
+        outcome: str | None = None,
+    ) -> list[dict]:
+        """Every visible prediction matching the History filters — no row cap.
+
+        Filters run in SQL (on target_date, the session predicted) so the
+        page sees the whole matching set and paginates it, instead of the
+        old newest-1000 slice that rendered any older date as an empty day.
+        ``outcome``: pending (no verdict and no P&L), right, wrong.
+        """
+        from db.models import ModelPrediction
+        with get_session() as session:
+            q = (select(ModelPrediction)
+                 .where(_visible(ModelPrediction))
+                 .order_by(ModelPrediction.target_date.desc(),
+                           ModelPrediction.symbol, ModelPrediction.model_name))
+            if symbols:
+                q = q.where(ModelPrediction.symbol.in_([s.upper() for s in symbols]))
+            if start is not None:
+                q = q.where(ModelPrediction.target_date >= start)
+            if end is not None:
+                q = q.where(ModelPrediction.target_date <= end)
+            if model and model != "all":
+                q = q.where(ModelPrediction.model_name == model)
+            if outcome == "pending":
+                q = q.where(ModelPrediction.was_correct.is_(None),
+                            ModelPrediction.pnl_dollars.is_(None))
+            elif outcome == "right":
+                q = q.where(ModelPrediction.was_correct.is_(True))
+            elif outcome == "wrong":
+                q = q.where(ModelPrediction.was_correct.is_(False))
+            return [_pred_to_dict(r) for r in session.execute(q).scalars().all()]
 
     def get_open_predictions(self, limit: int = 200) -> list[dict]:
         """Calls that have been made but cannot be scored yet.

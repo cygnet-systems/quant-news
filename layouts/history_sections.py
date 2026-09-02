@@ -415,13 +415,9 @@ def _ta_report_card(report):
                         href=f"/api/download/ta-report/{report.get('id', 0)}",
                         className="ta-pdf-btn",
                     ),
-                    html.A(
-                        [html.I(className="bi bi-table me-1"), "Data"],
-                        href=(f"/api/download/report-inputs?symbols={symbol}"
-                              f"&date={trade_date}"),
-                        className="ta-pdf-btn",
-                        title="Download the point-in-time inputs this report used (.xlsx)",
-                    ),
+                    _inputs_link(symbol, trade_date, report.get("news_window_days"),
+                                 "ta-pdf-btn",
+                                 "Download the point-in-time inputs this report used (.xlsx)"),
                 ],
                 className="ta-card-actions",
             ),
@@ -430,7 +426,7 @@ def _ta_report_card(report):
     )
 
 
-def build_ta_reports_section(ta_reports):
+def build_ta_reports_section(ta_reports, page=None):
     """Research reports, the richest artifact a run produces.
 
     Grouped by symbol so a ticker's report history reads as a timeline
@@ -440,6 +436,8 @@ def build_ta_reports_section(ta_reports):
     """
     if not ta_reports:
         return None
+    total = len(ta_reports)
+    ta_reports, pager = page_slice(ta_reports, "ta", page)
 
     by_symbol: dict[str, list] = {}
     for report in ta_reports:
@@ -472,8 +470,8 @@ def build_ta_reports_section(ta_reports):
     # is gone.
     return collapsible_section(
         "Research Reports", "ta",
-        html.Div(groups),
-        icon_class="bi-robot", default_open=True, count=len(ta_reports),
+        html.Div([pager] + groups + [pager]),
+        icon_class="bi-robot", default_open=True, count=total,
     )
 
 
@@ -484,10 +482,12 @@ _REPORT_TYPE_LABELS = {
 }
 
 
-def build_saved_reports_section(reports):
+def build_saved_reports_section(reports, page=None):
     """Stored PDF/JSON/MD report artifacts."""
     if not reports:
         return None
+    total = len(reports)
+    reports, pager = page_slice(reports, "reports", page)
     report_rows = []
     for r in reports:
         sym = r.get("symbol") or "Portfolio"
@@ -519,27 +519,72 @@ def build_saved_reports_section(reports):
 
     return collapsible_section(
         "Saved Reports", "reports",
-        html.Div(
+        html.Div([
+            pager,
             html.Table([
                 html.Thead(html.Tr([html.Th("Date"), html.Th("Symbol"), html.Th("Type"), html.Th("")])),
                 html.Tbody(report_rows),
             ], className="history-data-table"),
-            className="history-table-wrap",
-        ),
+            pager,
+        ], className="history-table-wrap"),
         # Open on arrival: a collapsed archive reads as an empty one.
-        icon_class="bi-file-earmark-text", default_open=True, count=len(reports),
+        icon_class="bi-file-earmark-text", default_open=True, count=total,
     )
 
 
-# Rows rendered in the prediction log before it truncates. Deferring the
-# build stopped it blocking page load, but opening the section still painted
-# every row: 886 predictions is 1044 table rows, enough to lock the browser
-# for seconds and read as a crash. The cap is on the SYMBOL groups actually
-# built, and what was dropped is stated rather than silently missing.
-PREDICTION_LOG_MAX_SYMBOLS = 12
+# Rows per page per archive bucket. Everything in scope is reachable through
+# the pager; nothing is silently cut off any more (the log used to keep the
+# 12 most recently active symbols and the loaders the newest N rows).
+PAGE_SIZE = {"predictions": 300, "ta": 24, "reports": 50, "recommendations": 50}
 
 
-def build_predictions_section(predictions, deferred: bool = False):
+def page_slice(items: list, bucket: str, page_state: dict | None):
+    """(items on the current page, pager row) for one archive bucket."""
+    size = PAGE_SIZE[bucket]
+    total = len(items)
+    offset = int((page_state or {}).get(bucket) or 0)
+    offset = max(0, min(offset, max(0, total - 1)))
+    offset -= offset % size
+    shown = items[offset:offset + size]
+    if total <= size:
+        return shown, None
+    lo, hi = offset + 1, min(offset + size, total)
+    pager = html.Div(
+        [
+            dbc.Button([html.I(className="bi bi-chevron-left")],
+                       id={"type": "history-pager", "bucket": bucket, "dir": "prev"},
+                       size="sm", color="secondary", outline=True,
+                       disabled=offset == 0, className="history-pager-btn"),
+            html.Span(f"{lo}–{hi} of {total}", className="history-pager-label"),
+            dbc.Button([html.I(className="bi bi-chevron-right")],
+                       id={"type": "history-pager", "bucket": bucket, "dir": "next"},
+                       size="sm", color="secondary", outline=True,
+                       disabled=hi >= total, className="history-pager-btn"),
+        ],
+        className="history-pager d-flex align-items-center gap-2 mb-2",
+    )
+    return shown, pager
+
+
+def _inputs_link(symbols_qs: str, as_of: str, lookback, cls: str, title: str):
+    """The point-in-time inputs download. Rendered only when the record
+    carries the news window it was made with — the export refuses to rebuild
+    inputs at a window the run did not use."""
+    if not lookback:
+        return html.Span(
+            [html.I(className="bi bi-table me-1"), "Data"],
+            className=f"{cls} disabled", style={"opacity": 0.45},
+            title="Inputs not reproducible: this record predates the news-window stamp",
+        )
+    return html.A(
+        [html.I(className="bi bi-table me-1"), "Data"],
+        href=(f"/api/download/report-inputs?symbols={symbols_qs}&date={as_of}"
+              f"&lookback={int(lookback)}"),
+        className=cls, title=title,
+    )
+
+
+def build_predictions_section(predictions, deferred: bool = False, page=None):
     """The per-call prediction log, grouped by symbol then date.
 
     With deferred=True the body is left empty and filled when the section is
@@ -562,6 +607,8 @@ def build_predictions_section(predictions, deferred: bool = False):
         )
     pending_count = sum(1 for p in predictions
                         if p.get("was_correct") is None and p.get("pnl_dollars") is None)
+    total_in_scope = len(predictions)
+    predictions, pager = page_slice(predictions, "predictions", page)
 
     def _pred_row(p):
         decision = p.get("decision", "HOLD")
@@ -592,19 +639,14 @@ def build_predictions_section(predictions, deferred: bool = False):
     for p in predictions:
         by_symbol.setdefault(p.get("symbol", "?"), []).append(p)
 
-    # Most recently active first, then cap. Alphabetical order would truncate
-    # to whatever happens to start with A, which is never what someone opening
-    # this log is looking for.
+    # Most recently active first. The page holds the newest rows in scope;
+    # the pager reaches the rest.
     def _latest(sym):
         return max((p.get("target_date") or p.get("prediction_date") or "")
                    for p in by_symbol[sym])
 
-    ordered = sorted(by_symbol, key=_latest, reverse=True)
-    shown = ordered[:PREDICTION_LOG_MAX_SYMBOLS]
-    hidden = ordered[PREDICTION_LOG_MAX_SYMBOLS:]
-
     symbol_groups = []
-    for sym in shown:
+    for sym in sorted(by_symbol, key=_latest, reverse=True):
         sym_preds = by_symbol[sym]
         # Directional hit rate only. HOLDs are now scored too (against the
         # no-trade band), but folding them in here would silently change
@@ -628,12 +670,9 @@ def build_predictions_section(predictions, deferred: bool = False):
                 html.Div(
                     [html.Span(f"As-of {d}", className="history-pred-date"),
                      html.Span(f"→ predicts {target} close", className="history-pred-target"),
-                     html.A(
-                         [html.I(className="bi bi-table me-1"), "Data"],
-                         href=f"/api/download/report-inputs?symbols={sym}&date={d}",
-                         className="history-dl-btn ms-auto",
-                         title="Download the inputs these models saw (.xlsx)",
-                     )],
+                     _inputs_link(sym, d, d_preds[0].get("news_window_days"),
+                                  "history-dl-btn ms-auto",
+                                  "Download the inputs these models saw (.xlsx)")],
                     className="history-pred-date-row",
                 ),
                 html.Table([
@@ -665,6 +704,8 @@ def build_predictions_section(predictions, deferred: bool = False):
                      style={"display": "none"}),
         ], className="history-collapsible-section history-pred-symbol-group"))
 
+    # Status only. The "Evaluate now" button that used to sit here had no
+    # callback; the working one is the Performance page toolbar's.
     eval_bar = html.Div(
         [
             html.Span(
@@ -672,38 +713,23 @@ def build_predictions_section(predictions, deferred: bool = False):
                 if pending_count else "All predictions evaluated",
                 className="history-eval-hint",
             ),
-            dbc.Button(
-                [html.I(className="bi bi-check2-circle me-1"), "Evaluate now"],
-                id="history-evaluate-btn",
-                size="sm", color="success", outline=True,
-                disabled=pending_count == 0,
-                className="history-evaluate-btn",
-            ),
         ],
         className="history-eval-bar",
     )
 
-    trailer = []
-    if hidden:
-        trailer.append(html.Div(
-            f"Showing the {len(shown)} most recently active symbols. "
-            f"{len(hidden)} more are in scope ({', '.join(hidden[:8])}"
-            f"{'…' if len(hidden) > 8 else ''}) — filter by symbol, or click a "
-            f"symbol in the scorecard above, to see them.",
-            className="history-log-truncated",
-        ))
-
     return collapsible_section(
         "Model Predictions", "predictions",
-        html.Div([eval_bar] + symbol_groups + trailer),
-        icon_class="bi-cpu", default_open=False, count=len(predictions),
+        html.Div([eval_bar, pager] + symbol_groups + [pager]),
+        icon_class="bi-cpu", default_open=False, count=total_in_scope,
     )
 
 
-def build_recommendations_section(recommendations):
+def build_recommendations_section(recommendations, page=None):
     """Portfolio-level synthesis runs."""
     if not recommendations:
         return None
+    total = len(recommendations)
+    recommendations, pager = page_slice(recommendations, "recommendations", page)
     rec_rows = []
     for rec in recommendations:
         syms = rec.get("symbols_csv", "")
@@ -723,11 +749,10 @@ def build_recommendations_section(recommendations):
 
         rec_as_of = (result.get("as_of") or created or "")[:10]
         sym_qs = ",".join(sorted({x.strip() for x in syms.split(",") if x.strip()}))
-        dl = html.A(
-            [html.I(className="bi bi-table me-1"), "Data"],
-            href=f"/api/download/report-inputs?symbols={sym_qs}&date={rec_as_of}",
-            className="history-dl-btn",
-            title="Download all model inputs + news behind this recommendation (.xlsx)",
+        dl = _inputs_link(
+            sym_qs, rec_as_of, (result.get("news_window") or {}).get("lookback_days"),
+            "history-dl-btn",
+            "Download all model inputs + news behind this recommendation (.xlsx)",
         ) if sym_qs and rec_as_of else html.Span("—")
         rec_rows.append(html.Tr([
             html.Td(created), html.Td(syms), html.Td(model),
@@ -738,17 +763,18 @@ def build_recommendations_section(recommendations):
 
     return collapsible_section(
         "Recommendations", "recs",
-        html.Div(
+        html.Div([
+            pager,
             html.Table([
                 html.Thead(html.Tr([html.Th("Date"), html.Th("Symbols"), html.Th("Model"),
                                     html.Th("Based on"), html.Th("Portfolio Action"),
                                     html.Th("")])),
                 html.Tbody(rec_rows),
             ], className="history-data-table"),
-            className="history-table-wrap",
-        ),
+            pager,
+        ], className="history-table-wrap"),
         # Open on arrival: a collapsed archive reads as an empty one.
-        icon_class="bi-lightning", default_open=True, count=len(recommendations),
+        icon_class="bi-lightning", default_open=True, count=total,
     )
 
 
@@ -775,7 +801,8 @@ def build_activity_section(activity_scope="all", stages=None, symbol=None,
                               title=_prog.DISPLAY_TZ_LABEL),
                     html.Span(e["message"], className="progress-msg"),
                 ], className="progress-line"
-                   + (" progress-line-error" if e["stage"] == "error" else ""))
+                   + (" progress-line-error" if e["stage"] == "error"
+                      else " progress-line-gap" if e["stage"] == "gap" else ""))
                 for e in run["events"]
             ]
             # get_activity_runs already hands these over in the display zone.

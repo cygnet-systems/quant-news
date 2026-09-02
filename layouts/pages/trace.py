@@ -225,18 +225,37 @@ def _payload_detail(payload: dict) -> html.Div:
     kind = payload.get("event")
     parts: list = []
     if kind == "news_window":
-        parts.append(_kv("window",
+        parts.append(_kv("requested",
                          f"{payload.get('filter')} "
                          f"{payload.get('lookback_days')}d → "
-                         f"{payload.get('as_of')}"))
+                         f"{payload.get('as_of')}, cap "
+                         f"{payload.get('max_articles') or 'none'}/symbol"))
         parts.append(_kv("articles", payload.get("articles")))
         per_sym = payload.get("articles_by_symbol") or {}
         status = payload.get("source_status") or {}
+        detail = payload.get("by_symbol") or {}
+
+        def _sym_line(s, n):
+            d = detail.get(s) or {}
+            bits = [f"{s}:{n}"]
+            if d.get("oldest") and d.get("newest"):
+                bits.append(f"{d['oldest']}→{d['newest']}")
+            if d.get("capped"):
+                bits.append(f"CAPPED {d.get('fetched')}→{d.get('kept')}, "
+                            f"effective {d.get('effective_days')}d")
+            if status.get(s) not in (None, "ok"):
+                bits.append(f"({status[s]})")
+            return " ".join(bits)
+
         if per_sym:
-            parts.append(_kv("per symbol", ", ".join(
-                f"{s}:{n}" + (f" ({status[s]})" if status.get(s) not in
-                              (None, "ok") else "")
-                for s, n in sorted(per_sym.items()))))
+            parts.append(_kv("per symbol", "; ".join(
+                _sym_line(s, n) for s, n in sorted(per_sym.items()))))
+        capped = [s for s, d in detail.items() if d.get("capped")]
+        if capped:
+            parts.append(html.Span(
+                f"Cap dropped the OLDEST articles for {', '.join(sorted(capped))} — "
+                f"the effective window is shorter than requested.",
+                style={"color": "var(--warning, #ffc107)"}))
     elif kind == "data_load":
         by_sym = payload.get("by_symbol") or {}
         parts.append(_kv("symbols", ", ".join(

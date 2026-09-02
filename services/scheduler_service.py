@@ -114,7 +114,7 @@ JOB_TYPES: dict[str, JobType] = {
         params_spec=(
             ("lookback", "News window (days)", MODEL.NEWS_LOOKBACK_DAYS,
              "Point-in-time news window ending at the data cutoff"),
-            ("max_articles", "Article cap per symbol", 500,
+            ("max_articles", "Article cap per symbol", MODEL.NEWS_MAX_ARTICLES,
              "Keep the newest N of the window; 0 = all"),
         ),
     ),
@@ -192,7 +192,8 @@ DEFAULT_JOBS = (
         "symbols_csv": ("PANW,BAC,VZ,HWM,DOC,HPQ,LUV,TPL,MPWR,MCD,"
                         "ROP,ETR,CMS,XYZ,HIG,IP,FLEX,MET,FIS,TYL"),
         "params_json": {"only_trading_days": True,
-                        "lookback": MODEL.NEWS_LOOKBACK_DAYS},
+                        "lookback": MODEL.NEWS_LOOKBACK_DAYS,
+                        "max_articles": MODEL.NEWS_MAX_ARTICLES},
     },
     {
         "id": EVALUATION_JOB,
@@ -526,11 +527,17 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
         cmd += ["--news-filter", str(params["news_filter"])]
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
-    if params.get("lookback"):
-        cmd += ["--lookback", str(int(params["lookback"]))]
-    # `is not None`, not truthiness: 0 is a real value here (no cap).
-    if params.get("max_articles") is not None:
-        cmd += ["--max-articles", str(int(params["max_articles"]))]
+    # Both REQUIRED for an analysis job — the CLI has no default for them,
+    # and a job that lacks them fails here with a message that names the fix
+    # rather than running on a window nobody chose. (Jobs created before the
+    # form had these knobs: open the Schedule page and save the job once.)
+    missing = [k for k in ("lookback", "max_articles") if params.get(k) is None]
+    if missing:
+        raise ValueError(
+            f"job params missing {', '.join(missing)} — open the Schedule page "
+            f"and save this job once to set them")
+    cmd += ["--lookback", str(int(params["lookback"]))]
+    cmd += ["--max-articles", str(int(params["max_articles"]))]
     if params.get("report_model"):
         cmd += ["--report-model", params["report_model"]]
     if params.get("recs_model"):

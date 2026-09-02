@@ -67,8 +67,14 @@ def main() -> int:
     parser.add_argument("--symbols", help="Comma-separated (default: watchlist)")
     parser.add_argument("--target", help="Target session YYYY-MM-DD "
                                          "(default: next unresolved session)")
-    parser.add_argument("--lookback", type=int, default=7,
-                        help="News window in days (default: 7)")
+    parser.add_argument("--lookback", type=int,
+                        default=config.MODEL.NEWS_LOOKBACK_DAYS,
+                        help=f"News window in days (default: "
+                             f"{config.MODEL.NEWS_LOOKBACK_DAYS})")
+    parser.add_argument("--max-articles", type=int, default=None,
+                        help="Per-symbol cap: keep the newest N articles of "
+                             "the window, 0 = all (default: config "
+                             "NEWS_MAX_ARTICLES)")
     parser.add_argument("--report-model", default=None,
                         help="Research/report model "
                              "(default: config REPORT_MODEL)")
@@ -121,7 +127,8 @@ def main() -> int:
         print(json.dumps(summary) if args.json
               else f"Evaluated {count} prediction(s); "
                    f"{backlog['pending_mature']} mature prediction(s) still "
-                   f"unscored")
+                   f"unscored; {backlog.get('unscorable', 0)} can never score "
+                   f"(no usable previous close)")
         # A clean run leaves no mature prediction unscored. A remaining
         # backlog is the "evaluated: 0 looked normal" failure shape — exit 2
         # so the scheduler records it as partial and mails accordingly.
@@ -223,6 +230,7 @@ def main() -> int:
         symbols,
         target=args.target,
         lookback_days=args.lookback,
+        max_articles=args.max_articles,
         report_model=args.report_model,
         recs_model=args.recs_model,
         models=models,

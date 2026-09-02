@@ -6,6 +6,7 @@ news aggregation, and AI-powered insights.
 
 import asyncio
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -58,7 +59,7 @@ from callbacks.chart_callbacks import (
     create_rsi_chart,
     create_volume_chart,
 )
-from config import APP, COLORS
+from config import APP, COLORS, MODEL
 from layouts.components import (
     calculate_period_label,
     create_metric_card,
@@ -441,19 +442,32 @@ def serve_saved_report(key: str = ""):
 
 
 @server.get("/api/download/report-inputs")
-def serve_report_inputs(symbols: str = "", date: str = ""):
+def serve_report_inputs(symbols: str = "", date: str = "",
+                        lookback: int | None = None, max_articles: int = 0):
     """Serve the point-in-time model-input workbook for a report/prediction.
 
-    Reconstructs inputs with the same lookahead-safe builders the models use.
+    Reconstructs inputs with the same lookahead-safe builders the models use,
+    for the news window the RECORD was made with (``lookback`` rides on the
+    link; a link without it is refused rather than rebuilt at some default).
     No LLM is involved — downloads must never incur model cost.
     """
     as_of = date[:10]
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:12]
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not syms or not as_of:
         raise HTTPException(status_code=400)
+    if lookback is None:
+        raise HTTPException(
+            status_code=400,
+            detail="lookback (the run's news window in days) is required — "
+                   "this record predates the stamp, so its inputs cannot be "
+                   "rebuilt faithfully")
+    if len(syms) > 12:
+        raise HTTPException(status_code=400,
+                            detail=f"at most 12 symbols per workbook ({len(syms)} given)")
     try:
         from services.export_service import build_model_inputs_xlsx
-        payload = build_model_inputs_xlsx(syms, as_of)
+        payload = build_model_inputs_xlsx(syms, as_of, news_lookback_days=lookback,
+                                          max_articles=max_articles)
     except Exception as e:
         logger.warning(f"Input-data export failed for {syms} @ {as_of}: {e}")
         raise HTTPException(status_code=500)
@@ -530,10 +544,13 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         # only for the buckets it renders.
         if path == "/performance":
             return performance_page.layout(
-                history_data or fetch_report_history(only={"predictions"}),
+                fetch_report_history(
+                    only={"predictions"},
+                    filters=history_filters(filter_symbols, filter_range,
+                                            filter_specific, model)),
                 filter_symbols, filter_range, filter_specific, outcome, model)
         return reports_page.layout(
-            history_data or fetch_report_history(
+            fetch_report_history(
                 only={"reports", "recommendations", "trading_agent_reports"}),
             filter_symbols, filter_range, filter_specific)
     if path == "/schedule":
@@ -581,28 +598,9 @@ def _build_route(path, history_data, filter_symbols, filter_range,
 
 
 def _serialize_articles(articles) -> list[dict]:
-    """NewsArticle objects -> the store/UI dict shape (shared by the news
-    store callback, the Home research pane and the run-input gap fill)."""
-    return [
-        {
-            "id": a.id,
-            "symbol": a.symbol,
-            "title": a.title,
-            "source": a.source,
-            "url": a.url,
-            "published_at": a.published_at.isoformat(),
-            "summary": a.summary,
-            "sentiment": a.sentiment,
-            "sentiment_score": a.sentiment_score,
-            "impact": a.impact,
-            "price_change_percent": a.price_change_percent,
-            "ticker_relevance_score": a.ticker_relevance_score,
-            "topics": a.topics,
-            "overall_sentiment_score": a.overall_sentiment_score,
-            "overall_sentiment_label": a.overall_sentiment_label,
-        }
-        for a in (articles or [])
-    ]
+    """NewsArticle objects -> the store/UI dict shape."""
+    from services.news_window import article_to_dict
+    return [article_to_dict(a) for a in articles]
 
 
 def _fill_run_inputs(symbols, stock_data, news_data=None):
@@ -810,17 +808,23 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     State("history-filter-date-range", "data"),
     State("history-filter-date-specific", "data"),
     State("history-filter-model", "data"),
+    State("history-filter-outcome", "data"),
+    State("history-page", "data"),
     prevent_initial_call=True,
 )
 def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specific,
-                          model):
-    """Build the prediction log the first time its section is opened."""
+                          model, outcome, page):
+    """Build the prediction log the first time its section is opened.
+
+    Applies the SAME outcome slice the section header announces — the body
+    used to ignore it, so "incorrect only (31)" expanded to every row."""
     if not n_clicks:
         raise PreventUpdate
-    from layouts.pages.performance import _by_model
-    buckets = filter_history_data(fetch_report_history(), filter_symbols,
-                                  filter_range, filter_specific)
-    section = build_predictions_section(_by_model(buckets["predictions"], model))
+    data = fetch_report_history(
+        only={"predictions"},
+        filters=history_filters(filter_symbols, filter_range, filter_specific,
+                                model, outcome))
+    section = build_predictions_section(data["predictions"], page=page)
     if section is None:
         return html.Div("No predictions match this filter.",
                         className="history-empty-msg")
@@ -854,11 +858,12 @@ def render_filter_chips(filter_symbols, filter_range, filter_specific):
     Input("history-filter-date-specific", "data"),
     Input("history-filter-outcome", "data"),
     Input("history-filter-model", "data"),
+    Input("history-page", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
 def render_archive_body(history_data, filter_symbols, filter_range,
-                        filter_specific, outcome, model, pathname):
+                        filter_specific, outcome, model, page, pathname):
     """Rebuild the filterable part of Performance or Reports.
 
     #archive-body exists only on those two routes, and only their own controls
@@ -867,11 +872,38 @@ def render_archive_body(history_data, filter_symbols, filter_range,
     path = (pathname or "/").rstrip("/") or "/"
     if path not in ("/performance", "/reports"):
         raise PreventUpdate
-    data = history_data or fetch_report_history()
+    # A filter change starts from page one; only a pager click keeps offsets.
+    page = page if ctx.triggered_id == "history-page" else {}
     if path == "/performance":
+        data = fetch_report_history(
+            only={"predictions"},
+            filters=history_filters(filter_symbols, filter_range,
+                                    filter_specific, model))
         return performance_page.body(data, filter_symbols, filter_range,
-                                     filter_specific, outcome, model)
-    return reports_page.body(data, filter_symbols, filter_range, filter_specific)
+                                     filter_specific, outcome, model, page=page)
+    data = fetch_report_history(
+        only={"reports", "recommendations", "trading_agent_reports"})
+    return reports_page.body(data, filter_symbols, filter_range, filter_specific,
+                             page=page)
+
+
+@callback(
+    Output("history-page", "data"),
+    Input({"type": "history-pager", "bucket": ALL, "dir": ALL}, "n_clicks"),
+    State("history-page", "data"),
+    prevent_initial_call=True,
+)
+def turn_history_page(clicks, page):
+    """Prev/Next on one archive bucket. Offsets are clamped at render."""
+    if not clicks or not any(c for c in clicks if c):
+        raise PreventUpdate
+    from layouts.history_sections import PAGE_SIZE
+    trig = ctx.triggered_id
+    page = dict(page or {})
+    bucket, direction = trig["bucket"], trig["dir"]
+    step = PAGE_SIZE[bucket] if direction == "next" else -PAGE_SIZE[bucket]
+    page[bucket] = max(0, int(page.get(bucket) or 0) + step)
+    return page
 
 
 def _performance_rows(f_symbols, f_range, f_specific, f_outcome,
@@ -882,14 +914,11 @@ def _performance_rows(f_symbols, f_range, f_specific, f_outcome,
     the DOM, so View Data and Export can never disagree with the table above
     them.
     """
-    from layouts.history_sections import filter_history_data
-    from layouts.pages.performance import _by_model, _by_outcome
-
-    data = fetch_report_history(only={"predictions"})
-    preds = filter_history_data(data, f_symbols, f_range or "all",
-                                f_specific)["predictions"]
-    preds = _by_model(preds, f_model or "all")
-    preds = _by_outcome(preds, f_outcome or "all")
+    preds = fetch_report_history(
+        only={"predictions"},
+        filters=history_filters(f_symbols, f_range or "all", f_specific,
+                                f_model or "all", f_outcome or "all"),
+    )["predictions"]
 
     keep = ("symbol", "model_name", "prediction_date", "target_date", "decision",
             "confidence", "up_probability", "previous_close", "predicted_close",
@@ -1752,11 +1781,11 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     Input("run-confirm-btn", "n_clicks"),
     Input("ai-retry-btn", "n_clicks"),
     State("run-scope", "value"),
-    State("news-data-store", "data"),
     State("run-symbols-store", "data"),
     State("stock-data-store", "data"),
     State("run-date-picker", "date"),
     State("run-lookback", "value"),
+    State("run-max-articles", "value"),
     State("run-model", "value"),
     State("run-type", "value"),
     State("run-recs", "value"),
@@ -1764,9 +1793,10 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     State("run-evidence", "value"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
+async def generate_ai_analysis(n_clicks, retry_clicks, scope,
                                run_symbols, stock_data, run_date, lookback,
-                               model, depth, recs, recs_model, run_evidence):
+                               max_articles_val, model, depth, recs,
+                               recs_model, run_evidence):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1785,9 +1815,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
     if ctx.triggered_id == "run-confirm-btn" and scope == "models":
         raise PreventUpdate
     # The run's symbol set comes from the dialog (watchlist / last cohort /
-    # custom), not from the watchlist directly. The store news is only a
-    # fallback here — the report does its own point-in-time fetch per
-    # symbol — so an empty news store must not block a run.
+    # custom), not from the watchlist directly. The report does its own
+    # point-in-time fetch per symbol; the browser's news store plays no part.
     symbols = (run_symbols or {}).get("symbols") or []
     if not (n_clicks or retry_clicks) or not symbols:
         raise PreventUpdate
@@ -1815,8 +1844,19 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
 
     # One set of controls, read once. There is no longer a second, hidden
     # parameter panel for another flow to read by mistake.
-    overnight_news = lookback == "overnight"
-    lookback_days = 1 if overnight_news else int(lookback or 7)
+    from services.news_window import (
+        RunParameterMissing, normalize_article_cap, normalize_lookback)
+    try:
+        overnight_news, lookback_days = normalize_lookback(lookback)
+        max_articles = normalize_article_cap(max_articles_val)
+    except RunParameterMissing as e:
+        # Refuse, visibly. No default: a report on a window the user did not
+        # pick would be indistinguishable from the one they asked for.
+        from services import progress_service as prog
+        prog.emit("error", f"Report rejected — {e}")
+        prog.finish_run(f"Report failed — {e}")
+        return {"failed": True, "error": str(e), "scope": scope,
+                "run_seq": n_clicks, "generated_at": datetime.now().isoformat()}
     window_desc = ("overnight close→open" if overnight_news
                    else f"{lookback_days}d")
     report_model = model or "gpt-5.6-luna"
@@ -1826,7 +1866,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
     # Terminal-derived evidence blocks (modal checklist); None only before
     # the modal has rendered once — treat as the default, both on.
     evidence_sel = (sorted(run_evidence) if run_evidence is not None
-                    else ["options", "quality"])
+                    else sorted(MODEL.DEFAULT_EVIDENCE))
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
     # Per-symbol analysis is always the full research agent now — the shallow
     # summarize_news_structured pass produced a thinner second opinion on the
@@ -1886,100 +1926,41 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
               f"/{len(symbols or [])} symbols (data through {as_of_str})",
               payload={"event": "data_load", "by_symbol": price_inputs})
 
-    articles_by_symbol = news_data.get("articles_by_symbol", {})
-
-    # News window: the SAME point-in-time fetch the modal preview showed —
-    # windowed [as_of - lookback, as_of] (or the overnight close→open gap),
-    # lookahead-safe. The dcc.Store's articles are only a fallback: they hold
-    # whatever the last background refresh grabbed, which may not cover the
-    # chosen window.
-    from config import MODEL as _M
+    # News window: the SAME point-in-time fetch the modal preview showed and
+    # the models subprocess uses — windowed [as_of - lookback, as_of] (or the
+    # overnight close→open gap), capped at the newest max_articles, lookahead-
+    # safe. The dcc.Store's articles are never used here: they hold whatever
+    # the last background refresh grabbed from "now", which is the wrong
+    # window for any backtest and an unlabelled one live.
     from services.news_window import (
-        fetch_overnight_news, fetch_point_in_time_news, filter_articles_as_of)
-
-    def _art_dict(a):
-        return {
-            "id": getattr(a, "id", None), "symbol": getattr(a, "symbol", None),
-            "title": getattr(a, "title", ""), "source": getattr(a, "source", None),
-            "url": getattr(a, "url", None),
-            "published_at": (a.published_at.isoformat()
-                             if getattr(a, "published_at", None) else None),
-            "summary": getattr(a, "summary", None),
-            "sentiment": getattr(a, "sentiment", None),
-            "sentiment_score": getattr(a, "sentiment_score", None),
-            "impact": getattr(a, "impact", None),
-            "price_change_percent": getattr(a, "price_change_percent", None),
-            "ticker_relevance_score": getattr(a, "ticker_relevance_score", None),
-            "topics": getattr(a, "topics", None),
-            "overall_sentiment_score": getattr(a, "overall_sentiment_score", None),
-            "overall_sentiment_label": getattr(a, "overall_sentiment_label", None),
-        }
-
-    windowed: dict[str, list] = {}
-    for sym in (symbols or []):
-        try:
-            if overnight_news:
-                fetched = fetch_overnight_news(
-                    sym, as_of_str, target_str,
-                    relevance_threshold=_M.NEWS_OVERNIGHT_RELEVANCE,
-                    max_articles=_M.NEWS_MAX_ARTICLES,
-                    start_time_et=_M.NEWS_OVERNIGHT_START_ET,
-                    end_time_et=_M.NEWS_OVERNIGHT_END_ET,
-                )
-            else:
-                fetched = fetch_point_in_time_news(
-                    sym, as_of_str, lookback_days=lookback_days)
-            windowed[sym] = [_art_dict(a) for a in fetched]
-        except Exception as e:
-            logger.warning(f"news fetch failed for {sym}, falling back to store: {e}")
-            windowed[sym] = filter_articles_as_of(
-                articles_by_symbol.get(sym, []), as_of_str, lookback_days=lookback_days)
-    articles_by_symbol = windowed
+        describe_news_window, fetch_run_news, news_window_payload)
+    articles_by_symbol, news_stats = await asyncio.to_thread(
+        fetch_run_news, symbols or [], as_of_str, target_str,
+        overnight=overnight_news, lookback_days=lookback_days,
+        max_articles=max_articles)
     total_articles = sum(len(a) for a in articles_by_symbol.values())
-    news_window_payload = {
-        "event": "news_window",
-        "filter": "overnight" if overnight_news else "lookback",
-        "lookback_days": lookback_days,
-        "as_of": as_of_str,
-        "target_date": target_str,
-        "articles": total_articles,
-        "articles_by_symbol": {s: len(a)
-                               for s, a in articles_by_symbol.items()},
-        "source_status": {s: ("ok" if a else "empty")
-                          for s, a in articles_by_symbol.items()},
-    }
-    if overnight_news:
-        prog.emit("news", f"Overnight window {as_of_str} {_M.NEWS_OVERNIGHT_START_ET} ET "
-                          f"→ {target_str} {_M.NEWS_OVERNIGHT_END_ET} ET "
-                          f"(relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE}): "
-                          f"{total_articles} articles fetched (point-in-time)",
-                  payload={**news_window_payload,
-                           "relevance_threshold": _M.NEWS_OVERNIGHT_RELEVANCE})
-    else:
-        prog.emit("news", f"News window {lookback_days}d ending {as_of_str} "
-                          f"(target {target_str} minus 1 trading day): "
-                          f"{total_articles} articles fetched (point-in-time)",
-                  payload=news_window_payload)
+    news_payload = news_window_payload(
+        overnight=overnight_news, lookback_days=lookback_days,
+        max_articles=max_articles, as_of=as_of_str, target=target_str,
+        stats_by_symbol=news_stats)
+    prog.emit("news", describe_news_window(news_payload), payload=news_payload)
+    news_down = [s for s, v in news_stats.items() if v["status"] == "unavailable"]
+    if news_down:
+        prog.emit("error",
+                  f"News source unavailable for {len(news_down)} of "
+                  f"{len(symbols or [])} symbols: {', '.join(news_down)} — "
+                  f"the report has NO news for them; treat their sections "
+                  f"as unsupported, not as quiet weeks.")
 
     # One key dict for both the cache check here and the store at the end —
     # and the trace payload records its hash plus a compact summary of what
     # fed it, so a cross-restart cache miss stops being undiagnosable.
-    report_cache_key = {
-        "news": articles_by_symbol,
-        "symbols": sorted(symbols or []),
-        "as_of": as_of_str,
-        # v5-flowq: per-symbol options positioning + quality screen
-        # ride the payload (and the research/portfolio prompts).
-        # Model, window and analysis type key the cache — switching
-        # model must not serve the other model's cached report.
-        "schema": "v5-flowq",
-        "model": report_model,
-        "lookback": "overnight" if overnight_news else lookback_days,
-        "thesis": include_thesis_flag,
-        "research": include_research,
-        "recs": recs_mode,
-        "evidence": evidence_sel,
-    }
+    from services.analysis_runner import report_cache_key as _report_key
+    report_cache_key = _report_key(
+        articles_by_symbol, symbols or [], as_of_str, report_model,
+        lookback_days, include_thesis_flag, evidence=evidence_sel,
+        max_articles=max_articles, overnight=overnight_news,
+        include_research=include_research, recs_mode=recs_mode)
 
     # Check persistent cache (Postgres + S3) before running LLM
     if _s3_available and ctx.triggered_id != "ai-retry-btn":
@@ -2024,6 +2005,8 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
 
     result = {
         "overall": None,
+        "news_window": {"lookback_days": lookback_days, "overnight": overnight_news,
+                        "max_articles": max_articles},
         "by_symbol": {},
         "as_of": as_of_str,
         "generated_at": datetime.now().isoformat(),
@@ -2176,9 +2159,19 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
         # depends on what the event-loop context happened to hold.
         with _usage.track("research", symbol=sym, trade_date=as_of_str,
                           section=f"research:{sym}"):
+            # The run's own windowed news — without it the agent fetched
+            # its own default window and the report footer printed that
+            # default while the dialog had said something else.
             res = model_obj.predict(sym, df, as_of=as_of_str,
                                     model=report_model,
-                                    include_thesis=include_thesis_flag)
+                                    include_thesis=include_thesis_flag,
+                                    news=articles_by_symbol.get(sym) or [],
+                                    news_lookback_days=lookback_days,
+                                    evidence=evidence_sel,
+                                    # Source failure vs quiet week: the
+                                    # research arm refuses to write blind.
+                                    news_status=(news_stats.get(sym) or {}).get("status"),
+                                    target_date=target_str)
         return res
 
     # Async fan-out: each task holds a worker thread only while its blocking
@@ -2287,6 +2280,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope, news_data,
             stock_data=enriched_stock_data,
             as_of_date=as_of_str,
             extra_blocks={"metrics": overall_metrics} if overall_metrics else None,
+            include_thesis=include_thesis_flag,
             model=report_model,
             provider=report_provider,
         ))
@@ -2876,7 +2870,6 @@ def update_period(clicks, current_period):
     State("stock-data-store", "data"),
     State("run-symbols-store", "data"),
     State("ensemble-config-store", "data"),
-    State("news-data-store", "data"),
     State({"type": "run-model-check", "model": ALL}, "value"),
     State("run-ensemble-check", "value"),
     State({"type": "run-ens-member", "model": ALL}, "value"),
@@ -2884,6 +2877,8 @@ def update_period(clicks, current_period):
     State("run-ensemble-method", "value"),
     State("run-ensemble-min-agree", "value"),
     State("run-date-picker", "date"),
+    State("run-lookback", "value"),
+    State("run-max-articles", "value"),
     State("run-model", "value"),
     State("run-type", "value"),
     State("run-evidence", "value"),
@@ -2894,9 +2889,10 @@ def update_period(clicks, current_period):
     prevent_initial_call=True,
 )
 def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
-                           ensemble_config, news_data, model_checks,
+                           ensemble_config, model_checks,
                            run_ensemble, ens_members, ens_weights, ens_method,
-                           ens_min_agree, predict_date_str, research_model,
+                           ens_min_agree, predict_date_str, lookback,
+                           max_articles_val, research_model,
                            research_depth, run_evidence):
     """Generate model predictions in a background subprocess.
 
@@ -2961,30 +2957,27 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
                    payload={"event": "run_process", "pid": os.getpid()})
         _prog.record_run_pid()
 
-        # Symbols outside the browser stores (cohort- or custom-scoped runs)
-        # fetch their own OHLCV and news here, in the background subprocess.
-        try:
-            stock_data, news_data = _fill_run_inputs(symbols, stock_data,
-                                                     news_data or {})
-        except Exception as e:
-            logger.exception("Run input fetch failed")
-            _prog.emit("error", f"Run input fetch failed: {str(e)[:200]}")
-            _prog.finish_run(f"Run failed — could not fetch input data "
-                             f"({str(e)[:120]})")
-            return {"_run_failed": str(e), "_meta": {"run_seq": n_clicks}}
-
-        research_kwargs = {}
+        # The dialog's news window and cap govern the models too — the
+        # sentiment and research models used to read the browser's news
+        # store (a rolling week from "now", 50 articles), whatever the
+        # dialog said. The window's days ride along so the research agent
+        # does not re-filter to its own default.
+        from services.news_window import (
+            normalize_article_cap, normalize_lookback)
+        overnight_news, lookback_days = normalize_lookback(lookback)
+        max_articles = normalize_article_cap(max_articles_val)
+        research_kwargs = {"news_lookback_days": lookback_days}
         if is_full_analysis:
             # The research report (trading_agents) honours the report
             # model/depth choices; `research_model` is a distinct kwarg so no
             # other model can mistake it for its own.
-            research_kwargs = {
+            research_kwargs.update({
                 "research_model": research_model or None,
                 "include_thesis": (research_depth or "thesis") != "standard",
                 # Modal checklist; None only before the modal rendered once.
                 "evidence": sorted(run_evidence) if run_evidence is not None
-                            else ["options", "quality"],
-            }
+                            else sorted(MODEL.DEFAULT_EVIDENCE),
+            })
 
         # Module-level os — a function-local `import os` here once shadowed
         # the name for the WHOLE body, so the pid emit above raised
@@ -3041,217 +3034,66 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
         return _abort_run(e)
 
     try:
-        from services.prediction_service import get_prediction_service
-        from services.stock_data import fetch_stock_data as fetch_ohlcv
+        from services.analysis_runner import load_market_data, run_predictions
+        from services.news_window import (
+            describe_news_window, fetch_run_news, news_window_payload)
 
-        from services import progress_service as _prog
+        # Model inputs come from the server-side price cache at a fixed
+        # depth, never from the browser store: the store holds whatever the
+        # chart's display period fetched (6 months for any window under a
+        # year), so the tree models trained on ~120 bars with SMA-200 blank
+        # whenever the chart happened to be on "1 month". This is the same
+        # loader the scheduled run uses.
+        stock_data = load_market_data(symbols, period="2y")
+        priced = [s for s in symbols if s in stock_data]
+        for sym in symbols:
+            if sym not in stock_data:
+                _prog.emit("error", f"{sym}: skipped — no price data available")
 
-        service = get_prediction_service()
-        results = {}
+        # Point-in-time news for the run: the same fetch, window and cap the
+        # report and the dialog preview use.
+        run_news, news_stats = fetch_run_news(
+            priced, str(predict_date), str(target_date),
+            overnight=overnight_news, lookback_days=lookback_days,
+            max_articles=max_articles)
+        news_payload = news_window_payload(
+            overnight=overnight_news, lookback_days=lookback_days,
+            max_articles=max_articles, as_of=str(predict_date),
+            target=str(target_date), stats_by_symbol=news_stats)
+        _prog.emit("news", describe_news_window(news_payload),
+                   payload=news_payload)
+        news_down = [s for s, v in news_stats.items()
+                     if v["status"] == "unavailable"]
+        if news_down:
+            _prog.emit("error",
+                       f"News source unavailable for {len(news_down)} of "
+                       f"{len(priced)} symbols: {', '.join(news_down)}. "
+                       f"Their sentiment and research models run WITHOUT "
+                       f"news; treat those calls as unsupported.")
 
-        spy_df = None
-        try:
-            spy_df = fetch_ohlcv("SPY", period="2y")
-            # Always truncate to the cutoff, not only when backtesting: a live
-            # run whose target is TODAY's close would otherwise be handed
-            # today's partial intraday bar, which the target has not produced yet.
-            spy_df = spy_df[spy_df.index <= str(predict_date)]
-        except Exception as e:
-            logger.warning(f"SPY fetch failed: {e}")
-
-        needs_historical = selected_models & {"xgboost_shap", "lightgbm"}
-        historical_global_news = {}
-        if needs_historical:
-            try:
-                from services.news_service import fetch_historical_av_news
-                from config import MODEL
-                logger.info("Fetching historical global news for training")
-                # Longest silent phase on a cold cache — announce its scope
-                # instead of letting the feed go dark for minutes.
-                _prog.emit("news", f"Fetching historical news for training "
-                                   f"(up to {len(symbols)} symbols × "
-                                   f"{MODEL.NEWS_LOOKBACK_MONTHS} months — can "
-                                   f"take minutes on first run)…")
-                historical_global_news = fetch_historical_av_news(
-                    "", months=MODEL.NEWS_LOOKBACK_MONTHS,
-                )
-                logger.info(
-                    f"Global news: "
-                    f"{sum(len(v) for v in historical_global_news.values())} "
-                    f"articles across {len(historical_global_news)} days"
-                )
-            except Exception as e:
-                logger.warning(f"Historical global news fetch failed: {e}")
-
-        # Resolve every symbol's frame BEFORE the model loop, so the run's
-        # price inputs land as ONE data_load event whatever their origin —
-        # the browser session store (the normal warm-watchlist case, which
-        # previously produced no data_load at all), the server gap-fill, or
-        # a fetch. The model loop then consumes these frames; nothing is
-        # parsed twice.
-        from services import usage_service as _usage
-        frames: dict[str, pd.DataFrame] = {}
-        price_inputs: dict[str, dict] = {}
-        for symbol in symbols:
-            sym_data = stock_data.get(symbol, {})
-            prices_json = sym_data.get("prices")
-            if not prices_json:
-                # Named, not just logged — "Stored 0 predictions" must never
-                # be the only clue a symbol had no data.
-                _prog.emit("error", f"{symbol}: skipped — no price data "
-                                    "available")
-                price_inputs[symbol] = {"bars": 0, "error": "no price data"}
-                continue
-
-            try:
-                df = pd.read_json(StringIO(prices_json))
-                if df.empty:
-                    _prog.emit("error", f"{symbol}: skipped — no price data "
-                                        "available")
-                    price_inputs[symbol] = {"bars": 0,
-                                            "error": "no price data"}
-                    continue
-            except Exception:
-                _prog.emit("error", f"{symbol}: skipped — price data "
-                                    "unreadable")
-                price_inputs[symbol] = {"bars": 0,
-                                        "error": "price data unreadable"}
-                continue
-
-            # Truncate OHLCV to the cutoff on EVERY run, not just backtests.
-            # The target session's own bar must never be visible — live, that
-            # bar is today's partial intraday print.
-            if "Date" in df.columns:
-                df = df[df["Date"] <= str(predict_date)]
-                dates = pd.to_datetime(df["Date"]) if len(df) else None
-            else:
-                df = df[df.index <= str(predict_date)]
-                dates = df.index if len(df) else None
-            if df.empty:
-                logger.warning(
-                    f"{symbol}: no data available as of {predict_date}"
-                )
-                _prog.emit("error", f"{symbol}: skipped — no price data "
-                                    f"as of {predict_date}")
-                price_inputs[symbol] = {
-                    "bars": 0, "error": f"no data as of {predict_date}"}
-                continue
-
-            frames[symbol] = df
-            price_inputs[symbol] = {
-                "bars": len(df),
-                "start": str(dates.min())[:10],
-                "end": str(dates.max())[:10],
-                # Entries the gap-fill created carry their own source stamp;
-                # everything else arrived through the browser session store.
-                "source": sym_data.get("source") or "session-store",
-            }
-
-        # No `period` here on purpose: the store's period label is the UI
-        # DISPLAY window (a "1D" chart still ships months of daily bars), so
-        # recording it would mislabel the data. start/end per symbol are the
-        # truth about what was consumed.
-        _prog.emit("action",
-                   f"Price inputs resolved: {len(frames)}/{len(symbols)} "
-                   f"symbols (cutoff {predict_date})",
-                   payload={"event": "data_load", "by_symbol": price_inputs})
-
-        for symbol, df in frames.items():
-            sym_news = []
-            if news_data and news_data.get("articles_by_symbol"):
-                sym_news = news_data["articles_by_symbol"].get(symbol) or []
-
-            # No lookahead: the news store holds articles fetched today, so it
-            # is windowed to the cutoff on EVERY run — live included, where it
-            # would otherwise leak articles published during the target session.
-            # Robust half-open UTC window (see services.news_window).
-            if sym_news:
-                from services.news_window import filter_articles_as_of
-                sym_news = filter_articles_as_of(sym_news, predict_date, lookback_days=3650)
-
-            historical_av_news = {}
-            if needs_historical:
-                try:
-                    from services.news_service import fetch_historical_av_news
-                    from config import MODEL
-                    logger.info(f"{symbol}: fetching historical AV news")
-                    historical_av_news = fetch_historical_av_news(
-                        symbol, months=MODEL.NEWS_LOOKBACK_MONTHS,
-                    )
-                    logger.info(
-                        f"{symbol}: "
-                        f"{sum(len(v) for v in historical_av_news.values())} "
-                        f"articles across {len(historical_av_news)} days"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"{symbol}: historical AV news fetch failed: {e}"
-                    )
-
-            mode = "backtest" if is_backtest else "live"
-            logger.info(
-                f"{symbol}: running {selected_models} ({mode}, "
-                f"date={predict_date})"
-            )
-            _prog.emit("models", f"{symbol}: running {len(selected_models)} models "
-                                 f"({mode}, as-of {predict_date})")
-
-            # The only LLM call under here is the research report — label it
-            # so its trace/spend land against this symbol (this runs in the
-            # background subprocess, so the context must be set HERE, not in
-            # the server process; mirrors analysis_runner.run_predictions).
-            with _usage.track("research", symbol=symbol,
-                              trade_date=str(predict_date),
-                              section=f"research:{symbol}"):
-                new_results = service.predict_symbol_no_store(
-                    symbol, df, spy_df=spy_df,
-                    news=sym_news,
-                    ensemble_config=ensemble_config,
-                    models_to_run=selected_models,
-                    run_ensemble=bool(run_ensemble),
-                    historical_av_news=historical_av_news,
-                    historical_global_news=historical_global_news,
-                    # Always the cutoff, live or backtest — downstream slicing
-                    # has to stop at the previous trading day either way.
-                    as_of=str(predict_date),
-                    **research_kwargs,
-                )
-
-            results[symbol] = new_results
-            decisions = {m: r.get("decision") for m, r in new_results.items()
-                         if isinstance(r, dict) and not r.get("error")}
-            _prog.emit("models", f"{symbol}: " + ", ".join(
-                f"{m}={d}" for m, d in decisions.items()))
-
-            # One summary line per symbol when anything failed or was
-            # skipped — the decisions line above only lists the survivors.
-            # Abstentions (a deliberate no-call, e.g. DeBERTa with no
-            # relevant news) are not failures and stay out of it.
-            failed = {
-                m: (r.get("error") or "")
-                for m, r in new_results.items()
-                if isinstance(r, dict) and r.get("error")
-                and not (r.get("details") or {}).get("abstained")
-            }
-            if failed:
-                ran = len(new_results) - len(failed)
-                _prog.emit("error",
-                           f"{symbol}: {ran} of {len(new_results)} models "
-                           "ran — " + ", ".join(
-                               f"{m} failed ({err[:60]})"
-                               for m, err in failed.items()))
-
-        # Attach metadata so persist_predictions knows the date, and so the
-        # report can state the target session rather than infer one.
-        results["_meta"] = {
-            "predict_date": predict_date.isoformat(),   # data cutoff
-            "target_date": target_date.isoformat(),     # session being predicted
-            "is_backtest": is_backtest,
-            # Ties this store to the confirm click that produced it, so the
-            # synthesis stage can pair it with the same click's AI report.
-            "run_seq": n_clicks,
-        }
-
+        # ONE implementation of the model stage (services.analysis_runner):
+        # the interactive copy that lived here had drifted from the
+        # scheduled one — no pipeline-epoch/news-status/regime stamps (so
+        # the scheduler could never reuse a UI run and the scoreboard could
+        # not tell supported calls from blind ones), and no abstention when
+        # the news source was down. force=True: a click is an explicit
+        # request to run, not a cache lookup.
+        results = run_predictions(
+            priced, stock_data, run_news,
+            target_date=target_date, cutoff_date=predict_date,
+            models=selected_models,
+            research_model=research_kwargs.get("research_model"),
+            news_status_by_symbol={s: v["status"] for s, v in news_stats.items()},
+            include_thesis=research_kwargs.get("include_thesis", True),
+            force=True,
+            evidence=research_kwargs.get("evidence"),
+            news_lookback_days=lookback_days,
+            ensemble_config=ensemble_config,
+            run_ensemble=bool(run_ensemble),
+        )
+        # Ties this store to the confirm click that produced it, so the
+        # synthesis stage can pair it with the same click's AI report.
+        results["_meta"]["run_seq"] = n_clicks
         return results
 
     except Exception as e:
@@ -3287,50 +3129,17 @@ def persist_predictions(signals, fa_requested, ai_analysis):
         return {"failed": signals["_run_failed"], "count": 0,
                 "stored_at": str(datetime.now())}
 
-    meta = signals.pop("_meta", {})
+    meta = signals.get("_meta") or {}
     predict_date_str = meta.get("predict_date")
     is_backtest = meta.get("is_backtest", False)
 
     try:
-        cache = get_cache()
-        stored = 0
-        for symbol, model_results in signals.items():
-            if not isinstance(model_results, dict):
-                continue
-            for model_name, result_dict in model_results.items():
-                if not isinstance(result_dict, dict):
-                    continue
-                if result_dict.get("error"):
-                    continue
-                cache.store_prediction(
-                    symbol, model_name, result_dict,
-                    prediction_date_str=predict_date_str,
-                )
-                stored += 1
-
-                if model_name == "trading_agents":
-                    details = result_dict.get("details", {})
-                    raw_response = details.get("raw_response", "")
-                    if raw_response:
-                        cache.save_trading_agent_report(
-                            symbol=symbol,
-                            trade_date=details.get("trade_date", ""),
-                            decision=result_dict.get("decision", "HOLD"),
-                            confidence=result_dict.get("confidence", 0.0),
-                            report_text=raw_response,
-                            model_name=details.get("model", ""),
-                            input_tokens=details.get("input_tokens", 0),
-                            output_tokens=details.get("output_tokens", 0),
-                        )
-
-        # Auto-evaluate backtest predictions (target date is in the past)
-        evaluated = 0
-        if is_backtest:
-            evaluated = cache.evaluate_predictions()
-
+        # ONE writer (services.analysis_runner.persist_predictions): the copy
+        # that lived here recorded the model that was ASKED for on research
+        # reports instead of the one that answered after a provider fallback.
+        from services.analysis_runner import persist_predictions as _persist
+        stored, evaluated = _persist(signals)
         from services import progress_service as prog
-        prog.emit("store", f"Stored {stored} predictions"
-                           + (f", evaluated {evaluated}" if evaluated else ""))
         # New rows: the launch screen must show this run, not the last one.
         from services.dashboard_service import invalidate_memo
         invalidate_memo()
@@ -3442,15 +3251,39 @@ def evaluate_predictions_now(n_clicks):
 )
 def load_report_history(symbols, _prediction_status, _download_done,
                         _eval_status, _ai_analysis, _recommendations):
-    """Load all historical data: reports, predictions, recommendations, TradingAgents."""
-    return fetch_report_history(symbols)
+    """Signal that the archive changed. The pages read the archive live
+    (fetch_report_history, filtered in SQL); shipping every prediction row
+    to the browser here was the reason the loaders had row caps at all."""
+    _history_memo.clear()
+    return {"refreshed_at": datetime.now().isoformat()}
 
 
 _HISTORY_TTL_S = 3.0
 _history_memo: dict = {}
 
 
-def fetch_report_history(symbols=None, only=None) -> dict:
+def history_filters(filter_symbols=None, filter_range="all", specific_date=None,
+                    model="all", outcome="all") -> dict:
+    """The History filter stores as a SQL-ready dict (dates on target_date).
+    Same semantics as layouts.history_sections.filter_items."""
+    from datetime import date as _date, timedelta as _td
+    from layouts.history_sections import current_session
+    start = end = None
+    if specific_date:
+        start = end = _date.fromisoformat(str(specific_date)[:10])
+    elif filter_range == "today":
+        start = end = current_session()
+    elif filter_range and filter_range != "all":
+        days = {"7d": 7, "30d": 30, "90d": 90}.get(filter_range, 0)
+        if days:
+            start = _date.today() - _td(days=days)
+    return {"symbols": sorted(filter_symbols) if filter_symbols else None,
+            "start": start, "end": end,
+            "model": model if model and model != "all" else None,
+            "outcome": outcome if outcome and outcome != "all" else None}
+
+
+def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
     """Read the archive straight from the cache layer.
 
     Called both by the store-populating callback and directly by the router.
@@ -3463,8 +3296,10 @@ def fetch_report_history(symbols=None, only=None) -> dict:
     deliberately shorter than any human round trip, so it cannot show stale
     data after a run.
     """
+    filters = filters or {}
     key = (tuple(sorted(symbols)) if symbols else (),
-           tuple(sorted(only)) if only else ())
+           tuple(sorted(only)) if only else (),
+           tuple(sorted((k, str(v)) for k, v in filters.items())))
     hit = _history_memo.get(key)
     if hit and (time.monotonic() - hit[0]) < _HISTORY_TTL_S:
         return hit[1]
@@ -3487,7 +3322,7 @@ def fetch_report_history(symbols=None, only=None) -> dict:
         # filter bar narrows what was loaded, it cannot load more.
         ta_reports = []
         if wanted("trading_agent_reports"):
-            ta_reports = cache.get_all_trading_agent_reports(limit=60)
+            ta_reports = cache.get_all_trading_agent_reports(limit=None)
             if symbols:
                 seen = {r.get("id") for r in ta_reports}
                 for symbol in symbols:
@@ -3498,12 +3333,17 @@ def fetch_report_history(symbols=None, only=None) -> dict:
         ta_reports.sort(key=lambda r: r.get("created_at", ""), reverse=True)
         result["trading_agent_reports"] = ta_reports
 
+        # No row caps: the pages paginate what they render, and a capped
+        # load made any date past the cap look like an empty day.
         if wanted("reports"):
-            result["reports"] = cache.list_report_catalog(limit=50)
+            result["reports"] = cache.list_report_catalog(limit=None)
         if wanted("predictions"):
-            result["predictions"] = cache.list_all_predictions(limit=1000)
+            result["predictions"] = cache.query_predictions(
+                symbols=filters.get("symbols"), start=filters.get("start"),
+                end=filters.get("end"), model=filters.get("model"),
+                outcome=filters.get("outcome"))
         if wanted("recommendations"):
-            result["recommendations"] = cache.list_recommendation_runs(limit=50)
+            result["recommendations"] = cache.list_recommendation_runs(limit=None)
 
         _history_memo[key] = (time.monotonic(), result)
         return result
@@ -4492,12 +4332,14 @@ def run_ensemble_effective(ens_on, run_checks, members, method, min_agree):
 @callback(
     Output("scheduler-panel-container", "children"),
     # Both live on the Schedule page, so neither exists on other routes.
+    Output("scheduler-fp", "data"),
     Input("scheduler-refresh", "n_intervals", allow_optional=True),
     Input("scheduler-action-status", "data", allow_optional=True),
     State("sched-new-name", "value", allow_optional=True),
     State("sched-new-symbols", "value", allow_optional=True),
+    State("scheduler-fp", "data", allow_optional=True),
 )
-def render_scheduler_panel(_n, _action, draft_name, draft_symbols):
+def render_scheduler_panel(_n, _action, draft_name, draft_symbols, last_fp):
     """Redraw the schedule panel from the database.
 
     Reads on a timer rather than caching in a Store: the job state is written
@@ -4518,15 +4360,25 @@ def render_scheduler_panel(_n, _action, draft_name, draft_symbols):
         raise PreventUpdate
 
     try:
+        jobs = scheduler_service.list_jobs()
+        runs = scheduler_service.recent_runs(limit=8)
+        # A timer tick redraws only when the database changed. Redrawing
+        # every 15s reset every job card's inputs, so an edit typed into an
+        # existing card was silently replaced by the stored values before
+        # Save read them — and Save then confirmed a change that never
+        # happened.
+        fp = hashlib.md5(json.dumps([jobs, runs], sort_keys=True,
+                                    default=str).encode()).hexdigest()
+        if timer_fired and fp == last_fp:
+            raise PreventUpdate
         return build_scheduler_panel(
-            scheduler_service.list_jobs(),
-            scheduler_service.recent_runs(limit=8),
-            scheduler_service.list_job_types(),
-        )
+            jobs, runs, scheduler_service.list_job_types()), fp
+    except PreventUpdate:
+        raise
     except Exception as e:
         logger.warning(f"Scheduler panel render failed: {e}")
         return html.Div(f"Scheduler unavailable: {str(e)[:160]}",
-                        className="scheduler-empty")
+                        className="scheduler-empty"), last_fp
 
 
 @callback(
@@ -4540,11 +4392,13 @@ def render_scheduler_panel(_n, _action, draft_name, draft_symbols):
     # Only the analysis job renders a symbol box.
     State({"type": "sched-symbols", "job": MATCH}, "value", allow_optional=True),
     State({"type": "sched-visibility", "job": MATCH}, "value"),
+    State({"type": "sched-param", "job": MATCH, "key": ALL}, "value"),
+    State({"type": "sched-param", "job": MATCH, "key": ALL}, "id"),
     prevent_initial_call=True,
 )
 def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
-                  visibility):
-    """Persist one job's schedule and reschedule it immediately."""
+                  visibility, param_values, param_ids):
+    """Persist one job's schedule (and its tuning params) and reschedule it."""
     if not n_clicks:
         raise PreventUpdate
 
@@ -4574,6 +4428,22 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
         fields["symbols_csv"] = cleaned
 
     from services import scheduler_service
+    # Tuning params were create-only: the card never showed them and this
+    # save never wrote them, so a window chosen at creation was frozen.
+    if param_ids:
+        current = next((j.get("params") or {} for j in scheduler_service.list_jobs()
+                        if j["id"] == job_id), {})
+        params = dict(current)
+        for pid, val in zip(param_ids, param_values or []):
+            if val is None or val == "":
+                continue
+            try:
+                params[pid["key"]] = (int(val) if float(val).is_integer()
+                                      else float(val))
+            except (TypeError, ValueError):
+                return html.Span(f"{pid['key']} must be a number",
+                                 className="scheduler-feedback-error")
+        fields["params_json"] = params
     if not scheduler_service.update_job(job_id, **fields):
         return html.Span("Save failed", className="scheduler-feedback-error")
 
@@ -4584,14 +4454,22 @@ def save_schedule(n_clicks, enabled, hour, minute, days, tz, symbols,
 
 @callback(
     Output({"type": "sched-new-params-group", "kind": ALL}, "style"),
+    Output("sched-new-hour", "value"),
+    Output("sched-new-minute", "value"),
     Input("sched-new-kind", "value", allow_optional=True),
     State({"type": "sched-new-params-group", "kind": ALL}, "id"),
     prevent_initial_call=True,
 )
 def show_kind_params(kind, group_ids):
-    """Reveal only the selected operation's tuning knobs."""
-    return [{"display": "flex" if g.get("kind") == kind else "none"}
-            for g in (group_ids or [])]
+    """Reveal only the selected operation's tuning knobs, and start the time
+    at the type's own default (07:00 predict, 18:00 evaluate, …) — the
+    declared defaults were exported and then ignored by a hardcoded 08:30."""
+    from services import scheduler_service
+    jt = next((t for t in scheduler_service.list_job_types() if t["kind"] == kind), None)
+    hour = jt["default_hour"] if jt else dash.no_update
+    minute = jt["default_minute"] if jt else dash.no_update
+    return ([{"display": "flex" if g.get("kind") == kind else "none"}
+             for g in (group_ids or [])], hour, minute)
 
 
 @callback(
@@ -4638,7 +4516,8 @@ def create_scheduled_job(n_clicks, kind, name, hour, minute, days, tz, symbols,
                                          className="scheduler-feedback-error")
 
     # Per-kind tuning knobs: only the selected kind's inputs apply.
-    params = {"only_trading_days": True}
+    # only_trading_days is read by the symbol-taking (analyze) jobs only.
+    params = {"only_trading_days": True} if needs.get(kind) else {}
     for pid, val in zip(param_ids or [], param_values or []):
         if pid.get("kind") == kind and val is not None:
             params[pid["key"]] = val
@@ -4776,12 +4655,14 @@ def download_ai_json(n_clicks, ai_analysis):
     Output("run-article-preview", "children"),
     Input("run-modal", "is_open"),
     Input("run-lookback", "value"),
+    Input("run-max-articles", "value"),
     Input("run-date-picker", "date"),
     # Input, not State: editing the run's symbol set refreshes the counts.
     Input("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
+async def preview_ai_report_articles(is_open, lookback, max_articles_val,
+                                     ai_date, run_symbols):
     """Fetch and show article availability for the chosen window BEFORE
     generation — the same point-in-time fetch generation uses, so the
     preview counts are the counts, not an estimate from the news store.
@@ -4800,7 +4681,9 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
 
     from config import MODEL as _M
     from utils.trading_calendar import resolve_target_and_cutoff
-    from services.news_window import fetch_overnight_news, fetch_point_in_time_news
+    from services.news_window import (
+        RunParameterMissing, fetch_run_news, normalize_article_cap,
+        normalize_lookback)
 
     # Same target/cutoff resolution as generation: the window ends at the
     # cutoff (previous trading day), not the target — previewing a window
@@ -4808,38 +4691,46 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
     picked = str(ai_date)[:10] if ai_date else None
     target_d, as_of_d = resolve_target_and_cutoff(picked)
     as_of, target = as_of_d.isoformat(), target_d.isoformat()
-    overnight = lookback == "overnight"
-    lookback_days = 1 if overnight else int(lookback or 7)
-
-    def _count(sym):
-        try:
-            if overnight:
-                return len(fetch_overnight_news(
-                    sym, as_of, target,
-                    relevance_threshold=_M.NEWS_OVERNIGHT_RELEVANCE,
-                    max_articles=_M.NEWS_MAX_ARTICLES,
-                    start_time_et=_M.NEWS_OVERNIGHT_START_ET,
-                    end_time_et=_M.NEWS_OVERNIGHT_END_ET,
-                ))
-            return len(fetch_point_in_time_news(sym, as_of, lookback_days=lookback_days))
-        except Exception as e:
-            logger.debug(f"article preview fetch failed for {sym}: {e}")
-            return 0
+    try:
+        overnight, lookback_days = normalize_lookback(lookback)
+        max_articles = normalize_article_cap(max_articles_val)
+    except RunParameterMissing as e:
+        return html.Div(f"Cannot preview — {e}", className="text-danger")
 
     sem = asyncio.Semaphore(APP.NEWS_FETCH_CONCURRENCY)
 
-    async def _count_guarded(sym):
+    async def _one(sym):
+        # No retries in a preview: a throttled vendor shows as "unavailable"
+        # now rather than freezing the dialog for the backoff.
         async with sem:
-            return await asyncio.to_thread(_count, sym)
+            _, stats = await asyncio.to_thread(
+                fetch_run_news, [sym], as_of, target, overnight=overnight,
+                lookback_days=lookback_days, max_articles=max_articles,
+                retries=1)
+            return stats[sym]
 
-    counts = await asyncio.gather(*(_count_guarded(s) for s in symbols))
+    stats = await asyncio.gather(*(_one(s) for s in symbols))
 
-    rows, total = [], 0
-    for sym, n in zip(symbols, counts):
+    rows, total, capped = [], 0, []
+    for sym, st in zip(symbols, stats):
+        n = int(st.get("kept") or 0)
         total += n
+        if st.get("capped"):
+            capped.append(sym)
+        span = (f"{st['oldest']} → {st['newest']}"
+                if st.get("oldest") and st.get("newest") else "—")
+        note = ""
+        if st.get("status") == "unavailable":
+            note = "source unavailable"
+        elif st.get("capped"):
+            note = (f"capped {st['fetched']}→{n}, effective "
+                    f"{st.get('effective_days')}d")
         rows.append(html.Tr([
             html.Td(sym),
             html.Td(str(n), style={"textAlign": "right"}),
+            html.Td(span, style={"color": "var(--text-secondary)"}),
+            html.Td(note, style={"color": ("var(--warning, #ffc107)"
+                                           if note else "inherit")}),
         ]))
 
     window_label = (
@@ -4847,15 +4738,24 @@ async def preview_ai_report_articles(is_open, lookback, ai_date, run_symbols):
         f"{target} {_M.NEWS_OVERNIGHT_END_ET} ET (relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE})"
         if overnight else
         f" in the {lookback_days}-day window ending {as_of} (data cutoff for target {target})"
-    )
+    ) + (f", newest {max_articles} per symbol" if max_articles else ", no cap")
+    warn = None
+    if capped:
+        warn = html.Div(
+            f"Cap drops the oldest articles for {', '.join(capped)} — raise "
+            f"the cap (0 = all) to keep the whole window.",
+            style={"color": "var(--warning, #ffc107)"}, className="mb-1")
     return html.Div([
         html.Div([
             html.Strong(f"{total} articles"),
             html.Span(window_label,
                       style={"color": "var(--text-secondary)"}),
         ], className="mb-1"),
+        warn,
         dbc.Table(
-            [html.Thead(html.Tr([html.Th("Symbol"), html.Th("Articles", style={"textAlign": "right"})])),
+            [html.Thead(html.Tr([html.Th("Symbol"),
+                                 html.Th("Articles", style={"textAlign": "right"}),
+                                 html.Th("Span"), html.Th("")])),
              html.Tbody(rows)],
             bordered=False, color="dark", size="sm", className="mb-0",
         ),
@@ -5150,7 +5050,7 @@ def toggle_model_info(info_clicks, close_click, run_evidence, depth):
     body = build_model_info_body(
         model_id,
         evidence=run_evidence if run_evidence is not None
-                 else ["options", "quality"],
+                 else list(MODEL.DEFAULT_EVIDENCE),
         include_thesis=(depth or "thesis") != "standard",
     )
     return True, title, body
@@ -5443,153 +5343,28 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     # As-of date travels with the AI report (set by the Full Analysis picker)
     trade_date = (ai_analysis.get("as_of") or datetime.now().strftime("%Y-%m-%d"))[:10]
 
-    # Check persistent cache
-    rec_data_hash = None
-    if _s3_available:
-        try:
-            from services import persistence_service as ps
-            # Hash only the stable report content. The payload also carries
-            # per-click correlation keys (run_seq — re-stamped even on a
-            # cache-served report — and scope), the from_cache marker and a
-            # generation timestamp; feeding those in meant an identical
-            # repeat run could never hit the stored recommendation.
-            _volatile = ("run_seq", "scope", "from_cache", "generated_at")
-            rec_data_hash = ps.compute_data_hash({
-                "ai_analysis": {k: v for k, v in ai_analysis.items()
-                                if k not in _volatile},
-                "model_signals": valid_signals,
-                "symbols": sorted(symbols or []),
-            })
-            rec_cache_payload = {
-                "event": "cache",
-                "kind": "recommendation",
-                "input_data_hash": rec_data_hash,
-                "summary": {
-                    "trade_date": trade_date,
-                    "symbols": sorted(symbols or []),
-                    "signal_models": sorted({m for v in valid_signals.values()
-                                             for m in v
-                                             if not m.startswith("_")}),
-                    "report_generated_at": ai_analysis.get("generated_at"),
-                    "report_from_cache": bool(ai_analysis.get("from_cache")),
-                },
-            }
-            cached = await asyncio.to_thread(
-                ps.get_cached_recommendation, trade_date, rec_data_hash)
-            if cached:
-                logger.info("Recommendation cache hit (Postgres)")
-                cached["from_cache"] = True
-                # A cache-served run is still a completed run — without the
-                # finish the panel spinner spun forever on a success.
-                prog.emit("luna", "Recommendation cache hit — synthesis "
-                                  "skipped",
-                          payload={**rec_cache_payload, "outcome": "hit"})
-                prog.finish_run(
-                    "Full Analysis complete (recommendations from cache)"
-                    if is_full_run
-                    else "Report complete (recommendations from cache)")
-                return cached, False
-            prog.emit("luna", "Recommendation cache miss — synthesizing fresh",
-                      payload={**rec_cache_payload, "outcome": "miss"})
-        except Exception as e:
-            logger.debug(f"Recommendation cache check failed: {e}")
+    # ONE synthesis stage (services.analysis_runner.run_recommendations):
+    # cache key, research merge, p_correct parsing, persistence and the
+    # model-that-answered stamp all live there. The copy that lived here
+    # stored NULL confidence whenever the model answered with p_correct
+    # instead of a conviction label, and recorded the configured model as
+    # the one used even after a dialog override or provider fallback.
+    from services.analysis_runner import run_recommendations
+    result = await asyncio.to_thread(
+        run_recommendations, ai_analysis, model_signals, symbols or [], trade_date)
 
-    # Full Analysis no longer runs the shallow per-symbol pass — its research
-    # text lives on the trading_agents signal. Backfill it into the analysis
-    # dict so Luna synthesizes from the SAME report the user reads, and stamp
-    # the basis honestly (History records what evidence Luna actually saw).
-    if basis != "signals":
-        ai_analysis, backfilled = _merge_research_into_analysis(
-            ai_analysis, valid_signals, symbols)
-        if backfilled and basis == "news+signals":
-            basis = "research+signals"
-
-    logger.info("Both stores ready — generating recommendations")
-    from config import MODEL as _MODEL_CFG
-    prog.emit("luna", f"Synthesis ({_MODEL_CFG.RECOMMENDATIONS_MODEL}) over "
-                      f"{len(symbols or [])} symbols — reasoning may take a minute…")
-    llm = get_llm()
-    _synthesis_t0 = time.time()
-
-    def _synthesize():
-        from services import usage_service as _usage
-        with _usage.track("recommendations", trade_date=trade_date,
-                          section="recommendations"):
-            return llm.generate_recommendations(
-                ai_analysis, model_signals, symbols or [],
-                basis=basis,
-                model_override=ai_analysis.get("recs_model"))
-
-    result = await asyncio.to_thread(_synthesize)
-    _synthesis_elapsed = time.time() - _synthesis_t0
-
+    if result and result.get("from_cache"):
+        # A cache-served run is still a completed run — without the finish
+        # the panel spinner spun forever on a success.
+        prog.finish_run(
+            "Full Analysis complete (recommendations from cache)"
+            if is_full_run else "Report complete (recommendations from cache)")
+        return result, False
     if result:
-        result["generated_at"] = datetime.now().isoformat()
-        result["as_of"] = trade_date
-        actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
-        prog.emit("luna", f"Synthesis finished in {_synthesis_elapsed:.0f}s — "
-                          + (", ".join(f"{s}={a}" for s, a in actions.items()) or "done"))
         prog.finish_run("Full Analysis complete" if is_full_run
                         else "Report complete")
-
-        # Score the synthesis like any model: persist each per-symbol action
-        # as a prediction under "recommendation_synthesis" so the existing
-        # evaluation loop, History tab, and Scoreboard pick it up unchanged.
-        # Conviction labels map to nominal confidences purely for display —
-        # our backtests showed they carry no calibration signal, so the raw
-        # label is kept in details as the honest record.
-        _conv2conf = {"HIGH": 0.8, "MEDIUM": 0.6, "LOW": 0.4}
-
-        def _persist_all():
-            """Blocking Postgres writes — one worker thread for the batch."""
-            for sym, rec in (result.get("by_symbol") or {}).items():
-                action = (rec.get("action") or "").upper()
-                if action not in ("BUY", "SELL", "HOLD"):
-                    continue
-                try:
-                    get_cache().store_prediction(
-                        sym, "recommendation_synthesis",
-                        {
-                            "decision": action,
-                            "confidence": _conv2conf.get(
-                                str(rec.get("conviction", "")).upper()),
-                            "up_probability": None,
-                            "details": {
-                                "synthesis_model": result.get("model_used"),
-                                "basis": result.get("basis"),
-                                "conviction": rec.get("conviction"),
-                                "key_level": rec.get("key_level"),
-                                "change_trigger": rec.get("change_trigger"),
-                                "reasoning": (rec.get("reasoning") or "")[:400],
-                            },
-                        },
-                        prediction_date_str=trade_date,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"recommendation prediction persist failed for {sym}: {e}")
-
-            # Store to Postgres
-            if _s3_available and rec_data_hash:
-                try:
-                    from services import persistence_service as ps
-                    from config import MODEL
-                    ps.store_recommendation(
-                        trade_date=trade_date,
-                        symbols=symbols or [],
-                        input_data_hash=rec_data_hash,
-                        result=result,
-                        model_used=MODEL.RECOMMENDATIONS_MODEL,
-                        provider_used=MODEL.RECOMMENDATIONS_PROVIDER,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to persist recommendation: {e}")
-
-        await asyncio.to_thread(_persist_all)
-
         return result, False
 
-    prog.emit("error", "Synthesis model returned empty response — synthesis failed")
     prog.finish_run(("Full Analysis" if is_full_run else "Report")
                     + " finished with errors")
     return {"error": "Recommendations model unavailable or returned empty response",

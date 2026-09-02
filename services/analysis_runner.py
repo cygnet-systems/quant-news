@@ -27,6 +27,9 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from config import MODEL
+from services.news_window import RunParameterMissing
+
 logger = logging.getLogger(__name__)
 
 ALL_MODELS: tuple[str, ...] = (
@@ -65,7 +68,12 @@ ALL_MODELS: tuple[str, ...] = (
 # prior-stance continuity block, news items carry their source, and the report
 # sections are reordered to lead with the symbol's own evidence. A prediction
 # written before this was made from materially different inputs.
-PIPELINE_EPOCH = "2026-08-23.1"
+# 2026-09-02.1 — research prompts open with a situation & investigation block
+# (web-researched on live runs: deal terms, regulators, key figures), gain
+# political/institutional flows and by-expiry put/call, lead with a Situation
+# section, and carry an evidence ledger; the default news window is 14 days.
+# Reports written before this were blind to the situation a symbol was in.
+PIPELINE_EPOCH = "2026-09-02.1"
 
 # Conviction labels map to nominal confidences for display only — backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -112,6 +120,10 @@ def merge_research_into_analysis(
             "structured": st,
             "provenance": det.get("provenance") or {},
             "model": det.get("model", ""),
+            # The situation the report was written under and what it was
+            # written without — the synthesis reads both.
+            "investigation": det.get("investigation") or {},
+            "evidence": det.get("evidence") or {},
         }
         if "recommendation" not in entry:
             entry["recommendation"] = (st.get("stance")
@@ -183,7 +195,7 @@ def attach_positioning_quality(
     so a re-attach after a cache restore costs one fetch per missing symbol.
     """
     ai_analysis = ai_analysis or {}
-    evidence = set(evidence) if evidence is not None else {"options", "quality"}
+    evidence = set(evidence) if evidence is not None else set(MODEL.DEFAULT_EVIDENCE)
     by_sym = dict(ai_analysis.get("by_symbol") or {})
     for sym in (symbols or []):
         entry = dict(by_sym.get(sym) or {})
@@ -322,11 +334,15 @@ def run_predictions(
     include_thesis: bool = True,
     force: bool = False,
     evidence: Optional[Iterable[str]] = None,
+    news_lookback_days: Optional[int] = None,
+    ensemble_config: Optional[dict] = None,
+    run_ensemble: bool = True,
 ) -> dict:
     """Run every model for each symbol as of ``cutoff_date``.
 
-    Mirrors ``generate_model_signals`` on its Full Analysis path: all models,
-    ensemble on, research report produced by trading_agents.
+    The ONE model stage: the Run dialog's background callback and the
+    scheduled run both call this (the dialog passes its ensemble controls
+    through ``ensemble_config``/``run_ensemble``).
 
     A symbol already analysed for this cutoff, against the same closing bar,
     is reused rather than re-run — the research call is an LLM round trip per
@@ -341,9 +357,11 @@ def run_predictions(
     from services.prediction_service import get_prediction_service
     from services.stock_data import fetch_stock_data as fetch_ohlcv
 
+    if news_lookback_days is None:
+        raise RunParameterMissing("run_predictions called without news_lookback_days")
     selected = set(models or ALL_MODELS)
     evidence_set = (sorted(evidence) if evidence is not None
-                    else ["options", "quality"])
+                    else sorted(MODEL.DEFAULT_EVIDENCE))
     service = get_prediction_service()
     is_backtest = target_date < date_cls.today()
 
@@ -378,7 +396,6 @@ def run_predictions(
     historical_global_news: dict = {}
     if needs_historical:
         try:
-            from config import MODEL
             from services.news_service import fetch_historical_av_news
             # This is the run's longest silent phase on a cold cache — say so
             # before it starts instead of letting the feed go dark.
@@ -387,10 +404,28 @@ def run_predictions(
                               f"{MODEL.NEWS_LOOKBACK_MONTHS} months — can take "
                               f"minutes on first run)…")
             historical_global_news = fetch_historical_av_news(
-                "", months=MODEL.NEWS_LOOKBACK_MONTHS)
+                "", months=MODEL.NEWS_LOOKBACK_MONTHS, as_of=str(cutoff_date))
         except Exception as e:
             logger.warning(f"Historical global news fetch failed: {e}")
             training_news_failures.append("_GLOBAL")
+
+    # Web investigations overlap the model loop instead of extending it
+    # (see investigation_service.prefetch_many). last_close is supplied by
+    # the in-loop call; the cache key does not depend on it.
+    investigation_pool = None
+    if "investigation" in evidence_set and "trading_agents" in selected:
+        try:
+            from services.investigation_service import prefetch_many
+            from models.trading_agents_model import TradingAgentsModel
+            investigation_pool = prefetch_many(
+                list(symbols), str(cutoff_date),
+                live=TradingAgentsModel._is_live(str(cutoff_date)),
+                target=str(target_date), news_by_symbol=news_by_symbol,
+                workers=MODEL.INVESTIGATION_WORKERS)
+            prog.emit("ta", f"Investigating {len(symbols)} symbols in the "
+                            f"background ({MODEL.INVESTIGATION_WORKERS} at a time)")
+        except Exception as e:
+            logger.warning(f"investigation prefetch not started: {e}")
 
     results: dict = {}
     skipped: dict[str, str] = {}
@@ -428,7 +463,8 @@ def run_predictions(
             reused = _reusable_predictions(
                 symbol, cutoff_date, selected, df,
                 research_model=research_model, news_count=len(sym_news),
-                evidence=evidence_set)
+                evidence=evidence_set, news_lookback_days=news_lookback_days,
+                include_thesis=include_thesis)
             if reused:
                 results[symbol] = reused
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
@@ -450,13 +486,19 @@ def run_predictions(
         historical_av_news: dict = {}
         if needs_historical:
             try:
-                from config import MODEL
                 from services.news_service import fetch_historical_av_news
                 historical_av_news = fetch_historical_av_news(
-                    symbol, months=MODEL.NEWS_LOOKBACK_MONTHS)
+                    symbol, months=MODEL.NEWS_LOOKBACK_MONTHS,
+                    as_of=str(cutoff_date))
             except Exception as e:
                 logger.warning(f"{symbol}: historical AV news fetch failed: {e}")
                 training_news_failures.append(symbol)
+
+        # "The source failed" and "the window was quiet" both yield zero
+        # articles. The difference rides into the models (the research arm
+        # refuses to write blind) and onto the stored prediction.
+        sym_status = (news_status_by_symbol or {}).get(
+            symbol, "ok" if sym_news else "empty")
 
         mode = "backtest" if is_backtest else "live"
         prog.emit("models", f"{symbol}: running {len(selected)} models "
@@ -468,22 +510,21 @@ def run_predictions(
             results[symbol] = service.predict_symbol_no_store(
                 symbol, df, spy_df=spy_df,
                 news=sym_news,
+                ensemble_config=ensemble_config,
                 models_to_run=selected,
-                run_ensemble=True,
+                run_ensemble=run_ensemble,
                 historical_av_news=historical_av_news,
                 historical_global_news=historical_global_news,
                 as_of=str(cutoff_date),
                 research_model=research_model,
                 include_thesis=include_thesis,
                 evidence=evidence_set,
+                news_lookback_days=news_lookback_days,
+                news_status=sym_status,
+                target_date=str(target_date),
             )
         # Stamp what these were produced under, so a later run can tell
         # whether they are still valid rather than assuming they are.
-        # "The source failed" and "the window was quiet" both yield zero
-        # articles. Carrying the difference onto the prediction is what lets
-        # the scoreboard separate a supported call from a blind one.
-        sym_status = (news_status_by_symbol or {}).get(
-            symbol, "ok" if sym_news else "empty")
 
         # A news-dependent model that could not read the news must not call a
         # direction — the call would be scored as if informed, poisoning both
@@ -515,6 +556,11 @@ def run_predictions(
                     entry["details"]["evidence"] = evidence_set
                     entry["details"].setdefault("news_count", len(sym_news))
                     entry["details"].setdefault("news_status", sym_status)
+                    # What the research model was FED, so reuse can tell a
+                    # 30-day/deep run from a 3-day/standard one that happened
+                    # to see the same article count.
+                    entry["details"]["news_window_days"] = news_lookback_days
+                    entry["details"]["include_thesis"] = bool(include_thesis)
                     if spy_regime:
                         entry["details"]["regime"] = spy_regime
 
@@ -522,6 +568,20 @@ def run_predictions(
                      if isinstance(r, dict) and not r.get("error")}
         prog.emit("models", f"{symbol}: " + ", ".join(
             f"{m}={d}" for m, d in decisions.items()))
+        # One summary line per symbol when anything failed — the decisions
+        # line above only lists the survivors. Abstentions (a deliberate
+        # no-call) are not failures.
+        failed = {
+            m: (r.get("error") or "") for m, r in results[symbol].items()
+            if isinstance(r, dict) and r.get("error")
+            and not (r.get("details") or {}).get("abstained")
+        }
+        if failed:
+            ran = len(results[symbol]) - len(failed)
+            prog.emit("error",
+                      f"{symbol}: {ran} of {len(results[symbol])} models ran — "
+                      + ", ".join(f"{m} failed ({err[:60]})"
+                                  for m, err in failed.items()))
 
     results["_meta"] = {
         "predict_date": cutoff_date.isoformat(),
@@ -541,6 +601,8 @@ def _reusable_predictions(
     research_model: Optional[str],
     news_count: int,
     evidence: Optional[list[str]] = None,
+    news_lookback_days: Optional[int] = None,
+    include_thesis: Optional[bool] = None,
 ) -> Optional[dict]:
     """Stored predictions for this exact analysis, or None to re-run.
 
@@ -621,6 +683,15 @@ def _reusable_predictions(
         logger.info(f"{symbol}: news window changed ({stored_news} → "
                     f"{news_count} articles) — re-running")
         return None
+    # Same count is not the same window: 7 days at 08:00 and overnight at
+    # 09:00 can both hold six articles. Rows from before these stamps
+    # existed carry None and are re-run once.
+    for key, wanted in (("news_window_days", news_lookback_days),
+                        ("include_thesis", include_thesis)):
+        if "trading_agents" in stored and research.get(key) != wanted:
+            logger.info(f"{symbol}: stored research {key}="
+                        f"{research.get(key)!r}, asked for {wanted!r} — re-running")
+            return None
 
     # Only the models this run asked for. The stored set for a date also holds
     # `recommendation_synthesis` — the synthesis step's OWN output, persisted as a
@@ -723,9 +794,11 @@ def build_ai_report(
     report_model: str,
     recs_model: str,
     stock_data: Optional[dict] = None,
-    lookback_days: int = 7,
+    lookback_days: Optional[int] = None,
     include_thesis: bool = True,
     evidence: Optional[Iterable[str]] = None,
+    max_articles: Optional[int] = None,
+    overnight: bool = False,
 ) -> dict:
     """Portfolio-level AI analysis for the run.
 
@@ -740,12 +813,19 @@ def build_ai_report(
     from services.llm_service import get_llm
     from services.stock_data import get_stock_info
 
+    if lookback_days is None or max_articles is None:
+        raise RunParameterMissing("build_ai_report called without the news "
+                                  "window / article cap")
     as_of = cutoff_date.isoformat()
     result: dict = {
         "overall": None,
         "by_symbol": {},
         "as_of": as_of,
         "generated_at": datetime.now().isoformat(),
+        # What this report was built from — the input-data export and the
+        # renderers read it back instead of assuming a window.
+        "news_window": {"lookback_days": lookback_days, "overnight": overnight,
+                        "max_articles": int(max_articles)},
     }
 
     enriched: dict = {}
@@ -768,9 +848,10 @@ def build_ai_report(
 
     # Same cache key the AI Report callback uses, so a scheduled run and a UI
     # run over identical scope share one entry instead of each paying.
-    cache_key = _report_cache_key(news_by_symbol, symbols, as_of, report_model,
-                                  lookback_days, include_thesis,
-                                  evidence=evidence)
+    cache_key = report_cache_key(news_by_symbol, symbols, as_of, report_model,
+                                 lookback_days, include_thesis,
+                                 evidence=evidence, max_articles=max_articles,
+                                 overnight=overnight)
     try:
         from services import persistence_service as ps
         cache_hash = ps.compute_data_hash(cache_key)
@@ -809,6 +890,9 @@ def build_ai_report(
                     stock_data=enriched,
                     as_of_date=as_of,
                     extra_blocks={"metrics": metrics_block} if metrics_block else None,
+                    # Depth used to key the cache here and never reach the
+                    # call — "Deep" was a cache miss with a Standard report.
+                    include_thesis=include_thesis,
                     model=report_model,
                     provider=provider,
                 )
@@ -823,24 +907,32 @@ def build_ai_report(
     return result
 
 
-def _report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
-                      report_model: str, lookback_days: int,
-                      include_thesis: bool,
-                      evidence: Optional[Iterable[str]] = None) -> dict:
-    """Same hash inputs the AI Report callback uses, so a scheduled run and a
-    UI run of identical scope share one cache entry."""
+def report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
+                     report_model: str, lookback_days: int,
+                     include_thesis: bool,
+                     evidence: Optional[Iterable[str]] = None,
+                     max_articles: Optional[int] = None,
+                     overnight: bool = False,
+                     include_research: bool = False,
+                     recs_mode: str = "auto") -> dict:
+    """The ONE set of AI-report cache inputs. The Run dialog and the
+    scheduled run both build their key here; when each had its own copy an
+    overnight run or a non-default recommendations basis could never share
+    the other's entry (and one of them silently mis-keyed the window)."""
+    from services.news_window import normalize_article_cap
     return {
         "news": news_by_symbol,
         "symbols": sorted(symbols),
         "as_of": as_of,
         "schema": "v5-flowq",
         "model": report_model,
-        "lookback": lookback_days,
+        "lookback": "overnight" if overnight else lookback_days,
+        "max_articles": normalize_article_cap(max_articles),
         "thesis": include_thesis,
-        "research": False,
-        "recs": "auto",
+        "research": include_research,
+        "recs": recs_mode,
         "evidence": (sorted(evidence) if evidence is not None
-                     else ["options", "quality"]),
+                     else sorted(MODEL.DEFAULT_EVIDENCE)),
     }
 
 
@@ -875,6 +967,10 @@ def _report_key_summary(news_by_symbol: dict, symbols: list[str],
 # Stage 4 — recommendation synthesis
 # ---------------------------------------------------------------------------
 
+RECOMMENDATION_KEY_VOLATILE = frozenset(
+    {"generated_at", "from_cache", "run_seq", "scope"})
+
+
 def run_recommendations(
     ai_analysis: dict,
     signals: dict,
@@ -887,7 +983,6 @@ def run_recommendations(
     the evaluation loop, History tab and Scoreboard score the synthesis like
     any other model.
     """
-    from config import MODEL
     from services import persistence_service as ps
     from services import progress_service as prog
     from services import usage_service as usage
@@ -898,10 +993,11 @@ def run_recommendations(
                      if k != "_meta" and isinstance(v, dict)}
 
     basis = ai_analysis.get("recs_request") or "news+signals"
-    ai_analysis, backfilled = merge_research_into_analysis(
-        ai_analysis, valid_signals, symbols)
-    if backfilled and basis == "news+signals":
-        basis = "research+signals"
+    if basis != "signals":
+        ai_analysis, backfilled = merge_research_into_analysis(
+            ai_analysis, valid_signals, symbols)
+        if backfilled and basis == "news+signals":
+            basis = "research+signals"
 
     rec_data_hash = None
     try:
@@ -910,7 +1006,10 @@ def run_recommendations(
         # so including them made the key unique every time and the cache
         # could never hit — the most expensive call in the run repeated on
         # identical inputs.
-        volatile = {"generated_at", "from_cache", "recs_model", "recs_request"}
+        # Envelope only. recs_model / recs_request are INPUTS: excluding
+        # them served one synthesis model's answer to a run that asked for
+        # another. run_seq/scope are the dialog's per-click correlation keys.
+        volatile = RECOMMENDATION_KEY_VOLATILE
         rec_data_hash = ps.compute_data_hash({
             "ai_analysis": {k: v for k, v in ai_analysis.items()
                             if k not in volatile},
@@ -960,6 +1059,9 @@ def run_recommendations(
 
     result["generated_at"] = datetime.now().isoformat()
     result["as_of"] = trade_date
+    # The window the report was built with rides along so the archive's
+    # Data link can rebuild exactly those inputs.
+    result["news_window"] = ai_analysis.get("news_window")
 
     cache = get_cache()
     for sym, rec in (result.get("by_symbol") or {}).items():
@@ -1042,7 +1144,7 @@ def run_recommendations(
 def run_full_analysis(
     symbols: list[str],
     target: Optional[str] = None,
-    lookback_days: int = 7,
+    lookback_days: Optional[int] = None,
     report_model: Optional[str] = None,
     recs_model: Optional[str] = None,
     include_thesis: bool = True,
@@ -1052,18 +1154,27 @@ def run_full_analysis(
     force: bool = False,
     news_filter: Optional[str] = None,
     evidence: Optional[Iterable[str]] = None,
+    max_articles: Optional[int] = None,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
 
     ``target`` is the session whose close is being predicted (defaults to the
     next unresolved session); data is cut off at the previous trading day.
     ``news_filter`` selects the news window formula ("lookback" | "overnight",
-    default from config). Returns a summary dict — the durable output is in
-    Postgres.
+    default from config). ``lookback_days`` and ``max_articles`` (newest N per
+    symbol, 0 = all) are REQUIRED — they come from the job's params or the
+    CLI, never from a default here. Returns a summary dict — the durable
+    output is in Postgres.
     """
-    from config import MODEL
+    if lookback_days is None or max_articles is None:
+        raise RunParameterMissing(
+            "run_full_analysis needs lookback_days and max_articles from the "
+            "job params / CLI (got "
+            f"lookback_days={lookback_days!r}, max_articles={max_articles!r})")
     from services import progress_service as prog
-    from services.news_window import fetch_overnight_news, fetch_point_in_time_news
+    from services.news_window import (
+        describe_news_window, fetch_run_news, news_window_payload,
+        normalize_article_cap, normalize_lookback)
     from utils.trading_calendar import resolve_target_and_cutoff
 
     report_model = report_model or MODEL.REPORT_MODEL
@@ -1082,67 +1193,23 @@ def run_full_analysis(
         prog.finish_run("Full Analysis aborted — no price data")
         return {"error": "no price data", "symbols": symbols}
 
-    from services.news_service import NewsUnavailable
+    max_articles = normalize_article_cap(max_articles)
+    _, lookback_days = normalize_lookback(lookback_days)
+    news_by_symbol, news_stats = fetch_run_news(
+        priced, as_of, target_date.isoformat(),
+        overnight=(news_filter == "overnight"),
+        lookback_days=lookback_days, max_articles=max_articles)
+    news_unavailable = [s for s in priced
+                        if news_stats[s]["status"] == "unavailable"]
+    news_empty = [s for s in priced if news_stats[s]["status"] == "empty"]
+    for sym in news_unavailable:
+        logger.warning("%s: news unavailable: %s", sym, news_stats[sym].get("error"))
 
-    news_by_symbol: dict[str, list] = {}
-    news_unavailable: list[str] = []   # the source failed
-    news_empty: list[str] = []         # the source answered, with nothing
-
-    for sym in priced:
-        articles = []
-        # Retry with backoff: the vendor throttles, and a loop over a whole
-        # watchlist is exactly the shape that trips it. Only NewsUnavailable
-        # is retried; a genuine empty window is not a failure to retry.
-        for attempt in (1, 2, 3):
-            try:
-                if news_filter == "overnight":
-                    articles = fetch_overnight_news(
-                        sym, as_of, target_date.isoformat(),
-                        relevance_threshold=MODEL.NEWS_OVERNIGHT_RELEVANCE,
-                        max_articles=MODEL.NEWS_MAX_ARTICLES,
-                        start_time_et=MODEL.NEWS_OVERNIGHT_START_ET,
-                        end_time_et=MODEL.NEWS_OVERNIGHT_END_ET,
-                    )
-                else:
-                    articles = fetch_point_in_time_news(
-                        sym, as_of, lookback_days=lookback_days,
-                        max_articles=MODEL.NEWS_MAX_ARTICLES)
-                break
-            except NewsUnavailable as e:
-                logger.warning("%s: news unavailable (attempt %d/3): %s",
-                               sym, attempt, e)
-                if attempt == 3:
-                    news_unavailable.append(sym)
-                else:
-                    time.sleep(2.0 * attempt)
-            except Exception as e:
-                logger.warning("%s: point-in-time news fetch failed: %s", sym, e)
-                news_unavailable.append(sym)
-                break
-
-        news_by_symbol[sym] = [_article_dict(a) for a in articles]
-        if not articles and sym not in news_unavailable:
-            news_empty.append(sym)
-
-    window_desc = ("overnight close→open" if news_filter == "overnight"
-                   else f"{lookback_days}d lookback")
-    prog.emit("news", f"News window ({window_desc}) ending {as_of}: "
-                      f"{sum(len(v) for v in news_by_symbol.values())} articles",
-              payload={
-                  "event": "news_window",
-                  "filter": news_filter,
-                  "lookback_days": lookback_days,
-                  "as_of": as_of,
-                  "target_date": target_date.isoformat(),
-                  "articles": sum(len(v) for v in news_by_symbol.values()),
-                  "articles_by_symbol": {s: len(v)
-                                         for s, v in news_by_symbol.items()},
-                  "source_status": {
-                      s: ("unavailable" if s in news_unavailable
-                          else "empty" if s in news_empty else "ok")
-                      for s in priced
-                  },
-              })
+    payload = news_window_payload(
+        overnight=(news_filter == "overnight"), lookback_days=lookback_days,
+        max_articles=max_articles, as_of=as_of,
+        target=target_date.isoformat(), stats_by_symbol=news_stats)
+    prog.emit("news", describe_news_window(payload), payload=payload)
 
     # "The source was down" and "the week was quiet" produce the same empty
     # list but mean opposite things, so they are reported separately. Without
@@ -1175,9 +1242,11 @@ def run_full_analysis(
             input_data_hash=ps.compute_data_hash(snapshot),
             content=json.dumps({
                 "as_of": as_of, "lookback_days": lookback_days,
+                "max_articles": max_articles,
                 "news_filter": news_filter,
                 "news_unavailable": news_unavailable,
                 "news_empty": news_empty,
+                "window_stats": payload["by_symbol"],
                 "articles": snapshot,
             }, default=str),
             file_format="json",
@@ -1185,11 +1254,7 @@ def run_full_analysis(
     except Exception as e:
         logger.warning(f"news snapshot not archived: {e}")
 
-    news_status_by_symbol = {
-        sym: ("unavailable" if sym in news_unavailable
-              else "empty" if sym in news_empty else "ok")
-        for sym in priced
-    }
+    news_status_by_symbol = {sym: news_stats[sym]["status"] for sym in priced}
 
     signals = run_predictions(
         priced, stock_data, news_by_symbol,
@@ -1198,6 +1263,7 @@ def run_full_analysis(
         include_thesis=include_thesis, force=force,
         news_status_by_symbol=news_status_by_symbol,
         evidence=evidence,
+        news_lookback_days=lookback_days,
     )
     stored, evaluated = persist_predictions(signals)
 
@@ -1206,6 +1272,7 @@ def run_full_analysis(
         report_model=report_model, recs_model=recs_model,
         stock_data=stock_data, lookback_days=lookback_days,
         include_thesis=include_thesis, evidence=evidence,
+        max_articles=max_articles, overnight=(news_filter == "overnight"),
     )
     # After the cache check on purpose: a restored report predating these
     # sections gets them attached instead of silently lacking them.
@@ -1239,9 +1306,11 @@ def run_full_analysis(
         merged, _ = merge_research_into_analysis(ai_analysis, signals, priced)
         ps.store_report(
             symbol=None, trade_date=as_of, report_type="ai_report",
-            input_data_hash=ps.compute_data_hash(_report_cache_key(
+            input_data_hash=ps.compute_data_hash(report_cache_key(
                 news_by_symbol, priced, as_of, report_model,
-                lookback_days, include_thesis, evidence=evidence)),
+                lookback_days, include_thesis, evidence=evidence,
+                max_articles=max_articles,
+                overnight=(news_filter == "overnight"))),
             content=json.dumps(merged, default=str, indent=2),
             file_format="json",
         )
@@ -1341,6 +1410,19 @@ def _assess_completeness(
     if abstained:
         logger.info("abstentions (no-input, not failures): "
                     + ", ".join(sorted(abstained)))
+    # Reports that exist but were written without evidence the run was
+    # configured to gather. Not a crash — but not a whole run either.
+    from services.evidence_contract import gaps_from_details
+    gap_notes = []
+    for symbol in symbols:
+        research = (signals.get(symbol) or {}).get("trading_agents") or {}
+        gaps = gaps_from_details(research.get("details")) if isinstance(research, dict) else []
+        if gaps:
+            gap_notes.append(f"{symbol} ({', '.join(g['label'] for g in gaps)})")
+    if gap_notes:
+        degraded.append("research written without expected evidence: "
+                        + "; ".join(gap_notes))
+
     by_symbol = (recommendations or {}).get("by_symbol") or {}
     if not by_symbol:
         degraded.append("no recommendations produced")
@@ -1390,23 +1472,3 @@ def evaluate_pending() -> int:
     return count
 
 
-def _article_dict(a) -> dict:
-    """Flatten a NewsArticle to the dict shape the models and LLM expect."""
-    published = getattr(a, "published_at", None)
-    return {
-        "id": getattr(a, "id", None),
-        "symbol": getattr(a, "symbol", None),
-        "title": getattr(a, "title", ""),
-        "source": getattr(a, "source", None),
-        "url": getattr(a, "url", None),
-        "published_at": published.isoformat() if published else None,
-        "summary": getattr(a, "summary", None),
-        "sentiment": getattr(a, "sentiment", None),
-        "sentiment_score": getattr(a, "sentiment_score", None),
-        "impact": getattr(a, "impact", None),
-        "price_change_percent": getattr(a, "price_change_percent", None),
-        "ticker_relevance_score": getattr(a, "ticker_relevance_score", None),
-        "topics": getattr(a, "topics", None),
-        "overall_sentiment_score": getattr(a, "overall_sentiment_score", None),
-        "overall_sentiment_label": getattr(a, "overall_sentiment_label", None),
-    }

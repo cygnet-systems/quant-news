@@ -23,10 +23,6 @@ load_dotenv()
 class IndicatorDefaults:
     """Default parameters for technical indicators."""
 
-    # Moving Averages
-    SMA_PERIODS: tuple[int, ...] = (20, 50, 200)
-    EMA_PERIODS: tuple[int, ...] = (12, 26)
-
     # MACD
     MACD_FAST: int = 12
     MACD_SLOW: int = 26
@@ -87,11 +83,13 @@ class APIConfig:
 
     # Request settings
     DEFAULT_TIMEOUT: int = 30
-    MAX_RETRIES: int = 3
 
     # LLM client timeout (seconds). Without it a hung socket pins a worker
     # thread for the SDK default of 600s. Synthesis calls run ~1 min.
     LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "180"))
+    # The investigation stage's tool loop (several web searches + a long
+    # JSON answer) runs minutes; it gets its own ceiling.
+    INVESTIGATION_TIMEOUT: int = int(os.getenv("INVESTIGATION_TIMEOUT", "600"))
 
 
 API: Final = APIConfig()
@@ -119,18 +117,6 @@ class AppConfig:
     # Default data period
     DEFAULT_PERIOD: str = "1y"
 
-    # Popular stocks for quick-add
-    POPULAR_STOCKS: tuple[str, ...] = (
-        "AAPL",
-        "MSFT",
-        "GOOGL",
-        "AMZN",
-        "NVDA",
-        "META",
-        "TSLA",
-        "JPM",
-    )
-
 
 APP: Final = AppConfig()
 
@@ -154,7 +140,6 @@ class Colors:
     BORDER_FOCUS: str = "#3D3D3D"
 
     # Text
-    TEXT_PRIMARY: str = "#FFFFFF"
     TEXT_SECONDARY: str = "#A0A0A0"
     TEXT_MUTED: str = "#666666"
 
@@ -167,7 +152,6 @@ class Colors:
 
     # Accent
     ACCENT_PRIMARY: str = "#00D4AA"
-    ACCENT_HOVER: str = "#00E5BB"
 
     # Chart colors (sequential)
     CHART_1: str = "#00D4AA"  # Primary (price)
@@ -182,59 +166,6 @@ class Colors:
 COLORS: Final = Colors()
 
 
-@dataclass(frozen=True)
-class Typography:
-    """Typography settings."""
-
-    FONT_PRIMARY: str = "'Inter', -apple-system, BlinkMacSystemFont, sans-serif"
-    FONT_MONO: str = "'JetBrains Mono', 'SF Mono', monospace"
-
-    # Font sizes (px)
-    TEXT_XS: int = 11
-    TEXT_SM: int = 13
-    TEXT_BASE: int = 15
-    TEXT_LG: int = 18
-    TEXT_XL: int = 24
-    TEXT_2XL: int = 32
-    TEXT_3XL: int = 48
-
-
-TYPOGRAPHY: Final = Typography()
-
-
-@dataclass(frozen=True)
-class Spacing:
-    """Spacing scale (px)."""
-
-    SPACE_1: int = 4
-    SPACE_2: int = 8
-    SPACE_3: int = 12
-    SPACE_4: int = 16
-    SPACE_5: int = 24
-    SPACE_6: int = 32
-    SPACE_8: int = 48
-
-
-SPACING: Final = Spacing()
-
-
-@dataclass(frozen=True)
-class Layout:
-    """Layout dimensions."""
-
-    SIDEBAR_WIDTH: int = 240
-    CONTEXT_PANEL_WIDTH: int = 320
-    CARD_BORDER_RADIUS: int = 12
-
-    # Breakpoints
-    BREAKPOINT_MOBILE: int = 768
-    BREAKPOINT_TABLET: int = 1024
-    BREAKPOINT_DESKTOP: int = 1440
-
-
-LAYOUT: Final = Layout()
-
-
 # =============================================================================
 # PLOTLY CHART THEME
 # =============================================================================
@@ -245,12 +176,12 @@ CHART_THEME: Final[dict] = {
     "plot_bgcolor": COLORS.BG_PRIMARY,
     "font": {
         "color": COLORS.TEXT_SECONDARY,
-        "family": TYPOGRAPHY.FONT_PRIMARY,
+        "family": "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
     },
     "xaxis": {
         "gridcolor": COLORS.BORDER_SUBTLE,
         "linecolor": COLORS.BORDER_SUBTLE,
-        "tickfont": {"size": TYPOGRAPHY.TEXT_XS},
+        "tickfont": {"size": 11},
         "showgrid": True,
         "gridwidth": 1,
         "griddash": "dot",
@@ -258,7 +189,7 @@ CHART_THEME: Final[dict] = {
     "yaxis": {
         "gridcolor": COLORS.BORDER_SUBTLE,
         "linecolor": COLORS.BORDER_SUBTLE,
-        "tickfont": {"size": TYPOGRAPHY.TEXT_XS},
+        "tickfont": {"size": 11},
         "side": "right",  # Bloomberg-style
         "showgrid": True,
         "gridwidth": 1,
@@ -269,8 +200,8 @@ CHART_THEME: Final[dict] = {
         "bgcolor": COLORS.BG_SECONDARY,
         "bordercolor": COLORS.BORDER_FOCUS,
         "font": {
-            "family": TYPOGRAPHY.FONT_MONO,
-            "size": TYPOGRAPHY.TEXT_SM,
+            "family": "'JetBrains Mono', 'SF Mono', monospace",
+            "size": 13,
         },
     },
     "margin": {"l": 10, "r": 60, "t": 40, "b": 40},
@@ -305,7 +236,6 @@ class ModelConfig:
 
     # Training
     MIN_TRAINING_SAMPLES: int = 30
-    TRAINING_HISTORY_PERIOD: str = "1y"
     LABEL_AMBIGUITY_THRESHOLD: float = 0.0015  # 0.15%, set to 0.0 to disable
     NEWS_LOOKBACK_MONTHS: int = 3
 
@@ -318,15 +248,35 @@ class ModelConfig:
     # Every parameter is an owner-tunable formula input (env-overridable), and
     # jobs can override the mode per run via params_json {"news_filter": ...}.
     NEWS_FILTER_MODE: str = os.getenv("NEWS_FILTER_MODE", "lookback")
+    # The one news-window default every entry point (Run dialog, scheduler
+    # job form, CLI, library fallback) reads. 14, not 7: the 2026-09-01 BHF
+    # report saw 1 of the 5 relevant articles Alpha Vantage held because the
+    # dialog's 7-day default cut off the CAO resignation and the Delaware
+    # review coverage a week earlier — 14 days is the drawdown-forensics
+    # horizon the research prompt was written for.
+    # FRONTEND default only: it seeds the Run dialog select, the job form and
+    # the seeded daily job. No code path falls back to it — a run whose window
+    # did not arrive from one of those raises RunParameterMissing.
+    NEWS_LOOKBACK_DAYS: int = int(os.getenv("NEWS_LOOKBACK_DAYS", "14"))
     NEWS_OVERNIGHT_START_ET: str = os.getenv("NEWS_OVERNIGHT_START_ET", "16:00")
     NEWS_OVERNIGHT_END_ET: str = os.getenv("NEWS_OVERNIGHT_END_ET", "09:30")
     # The overnight window is short, so it uses the stricter FEATURE-grade
     # relevance bar (matches DEBERTA_RELEVANCE_THRESHOLD) vs the lookback
     # path's looser 0.5.
     NEWS_OVERNIGHT_RELEVANCE: float = float(os.getenv("NEWS_OVERNIGHT_RELEVANCE", "0.7"))
-    # Post-filter ceiling per symbol per window, now that fetching paginates
-    # past AV's page size instead of truncating at 50.
+    # Default per-symbol cap on a run's news window: keep the NEWEST N of
+    # the window, 0 = everything the window holds. The Run dialog, the
+    # scheduler job form and the CLI all expose this; the trace records
+    # when it bites (fetched vs kept, effective span).
     NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "500"))
+    # How many of the window's articles a PROMPT actually reads. Sampled
+    # spread across the window (services.news_window.select_spread), never
+    # "the newest N" — that is what quietly turned a 30-day window into a
+    # 3-day one. 0 = every kept article (watch the token bill).
+    #   research: per symbol, the trading_agents research report
+    #   synthesis: in total across all symbols, the portfolio-level report
+    NEWS_PROMPT_ARTICLES: int = int(os.getenv("NEWS_PROMPT_ARTICLES", "25"))
+    NEWS_SYNTHESIS_ARTICLES: int = int(os.getenv("NEWS_SYNTHESIS_ARTICLES", "40"))
 
     # Decision thresholds (shared across Kronos and XGBoost)
     BUY_THRESHOLD: float = 0.55
@@ -357,6 +307,37 @@ class ModelConfig:
     # flagged data conflicts explicitly, 2x faster, ~2.8x cheaper at
     # $1/$6 per M vs $3/$15 — and research is the N-calls-per-run role.
     TRADING_AGENTS_MODEL: str = "gpt-5.6-luna"
+    # Evidence blocks the research prompt and synthesis carry by default
+    # (the Run dialog checklist, scheduled runs and the CLI all start from
+    # this list). Adding a key here changes what every default run reads —
+    # bump PIPELINE_EPOCH alongside.
+    #   options       — point-in-time put/call positioning
+    #   quality       — Bad Apples screen + news red flags
+    #   investigation — situation classifier + web-researched context
+    #                   (deal terms, regulators, key figures), live runs only
+    #   political     — congressional trades + 13F holder flows (Alpha Vantage)
+    DEFAULT_EVIDENCE: tuple[str, ...] = ("options", "quality",
+                                         "investigation", "political")
+
+    # Investigation stage (services/investigation_service.py): one
+    # tool-using LLM call per symbol that classifies the situation
+    # (pending acquisition, legal overhang, earnings event, momentum only…)
+    # and researches it on the open web with citations. Anthropic only —
+    # the web_search server tool does the browsing.
+    #   mode: "auto" = web research on live runs, classification-only on
+    #         backtests (web results cannot be bounded to a past as-of);
+    #         "off" = classification-only everywhere; "always" = web
+    #         research even on backtests (experiments only: lookahead).
+    INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "claude-opus-5")
+    INVESTIGATION_MODE: str = os.getenv("INVESTIGATION_MODE", "auto")
+    INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "6"))
+    # Investigations run concurrently ahead of the model loop; each takes
+    # minutes, and the scheduled job has a 75-minute ceiling.
+    INVESTIGATION_WORKERS: int = int(os.getenv("INVESTIGATION_WORKERS", "4"))
+    # Output budget covers thinking + interim text between searches + the
+    # JSON; 6000 truncated the first live run before the JSON was written.
+    INVESTIGATION_MAX_TOKENS: int = int(os.getenv("INVESTIGATION_MAX_TOKENS", "20000"))
+
     # Swappable research backend: "single_agent" (in-tree default) or
     # "tradingagents" (adapter over a pinned external release; see
     # models/research_backend.py). Lets us ingest a future TradingAgents version
@@ -433,6 +414,11 @@ class ModelConfig:
     # so the Luna price advantage is ~3 cents — quality wins here.
     RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "claude-sonnet-5")
     RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "anthropic")
+    # Re-asked once on this model when the primary fails after the report
+    # and predictions have already been paid for. The row records the model
+    # that actually answered (model_used), so a fallback run is visible.
+    RECOMMENDATIONS_FALLBACK_MODEL: str = os.getenv(
+        "RECOMMENDATIONS_FALLBACK_MODEL", "claude-sonnet-4-6")
     # 5000: key_level/change_trigger/watch_items grew the JSON; a truncated
     # payload fails the parser and blanks the whole Luna panel. The synthesis
     # is one call for the WHOLE run, so the ceiling has to cover the widest
@@ -462,10 +448,14 @@ MODEL: Final = ModelConfig()
 # against current provider pricing before treating spend reports as exact.
 LLM_PRICING: Final[dict[str, dict[str, float]]] = {
     "gpt-5.6-luna":     {"input": 1.00, "output": 6.00},
-    "claude-sonnet-5":  {"input": 3.00, "output": 15.00},
+    # Anthropic list rates (2026-09-02): Opus 5 $5/$25, Sonnet 5 $2/$10,
+    # Sonnet 4.6 $3/$15. The investigation stage runs on one of the first
+    # two; unpriced rows were hiding its spend.
+    "claude-opus-5":    {"input": 5.00, "output": 25.00},
+    "claude-sonnet-5":  {"input": 2.00, "output": 10.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
 }
-LLM_PRICING_VERIFIED_ON: Final[str] = "2026-07-26"
+LLM_PRICING_VERIFIED_ON: Final[str] = "2026-09-02"
 
 
 def get_llm_rates(model: str | None) -> tuple[float | None, float | None]:
@@ -557,18 +547,8 @@ STORAGE: Final = StorageConfig()
 class StrategyConfig:
     """Strategy evaluation and scheduling settings."""
 
-    # Scheduler (ET timezone, weekdays only)
-    EVAL_SCHEDULE_HOUR: int = 16
-    EVAL_SCHEDULE_MINUTE: int = 35
-
-    # Position sizing
-    DEFAULT_POSITION_SIZE: float = 1000.0
-
     # Confidence threshold strategy
     CONFIDENCE_THRESHOLD: float = 0.65
-
-    # vectorbt portfolio
-    VECTORBT_INIT_CASH: float = 10000.0
 
     # Minimum trades before showing metrics
     MIN_TRADES_FOR_METRICS: int = 5

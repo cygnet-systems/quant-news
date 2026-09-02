@@ -212,15 +212,17 @@ def get_stock_info(symbol: str) -> StockInfo:
             name=info.get("shortName", symbol),
             sector=info.get("sector", "N/A"),
             industry=info.get("industry", "N/A"),
-            market_cap=info.get("marketCap", 0),
+            # None, not 0, for absent fields: a 0 rendered as
+            # "52-Week High: $0.00" in prompts and reads as data.
+            market_cap=info.get("marketCap"),
             current_price=current_price,
             previous_close=previous_close,
             day_change=day_change,
             day_change_percent=day_change_percent,
-            volume=info.get("volume", 0),
-            avg_volume=info.get("averageVolume", 0),
-            fifty_two_week_high=info.get("fiftyTwoWeekHigh", 0),
-            fifty_two_week_low=info.get("fiftyTwoWeekLow", 0),
+            volume=info.get("volume"),
+            avg_volume=info.get("averageVolume"),
+            fifty_two_week_high=info.get("fiftyTwoWeekHigh"),
+            fifty_two_week_low=info.get("fiftyTwoWeekLow"),
             pe_ratio=info.get("trailingPE"),
             dividend_yield=info.get("dividendYield"),
         )
@@ -266,8 +268,10 @@ def get_multiple_stocks(
         try:
             df = fetch_stock_data(symbol, period)
             result[symbol.upper()] = df
-        except ValueError:
-            # Skip invalid symbols
+        except ValueError as e:
+            # Every fetch failure arrives as ValueError — an outage is not an
+            # "invalid symbol". Say which symbol vanished and why.
+            logger.warning(f"{symbol}: dropped from multi-symbol fetch: {e}")
             continue
 
     return result

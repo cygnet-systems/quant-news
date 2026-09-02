@@ -412,27 +412,29 @@ def _build_provenance_box(
     by_symbol = (ai_analysis or {}).get("by_symbol", {}) or {}
 
     # Per-symbol research reports (deep tier)
-    research_models: dict[str, list[str]] = {}
-    research_inputs = None
+    # One row per symbol: the inputs differ per symbol (article counts,
+    # bars), and the old single string generalised the first symbol's
+    # numbers to every other row.
     for sym in symbols:
         research = (by_symbol.get(sym) or {}).get("research") or {}
         if not research.get("raw_response"):
             continue
         prov = research.get("provenance") or {}
         model = research.get("model") or prov.get("model") or "unknown model"
-        research_models.setdefault(model, []).append(sym)
-        if prov and research_inputs is None:
-            news = (f"{prov.get('news_count', '?')} news articles "
-                    f"({prov.get('news_window_days', '?')}d point-in-time window)"
-                    if prov.get("news_enabled", True) else "news disabled")
-            research_inputs = (
-                f"per symbol: 1y OHLCV, SPY & sector-ETF context, "
-                f"fundamentals (as-of filtered), {news}, "
-                f"precomputed metrics/events/peers"
-            )
-    for model, syms in research_models.items():
-        items.append((f"Research report ({', '.join(syms)})", model,
-                      research_inputs or "per-symbol point-in-time dataset"))
+        if prov.get("news_enabled", True):
+            read = prov.get("news_prompt_articles")
+            news = (f"{read if read is not None else '?'} of "
+                    f"{prov.get('news_count', '?')} news articles read "
+                    f"({prov.get('news_window_days', '?')}d point-in-time window)")
+        else:
+            news = "news disabled"
+        bars = prov.get("ohlcv_bars")
+        through = prov.get("ohlcv_through")
+        ohlcv = (f"{bars} OHLCV bars through {through}" if bars else "OHLCV")
+        items.append((f"Research report ({sym})", model,
+                      f"{ohlcv}, SPY & sector-ETF context, fundamentals "
+                      f"(as-of filtered), {news}, precomputed "
+                      f"metrics/events/peers"))
 
     # Shallow news-summary tier (per-symbol entries without research)
     shallow_syms = [s for s in symbols

@@ -79,6 +79,9 @@ def create_layout() -> html.Div:
             # Model slice of the scoreboard: "all" or one model_name.
             # Session-scoped for the same reason as the outcome slice.
             dcc.Store(id="history-filter-model", data="all"),
+            # Page offsets per archive bucket ({"predictions": 200, ...}).
+            # Session-scoped; filter changes reset it.
+            dcc.Store(id="history-page", data={}),
             # Activity Log scope. Honoured only for Administrators — the
             # server pins everyone else to their own rows regardless.
             dcc.Store(id="history-activity-scope", data="all", storage_type="local"),
@@ -232,8 +235,6 @@ def create_layout() -> html.Div:
             # Download components for exports
             dcc.Download(id="download-data"),
             dcc.Download(id="download-report"),
-            dcc.Download(id="download-hist-report"),
-            dcc.Download(id="download-ta-report"),
 
             # The shell. Only #page-content is routed: the stores above and the
             # modals, downloads, activity panel and toasts below stay mounted
@@ -288,56 +289,6 @@ def create_layout() -> html.Div:
             # Ensemble config drawer (offcanvas)
             create_ensemble_config_drawer(),
 
-            # Toast notifications
-            dbc.Toast(
-                "",
-                id="download-error-toast",
-                header="Download Failed",
-                icon="danger",
-                is_open=False,
-                dismissable=True,
-                duration=5000,
-                style={
-                    "position": "fixed",
-                    "top": 16,
-                    "right": 16,
-                    "zIndex": 9999,
-                    "width": 320,
-                },
-            ),
-            dbc.Toast(
-                "",
-                id="history-eval-toast",
-                header="Prediction Evaluation",
-                icon="success",
-                is_open=False,
-                dismissable=True,
-                duration=6000,
-                style={
-                    "position": "fixed",
-                    "top": 16,
-                    "right": 16,
-                    "zIndex": 9999,
-                    "width": 340,
-                },
-            ),
-            dbc.Toast(
-                "",
-                id="run-started-toast",
-                header="Run started",
-                icon="success",
-                is_open=False,
-                dismissable=True,
-                duration=6000,
-                style={
-                    "position": "fixed",
-                    "top": 16,
-                    "right": 16,
-                    "zIndex": 9999,
-                    "width": 340,
-                },
-            ),
-            html.Div(id="toast-container"),
         ],
         className="app-container",
     )

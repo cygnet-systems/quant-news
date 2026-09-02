@@ -413,7 +413,7 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
 
 
 def body(history_data=None, filter_symbols=None, filter_date_range="all",
-         specific_date=None, outcome="all", model="all") -> list:
+         specific_date=None, outcome="all", model="all", page=None) -> list:
     history_data = history_data or {}
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
@@ -423,7 +423,7 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
     # Filtering the aggregates too would make "wrong" show a 0% hit rate,
     # which is arithmetic rather than information.
     log_preds = _by_outcome(preds, outcome)
-    log = build_predictions_section(log_preds, deferred=True)
+    log = build_predictions_section(log_preds, deferred=True, page=page)
 
     subtitle = "Prediction log"
     if outcome != "all":
@@ -484,8 +484,11 @@ def alpha_lab_section() -> html.Div:
     tests = {t.get("hypothesis"): t for t in (snap or {}).get("tests", [])}
 
     cards = []
-    for key, info in HYPOTHESIS_INFO.items():
+    for key, default_info in HYPOTHESIS_INFO.items():
         t = tests.get(key) or {}
+        # The snapshot carries the explanation rendered with the job's OWN
+        # thresholds; the default copy is only for a test that never ran.
+        info = t.get("info") or default_info
         status = t.get("status") or ("accruing" if t else "no_run")
         label, cls, status_help = _LAB_STATUS.get(
             status, ("NOT RUN YET", "muted",

@@ -24,6 +24,9 @@ def layout() -> html.Div:
             # would be 4 pointless queries a minute.
             dcc.Interval(id="scheduler-refresh", interval=15_000),
             dcc.Store(id="scheduler-action-status"),
+            # Fingerprint of the last render; a timer tick that changes
+            # nothing must not redraw (and reset) the job cards.
+            dcc.Store(id="scheduler-fp"),
             # Populated by render_scheduler_panel.
             dcc.Loading(
                 html.Div(id="scheduler-panel-container"),

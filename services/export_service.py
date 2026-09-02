@@ -9,6 +9,7 @@ AI Analysis / Recommendations sheets appear only when those stores hold
 data — the workbook grows with whatever the session has produced.
 """
 
+from typing import Optional
 import io
 import logging
 from datetime import datetime
@@ -268,7 +269,8 @@ def _linkify_url_column(writer: pd.ExcelWriter, sheet: str, df: pd.DataFrame) ->
 def build_model_inputs_xlsx(
     symbols: list[str],
     as_of: str,
-    news_lookback_days: int = 14,
+    news_lookback_days: Optional[int] = None,
+    max_articles: int = 0,
 ) -> bytes:
     """Workbook of the point-in-time inputs behind a report/prediction/rec.
 
@@ -279,6 +281,10 @@ def build_model_inputs_xlsx(
     with the SAME lookahead-safe builders the models use — sliced to as_of —
     so users can audit the inputs and draw their own conclusions.
     """
+    from services.news_window import RunParameterMissing
+    if news_lookback_days is None:
+        raise RunParameterMissing("model-inputs export needs the run's news "
+                                  "window; none was supplied")
     from datetime import datetime as _dt
 
     from models.feature_builder import FEATURE_VERSION, LiveFeatureBuilder
@@ -327,7 +333,8 @@ def build_model_inputs_xlsx(
         # --- news window (links + precomputed sentiment features) ---
         try:
             articles = fetch_point_in_time_news(sym, as_of,
-                                                lookback_days=news_lookback_days)
+                                                lookback_days=news_lookback_days,
+                                                max_articles=max_articles)
         except Exception:
             articles = []
         news_all.extend(_news_rows(sym, articles))

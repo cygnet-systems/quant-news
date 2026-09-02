@@ -237,26 +237,6 @@ def _rolling_uncached(days, group_key, symbols):
     return aggregate_predictions(preds, group_key)
 
 
-def get_pnl_series(days: int = 30, symbols: list[str] | None = None) -> list[dict]:
-    """Cumulative P&L by prediction date, for the Home sparkline."""
-    end = datetime.now().date()
-    start = end - timedelta(days=days)
-    preds = get_cache().get_predictions_between(start, end, symbols=symbols)
-
-    daily: dict[str, float] = {}
-    for p in preds:
-        if p.get("pnl_dollars") is None:
-            continue
-        daily[p["prediction_date"]] = daily.get(p["prediction_date"], 0.0) + p["pnl_dollars"]
-
-    running = 0.0
-    series = []
-    for d in sorted(daily):
-        running += daily[d]
-        series.append({"date": d, "daily": daily[d], "cumulative": running})
-    return series
-
-
 def get_latest_cohort() -> dict:
     """The latest cutoff's cohort (memoized)."""
     return get_cohort(None)

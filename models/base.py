@@ -70,21 +70,6 @@ class PredictionResult:
             "model_version": self.model_version,
         }
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "PredictionResult":
-        """Deserialize from dictionary."""
-        return cls(
-            model_name=data["model_name"],
-            decision=data["decision"],
-            confidence=data["confidence"],
-            up_probability=data["up_probability"],
-            details=data.get("details", {}),
-            error=data.get("error"),
-            predicted_close=data.get("predicted_close"),
-            model_version=data.get("model_version"),
-        )
-
-
 def compute_pnl(
     decision: str,
     previous_close: float,

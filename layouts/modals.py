@@ -49,13 +49,14 @@ def create_data_modal() -> dbc.Modal:
 
 
 def _report_param_selects(prefix: str) -> dict:
-    """Shared parameter selects for report generation.
+    """Parameter controls for the Run dialog (prefix "run").
 
-    Rendered in BOTH the AI Report modal (prefix "ai-report" — preserves its
-    existing component ids) and the Full Analysis modal (prefix "fa"), so each
-    flow owns its own visible, configurable state instead of one modal
-    silently reading the other's.
+    The news window and article cap govern EVERY consumer of the run's news
+    — the sentiment and research models as well as the report — which is
+    why they render in their own always-visible section, not under Report.
     """
+    from config import MODEL
+
     return {
         "lookback": dbc.Select(
             id=f"{prefix}-lookback",
@@ -63,10 +64,25 @@ def _report_param_selects(prefix: str) -> dict:
                 {"label": "3 days", "value": "3"},
                 {"label": "7 days", "value": "7"},
                 {"label": "14 days", "value": "14"},
-                {"label": "30 days", "value": "30"},
+                {"label": "1 month (30 days)", "value": "30"},
+                {"label": "2 months (60 days)", "value": "60"},
+                {"label": "3 months (90 days)", "value": "90"},
+                {"label": "6 months (180 days)", "value": "180"},
+                {"label": "1 year (365 days)", "value": "365"},
                 {"label": "Overnight (close → open)", "value": "overnight"},
             ],
-            value="7",
+            value=str(MODEL.NEWS_LOOKBACK_DAYS),
+            size="sm",
+        ),
+        # Per-symbol cap on the window: keep the newest N, 0 = all. Applied
+        # at fetch time and reported in the trace when it bites; the prompts
+        # then sample ACROSS what is kept rather than reading the newest few.
+        "max_articles": dbc.Input(
+            id=f"{prefix}-max-articles",
+            type="number",
+            min=0,
+            step=1,
+            value=MODEL.NEWS_MAX_ARTICLES,
             size="sm",
         ),
         "model": dbc.Select(
@@ -747,6 +763,30 @@ def create_run_modal() -> dbc.Modal:
                 ),
                 html.Div(id="run-data-summary"),
 
+                # --- News (feeds models AND report, every scope) ---
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("News", className="mb-2"),
+                        html.Div(
+                            [
+                                field("Window", sel["lookback"],
+                                      "Point-in-time: articles published in "
+                                      "this many days up to the data cutoff."),
+                                field("Article cap per symbol",
+                                      sel["max_articles"],
+                                      "Keep the newest N of the window; "
+                                      "0 = all. The trace reports when this "
+                                      "drops articles."),
+                            ],
+                            className="run-field-grid",
+                        ),
+                        html.Div(id="run-article-preview",
+                                 className="run-article-preview"),
+                    ],
+                    id="run-news-section",
+                ),
+
                 # --- Models ---
                 html.Div(
                     [
@@ -765,14 +805,11 @@ def create_run_modal() -> dbc.Modal:
                         html.H6("Report", className="mb-2"),
                         html.Div(
                             [
-                                field("News window", sel["lookback"]),
                                 field("Report model", sel["model"]),
                                 field("Depth", sel["type"]),
                             ],
                             className="run-field-grid",
                         ),
-                        html.Div(id="run-article-preview",
-                                 className="run-article-preview"),
                         # Terminal-derived evidence blocks, selectable per
                         # run. Both default on; the research prompt, the
                         # synthesis evidence and the rendered report sections
@@ -788,8 +825,12 @@ def create_run_modal() -> dbc.Modal:
                                          "value": "options"},
                                         {"label": "Quality screen (Bad Apples + news red flags)",
                                          "value": "quality"},
+                                        {"label": "Situation & investigation (web research, live runs)",
+                                         "value": "investigation"},
+                                        {"label": "Political & institutional flows",
+                                         "value": "political"},
                                     ],
-                                    value=["options", "quality"],
+                                    value=list(MODEL.DEFAULT_EVIDENCE),
                                     inline=True,
                                     className="run-evidence-checklist",
                                 ),

@@ -66,15 +66,15 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
 
 
 def body(history_data=None, filter_symbols=None, filter_date_range="all",
-         specific_date=None) -> list:
+         specific_date=None, page=None) -> list:
     history_data = history_data or {}
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
 
     sections = [
-        build_ta_reports_section(buckets["trading_agent_reports"]),
-        build_saved_reports_section(buckets["reports"]),
-        build_recommendations_section(buckets["recommendations"]),
+        build_ta_reports_section(buckets["trading_agent_reports"], page=page),
+        build_saved_reports_section(buckets["reports"], page=page),
+        build_recommendations_section(buckets["recommendations"], page=page),
     ]
     sections = [s for s in sections if s is not None]
 

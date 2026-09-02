@@ -61,27 +61,6 @@ def compute_data_hash(data: dict | list | str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def compute_prediction_input_hash(
-    symbol: str,
-    trade_date: str,
-    stock_data: dict,
-    news_data: dict | None = None,
-) -> str:
-    """Hash the inputs that feed into a prediction for a symbol+date.
-
-    Includes stock prices and news so that if either changes, the
-    prediction is invalidated.
-    """
-    payload = {
-        "symbol": symbol,
-        "trade_date": trade_date,
-        "stock_data_hash": compute_data_hash(stock_data),
-    }
-    if news_data:
-        payload["news_data_hash"] = compute_data_hash(news_data)
-    return compute_data_hash(payload)
-
-
 # ---------------------------------------------------------------------------
 # Data snapshots (input data fingerprints)
 # ---------------------------------------------------------------------------
@@ -121,17 +100,6 @@ def upsert_data_snapshot(
             record_count=record_count,
         ))
         return True
-
-
-def get_data_hash(symbol: str, trade_date: str, data_type: str) -> Optional[str]:
-    """Get the stored content hash for a snapshot key, or None."""
-    with get_session() as session:
-        stmt = select(DataSnapshot.content_hash).where(
-            DataSnapshot.symbol == symbol,
-            DataSnapshot.trade_date == trade_date,
-            DataSnapshot.data_type == data_type,
-        )
-        return session.execute(stmt).scalar_one_or_none()
 
 
 # ---------------------------------------------------------------------------

@@ -61,19 +61,24 @@ def _pav(pairs: list[tuple[float, float]]) -> list[tuple[float, float]]:
     return [(b[2], b[0] / b[1]) for b in blocks]
 
 
-def _fit_all() -> dict[str, _ModelFit]:
+def _fit_all(as_of: Optional[str] = None) -> dict[str, _ModelFit]:
+    """Isotonic fits per model. ``as_of`` bounds the outcomes used (by
+    target_date, the session whose close resolved the call) so a backtest
+    does not calibrate on sessions it has not reached."""
     from db.session import get_session
     from sqlalchemy import text
 
+    upper = "AND target_date <= CAST(:upper AS date)" if as_of else ""
     fits: dict[str, _ModelFit] = {}
     with get_session() as session:
-        rows = session.execute(text("""
+        rows = session.execute(text(f"""
             SELECT model_name, confidence, was_correct
             FROM model_predictions
             WHERE was_correct IS NOT NULL
               AND decision != 'HOLD'
               AND confidence IS NOT NULL
-        """)).fetchall()
+              {upper}
+        """), {"upper": as_of} if as_of else {}).fetchall()
 
     by_model: dict[str, list[tuple[float, float]]] = {}
     for model, conf, correct in rows:
@@ -87,6 +92,26 @@ def _fit_all() -> dict[str, _ModelFit]:
             fit.base_rate = sum(y for _, y in pairs) / len(pairs)
         fits[model] = fit
     return fits
+
+
+# Historical fits are immutable, so one per as_of is kept for the process.
+_fits_as_of: dict[str, dict[str, _ModelFit]] = {}
+
+
+def _fits_for(as_of: Optional[str]) -> dict[str, _ModelFit]:
+    if not as_of:
+        _ensure_fresh()
+        return _fits
+    key = str(as_of)[:10]
+    if key not in _fits_as_of:
+        with _lock:
+            if key not in _fits_as_of:
+                try:
+                    _fits_as_of[key] = _fit_all(key)
+                except Exception as e:
+                    logger.warning(f"Calibration fit as of {key} failed: {e}")
+                    _fits_as_of[key] = {}
+    return _fits_as_of[key]
 
 
 def _ensure_fresh() -> None:
@@ -108,17 +133,18 @@ def _ensure_fresh() -> None:
             _fitted_at = time.monotonic()
 
 
-def calibrate(model_name: str, raw_confidence: Optional[float]) -> Optional[float]:
+def calibrate(model_name: str, raw_confidence: Optional[float],
+              as_of: Optional[str] = None) -> Optional[float]:
     """Map a raw confidence to its historical hit rate for this model.
 
     Returns None when there is not enough evaluated history to say anything
     (< MIN_SAMPLES active evaluated calls) — callers should then show no
-    number rather than an unearned one.
+    number rather than an unearned one. ``as_of`` (backtests) restricts the
+    history to outcomes resolved by that date.
     """
     if raw_confidence is None:
         return None
-    _ensure_fresh()
-    fit = _fits.get(model_name)
+    fit = _fits_for(as_of).get(model_name)
     if fit is None or not fit.steps:
         return None
     value = fit.steps[0][1]
@@ -133,7 +159,8 @@ def calibrate(model_name: str, raw_confidence: Optional[float]) -> Optional[floa
 _hit_cache: dict[tuple[str, int], tuple[float, Optional[float]]] = {}
 
 
-def rolling_hit_rate(model_name: str, days: int = 30) -> Optional[float]:
+def rolling_hit_rate(model_name: str, days: int = 30,
+                     as_of: Optional[str] = None) -> Optional[float]:
     """Decay-free rolling hit rate on active calls over the last `days`.
 
     Used for performance-decay ensemble weighting. None below MIN_SAMPLES/3 —
@@ -144,25 +171,32 @@ def rolling_hit_rate(model_name: str, days: int = 30) -> Optional[float]:
     from db.session import get_session
     from sqlalchemy import text
 
-    key = (model_name, days)
+    key = (model_name, days, str(as_of)[:10] if as_of else None)
     cached = _hit_cache.get(key)
     if cached and time.monotonic() - cached[0] < CALIBRATION_TTL_S:
         return cached[1]
 
+    # Window ends at as_of (outcomes resolved by then) instead of today, so
+    # a backtest's ensemble weights cannot see the future.
+    anchor = "CAST(:upper AS date)" if as_of else "CURRENT_DATE"
+    params = {"model": model_name, "days": days}
+    if as_of:
+        params["upper"] = str(as_of)[:10]
     with get_session() as session:
-        row = session.execute(text("""
+        row = session.execute(text(f"""
             SELECT count(*),
                    avg(CASE WHEN was_correct THEN 1.0 ELSE 0.0 END)
             FROM model_predictions
             WHERE model_name = :model
               AND was_correct IS NOT NULL
               AND decision != 'HOLD'
-              AND prediction_date >= (CURRENT_DATE - make_interval(days => :days))
-        """), {"model": model_name, "days": days}).fetchone()
+              AND target_date <= {anchor}
+              AND prediction_date >= ({anchor} - make_interval(days => :days))
+        """), params).fetchone()
     n, rate = (row[0] or 0), row[1]
     result = (None if n < max(10, MIN_SAMPLES // 3) or rate is None
               else round(float(rate), 3))
-    _hit_cache[(model_name, days)] = (time.monotonic(), result)
+    _hit_cache[key] = (time.monotonic(), result)
     return result
 
 
@@ -256,22 +290,6 @@ def track_record_sentence(
     return (f"{stats['hit_rate']:.0%} of scored non-HOLD calls for "
             f"{label} were directionally correct over the last {days} days "
             f"(n={stats['n']}, through {stats['through']}). Coin-flip is 50%.")
-
-
-def calibration_table() -> dict[str, dict]:
-    """Snapshot for the scoreboard: per model, sample size, base rate, and
-    the fitted mapping at a few reference raw confidences."""
-    _ensure_fresh()
-    out = {}
-    for model, fit in _fits.items():
-        entry: dict = {"n": fit.n, "base_rate": fit.base_rate}
-        if fit.steps:
-            entry["mapping"] = {
-                str(ref): calibrate(model, ref)
-                for ref in (0.3, 0.5, 0.7, 0.9)
-            }
-        out[model] = entry
-    return out
 
 
 def invalidate() -> None:

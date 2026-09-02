@@ -96,6 +96,7 @@ class TradingAgentsAdapter:
         include_thesis: bool = False,
         track_record: Optional[str] = None,
         use_continuity: bool = True,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         # When adopting a release, map onto its PUBLIC API here, e.g.:
         #   from tradingagents.graph.trading_graph import TradingAgentsGraph

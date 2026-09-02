@@ -249,6 +249,35 @@ def _job_card(job: dict) -> dbc.Card:
 
     children = [header, _status_line(job), schedule_row]
 
+    # The type's tuning knobs, editable in place. They used to be settable
+    # only on the create form and invisible afterwards — a 30-day news
+    # window chosen at creation could never be seen or changed again.
+    spec = job.get("params_spec") or []
+    if spec:
+        params = job.get("params") or {}
+        children.append(html.Div(
+            [
+                html.Div(
+                    [
+                        dbc.Label(item["label"], className="scheduler-label"),
+                        dbc.Input(
+                            id={"type": "sched-param", "job": job_id,
+                                "key": item["key"]},
+                            type="number",
+                            value=params.get(item["key"], item["default"]),
+                            size="sm",
+                            disabled=not can_manage,
+                            className="scheduler-time-input",
+                        ),
+                        html.Small(item["help"], className="scheduler-hint"),
+                    ],
+                    className="scheduler-field",
+                )
+                for item in spec
+            ],
+            className="scheduler-row scheduler-params-row",
+        ))
+
     if is_analysis:
         children.append(
             html.Div(

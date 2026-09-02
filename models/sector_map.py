@@ -86,6 +86,13 @@ PEER_MAP: dict[str, list[str]] = {
     "TSLA": ["RIVN", "LCID", "GM", "F"],
     # Progressive-style insurers
     "PGR": ["ALL", "TRV", "CB", "HIG"],
+    # Life / annuity insurers (variable-annuity and spread businesses)
+    "BHF": ["JXN", "CRBG", "LNC", "PRU"],
+    "JXN": ["BHF", "CRBG", "LNC", "PRU"],
+    "CRBG": ["BHF", "JXN", "LNC", "EQH"],
+    "LNC": ["BHF", "JXN", "PRU", "MET"],
+    "MET": ["PRU", "LNC", "AFL", "PFG"],
+    "HIG": ["TRV", "ALL", "CB", "PGR"],
 }
 
 # Runtime cache: symbol -> resolved info dict

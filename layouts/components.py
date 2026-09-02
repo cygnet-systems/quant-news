@@ -10,7 +10,7 @@ from typing import Any, Optional
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from config import COLORS, MODEL, SPACING
+from config import COLORS, MODEL
 
 
 def calculate_period_label(start_date: str, end_date: str) -> str:
@@ -102,113 +102,6 @@ def create_metric_card(
     )
 
 
-def create_news_card(
-    title: str,
-    source: str,
-    time_ago: str,
-    summary: Optional[str] = None,
-    sentiment: Optional[str] = None,
-    url: Optional[str] = None,
-    impact: Optional[str] = None,
-    price_change_percent: Optional[float] = None,
-    symbol: Optional[str] = None,
-) -> dbc.Card:
-    """Create a news article card.
-
-    Args:
-        title: Article headline.
-        source: News source name.
-        time_ago: Relative time (e.g., "2h ago").
-        summary: Optional article summary.
-        sentiment: Optional sentiment ('bullish', 'bearish', 'neutral').
-        url: Optional article URL.
-        impact: Optional stock impact description (e.g., "Price target raised").
-        price_change_percent: Optional current stock price change percentage.
-        symbol: Optional stock ticker symbol.
-
-    Returns:
-        Styled news card component.
-    """
-    # Sentiment badge
-    sentiment_badge = None
-    if sentiment:
-        badge_color = {
-            "bullish": "success",
-            "bearish": "danger",
-            "neutral": "secondary",
-        }.get(sentiment, "secondary")
-
-        sentiment_badge = dbc.Badge(
-            sentiment.upper(),
-            color=badge_color,
-            className="sentiment-badge me-2",
-        )
-
-    # Price change badge (e.g., "RGTI -2.10%")
-    price_badge = None
-    if price_change_percent is not None and symbol:
-        is_positive = price_change_percent >= 0
-        price_color = "success" if is_positive else "danger"
-        price_sign = "+" if is_positive else ""
-        price_text = f"{symbol} {price_sign}{price_change_percent:.2f}%"
-
-        price_badge = dbc.Badge(
-            price_text,
-            color=price_color,
-            className="price-badge me-2",
-            style={"fontWeight": "600"},
-        )
-
-    # Impact badge
-    impact_badge = None
-    if impact:
-        # Determine badge color based on impact type
-        impact_lower = impact.lower()
-        if any(word in impact_lower for word in ["raised", "beat", "growth", "upgraded", "positive", "approval", "buying", "bullish", "increased", "expansion", "awarded"]):
-            impact_color = "info"
-        elif any(word in impact_lower for word in ["lowered", "miss", "decline", "downgraded", "negative", "rejection", "selling", "bearish", "cut", "layoffs", "lost", "recall"]):
-            impact_color = "warning"
-        else:
-            impact_color = "light"
-
-        impact_badge = dbc.Badge(
-            impact,
-            color=impact_color,
-            className="impact-badge me-2",
-            style={"fontWeight": "500"},
-        )
-
-    # Title (optionally linked)
-    title_element = html.A(
-        title,
-        href=url,
-        target="_blank",
-        className="news-title",
-    ) if url else html.Span(title, className="news-title")
-
-    return dbc.Card(
-        dbc.CardBody(
-            [
-                html.Div(
-                    [
-                        sentiment_badge,
-                        price_badge,
-                        impact_badge,
-                        html.Span(source, className="news-source"),
-                        html.Span(" | ", className="news-divider"),
-                        html.Span(time_ago, className="news-time"),
-                    ],
-                    className="news-meta",
-                ),
-                title_element,
-                html.P(summary, className="news-summary") if summary else None,
-            ],
-            className="news-card-body",
-        ),
-        className="news-card mb-2",
-    )
-
-
 def create_period_selector(selected: str = "1y") -> dbc.ButtonGroup:
     """Create time period selector buttons.
 
@@ -253,103 +146,27 @@ def create_indicator_toggles() -> html.Div:
     Returns:
         Div containing indicator checkboxes with explanatory tooltips.
     """
-    # (label, value, default_checked, tooltip_text)
+    # (label, value, default_checked). Only overlays the price chart draws
+    # are listed: a "Volume" toggle used to sit here and changed nothing
+    # (the volume pane renders regardless).
     indicators = [
-        ("SMA 20", "sma_20", True, "20-day Simple Moving Average: Average of the last 20 closing prices"),
-        ("SMA 50", "sma_50", True, "50-day Simple Moving Average: Medium-term trend indicator"),
-        ("SMA 200", "sma_200", False, "200-day Simple Moving Average: Long-term trend indicator"),
-        ("Bollinger", "bollinger", False, "Bollinger Bands: 20-day SMA ± 2 standard deviations"),
-        ("Volume", "volume", True, "Trading volume with 20-day moving average"),
+        ("SMA 20", "sma_20", True),
+        ("SMA 50", "sma_50", True),
+        ("SMA 200", "sma_200", False),
+        ("Bollinger", "bollinger", False),
     ]
-
-    indicator_items = []
-    for label, value, checked, tooltip in indicators:
-        item_id = f"indicator-{value}"
-        indicator_items.append(
-            html.Div(
-                [
-                    dbc.Checkbox(
-                        id={"type": "indicator-check", "indicator": value},
-                        value=checked,
-                        className="indicator-checkbox",
-                    ),
-                    html.Span(
-                        label,
-                        id=item_id,
-                        className="indicator-label",
-                    ),
-                    dbc.Tooltip(
-                        tooltip,
-                        target=item_id,
-                        placement="right",
-                    ),
-                ],
-                className="indicator-item",
-            )
-        )
-
-    # Hidden checklist to maintain compatibility with existing callback
     return html.Div(
         [
             dbc.Checklist(
                 id="indicator-toggles",
-                options=[
-                    {"label": label, "value": value}
-                    for label, value, _, _ in indicators
-                ],
-                value=[value for _, value, checked, _ in indicators if checked],
+                options=[{"label": label, "value": value}
+                         for label, value, _ in indicators],
+                value=[value for _, value, checked in indicators if checked],
                 inline=True,
                 className="indicator-toggles",
             ),
         ],
         className="indicator-toggle-container",
-    )
-
-
-def create_loading_spinner(component_id: str) -> dcc.Loading:
-    """Create a loading spinner wrapper.
-
-    Args:
-        component_id: ID of component to wrap.
-
-    Returns:
-        Loading component with spinner.
-    """
-    return dcc.Loading(
-        id=f"{component_id}-loading",
-        type="circle",
-        color=COLORS.ACCENT_PRIMARY,
-    )
-
-
-def create_cache_status_badge(
-    last_updated: Optional[str] = None,
-    record_count: Optional[int] = None,
-) -> html.Div:
-    """Create cache status indicator.
-
-    Args:
-        last_updated: Last update timestamp.
-        record_count: Number of cached records.
-
-    Returns:
-        Status badge component.
-    """
-    if last_updated:
-        status_text = f"Cached: {last_updated}"
-        if record_count:
-            status_text += f" ({record_count} records)"
-        color = COLORS.POSITIVE
-    else:
-        status_text = "Not cached"
-        color = COLORS.TEXT_MUTED
-
-    return html.Div(
-        [
-            html.Span("", className="cache-dot", style={"backgroundColor": color}),
-            html.Span(status_text, className="cache-text"),
-        ],
-        className="cache-status",
     )
 
 
@@ -388,41 +205,6 @@ def create_data_actions(include_refresh: bool = True) -> html.Div:
         ),
     ])
     return html.Div(buttons, className="data-actions")
-
-
-def create_empty_state(message: str = "No data to display") -> html.Div:
-    """Create an empty state placeholder.
-
-    Args:
-        message: Message to display.
-
-    Returns:
-        Styled empty state component.
-    """
-    return html.Div(
-        [
-            html.Div(className="empty-icon"),
-            html.P(message, className="empty-message"),
-        ],
-        className="empty-state",
-    )
-
-
-def create_error_alert(message: str) -> dbc.Alert:
-    """Create an error alert.
-
-    Args:
-        message: Error message to display.
-
-    Returns:
-        Bootstrap alert component.
-    """
-    return dbc.Alert(
-        message,
-        color="danger",
-        dismissable=True,
-        className="error-alert",
-    )
 
 
 def create_recommendation_banner(
@@ -634,15 +416,10 @@ def create_top_headlines(
         html.Ul(headline_items, className="headline-list"),
     ]
 
-    # Add "See all" link if there are more articles
     if total_count > max_count:
-        children.append(
-            html.Span(
-                f"See all {total_count} articles →",
-                id="see-all-news-link",
-                className="see-all-link",
-            )
-        )
+        children.append(html.Span(
+            f"Showing {max_count} of {total_count} articles",
+            className="see-all-link"))
 
     return html.Div(children, className="top-headlines")
 
@@ -744,10 +521,6 @@ def create_ensemble_config_drawer() -> dbc.Offcanvas:
                             html.Span(
                                 display_name,
                                 className="ensemble-model-label",
-                            ),
-                            html.Span(
-                                id={"type": "ensemble-model-decision", "model": model_id},
-                                className="ensemble-model-decision",
                             ),
                         ],
                         className="ensemble-model-header",

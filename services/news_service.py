@@ -155,7 +155,7 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
 
     Args:
         symbol: Stock ticker symbol.
-        max_articles: Maximum number of articles to return.
+        max_articles: Maximum number of articles to return (0 = all).
 
     Returns:
         List of NewsArticle objects.
@@ -170,11 +170,27 @@ def fetch_yfinance_news(symbol: str, max_articles: int = 10) -> list[NewsArticle
             return []
 
         articles = []
-        for item in news[:max_articles]:
-            # Parse timestamp
-            pub_time = datetime.fromtimestamp(item.get("providerPublishTime", 0))
+        for item in (news[:max_articles] if max_articles else news):
+            # Newer yfinance nests the article under "content" with an ISO
+            # pubDate; older builds carry an epoch providerPublishTime. An
+            # article with neither is skipped — stamping it 1970 put it
+            # outside every window while still counting as "fetched".
+            content = item.get("content") or {}
+            epoch = item.get("providerPublishTime")
+            iso = content.get("pubDate") or content.get("displayTime")
+            if epoch:
+                pub_time = datetime.fromtimestamp(epoch)
+            elif iso:
+                try:
+                    pub_time = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+                except ValueError:
+                    logger.debug(f"{symbol}: yfinance article has unparseable date {iso!r}")
+                    continue
+            else:
+                logger.debug(f"{symbol}: yfinance article has no publish time — skipped")
+                continue
 
-            title = item.get("title", "")
+            title = item.get("title") or content.get("title", "")
             article = NewsArticle(
                 id=_generate_article_id(
                     title,
@@ -281,7 +297,7 @@ def _parse_av_feed_item(item: dict, symbol: str) -> Optional[dict]:
 
 def fetch_alpha_vantage_news(
     symbol: str,
-    max_articles: int = 50,
+    max_articles: int = 0,
     topics: Optional[str] = None,
     time_from: Optional[str] = None,
     time_to: Optional[str] = None,
@@ -298,7 +314,9 @@ def fetch_alpha_vantage_news(
 
     Args:
         symbol: Stock ticker symbol.
-        max_articles: Maximum articles to return AFTER relevance filtering.
+        max_articles: Keep only the newest N AFTER relevance filtering; 0
+            (the default) returns everything the window holds. The
+            point-in-time callers pass 0 and apply their own, reported cap.
         topics: Comma-separated topics to filter by.
         time_from: Start time in YYYYMMDDTHHMM format. Defaults to 7 days ago.
         time_to: End time in YYYYMMDDTHHMM format.
@@ -416,7 +434,7 @@ def fetch_alpha_vantage_news(
                 overall_sentiment_label=parsed["overall_sentiment_label"],
             ))
 
-        if len(articles) > max_articles:
+        if max_articles and len(articles) > max_articles:
             logger.info(f"{symbol}: {len(articles)} relevant articles in "
                         f"window, keeping newest {max_articles}")
             articles = articles[:max_articles]
@@ -514,7 +532,7 @@ def fetch_news(
     # Sort by date (newest first)
     articles.sort(key=lambda x: x.published_at, reverse=True)
 
-    return articles[:max_articles]
+    return articles[:max_articles] if max_articles else articles
 
 
 def fetch_news_cached(
@@ -578,28 +596,6 @@ def fetch_news_cached(
     return articles
 
 
-def fetch_news_multiple(
-    symbols: list[str],
-    max_per_symbol: int = 5,
-) -> dict[str, list[NewsArticle]]:
-    """Fetch news for multiple symbols.
-
-    Args:
-        symbols: List of stock ticker symbols.
-        max_per_symbol: Maximum articles per symbol.
-
-    Returns:
-        Dictionary mapping symbol to list of articles.
-    """
-    result: dict[str, list[NewsArticle]] = {}
-
-    for symbol in symbols:
-        articles = fetch_news(symbol, max_per_symbol)
-        result[symbol.upper()] = articles
-
-    return result
-
-
 def get_sentiment_summary(articles: list[NewsArticle]) -> dict:
     """Calculate sentiment summary from articles.
 
@@ -649,15 +645,20 @@ def get_sentiment_summary(articles: list[NewsArticle]) -> dict:
 def fetch_historical_av_news(
     symbol: str,
     months: int = 3,
+    as_of: Optional[str] = None,
 ) -> dict[str, list[dict]]:
-    """Fetch AV news for past N months, grouped by date.
+    """Fetch AV news for the N months ending at ``as_of``, grouped by date.
 
-    Results are cached in the DuckDB historical_news table. Subsequent calls
-    for the same symbol+date range hit the cache.
+    Results are cached in the Postgres historical_news table. Subsequent
+    calls for the same symbol+date range hit the cache.
 
     Args:
         symbol: Stock ticker symbol (or "" for global news).
         months: Number of months of history to fetch.
+        as_of: Window end (YYYY-MM-DD). None = now. A backtest MUST pass its
+            cutoff: the window used to end at "now" regardless, so the
+            tree models trained on news published after the session they
+            were predicting.
 
     Returns:
         Dict mapping date string (YYYY-MM-DD) to list of article dicts.
@@ -677,7 +678,8 @@ def fetch_historical_av_news(
     cache_symbol = symbol.upper() if symbol else "_GLOBAL"
 
     # Check cache first
-    end_date = datetime.now()
+    end_date = (datetime.strptime(str(as_of)[:10], "%Y-%m-%d").replace(
+        hour=23, minute=59) if as_of else datetime.now())
     start_date = end_date - timedelta(days=30 * months)
     cached = cache.get_historical_news(
         cache_symbol,
@@ -712,6 +714,7 @@ def fetch_historical_av_news(
     # Fetch from AV API in monthly windows
     all_articles: list[dict] = []
     seen_urls: set[str] = set()
+    failed_months: list[str] = []
 
     for m in range(months):
         month_end = end_date - timedelta(days=30 * m)
@@ -777,8 +780,16 @@ def fetch_historical_av_news(
         except NewsUnavailable:
             raise
         except Exception as e:
+            # Not `continue` in silence: a transport error here dropped a
+            # whole month from the training corpus and the model trained on
+            # the hole with nothing recording it.
             logger.warning(f"AV news fetch error (month {m}): {e}")
-            continue
+            failed_months.append(f"{time_from[:8]}-{time_to[:8]}: {e}")
+    if failed_months:
+        raise NewsUnavailable(
+            f"historical news for {cache_symbol} incomplete — "
+            f"{len(failed_months)}/{months} month slices failed: "
+            + "; ".join(failed_months)[:300])
 
     # Store in cache
     if all_articles:
@@ -796,46 +807,3 @@ def fetch_historical_av_news(
     return result
 
 
-def fetch_global_market_news(months: int = 1) -> dict[str, list[dict]]:
-    """Fetch global market/macro news from Alpha Vantage.
-
-    Uses topics: economy_macro, economy_fiscal, economy_monetary,
-    financial_markets. Cached with symbol="_GLOBAL".
-
-    Args:
-        months: Number of months of history.
-
-    Returns:
-        Dict mapping date string to list of article dicts.
-    """
-    return fetch_historical_av_news(symbol="", months=months)
-
-
-def format_time_ago(dt: datetime) -> str:
-    """Format datetime as relative time string.
-
-    Args:
-        dt: Datetime to format.
-
-    Returns:
-        Human-readable relative time (e.g., "2h ago", "3d ago").
-    """
-    now = datetime.now()
-    diff = now - dt
-
-    seconds = diff.total_seconds()
-
-    if seconds < 60:
-        return "just now"
-    elif seconds < 3600:
-        minutes = int(seconds / 60)
-        return f"{minutes}m ago"
-    elif seconds < 86400:
-        hours = int(seconds / 3600)
-        return f"{hours}h ago"
-    elif seconds < 604800:
-        days = int(seconds / 86400)
-        return f"{days}d ago"
-    else:
-        weeks = int(seconds / 604800)
-        return f"{weeks}w ago"
