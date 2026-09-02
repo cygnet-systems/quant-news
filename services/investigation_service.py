@@ -76,6 +76,7 @@ class Investigation:
     spread_pct: Optional[float] = None
     parse_ok: bool = True
     error: Optional[str] = None
+    web_skipped: str = ""      # why a web-enabled run stayed web-free
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -198,6 +199,29 @@ def investigate(
                 raise RuntimeError(_CACHE[key].error)
             return _CACHE[key]
         key_lock = _KEY_LOCKS.setdefault(key, threading.Lock())
+
+    # Triage before paying for a search: the web-free classification is a
+    # fraction of a cent, and a name that comes back MOMENTUM_ONLY has
+    # nothing for the web to add. The web result is cached under its own
+    # key; the triage result under web=False, so nothing runs twice.
+    if web and MODEL.INVESTIGATION_WEB_SKIP:
+        try:
+            triage = investigate(symbol, as_of, web=False, target=target,
+                                 profile=profile, headlines=headlines,
+                                 filings=filings, quality=quality,
+                                 last_close=last_close, model=model)
+        except Exception as e:
+            # A failed triage must not block the real research.
+            logger.warning(f"{symbol}: web-free triage failed ({str(e)[:80]}); "
+                           f"searching anyway")
+            triage = None
+        if triage is not None and triage.situation in MODEL.INVESTIGATION_WEB_SKIP:
+            skipped = Investigation(**{**triage.__dict__})
+            skipped.web_skipped = (f"classified {triage.situation} from the "
+                                   f"supplied evidence; web research not spent")
+            with _CACHE_LOCK:
+                _CACHE[key] = skipped
+            return skipped
     with key_lock:
         with _CACHE_LOCK:
             if key in _CACHE:
@@ -347,8 +371,12 @@ def default_tools(target_date) -> list[str]:
 
 def format_investigation_block(inv: Investigation, last_close: Optional[float] = None) -> str:
     """The prompt block. States its own provenance (web vs supplied-only)."""
-    src = ("web research + supplied evidence" if inv.web
-           else "supplied evidence only, no web access on a historical as-of")
+    if inv.web:
+        src = "web research + supplied evidence"
+    elif inv.web_skipped:
+        src = "supplied evidence only; " + inv.web_skipped
+    else:
+        src = "supplied evidence only, no web access on a historical as-of"
     lines = [f"[{inv.symbol}: situation & investigation as of {inv.as_of} ({src})]",
              f"Situation: {inv.situation} (confidence {inv.situation_confidence})"
              + (f": {inv.one_line}" if inv.one_line else "")]

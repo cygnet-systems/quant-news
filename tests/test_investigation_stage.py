@@ -71,6 +71,19 @@ class _FakeLLM:
         return self.text
 
 
+class _TriageLLM(_FakeLLM):
+    """Web-free call returns one label, the web call another."""
+    def __init__(self, plain_label, web_label="PENDING_ACQUISITION"):
+        super().__init__(_wrapped({**BHF_JSON, "situation": web_label}))
+        self.plain_text = _wrapped({**BHF_JSON, "situation": plain_label,
+                                    "deal": {"present": False}})
+    def generate(self, prompt, system, **kw):
+        self.plain_calls += 1
+        kw.get("usage_out", {}).update({"input_tokens": 100, "output_tokens": 50,
+                                        "model": "m", "provider": "anthropic"})
+        return self.plain_text
+
+
 def test_extract_json_takes_the_last_fence_and_tolerates_prose():
     text = "thinking ```json\n{\"a\": 1}\n``` more ```json\n{\"b\": 2}\n```"
     assert _extract_json(text) == {"b": 2}
@@ -83,7 +96,9 @@ def test_live_run_uses_web_and_computes_spread():
     with patch("services.llm_service.get_llm", return_value=fake):
         inv = investigate("bhf", "2026-09-01", web=True, target="2026-09-02",
                           last_close=52.99)
-    assert fake.web_calls == 1 and fake.plain_calls == 0
+    # One web-free triage call, then the search (the triage label comes
+    # from the same fake JSON, which is not a skip label).
+    assert fake.web_calls == 1 and fake.plain_calls == 1
     assert inv.web is True
     assert inv.situation == "PENDING_ACQUISITION"
     assert inv.spread_pct == pytest.approx(32.1, abs=0.05)
@@ -123,12 +138,23 @@ def test_unparseable_response_raises_instead_of_a_blank_block():
 
 
 def test_failed_investigation_is_cached_so_the_search_is_not_paid_twice():
-    fake = _FakeLLM("I could not determine anything.")
+    # Triage classifies fine; the web call comes back unparseable. The
+    # failure is cached under the web key, so a retry costs nothing.
+    fake = _TriageLLM("LEADERSHIP_CHANGE")
+    fake.text = "I could not determine anything."
     with patch("services.llm_service.get_llm", return_value=fake):
         for _ in range(2):
             with pytest.raises(RuntimeError, match="not parseable"):
                 investigate("BHF", "2026-09-01", web=True)
-    assert fake.web_calls == 1
+    assert fake.web_calls == 1 and fake.plain_calls == 1
+
+
+def test_failed_triage_does_not_block_the_search():
+    fake = _FakeLLM(_wrapped(BHF_JSON))
+    fake.generate = lambda *a, **k: "garbage"          # triage unparseable
+    with patch("services.llm_service.get_llm", return_value=fake):
+        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+    assert fake.web_calls == 1 and inv.web is True
 
 
 def test_prefetch_warms_the_cache_for_the_in_loop_call():
@@ -161,6 +187,29 @@ def test_default_tools_follow_the_target_date():
     assert default_tools(today - timedelta(days=1)) == []
     assert default_tools("2026-01-05") == []
     assert default_tools(None) == ["web_research"]
+
+
+def test_momentum_only_names_never_pay_for_a_search():
+    fake = _TriageLLM("MOMENTUM_ONLY")
+    with patch("services.llm_service.get_llm", return_value=fake):
+        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+    assert fake.plain_calls == 1 and fake.web_calls == 0
+    assert inv.web is False and inv.situation == "MOMENTUM_ONLY"
+    assert "web research not spent" in inv.web_skipped
+    assert "web research not spent" in format_investigation_block(inv, 52.99)
+    # Cached under the web=True key: a second call costs nothing.
+    with patch("services.llm_service.get_llm", return_value=fake):
+        investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+    assert fake.plain_calls == 1 and fake.web_calls == 0
+
+
+def test_special_situations_still_get_the_web():
+    fake = _TriageLLM("LEADERSHIP_CHANGE")
+    with patch("services.llm_service.get_llm", return_value=fake):
+        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+    assert fake.plain_calls == 1 and fake.web_calls == 1
+    assert inv.web is True and inv.situation == "PENDING_ACQUISITION"
+    assert inv.spread_pct == pytest.approx(32.1, abs=0.05)
 
 
 def test_unknown_situation_label_falls_back_to_other():

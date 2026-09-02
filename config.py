@@ -338,6 +338,13 @@ class ModelConfig:
     # Reasoning effort for gpt-* investigators (OpenAI Responses API).
     INVESTIGATION_OPENAI_EFFORT: str = os.getenv("INVESTIGATION_OPENAI_EFFORT", "medium")
     INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "6"))
+    # Two-stage triage: every name is classified web-free first (a
+    # fraction of a cent); the web search runs only for situations that
+    # can be researched. OpenAI bills the hosted search per call on top of
+    # tokens, so searching all 20 names a day blew the $0.80/day budget.
+    INVESTIGATION_WEB_SKIP: tuple[str, ...] = tuple(
+        s.strip().upper() for s in
+        os.getenv("INVESTIGATION_WEB_SKIP", "MOMENTUM_ONLY").split(",") if s.strip())
     # Investigations run concurrently ahead of the model loop; each takes
     # minutes, and the scheduled job has a 75-minute ceiling.
     INVESTIGATION_WORKERS: int = int(os.getenv("INVESTIGATION_WORKERS", "4"))
