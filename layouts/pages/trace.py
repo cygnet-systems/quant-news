@@ -96,8 +96,9 @@ def layout(runs: list[dict] | None = None,
         # the merely-most-recent one.
         try:
             from services import progress_service as prog
-            if prog.get_feed().get("active"):
-                live = prog.current_run_id()
+            feed = prog.get_feed()
+            if feed.get("active"):
+                live = feed.get("run_id")
                 if any(r["run_id"] == live for r in runs):
                     selected_run = live
         except Exception:

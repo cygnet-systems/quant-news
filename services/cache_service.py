@@ -141,14 +141,24 @@ def _visible(model_cls):
     return cond
 
 
-def _current_run_id():
-    """The pipeline run this write belongs to ("adhoc" outside a run.
-    same grouping the activity log and llm_usage use)."""
+def _fallback_run_id(what: str):
+    """Run identity for a write whose caller passed no run_id.
+
+    Only the headless paths (benchmark, scripts) may land here: every UI and
+    scheduled writer threads the analysis_runs id explicitly, because the
+    process-local guess below cannot name a run that lives in another
+    process (the server persisting the model subprocess's output stamped
+    everything "adhoc", and two users' runs shared one id before that).
+    The warning is the tell that a caller was missed.
+    """
     try:
         from services import progress_service as prog
-        return prog.current_run_id()
+        run_id = prog.current_run_id()
     except Exception:
-        return None
+        run_id = None
+    logger.warning("%s written without an explicit run_id; falling back to "
+                   "the process-local run %r", what, run_id)
+    return run_id
 
 
 class CacheService:
@@ -658,6 +668,7 @@ class CacheService:
     def store_prediction(
         self, symbol: str, model_name: str, result: dict,
         prediction_date_str: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         from db.models import ModelPrediction, StockPrice
         from utils.trading_calendar import get_next_trading_day
@@ -726,7 +737,8 @@ class CacheService:
                 input_data_hash=data_hash,
                 # The run that produced this row, and how long the model took
                 #: what lets the Trace page join a run to its predictions.
-                run_id=_current_run_id(),
+                run_id=(run_id if run_id is not None
+                        else _fallback_run_id(f"prediction {pred_id}")),
                 duration_ms=result.get("duration_ms"),
                 created_at=datetime.now(timezone.utc),
                 # Re-storing a prediction id invalidates any prior evaluation:
@@ -1075,7 +1087,7 @@ class CacheService:
     def save_trading_agent_report(
         self, symbol: str, trade_date: str, decision: str, confidence: float,
         report_text: str, model_name: str = "", input_tokens: int = 0,
-        output_tokens: int = 0,
+        output_tokens: int = 0, run_id: str | None = None,
     ) -> None:
         import uuid
         from db.models import TradingAgentReport
@@ -1091,7 +1103,8 @@ class CacheService:
                 model_name=model_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                run_id=_current_run_id(),
+                run_id=(run_id if run_id is not None
+                        else _fallback_run_id(f"research report {symbol}")),
                 owner_uid=_current_uid(),
                 is_public=_default_public(),
             ))

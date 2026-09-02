@@ -37,6 +37,16 @@ def create_layout() -> html.Div:
             # {"source", "symbols", "watchlist", "cohort"}. Session-scoped on
             # purpose: a one-off run tweak should not survive a reload.
             dcc.Store(id="run-symbols-store", data={}),
+            # The run the confirm dispatcher last created, shape {"run_id",
+            # "started", "scope", "symbols", "owner_uid", "kind"}. The stage
+            # callbacks trigger on it, not on the confirm click: the click's
+            # own callbacks all fire before any of them could have written
+            # the id. run-dispatched holds the last run_id the stages picked
+            # up, so a run-store that re-emits the same id (a session store
+            # restoring on reload) does not start the stages twice. It is
+            # declared first so it restores before run-store does.
+            dcc.Store(id="run-dispatched", data=None, storage_type="session"),
+            dcc.Store(id="run-store", data=None, storage_type="session"),
             # Home prediction-board symbol narrow. Session-scoped on purpose:
             # "show me AAPL" answers a question you are asking now, not one
             # you want still applied tomorrow.
@@ -203,6 +213,24 @@ def create_layout() -> html.Div:
                 id="progress-reopen-btn",
                 className="progress-reopen",
                 style={"display": "none"},
+            ),
+
+            # Toasts. Both ids were callback Outputs long before anything
+            # mounted them (suppress_callback_exceptions hid it), so the
+            # "Run started" acknowledgement and the evaluation result never
+            # rendered anywhere.
+            html.Div(
+                [
+                    dbc.Toast(id="run-started-toast", header="Run started",
+                              icon="success", is_open=False,
+                              dismissable=True, duration=6000),
+                    dbc.Toast(id="history-eval-toast", header="Evaluation",
+                              is_open=False, dismissable=True, duration=8000),
+                ],
+                style={"position": "fixed", "bottom": "1rem", "right": "1rem",
+                       "zIndex": 1080, "display": "flex",
+                       "flexDirection": "column", "gap": ".5rem",
+                       "maxWidth": "24rem"},
             ),
 
             # Full Analysis / Recommendations stores

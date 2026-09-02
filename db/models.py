@@ -13,6 +13,8 @@ Tables:
     strategy_evaluations: per-prediction strategy evaluation results
     strategy_metrics: aggregate strategy performance metrics
     trading_agent_reports. TradingAgents research reports
+    analysis_runs: one row per analysis run (manual or scheduled), its status,
+        per-stage progress and counters
 """
 
 from datetime import date, datetime
@@ -545,6 +547,52 @@ class JobRun(Base):
 
     __table_args__ = (
         Index("ix_job_runs_job_time", "job_id", "started_at"),
+    )
+
+
+class AnalysisRun(Base):
+    """One analysis run, whether started from the Run dialog or by the
+    scheduler. The row a run page, the per-owner lock, a cancel and the
+    completion link all key on.
+
+    kind: manual | scheduled. status: queued | running | done | failed |
+    cancelled; the last three are terminal and stamp finished_at.
+
+    stages_json is {stage: {"state", "done", "total"}} for the stages news,
+    models, research, synthesis, report; counters_json holds whatever totals
+    the runner reports (articles, predictions, reports, ...). Both are JSON
+    so a new stage or counter never needs a migration. job_run_id links a
+    scheduled run to the job_runs row that launched it.
+    """
+
+    __tablename__ = "analysis_runs"
+
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_uid: Mapped[str | None] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    preset: Mapped[str | None] = mapped_column(String(16))
+    config_json: Mapped[dict | None] = mapped_column(JSONB)
+    symbols_csv: Mapped[str] = mapped_column(Text, nullable=False)
+    prediction_date: Mapped[date | None] = mapped_column(Date)
+    target_date: Mapped[date | None] = mapped_column(Date)
+    stages_json: Mapped[dict | None] = mapped_column(JSONB)
+    counters_json: Mapped[dict | None] = mapped_column(JSONB)
+    estimate_s: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+    job_run_id: Mapped[int | None] = mapped_column(Integer)
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False,
+                                            server_default=text("true"),
+                                            default=True)
+
+    __table_args__ = (
+        Index("ix_analysis_runs_owner_status", "owner_uid", "status"),
+        Index("ix_analysis_runs_started", "started_at"),
+        Index("ix_analysis_runs_kind_date", "kind", "prediction_date"),
     )
 
 

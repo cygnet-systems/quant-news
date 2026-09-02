@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import date as date_cls
 from datetime import datetime
@@ -454,7 +455,28 @@ def run_predictions(
     sym_list = list(symbols)
     results: dict = {}
     skipped: dict[str, str] = {}
+
+    # Counters for the run row: symbols through the model loop and, when
+    # the research model is on, symbols that came out with a verdict. Both
+    # are reported as running totals at the top of each iteration, so a
+    # skipped or reused symbol counts as processed too.
+    research_on = "trading_agents" in selected
+    research_done = 0
+
+    def _has_research(entries: dict) -> bool:
+        entry = entries.get("trading_agents")
+        return isinstance(entry, dict) and not entry.get("error")
+
+    prog.emit_progress("models", done=0, total=len(sym_list), state="running")
+    if research_on:
+        prog.emit_progress("research", done=0, total=len(sym_list),
+                           state="running")
     for i, symbol in enumerate(sym_list):
+        if i:
+            prog.emit_progress("models", done=i, total=len(sym_list))
+            if research_on:
+                prog.emit_progress("research", done=research_done,
+                                   total=len(sym_list))
         prices_json = (stock_data.get(symbol) or {}).get("prices")
         if not prices_json:
             logger.warning(f"{symbol}: no price data, skipping")
@@ -492,6 +514,7 @@ def run_predictions(
                 include_thesis=include_thesis, tools=tools_set)
             if reused:
                 results[symbol] = reused
+                research_done += 1 if _has_research(reused) else 0
                 prog.emit("models", f"{symbol}: reusing {len(reused)} stored "
                                     f"predictions for {cutoff_date} (unchanged data)",
                           payload={
@@ -597,6 +620,7 @@ def run_predictions(
 
         decisions = {m: r.get("decision") for m, r in results[symbol].items()
                      if isinstance(r, dict) and not r.get("error")}
+        research_done += 1 if _has_research(results[symbol]) else 0
         prog.emit("models", f"{symbol}: " + ", ".join(
             f"{m}={d}" for m, d in decisions.items()))
         # One summary line per symbol when anything failed, the decisions
@@ -616,6 +640,12 @@ def run_predictions(
 
     if investigation_pool is not None:
         investigation_pool.shutdown(wait=False)
+    prog.emit_progress("models", done=len(sym_list), total=len(sym_list),
+                       state="done")
+    if research_on:
+        # The research stage closes in persist_predictions, once its
+        # reports are written; this is the loop's final count.
+        prog.emit_progress("research", done=research_done, total=len(sym_list))
     prog.emit_memory("model loop", symbols=len(results))
     results["_meta"] = {
         "predict_date": cutoff_date.isoformat(),
@@ -745,11 +775,13 @@ def _reusable_predictions(
             for name, entry in stored.items() if name in wanted}
 
 
-def persist_predictions(signals: dict) -> tuple[int, int]:
+def persist_predictions(signals: dict, run_id: Optional[str] = None) -> tuple[int, int]:
     """Write predictions (and research reports) to Postgres.
 
     Returns ``(stored, evaluated)``, backtest runs are scored immediately,
-    exactly as ``persist_predictions`` does in the app.
+    exactly as ``persist_predictions`` does in the app. ``run_id`` is the
+    analysis_runs row the rows are stamped with; the signals' ``_meta``
+    carries it too when the model stage ran in another process.
     """
     from services import progress_service as prog
     from services.cache_service import get_cache
@@ -757,18 +789,25 @@ def persist_predictions(signals: dict) -> tuple[int, int]:
     signals = dict(signals)
     meta = signals.pop("_meta", {})
     predict_date_str = meta.get("predict_date")
+    run_id = run_id or meta.get("run_id") or None
     cache = get_cache()
 
     stored = 0
+    reports = 0
+    n_symbols = 0
+    research_asked = False
     for symbol, model_results in signals.items():
         if not isinstance(model_results, dict):
             continue
+        n_symbols += 1
+        research_asked = research_asked or "trading_agents" in model_results
         for model_name, result_dict in model_results.items():
             if not isinstance(result_dict, dict) or result_dict.get("error"):
                 continue
             cache.store_prediction(
                 symbol, model_name, result_dict,
                 prediction_date_str=predict_date_str,
+                run_id=run_id,
             )
             stored += 1
 
@@ -776,6 +815,7 @@ def persist_predictions(signals: dict) -> tuple[int, int]:
                 details = result_dict.get("details", {})
                 raw_response = details.get("raw_response", "")
                 if raw_response:
+                    reports += 1
                     cache.save_trading_agent_report(
                         symbol=symbol,
                         trade_date=details.get("trade_date", ""),
@@ -788,11 +828,23 @@ def persist_predictions(signals: dict) -> tuple[int, int]:
                                     or details.get("model", "")),
                         input_tokens=details.get("input_tokens", 0),
                         output_tokens=details.get("output_tokens", 0),
+                        run_id=run_id,
                     )
 
     evaluated = cache.evaluate_predictions() if meta.get("is_backtest") else 0
     prog.emit("store", f"Stored {stored} predictions"
-                       + (f", evaluated {evaluated}" if evaluated else ""))
+                       + (f", evaluated {evaluated}" if evaluated else ""),
+              run_id=run_id)
+    prog.emit_progress("models", predictions=stored, run_id=run_id)
+    # The research verdicts are written here, beside the predictions they
+    # ride on, so this is where that stage closes: on its reports, not on
+    # the model loop ending.
+    if research_asked:
+        prog.emit_progress("research", done=reports, total=n_symbols,
+                           state="done" if reports else "failed",
+                           research_reports=reports, run_id=run_id)
+    else:
+        prog.emit_progress("research", state="skipped", run_id=run_id)
     return stored, evaluated
 
 
@@ -842,6 +894,7 @@ def build_ai_report(
     evidence: Optional[Iterable[str]] = None,
     max_articles: Optional[int] = None,
     overnight: bool = False,
+    run_id: Optional[str] = None,
 ) -> dict:
     """Portfolio-level AI analysis for the run.
 
@@ -860,6 +913,8 @@ def build_ai_report(
         raise RunParameterMissing("build_ai_report called without the news "
                                   "window / article cap")
     as_of = cutoff_date.isoformat()
+    prog.emit_progress("report", state="running", total=len(symbols),
+                       run_id=run_id)
     result: dict = {
         "overall": None,
         "by_symbol": {},
@@ -907,23 +962,27 @@ def build_ai_report(
         cached = ps.get_cached_report(None, as_of, "ai_report", cache_hash)
         if cached:
             prog.emit("ai", "AI report cache hit, regeneration skipped",
-                      payload={**cache_payload, "outcome": "hit"})
+                      payload={**cache_payload, "outcome": "hit"},
+                      run_id=run_id)
             restored = json.loads(cached)
             restored["from_cache"] = True
             restored["recs_request"] = "news+signals"
             restored["recs_model"] = recs_model
+            prog.emit_progress("report", state="done", done=len(symbols),
+                               total=len(symbols), run_id=run_id)
             return restored
         # A miss on inputs that look unchanged is a diagnosable event now:
         # the payload records the hash and what fed it, so a cross-restart
         # miss can be compared against the hit that should have happened.
         prog.emit("ai", "AI report cache miss, generating fresh",
-                  payload={**cache_payload, "outcome": "miss"})
+                  payload={**cache_payload, "outcome": "miss"}, run_id=run_id)
     except Exception as e:
         logger.debug(f"AI report cache check failed: {e}")
 
     if all_articles:
         prog.emit("ai", f"Overall: synthesizing {len(all_articles)} articles "
-                        f"across {len(symbols)} symbols ({report_model})…")
+                        f"across {len(symbols)} symbols ({report_model})…",
+                  run_id=run_id)
         provider = "openai" if report_model.startswith("gpt-") else "anthropic"
         try:
             with usage.track("ai_report", trade_date=as_of,
@@ -941,12 +1000,16 @@ def build_ai_report(
                 )
         except Exception as e:
             logger.warning(f"Overall AI analysis failed: {e}")
-            prog.emit("error", f"Overall AI analysis failed: {str(e)[:80]}")
+            prog.emit("error", f"Overall AI analysis failed: {str(e)[:80]}",
+                      run_id=run_id)
 
     result["recs_request"] = "news+signals"
     result["recs_model"] = recs_model
     if not result["overall"]:
         result["failed"] = True
+    prog.emit_progress("report", state="failed" if result.get("failed") else "done",
+                       done=0 if result.get("failed") else len(symbols),
+                       total=len(symbols), run_id=run_id)
     return result
 
 
@@ -1021,12 +1084,14 @@ def run_recommendations(
     signals: dict,
     symbols: list[str],
     trade_date: str,
+    run_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Synthesize predictions + research into per-symbol actions and persist.
 
     Each action is also stored as a ``recommendation_synthesis`` prediction so
     the evaluation loop, History tab and Scoreboard score the synthesis like
-    any other model.
+    any other model. ``run_id`` stamps those rows and the synthesis row with
+    the analysis_runs row they belong to.
     """
     from services import persistence_service as ps
     from services import progress_service as prog
@@ -1036,6 +1101,8 @@ def run_recommendations(
 
     valid_signals = {k: v for k, v in (signals or {}).items()
                      if k != "_meta" and isinstance(v, dict)}
+    prog.emit_progress("synthesis", state="running", done=0, total=len(symbols),
+                       run_id=run_id)
 
     basis = ai_analysis.get("recs_request") or "news+signals"
     if basis != "signals":
@@ -1078,16 +1145,21 @@ def run_recommendations(
             # Identical evidence in, identical synthesis out, re-asking is
             # the single most expensive call in the run.
             prog.emit("luna", "Recommendation cache hit, synthesis skipped",
-                      payload={**rec_cache_payload, "outcome": "hit"})
+                      payload={**rec_cache_payload, "outcome": "hit"},
+                      run_id=run_id)
             cached["from_cache"] = True
+            prog.emit_progress("synthesis", state="done",
+                               done=len(cached.get("by_symbol") or {}),
+                               total=len(symbols), run_id=run_id)
             return cached
         prog.emit("luna", "Recommendation cache miss, synthesizing fresh",
-                  payload={**rec_cache_payload, "outcome": "miss"})
+                  payload={**rec_cache_payload, "outcome": "miss"},
+                  run_id=run_id)
     except Exception as e:
         logger.debug(f"Recommendation cache check failed: {e}")
 
     prog.emit("luna", f"Synthesis ({ai_analysis.get('recs_model')}) over "
-                      f"{len(symbols)} symbols…")
+                      f"{len(symbols)} symbols…", run_id=run_id)
     synthesis_started = time.time()
     with usage.track("recommendations", trade_date=trade_date,
                      section="recommendations"):
@@ -1099,7 +1171,8 @@ def run_recommendations(
     synthesis_ms = int((time.time() - synthesis_started) * 1000)
     if not result:
         prog.emit("error", "Synthesis model returned empty response, "
-                           "synthesis failed")
+                           "synthesis failed", run_id=run_id)
+        prog.emit_progress("synthesis", state="failed", run_id=run_id)
         return None
 
     result["generated_at"] = datetime.now().isoformat()
@@ -1155,6 +1228,7 @@ def run_recommendations(
                     },
                 },
                 prediction_date_str=trade_date,
+                run_id=run_id,
             )
         except Exception as e:
             logger.warning(f"recommendation persist failed for {sym}: {e}")
@@ -1172,19 +1246,53 @@ def run_recommendations(
                 provider_used=(result.get("provider_used")
                                or MODEL.RECOMMENDATIONS_PROVIDER),
                 duration_ms=synthesis_ms,
+                run_id=run_id,
             )
         except Exception as e:
             logger.warning(f"Failed to persist recommendation: {e}")
 
     actions = {s: v.get("action") for s, v in (result.get("by_symbol") or {}).items()}
     prog.emit("luna", "Synthesis finished, " + (", ".join(
-        f"{s}={a}" for s, a in actions.items()) or "done"))
+        f"{s}={a}" for s, a in actions.items()) or "done"), run_id=run_id)
+    prog.emit_progress("synthesis", state="done", done=len(actions),
+                       total=len(symbols), run_id=run_id)
     return result
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+def _create_scheduled_run_row(symbols: list[str], cutoff_date: date_cls,
+                              target_date: date_cls, config: dict) -> Optional[str]:
+    """The analysis_runs row for a scheduled run, or None when the database
+    refuses: the pipeline and the feed carry on without it, only the pill
+    and the run page lose this run. The JobRun link and the owner travel by
+    env from scheduler_service.run_job (a CLI run has neither)."""
+    try:
+        from services import run_service
+        job_run_id = os.environ.get("QUANTNEWS_JOB_RUN_ID")
+        return run_service.create_run(
+            "scheduled", symbols, os.environ.get("QUANTNEWS_RUN_OWNER") or None,
+            config=config, prediction_date=cutoff_date, target_date=target_date,
+            job_run_id=int(job_run_id) if job_run_id else None)
+    except Exception as e:
+        logger.warning(f"analysis_runs row not created: {e}")
+        return None
+
+
+def _close_run_row(run_id: Optional[str], status: str,
+                   error: Optional[str] = None) -> None:
+    """Best-effort terminal status; sticky on the row's side, so a run the
+    user cancelled keeps that outcome when this lands late."""
+    if not run_id:
+        return
+    try:
+        from services import run_service
+        run_service.set_status(run_id, status, error=error)
+    except Exception as e:
+        logger.warning(f"analysis_runs row {run_id[:8]} not closed: {e}")
+
 
 def run_full_analysis(
     symbols: list[str],
@@ -1218,12 +1326,87 @@ def run_full_analysis(
     symbol, 0 = all) are REQUIRED. They come from the job's params or the
     CLI, never from a default here. Returns a summary dict, the durable
     output is in Postgres.
+
+    This layer owns the run record: an analysis_runs row (kind=scheduled)
+    created BEFORE the feed opens and closed from here, whatever the stages
+    do. The scheduler's own JobRun bookkeeping stays where it is; nothing
+    about this row is decided in run_job's finalize block.
     """
     if lookback_days is None or max_articles is None:
         raise RunParameterMissing(
             "run_full_analysis needs lookback_days and max_articles from the "
             "job params / CLI (got "
             f"lookback_days={lookback_days!r}, max_articles={max_articles!r})")
+    from services import progress_service as prog
+    from utils.trading_calendar import resolve_target_and_cutoff
+
+    target_date, cutoff_date = resolve_target_and_cutoff(target)
+    row_id = _create_scheduled_run_row(symbols, cutoff_date, target_date, {
+        "lookback_days": lookback_days,
+        "max_articles": max_articles,
+        "report_model": report_model or MODEL.REPORT_MODEL,
+        "recs_model": recs_model or MODEL.RECOMMENDATIONS_MODEL,
+        "include_thesis": bool(include_thesis),
+        "models": sorted(models) if models else None,
+        "period": period,
+        "force_refresh": bool(force_refresh),
+        "force": bool(force),
+        "news_filter": (news_filter or MODEL.NEWS_FILTER_MODE).lower(),
+        "evidence": sorted(evidence) if evidence is not None else None,
+        "tools": sorted(tools) if tools else None,
+        "recs_mode": recs_mode,
+        "ensemble_config": ensemble_config,
+        "run_ensemble": bool(run_ensemble),
+    })
+    run_id = prog.start_run(
+        f"Full Analysis (scheduled), {len(symbols)} symbols, "
+        f"target {target_date} (data through {cutoff_date.isoformat()})",
+        run_id=row_id, owner_uid=os.environ.get("QUANTNEWS_RUN_OWNER") or None,
+        kind="scheduled")
+    try:
+        summary = _run_stages(
+            symbols, target=target, lookback_days=lookback_days,
+            report_model=report_model, recs_model=recs_model,
+            include_thesis=include_thesis, models=models, period=period,
+            force_refresh=force_refresh, force=force, news_filter=news_filter,
+            evidence=evidence, max_articles=max_articles, tools=tools,
+            recs_mode=recs_mode, ensemble_config=ensemble_config,
+            run_ensemble=run_ensemble, run_id=run_id)
+    except Exception as e:
+        # An escaped stage error used to leave the feed open until the
+        # watchdog's stall timer; the run is over the moment it raises.
+        prog.emit("error", f"Full Analysis crashed: {str(e)[:200]}",
+                  run_id=run_id)
+        prog.finish_run(f"Full Analysis failed: {str(e)[:120]}", run_id=run_id)
+        _close_run_row(row_id, "failed", error=str(e))
+        raise
+    error = summary.get("error")
+    _close_run_row(row_id, "failed" if error else "done",
+                   error=str(error) if error else None)
+    return summary
+
+
+def _run_stages(
+    symbols: list[str],
+    target: Optional[str] = None,
+    lookback_days: Optional[int] = None,
+    report_model: Optional[str] = None,
+    recs_model: Optional[str] = None,
+    include_thesis: bool = True,
+    models: Optional[set[str]] = None,
+    period: str = "2y",
+    force_refresh: bool = True,
+    force: bool = False,
+    news_filter: Optional[str] = None,
+    evidence: Optional[Iterable[str]] = None,
+    max_articles: Optional[int] = None,
+    tools: Optional[Iterable[str]] = None,
+    recs_mode: str = "auto",
+    ensemble_config: Optional[dict] = None,
+    run_ensemble: bool = True,
+    run_id: Optional[str] = None,
+) -> dict:
+    """The stages of run_full_analysis, inside an already-open run."""
     from services import progress_service as prog
     from services.news_window import (
         describe_news_window, fetch_run_news, news_window_payload,
@@ -1237,9 +1420,6 @@ def run_full_analysis(
     as_of = cutoff_date.isoformat()
     started = datetime.now()
 
-    prog.start_run(f"Full Analysis (scheduled), {len(symbols)} symbols, "
-                   f"target {target_date} (data through {as_of})")
-
     prog.emit_memory("run start", symbols=len(symbols))
     stock_data = load_market_data(symbols, period=period, force_refresh=force_refresh)
     prog.emit_memory("market data")
@@ -1250,10 +1430,23 @@ def run_full_analysis(
 
     max_articles = normalize_article_cap(max_articles)
     _, lookback_days = normalize_lookback(lookback_days)
+    news_seen = {"symbols": 0, "articles": 0}
+
+    def _news_progress(sym: str, articles: list, stats: dict) -> None:
+        news_seen["symbols"] += 1
+        news_seen["articles"] += len(articles)
+        prog.emit_progress(
+            "news", done=news_seen["symbols"], total=len(priced),
+            state="done" if news_seen["symbols"] == len(priced) else "running",
+            articles=news_seen["articles"], run_id=run_id)
+
+    prog.emit_progress("news", done=0, total=len(priced), state="running",
+                       run_id=run_id)
     news_by_symbol, news_stats = fetch_run_news(
         priced, as_of, target_date.isoformat(),
         overnight=(news_filter == "overnight"),
-        lookback_days=lookback_days, max_articles=max_articles)
+        lookback_days=lookback_days, max_articles=max_articles,
+        on_symbol=_news_progress)
     news_unavailable = [s for s in priced
                         if news_stats[s]["status"] == "unavailable"]
     news_empty = [s for s in priced if news_stats[s]["status"] == "empty"]
@@ -1325,7 +1518,7 @@ def run_full_analysis(
         run_ensemble=run_ensemble,
         tools=tools,
     )
-    stored, evaluated = persist_predictions(signals)
+    stored, evaluated = persist_predictions(signals, run_id=run_id)
     prog.emit_memory("predictions persisted")
 
     ai_analysis = build_ai_report(
@@ -1334,6 +1527,7 @@ def run_full_analysis(
         stock_data=stock_data, lookback_days=lookback_days,
         include_thesis=include_thesis, evidence=evidence,
         max_articles=max_articles, overnight=(news_filter == "overnight"),
+        run_id=run_id,
     )
     # After the cache check on purpose: a restored report predating these
     # sections gets them attached instead of silently lacking them.
@@ -1348,9 +1542,11 @@ def run_full_analysis(
                                    else "news+signals")
     if recs_mode == "off":
         prog.emit("luna", "Recommendations off for this job — synthesis skipped")
+        prog.emit_progress("synthesis", state="skipped", run_id=run_id)
         recommendations = None
     else:
-        recommendations = run_recommendations(ai_analysis, signals, priced, as_of)
+        recommendations = run_recommendations(ai_analysis, signals, priced, as_of,
+                                              run_id=run_id)
     prog.emit_memory("synthesis")
 
     # Synthesis rows are written AFTER persist_predictions' auto-evaluate, so
@@ -1387,11 +1583,13 @@ def run_full_analysis(
             file_format="json",
         )
         archived = True
+        prog.emit_progress("report", state="done", archived=1, run_id=run_id)
     except Exception as e:
         archive_error = str(e)
         logger.error(f"AI report NOT archived, it is unrecoverable once this "
                      f"process exits: {e}")
         prog.emit("error", f"AI report not archived: {str(e)[:120]}")
+        prog.emit_progress("report", state="failed", archived=0, run_id=run_id)
 
     coverage, degraded = _assess_completeness(
         signals, priced, models, recommendations)

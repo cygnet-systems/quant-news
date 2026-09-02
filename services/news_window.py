@@ -720,6 +720,7 @@ def fetch_run_news(
     max_articles: int,
     retries: int = 3,
     sleep=None,
+    on_symbol=None,
 ) -> tuple[dict[str, list[dict]], dict[str, dict]]:
     """Point-in-time news for a run, one implementation for every path.
 
@@ -730,6 +731,10 @@ def fetch_run_news(
     ``error``). "The source was down" and "the week was quiet" produce the
     same empty list but mean opposite things; downstream must not conflate
     them.
+
+    ``on_symbol(symbol, articles, stats)`` is called after each symbol: a
+    watchlist fetch under vendor throttling is the run's longest silent
+    stretch, and this is where the runner reports it symbol by symbol.
     """
     import time as _time
     from config import MODEL
@@ -778,6 +783,11 @@ def fetch_run_news(
         if error:
             entry["error"] = error[:200]
         stats_by_symbol[sym] = entry
+        if on_symbol is not None:
+            try:
+                on_symbol(sym, by_symbol[sym], entry)
+            except Exception as e:  # noqa: BLE001 - progress must not stop the fetch
+                logger.debug("news progress hook failed for %s: %s", sym, e)
     return by_symbol, stats_by_symbol
 
 

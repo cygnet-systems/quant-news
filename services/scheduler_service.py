@@ -652,6 +652,10 @@ def run_job(job_id: str, trigger: str = "schedule",
         run_env["QUANTNEWS_RUN_OWNER"] = job["owner_uid"]
         run_env["QUANTNEWS_USER"] = job["owner_uid"]
     run_env["QUANTNEWS_RUN_PUBLIC"] = "1" if job["is_public"] else "0"
+    # The runner creates its own analysis_runs row (kind=scheduled) and
+    # links it back to this JobRun through the env; the row's status is
+    # set from inside the runner, never from the finalize block below.
+    run_env["QUANTNEWS_JOB_RUN_ID"] = str(run_pk)
     try:
         if cmd is None:
             raise RuntimeError(detail)
@@ -747,6 +751,11 @@ def run_job(job_id: str, trigger: str = "schedule",
               f"Scheduled job {job_id}: {status} in {duration_ms // 1000}s",
               feed=False, run_id=job_run_id, run_title=f"Scheduled job {job_id}")
     logger.info(f"Scheduled job {job_id} finished: {status} ({duration_ms}ms)")
+    # The runner closes its own analysis_runs row on the way out; one still
+    # active now is a run whose process was killed at the ceiling or died,
+    # and it would stay this owner's lock on the Run dialog. Closed here,
+    # AFTER the finalize above and never inside it.
+    _close_linked_analysis_runs(run_pk, status, detail)
 
     # A run that finishes just inside the ceiling is a failure waiting for a
     # slow provider day, and nothing else would say so until the day it is
@@ -761,6 +770,22 @@ def run_job(job_id: str, trigger: str = "schedule",
 
     _notify(job, status, summary, detail, started, duration_ms)
     return {"status": status, "detail": detail, "duration_ms": duration_ms}
+
+
+def _close_linked_analysis_runs(run_pk: int, status: str, detail: str) -> None:
+    """Fail the analysis_runs rows still active for a finalized job run and
+    close their feeds. Best-effort: the job's own bookkeeping is done."""
+    try:
+        from services import progress_service as prog
+        from services import run_service
+
+        first_line = (detail or "").strip().splitlines()[:1]
+        error = (f"scheduler job run {run_pk} ended ({status}) before the "
+                 f"run closed" + (f": {first_line[0][:300]}" if first_line else ""))
+        for run in run_service.fail_linked(run_pk, error):
+            prog.close_reaped(run)
+    except Exception as e:
+        logger.warning(f"analysis_runs rows for job run {run_pk} not closed: {e}")
 
 
 def _notify(job: dict, status: str, summary: dict, log: str, started: datetime,
@@ -1178,6 +1203,10 @@ def _watchdog() -> None:
                                f"{JOB_TIMEOUT_SECONDS // 60}-minute ceiling")
     except Exception as e:
         logger.debug(f"watchdog reap skipped: {e}")
+    # The analysis_runs side of the same rule, for the hours when no browser
+    # is polling the progress panel (whose tick reaps too). A job run just
+    # reaped above finalizes its linked analysis_runs row here.
+    prog.reap_orphans()
 
     try:
         state = health()

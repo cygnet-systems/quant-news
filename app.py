@@ -1776,9 +1776,88 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     }
 
 
+# =============================================================================
+# RUN RECORD: the analysis_runs row behind a confirm, and its dispatch
+# =============================================================================
+
+# The run dialog's model checklist, in the order the modal renders it.
+_RUN_MODEL_IDS = [
+    "kronos_mini", "xgboost_shap", "lightgbm",
+    "deberta_sentiment", "trading_agents",
+]
+
+
+def _run_owner_uid():
+    """Owner of a run confirmed in this request: the signed-in user, None
+    when anonymous. The same attribution predictions and reports get, so a
+    run row and its artifacts always agree on whose they are."""
+    try:
+        from services.auth_service import effective_uid
+        return effective_uid()
+    except Exception:
+        return None
+
+
+def _dispatch_run_id(run_store, dispatched) -> str:
+    """The run a stage callback fires for; PreventUpdate when there is none.
+
+    The stages trigger on run-store rather than on the confirm click: the
+    click's own callbacks all fire at once, before the dispatcher could have
+    written the id. A store value the stages already handled (run-dispatched
+    carries the last one) or a run no longer in flight (a session store
+    restoring on reload) is not a new confirm.
+    """
+    run_id = (run_store or {}).get("run_id")
+    if not run_id or run_id == (dispatched or {}).get("run_id"):
+        raise PreventUpdate
+    try:
+        from services import run_service
+        row = run_service.get_run(run_id)
+    except Exception as e:
+        logger.warning("run %s: run row unreadable: %s", run_id[:8], e)
+        row = None
+    if row is not None and not row["active"]:
+        raise PreventUpdate
+    return run_id
+
+
+def _close_run(run_id, message: str, status: str = "done", error=None) -> None:
+    """Close a UI run: the feed's closing line and the analysis_runs status,
+    together, from whichever process finishes last. Terminal statuses are
+    sticky on the row, so a stage closing after a cancel changes nothing."""
+    from services import progress_service as prog
+    prog.finish_run(message, run_id=run_id)
+    if not run_id:
+        return
+    try:
+        from services import run_service
+        first_line = (str(error).strip().splitlines() or [""])[0][:500] \
+            if error is not None else None
+        run_service.set_status(run_id, status, error=first_line or None)
+    except Exception as e:
+        logger.warning("run %s: status %s not recorded: %s",
+                       run_id[:8], status, e)
+
+
+@callback(
+    Output("run-dispatched", "data"),
+    Input("run-store", "data"),
+    State("run-dispatched", "data"),
+    prevent_initial_call=True,
+)
+def mark_run_dispatched(run_store, dispatched):
+    """Remember which run the stages were handed. Fires in the same batch as
+    the stages, so they still see the previous value; the next emission of
+    the same id (a reload restoring the session store) sees this one."""
+    run_id = (run_store or {}).get("run_id")
+    if not run_id or run_id == (dispatched or {}).get("run_id"):
+        raise PreventUpdate
+    return {"run_id": run_id, "at": datetime.now().isoformat()}
+
+
 @callback(
     Output("ai-analysis-store", "data"),
-    Input("run-confirm-btn", "n_clicks"),
+    Input("run-store", "data"),
     Input("ai-retry-btn", "n_clicks"),
     State("run-scope", "value"),
     State("run-symbols-store", "data"),
@@ -1792,12 +1871,14 @@ async def fetch_news_data(symbols, refresh_click, cache_enabled):
     State("run-recs-model", "value"),
     State("run-evidence", "value"),
     State("run-tools", "value"),
+    State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
-async def generate_ai_analysis(n_clicks, retry_clicks, scope,
+async def generate_ai_analysis(run_store, retry_clicks, scope,
                                run_symbols, stock_data, run_date, lookback,
                                max_articles_val, model, depth, recs,
-                               recs_model, run_evidence, run_tools):
+                               recs_model, run_evidence, run_tools,
+                               dispatched):
     """Generate structured AI analysis grounded in financial data and news.
 
     Triggered by user clicking "AI Report" or "Full Analysis" button.
@@ -1810,17 +1891,38 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     live quote data is suppressed for past dates, no lookahead in backtests.
     """
     from datetime import date as date_cls
+    from functools import partial
 
-    # A models-only run has no report to build.
-    scope = scope or "full"
-    if ctx.triggered_id == "run-confirm-btn" and scope == "models":
-        raise PreventUpdate
+    # The dispatcher's snapshot of scope and symbols wins over the dialog
+    # controls, which the user may have touched since confirming.
+    scope = (run_store or {}).get("scope") or scope or "full"
+    if ctx.triggered_id == "run-store":
+        run_id = _dispatch_run_id(run_store, dispatched)
+        # A models-only run has no report to build.
+        if scope == "models":
+            raise PreventUpdate
+    else:
+        # Retry re-runs the report under the run the dialog last started.
+        if not retry_clicks:
+            raise PreventUpdate
+        run_id = (run_store or {}).get("run_id")
     # The run's symbol set comes from the dialog (watchlist / last cohort /
     # custom), not from the watchlist directly. The report does its own
     # point-in-time fetch per symbol; the browser's news store plays no part.
-    symbols = (run_symbols or {}).get("symbols") or []
-    if not (n_clicks or retry_clicks) or not symbols:
+    symbols = ((run_store or {}).get("symbols")
+               or (run_symbols or {}).get("symbols") or [])
+    if not symbols:
         raise PreventUpdate
+
+    # Every feed line of this stage names its run: the server process hosts
+    # every user's report stage at once, so an unnamed emit could land in
+    # another user's feed.
+    from services import progress_service as prog
+    emit = partial(prog.emit, run_id=run_id)
+    # The structured counterpart (stage state, done/total, counters): what
+    # the run row, the pill and the run page read. Same rule, same run.
+    progress = partial(prog.emit_progress, run_id=run_id)
+    n_symbols = len(symbols)
 
     # Metric/signal context for symbols outside the browser stores (e.g. a
     # cohort-scoped or single-symbol run) is fetched server-side.
@@ -1853,11 +1955,12 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     except RunParameterMissing as e:
         # Refuse, visibly. No default: a report on a window the user did not
         # pick would be indistinguishable from the one they asked for.
-        from services import progress_service as prog
-        prog.emit("error", f"Report rejected: {e}")
-        prog.finish_run(f"Report failed: {e}")
+        emit("error", f"Report rejected: {e}")
+        progress("report", state="failed", done=0, total=n_symbols)
+        _close_run(run_id, f"Report failed: {e}", "failed", error=e)
         return {"failed": True, "error": str(e), "scope": scope,
-                "run_seq": n_clicks, "generated_at": datetime.now().isoformat()}
+                "run_seq": run_id, "run_id": run_id,
+                "generated_at": datetime.now().isoformat()}
     window_desc = ("overnight close→open" if overnight_news
                    else f"{lookback_days}d")
     report_model = model or "gpt-5.6-luna"
@@ -1878,20 +1981,27 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     # it here too would double the LLM spend for identical output.
     include_research = not is_full
 
-    from services import progress_service as prog
+    owner_uid = (run_store or {}).get("owner_uid") or _run_owner_uid()
     if is_full:
         prog.start_run(f"Full Analysis: {len(symbols or [])} symbols, "
                        f"target {target_str} (data through {as_of_str})"
-                       + (" (backtest)" if is_backtest else ""))
+                       + (" (backtest)" if is_backtest else ""),
+                       run_id=run_id, owner_uid=owner_uid, kind="manual")
     else:
         # A report-only run is a run too: without its own boundary the panel
         # keeps the previous run's green check through the whole generation
         # and polls at the idle rate.
         prog.start_run(f"Report: {len(symbols or [])} symbols, "
                        f"target {target_str} (data through {as_of_str})"
-                       + (" (backtest)" if is_backtest else ""))
-    prog.emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
-    prog.emit("action", f"Options: model={report_model}, window={window_desc}, "
+                       + (" (backtest)" if is_backtest else ""),
+                       run_id=run_id, owner_uid=owner_uid, kind="manual")
+    # First structured event of the run: this is what flips the row from
+    # queued to running, before any fetch.
+    progress("report", state="running", done=0, total=n_symbols)
+    if recs_mode == "off":
+        progress("synthesis", state="skipped")
+    emit("ai", f"AI Report starting for {', '.join(symbols or [])}")
+    emit("action", f"Options: model={report_model}, window={window_desc}, "
                         f"type={'thesis' if include_thesis_flag else 'standard'}, "
                         f"research={'pipeline' if is_full else 'on'}, "
                         f"recs={recs_mode} ({recs_model_val}), "
@@ -1923,7 +2033,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
             price_inputs[sym] = {"bars": 0, "error": str(e)[:120]}
     # No `period`: the store's label is the UI display window, not the data
     # window: per-symbol start/end record what was actually consumed.
-    prog.emit("action",
+    emit("action",
               f"Price inputs resolved: "
               f"{sum(1 for v in price_inputs.values() if v.get('bars'))}"
               f"/{len(symbols or [])} symbols (data through {as_of_str})",
@@ -1937,19 +2047,29 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     # window for any backtest and an unlabelled one live.
     from services.news_window import (
         describe_news_window, fetch_run_news, news_window_payload)
+    news_seen = {"symbols": 0, "articles": 0}
+
+    def _news_progress(sym: str, articles: list, stats: dict) -> None:
+        news_seen["symbols"] += 1
+        news_seen["articles"] += len(articles)
+        progress("news", done=news_seen["symbols"], total=n_symbols,
+                 state="done" if news_seen["symbols"] == n_symbols else "running",
+                 articles=news_seen["articles"])
+
+    progress("news", done=0, total=n_symbols, state="running")
     articles_by_symbol, news_stats = await asyncio.to_thread(
         fetch_run_news, symbols or [], as_of_str, target_str,
         overnight=overnight_news, lookback_days=lookback_days,
-        max_articles=max_articles)
+        max_articles=max_articles, on_symbol=_news_progress)
     total_articles = sum(len(a) for a in articles_by_symbol.values())
     news_payload = news_window_payload(
         overnight=overnight_news, lookback_days=lookback_days,
         max_articles=max_articles, as_of=as_of_str, target=target_str,
         stats_by_symbol=news_stats)
-    prog.emit("news", describe_news_window(news_payload), payload=news_payload)
+    emit("news", describe_news_window(news_payload), payload=news_payload)
     news_down = [s for s, v in news_stats.items() if v["status"] == "unavailable"]
     if news_down:
-        prog.emit("error",
+        emit("error",
                   f"News source unavailable for {len(news_down)} of "
                   f"{len(symbols or [])} symbols: {', '.join(news_down)}: "
                   f"the report has NO news for them; treat their sections "
@@ -1984,22 +2104,25 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
             }
             cached = ps.get_cached_report(None, as_of_str, "ai_report", data_hash)
             if not cached:
-                prog.emit("ai", "AI report cache miss, generating fresh",
+                emit("ai", "AI report cache miss, generating fresh",
                           payload={**report_cache_payload, "outcome": "miss"})
             if cached:
                 logger.info("AI report cache hit (Postgres/S3)")
-                prog.emit("ai", "AI report cache hit, regeneration skipped",
+                emit("ai", "AI report cache hit, regeneration skipped",
                           payload={**report_cache_payload, "outcome": "hit"})
                 cached_result = json.loads(cached)
                 cached_result["from_cache"] = True
                 # Re-stamp for THIS click. The stored copy carries the
                 # correlation keys of the run that originally produced it.
-                cached_result["run_seq"] = n_clicks
+                cached_result["run_seq"] = run_id
+                cached_result["run_id"] = run_id
                 cached_result["scope"] = scope
+                progress("report", state="done", done=n_symbols,
+                         total=n_symbols)
                 if not is_full and recs_mode == "off":
                     # Nothing left to run for this scope: close the run.
-                    prog.finish_run(f"Report complete ({len(symbols or [])} "
-                                    "symbols, from cache)")
+                    _close_run(run_id, f"Report complete ({len(symbols or [])} "
+                                       "symbols, from cache)")
                 return cached_result
         except Exception as e:
             logger.debug(f"AI report cache check failed: {e}")
@@ -2014,11 +2137,12 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
         "by_symbol": {},
         "as_of": as_of_str,
         "generated_at": datetime.now().isoformat(),
-        # Correlation keys: run_seq ties this payload to the confirm click
-        # that produced it (the model-signals _meta carries the same value),
+        # Correlation keys: run_seq ties this payload to the run that
+        # produced it (the model-signals _meta carries the same value),
         # and scope lets the synthesis callback tell a report-only payload
         # from a full-pipeline one even if a stale requested flag lingers.
-        "run_seq": n_clicks,
+        "run_seq": run_id,
+        "run_id": run_id,
         "scope": scope,
     }
 
@@ -2028,7 +2152,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     for symbol in (symbols or []):
         # One line per symbol: this loop is network-bound (profile, events,
         # peers, options, quality) and used to run in total silence.
-        prog.emit("ai", f"{symbol}: gathering fundamentals, options, "
+        emit("ai", f"{symbol}: gathering fundamentals, options, "
                         f"quality screens…")
         sym_data = stock_data.get(symbol, {})
         enriched = {
@@ -2154,7 +2278,7 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
             last_bar = pd.to_datetime(df.index.max()).date()
             age = (date_cls.fromisoformat(as_of_str) - last_bar).days
             if age > 5:
-                prog.emit("ta", f"{sym}: cached prices end {last_bar} "
+                emit("ta", f"{sym}: cached prices end {last_bar} "
                                 f"({age}d before {as_of_str}): refetching fresh")
                 df = None
         model_obj = TradingAgentsModel()
@@ -2185,20 +2309,34 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     n_workers = min(len(symbol_tasks) * (2 if include_research else 1) + 1, 8)
     sem = asyncio.Semaphore(n_workers)
 
+    # Research progress: one step per symbol whose task ended, written or
+    # not; the reports counter is what actually landed.
+    research_seen = {"done": 0, "written": 0}
+
+    def _research_step(written: bool) -> None:
+        research_seen["done"] += 1
+        research_seen["written"] += 1 if written else 0
+        progress("research", done=research_seen["done"],
+                 total=len(symbol_tasks),
+                 research_reports=research_seen["written"])
+
     async def _run_task(task_type, symbol, fn, *args, **kw):
         try:
             async with sem:
                 analysis = await asyncio.to_thread(fn, *args, **kw)
         except Exception as e:
             logger.warning(f"Error in LLM analysis for {task_type} {symbol}: {e}")
-            prog.emit("error", f"AI analysis failed for {symbol or 'overall'}: {str(e)[:80]}")
+            emit("error", f"AI analysis failed for {symbol or 'overall'}: {str(e)[:80]}")
+            if task_type == "research":
+                _research_step(False)
             return
 
         if task_type == "research":
             r = analysis  # PredictionResult
             if r is None or r.error:
-                prog.emit("error", f"{symbol}: research report failed: "
+                emit("error", f"{symbol}: research report failed: "
                                    f"{(r.error if r else 'no result')[:80]}")
+                _research_step(False)
                 return
             details = r.details or {}
             raw = details.get("raw_response", "")
@@ -2227,27 +2365,31 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
                     # report it wrote recorded 0 and cost was unmeasurable.
                     input_tokens=details.get("input_tokens", 0),
                     output_tokens=details.get("output_tokens", 0),
+                    run_id=run_id,
                 )
             except Exception as e:
                 logger.warning(f"research report persist failed for {symbol}: {e}")
-            prog.emit("ta", f"{symbol}: research → {r.decision} "
+            emit("ta", f"{symbol}: research → {r.decision} "
                             f"({r.confidence:.0%})")
+            _research_step(True)
             return
         if analysis:
             if task_type == "symbol":
                 result["by_symbol"][symbol] = analysis
-                prog.emit("ai", f"{symbol}: {analysis.get('recommendation', '?')} "
+                emit("ai", f"{symbol}: {analysis.get('recommendation', '?')} "
                                 f"({int((analysis.get('confidence') or 0) * 100)}%)")
             else:
                 result["overall"] = analysis
-                prog.emit("ai", f"Overall: {analysis.get('recommendation', '?')}")
+                emit("ai", f"Overall: {analysis.get('recommendation', '?')}")
 
     aio_tasks = []
 
     if include_research:
+        progress("research", done=0, total=len(symbol_tasks),
+                 state="running", research_reports=0)
         for symbol in symbol_tasks:
             aio_tasks.append(_run_task("research", symbol, _run_research, symbol))
-            prog.emit("ta", f"{symbol}: research report starting ({report_model})…")
+            emit("ta", f"{symbol}: research report starting ({report_model})…")
 
     # The research report IS the per-symbol text analysis. The shallow
     # summarize_news_structured per-symbol pass that used to run instead of
@@ -2289,10 +2431,18 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
             model=report_model,
             provider=report_provider,
         ))
-        prog.emit("ai", f"Overall: synthesizing {len(overall_articles)} articles "
+        emit("ai", f"Overall: synthesizing {len(overall_articles)} articles "
                         f"across {len(symbols or [])} symbols…")
 
     await asyncio.gather(*aio_tasks)
+
+    if include_research:
+        # Same verdicts the scheduled runner records: done when reports
+        # landed, failed when research was asked for and none did.
+        progress("research", done=research_seen["done"],
+                 total=len(symbol_tasks),
+                 state="done" if research_seen["written"] else "failed",
+                 research_reports=research_seen["written"])
 
     # Attach research to each symbol's analysis dict so the tab renderer
     # gets everything through one object (additive key; old payloads and
@@ -2336,20 +2486,22 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
 
     if not result["by_symbol"] and not result["overall"]:
         result["failed"] = True
-        prog.emit("error", "AI Report produced no analysis")
+        emit("error", "AI Report produced no analysis")
+        progress("report", state="failed", done=0, total=n_symbols)
     else:
         # Count what the report covered. Full scope defers the per-symbol
         # research to the model stage, so by_symbol is legitimately empty
         # there: fall back to the run's symbol list rather than saying "0".
         n_covered = len(result["by_symbol"]) or len(symbols or [])
         if is_full:
-            prog.emit("ai", f"AI Report complete ({n_covered} symbols): "
+            emit("ai", f"AI Report complete ({n_covered} symbols): "
                             "model predictions next")
         elif recs_mode != "off":
-            prog.emit("ai", f"AI Report complete ({n_covered} symbols): "
+            emit("ai", f"AI Report complete ({n_covered} symbols): "
                             "synthesizing recommendations next")
         else:
-            prog.emit("ai", f"AI Report complete ({n_covered} symbols)")
+            emit("ai", f"AI Report complete ({n_covered} symbols)")
+        progress("report", state="done", done=n_covered, total=n_symbols)
 
     # Per-symbol options positioning + quality screen ride the payload so the
     # synthesis prompt and every renderer read one source. After the failed
@@ -2382,11 +2534,12 @@ async def generate_ai_analysis(n_clicks, retry_clicks, scope,
     # persist/synthesis stages once the models land.
     if not is_full:
         if result.get("failed"):
-            prog.finish_run("Report failed: no analysis produced")
+            _close_run(run_id, "Report failed: no analysis produced", "failed",
+                       error="AI report produced no analysis")
         elif recs_mode == "off":
-            prog.finish_run(f"Report complete "
-                            f"({len(result['by_symbol']) or len(symbols or [])}"
-                            " symbols)")
+            _close_run(run_id, f"Report complete "
+                               f"({len(result['by_symbol']) or len(symbols or [])}"
+                               " symbols)")
 
     return result
 
@@ -2870,7 +3023,7 @@ def update_period(clicks, current_period):
 
 @callback(
     Output("model-signals-store", "data"),
-    Input("run-confirm-btn", "n_clicks"),
+    Input("run-store", "data"),
     State("run-scope", "value"),
     State("stock-data-store", "data"),
     State("run-symbols-store", "data"),
@@ -2888,37 +3041,49 @@ def update_period(clicks, current_period):
     State("run-type", "value"),
     State("run-evidence", "value"),
     State("run-tools", "value"),
+    State("run-dispatched", "data"),
     background=True,
     running=[
         (Output("prediction-running-indicator", "style"), {"display": "block"}, {"display": "none"}),
     ],
     prevent_initial_call=True,
 )
-def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
+def generate_model_signals(run_store, scope, stock_data, run_symbols,
                            ensemble_config, model_checks,
                            run_ensemble, ens_members, ens_weights, ens_method,
                            ens_min_agree, predict_date_str, lookback,
                            max_articles_val, research_model,
-                           research_depth, run_evidence, run_tools):
+                           research_depth, run_evidence, run_tools,
+                           dispatched):
     """Generate model predictions in a background subprocess.
 
     Supports backtesting: when the selected as-of date is in the past, OHLCV
     data is truncated to that date so models only see data available
     as of that day. The selected date is stored in metadata for
     correct persistence.
+
+    The run id arrives as an argument (run-store is an Input, so its value
+    is serialised into this subprocess) and is asserted before any work:
+    the row it names is what the persisted predictions, the feed and the
+    cancel path key on, so a stage without one must not run at all.
     """
+    from functools import partial
+
     # A report-only run has no models to execute.
-    scope = scope or "full"
+    scope = (run_store or {}).get("scope") or scope or "full"
     if scope == "report":
         raise PreventUpdate
-    symbols = (run_symbols or {}).get("symbols") or []
-    if not n_clicks or not symbols:
+    run_id = _dispatch_run_id(run_store, dispatched)
+    symbols = ((run_store or {}).get("symbols")
+               or (run_symbols or {}).get("symbols") or [])
+    if not symbols:
         raise PreventUpdate
 
     # The model checkboxes are now honoured on every scope. Full pipeline used
     # to overwrite them with [True] * 5, so the boxes you unticked ran anyway.
     is_full_analysis = scope == "full"
     from services import progress_service as _prog
+    _emit = partial(_prog.emit, run_id=run_id)
 
     def _abort_run(exc: Exception) -> dict:
         """Close the run as a failure and hand downstream a marked payload.
@@ -2933,22 +3098,34 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
         badge as if successful and left the panel spinning forever.
         """
         logger.exception("Model signal generation error")
-        _prog.emit("error", f"Model run failed: {str(exc)[:200]}")
-        _prog.finish_run(("Full Analysis" if is_full_analysis
-                          else "Predictions")
-                         + f" failed: {str(exc)[:120]}")
-        return {"_run_failed": str(exc), "_meta": {"run_seq": n_clicks}}
+        _emit("error", f"Model run failed: {str(exc)[:200]}")
+        _close_run(run_id, ("Full Analysis" if is_full_analysis
+                            else "Predictions")
+                   + f" failed: {str(exc)[:120]}", "failed", error=exc)
+        return {"_run_failed": str(exc),
+                "_meta": {"run_seq": run_id, "run_id": run_id}}
 
     # Everything after the guards runs under a catch-all. A one-line bug
     # before the old try boundary shipped as "every run dies at +1s with a
     # bare HTTP 500 and a forever-running badge". Nothing here may execute
     # unprotected.
     try:
+        # For anything in this process that reads the run from the
+        # environment; the id itself travels as an argument.
+        os.environ["QUANTNEWS_RUN_ID"] = run_id
         if not is_full_analysis:
             # Models-only owns the feed; the full pipeline started it
             # already. Started BEFORE the input fill so the first emits below
             # group under this run, not the previous one.
-            _prog.start_run(f"Predictions: {len(symbols or [])} symbols")
+            _prog.start_run(f"Predictions: {len(symbols or [])} symbols",
+                            run_id=run_id,
+                            owner_uid=(run_store or {}).get("owner_uid"),
+                            kind="manual")
+        else:
+            # The server opened this run; this process only executes one of
+            # its stages. Unnamed emits and the LLM usage rows written here
+            # must still group under it.
+            _prog.adopt_run(run_id)
 
         # First line before any heavy work: the subprocess spends its first
         # seconds on imports and input fetches with nothing on the panel.
@@ -2958,10 +3135,10 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
         # grinding": this process has been observed dying without a
         # traceback (torch/MPS native teardown), which previously left the
         # run spinning forever.
-        _prog.emit("models", "Preparing model engine (first run loads model "
-                             "weights)…",
-                   payload={"event": "run_process", "pid": os.getpid()})
-        _prog.record_run_pid()
+        _emit("models", "Preparing model engine (first run loads model "
+                        "weights)…",
+              payload={"event": "run_process", "pid": os.getpid()})
+        _prog.record_run_pid(run_id)
 
         # The dialog's news window and cap govern the models too, the
         # sentiment and research models used to read the browser's news
@@ -3005,10 +3182,7 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
 
         is_backtest = target_date < date_cls.today()
 
-        _ALL_MODEL_IDS = [
-            "kronos_mini", "xgboost_shap", "lightgbm",
-            "deberta_sentiment", "trading_agents",
-        ]
+        _ALL_MODEL_IDS = _RUN_MODEL_IDS
         selected_models = set()
         for model_id, checked in zip(_ALL_MODEL_IDS, model_checks or []):
             if checked:
@@ -3055,7 +3229,7 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
         priced = [s for s in symbols if s in stock_data]
         for sym in symbols:
             if sym not in stock_data:
-                _prog.emit("error", f"{sym}: skipped: no price data available")
+                _emit("error", f"{sym}: skipped: no price data available")
 
         # Point-in-time news for the run: the same fetch, window and cap the
         # report and the dialog preview use.
@@ -3067,16 +3241,16 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
             overnight=overnight_news, lookback_days=lookback_days,
             max_articles=max_articles, as_of=str(predict_date),
             target=str(target_date), stats_by_symbol=news_stats)
-        _prog.emit("news", describe_news_window(news_payload),
-                   payload=news_payload)
+        _emit("news", describe_news_window(news_payload),
+              payload=news_payload)
         news_down = [s for s, v in news_stats.items()
                      if v["status"] == "unavailable"]
         if news_down:
-            _prog.emit("error",
-                       f"News source unavailable for {len(news_down)} of "
-                       f"{len(priced)} symbols: {', '.join(news_down)}. "
-                       f"Their sentiment and research models run WITHOUT "
-                       f"news; treat those calls as unsupported.")
+            _emit("error",
+                  f"News source unavailable for {len(news_down)} of "
+                  f"{len(priced)} symbols: {', '.join(news_down)}. "
+                  f"Their sentiment and research models run WITHOUT "
+                  f"news; treat those calls as unsupported.")
 
         # ONE implementation of the model stage (services.analysis_runner):
         # the interactive copy that lived here had drifted from the
@@ -3098,9 +3272,11 @@ def generate_model_signals(n_clicks, scope, stock_data, run_symbols,
             ensemble_config=ensemble_config,
             run_ensemble=bool(run_ensemble),
         )
-        # Ties this store to the confirm click that produced it, so the
-        # synthesis stage can pair it with the same click's AI report.
-        results["_meta"]["run_seq"] = n_clicks
+        # Ties this store to the run that produced it, so the synthesis
+        # stage can pair it with the same run's AI report and the server
+        # can stamp the rows it persists.
+        results["_meta"]["run_seq"] = run_id
+        results["_meta"]["run_id"] = run_id
         return results
 
     except Exception as e:
@@ -3124,11 +3300,14 @@ def persist_predictions(signals, fa_requested, ai_analysis):
     """
     if not signals:
         raise PreventUpdate
+    meta = signals.get("_meta") or {}
+    run_id = meta.get("run_id")
+    fa_requested = _synthesis_armed(fa_requested, run_id)
     # The worker's output is in hand. Its pid no longer stands for the
     # run's health, alive or not (the watchdog must not flag a subprocess
     # that exited after delivering).
     from services import progress_service as _prog_pid
-    _prog_pid.clear_run_pid()
+    _prog_pid.clear_run_pid(run_id)
     if signals.get("_run_failed"):
         # The background handler already emitted the failure and finished
         # the run: pass a failed status through so the pages listening on
@@ -3136,7 +3315,6 @@ def persist_predictions(signals, fa_requested, ai_analysis):
         return {"failed": signals["_run_failed"], "count": 0,
                 "stored_at": str(datetime.now())}
 
-    meta = signals.get("_meta") or {}
     predict_date_str = meta.get("predict_date")
     is_backtest = meta.get("is_backtest", False)
 
@@ -3145,13 +3323,13 @@ def persist_predictions(signals, fa_requested, ai_analysis):
         # that lived here recorded the model that was ASKED for on research
         # reports instead of the one that answered after a provider fallback.
         from services.analysis_runner import persist_predictions as _persist
-        stored, evaluated = _persist(signals)
+        stored, evaluated = _persist(signals, run_id=run_id)
         from services import progress_service as prog
         # New rows: the launch screen must show this run, not the last one.
         from services.dashboard_service import invalidate_memo
         invalidate_memo()
         if not fa_requested:
-            prog.finish_run(f"Predictions complete: {stored} stored")
+            _close_run(run_id, f"Predictions complete: {stored} stored")
         elif ((ai_analysis or {}).get("failed")
               and (ai_analysis or {}).get("run_seq") == meta.get("run_seq")):
             # This run's report already failed: no synthesis is coming, so
@@ -3159,7 +3337,8 @@ def persist_predictions(signals, fa_requested, ai_analysis):
             # callback sees the same store pair and closes the run.
             pass
         else:
-            prog.emit("luna", "Handing off to recommendation synthesis…")
+            prog.emit("luna", "Handing off to recommendation synthesis…",
+                      run_id=run_id)
 
         return {
             "stored_at": str(datetime.now()),
@@ -3167,20 +3346,35 @@ def persist_predictions(signals, fa_requested, ai_analysis):
             "evaluated": evaluated,
             "is_backtest": is_backtest,
             "predict_date": predict_date_str,
+            "run_id": run_id,
         }
 
     except Exception as e:
         logger.error(f"Prediction persistence error: {e}")
         from services import progress_service as prog
-        prog.emit("error", f"Prediction storage failed: {str(e)[:200]}")
+        prog.emit("error", f"Prediction storage failed: {str(e)[:200]}",
+                  run_id=run_id)
         if not fa_requested:
-            prog.finish_run("Predictions finished with errors, storage "
-                            "failed")
+            _close_run(run_id, "Predictions finished with errors, storage "
+                               "failed", "failed", error=e)
         else:
             # The signals are still in the store, so synthesis can proceed
-            # and owns the finish; only the persisted rows are missing.
-            prog.emit("luna", "Handing off to recommendation synthesis…")
-        return {"error": str(e), "stored_at": str(datetime.now())}
+            # and owns the finish; only the persisted rows are missing. The
+            # row keeps the error text while it stays running, so the run
+            # page can say what was lost once synthesis closes it as done.
+            if run_id:
+                try:
+                    from services import run_service
+                    run_service.set_status(
+                        run_id, "running",
+                        error=f"prediction storage failed: {str(e)[:400]}")
+                except Exception as e2:
+                    logger.warning("run %s: storage error not recorded: %s",
+                                   run_id[:8], e2)
+            prog.emit("luna", "Handing off to recommendation synthesis…",
+                      run_id=run_id)
+        return {"error": str(e), "stored_at": str(datetime.now()),
+                "run_id": run_id}
 
 
 # =============================================================================
@@ -3395,8 +3589,10 @@ _PROGRESS_POLL_IDLE_MS = 10_000
     State("progress-interval", "interval"),
     State("progress-snap-store", "data"),
     State("progress-fp-store", "data"),
+    State("run-store", "data"),
 )
-def render_progress_panel(_n, _current_interval, last_snap, last_fp):
+def render_progress_panel(_n, _current_interval, last_snap, last_fp,
+                          run_store=None):
     """Live activity feed for pipeline runs.
 
     Streams events emitted by every stage (including the background model
@@ -3411,7 +3607,12 @@ def render_progress_panel(_n, _current_interval, last_snap, last_fp):
     # idle (one diskcache read); emits + closes the run at most once.
     prog.watchdog_check()
 
-    feed = prog.get_feed()
+    # This viewer's own run while it is in flight; otherwise the feed's
+    # default (the newest run in flight, or the rolling log when idle).
+    # Without the pin, confirming a run in another session (or a scheduled
+    # job starting) switched every open panel to that run's feed.
+    own_run = (run_store or {}).get("run_id")
+    feed = prog.get_feed(own_run if prog.is_active(own_run) else None)
     events = feed.get("events") or []
     active = bool(feed.get("active"))
     poll = (_PROGRESS_POLL_ACTIVE_MS if active
@@ -3439,7 +3640,7 @@ def render_progress_panel(_n, _current_interval, last_snap, last_fp):
     # (cold-start rehydrate, another publisher process).
     newest = events[-1]
     fp = [len(events), newest.get("t"), newest.get("stage"),
-          newest.get("message"), snap, active]
+          newest.get("message"), snap, active, feed.get("run_id")]
     if fp == last_fp:
         return (dash.no_update, dash.no_update, dash.no_update, poll_out,
                 snap_out, dash.no_update)
@@ -3613,7 +3814,9 @@ def render_trace_view(_n, run_id, wm):
 
     feed = prog.get_feed()
     active = bool(feed.get("active"))
-    live_run = prog.current_run_id()
+    # The feed names the run in flight whichever process opened it; this
+    # process's own run id is only set for runs it started itself.
+    live_run = feed.get("run_id")
     poll = (trace_page.POLL_ACTIVE_MS if active and run_id == live_run
             else trace_page.POLL_IDLE_MS)
     poll_out = poll if poll != wm.get("poll") else dash.no_update
@@ -4745,6 +4948,14 @@ def run_job_now(clicks):
 def _startup():
     """One-time server-process startup: progress hydrate, S3, auth, scheduler."""
     _progress_service.hydrate_from_db()
+    # Every run this server (or the one it replaced) had in flight died with
+    # it, and a queued/running row is its owner's lock on the Run dialog.
+    from services import run_service
+    reaped = _progress_service.reap_orphans(
+        max_age_s=0, error=run_service.ORPHAN_RESTART_ERROR)
+    if reaped:
+        logger.warning("Failed %d run(s) left in flight by the previous "
+                       "server process", len(reaped))
     _init_s3()
     # Auth tables (no-op when AUTH_DATABASE_URL points at the shared Cygnet
     # auth DB, which already has them from CygnetResearchTerminal).
@@ -5064,6 +5275,9 @@ def _run_source_options(watchlist, cohort_syms):
     Output("run-date-picker", "date"),
     Output("run-date-picker", "max_date_allowed"),
     Output("run-date-picker", "disabled_days"),
+    # The run record: written once per accepted confirm, and the ONLY
+    # trigger of the stage callbacks (see _dispatch_run_id).
+    Output("run-store", "data"),
     Input("run-analysis-btn", "n_clicks"),
     Input("reports-new-btn", "n_clicks", allow_optional=True),
     Input({"type": "new-report-btn", "symbol": ALL}, "n_clicks"),
@@ -5076,11 +5290,30 @@ def _run_source_options(watchlist, cohort_syms):
     State("run-symbols-store", "data"),
     State("run-scope", "value"),
     State("progress-panel-state", "data"),
+    # The dialog's values, recorded on the run row as its config.
+    State("run-date-picker", "date"),
+    State("run-lookback", "value"),
+    State("run-max-articles", "value"),
+    State("run-model", "value"),
+    State("run-type", "value"),
+    State("run-recs", "value"),
+    State("run-recs-model", "value"),
+    State("run-evidence", "value"),
+    State("run-tools", "value"),
+    State({"type": "run-model-check", "model": ALL}, "value"),
+    State("run-ensemble-check", "value"),
+    State("run-ensemble-method", "value"),
+    State("run-ensemble-min-agree", "value"),
     prevent_initial_call=True,
 )
 def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                      confirm_clicks, stock_data, watchlist,
-                     news_data, is_open, run_store, run_scope, panel_state):
+                     news_data, is_open, run_store, run_scope, panel_state,
+                     run_date=None, lookback=None, max_articles=None,
+                     report_model=None, depth=None, recs=None,
+                     recs_model=None, run_evidence=None, run_tools=None,
+                     model_checks=None, run_ensemble=None, ens_method=None,
+                     ens_min_agree=None):
     """Open or close the single run dialog, preset by where it was opened.
 
     Two kinds of opener, deliberately: the toolbar button (the ONE global
@@ -5090,11 +5323,14 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     New-report button (scope=report, just that symbol). The old Home header
     duplicate, which carried no context at all, is gone.
 
-    Confirm also owns the immediate acknowledgement: force-open the activity
-    panel (a user who once closed it otherwise gets zero feedback) and toast
-    where the results will land. An empty symbol set keeps the dialog open
-    with an inline message instead of silently no-opping, every downstream
-    stage guards on the list being non-empty.
+    Confirm is the run dispatcher: one run per owner at a time (a second
+    confirm is refused with a Cancel button while one is in flight), then
+    the analysis_runs row is created and its id written to run-store, which
+    is what starts the stages. It also owns the immediate acknowledgement:
+    force-open the activity panel (a user who once closed it otherwise gets
+    zero feedback) and toast the symbols and the estimate. An empty symbol
+    set keeps the dialog open with an inline message instead of silently
+    no-opping, every downstream stage guards on the list being non-empty.
     """
     triggered = ctx.triggered_id
     no_sym_update = (dash.no_update,) * 3
@@ -5102,35 +5338,115 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     no_feedback = (dash.no_update,) * 4
     # date-picker date + max_date_allowed + disabled_days
     no_picker = (dash.no_update,) * 3
+    no_run = (dash.no_update,)
 
     if triggered == "run-cancel-btn":
         return (False, dash.no_update, dash.no_update) + no_sym_update \
-            + ("",) + no_feedback + no_picker
+            + ("",) + no_feedback + no_picker + no_run
 
     if triggered == "run-confirm-btn":
         symbols = (run_store or {}).get("symbols") or []
+        keep_open = (dash.no_update,) * 6
+
+        def refuse(message):
+            return keep_open + (message,) + no_feedback + no_picker + no_run
+
         if not symbols:
-            return (dash.no_update,) * 6 \
-                + ("Add at least one symbol to run.",) + no_feedback \
-                + no_picker
-        panel = dict(panel_state or {})
-        panel.setdefault("mode", "normal")
-        panel["closed"] = False
+            return refuse("Add at least one symbol to run.")
+        scope = run_scope or "full"
+        from services import progress_service as prog
+        from services import run_service
+
+        owner_uid = _run_owner_uid()
+        try:
+            active = run_service.active_run_for(owner_uid)
+        except Exception as e:
+            logger.warning("Run dialog: could not check for an active run: %s", e)
+            return refuse(f"Could not check for a run in progress: {str(e)[:120]}")
+        # A row whose process is provably gone (the scheduler finalized its
+        # job, or nothing has reported on it past the run ceiling) is
+        # failed here rather than refusing this owner forever.
+        if active is not None and prog.fail_orphan(active):
+            active = None
+        if active is not None:
+            if active.get("kind") == "scheduled":
+                return refuse("A scheduled run is in progress. Wait for it "
+                              "to finish before starting another.")
+            return refuse([
+                "You have a run in progress. Cancel it to start another. ",
+                dbc.Button("Cancel run", id="run-cancel-active-btn",
+                           size="sm", outline=True, color="danger",
+                           className="ms-2"),
+            ])
+
+        # The dialog's values as the row's config, and the estimate the
+        # toast quotes; the same inputs the preflight line reads.
+        from layouts.modals import _fmt_duration, estimate_run_seconds
+        from utils.trading_calendar import resolve_target_and_cutoff
+        selected_models = [m for m, on in zip(_RUN_MODEL_IDS, model_checks or [])
+                           if on]
+        recs_on = scope == "full" and (recs or "auto") != "off"
+        estimate_s = estimate_run_seconds(scope, len(symbols), selected_models,
+                                          recs_on)
+        picked = str(run_date)[:10] if run_date else None
+        try:
+            target_d, cutoff_d = resolve_target_and_cutoff(picked)
+        except Exception as e:
+            logger.warning("Run dialog: target date unresolved (%s): %s",
+                           picked, e)
+            target_d = cutoff_d = None
+        config = {
+            "scope": scope,
+            "target_date": picked,
+            "lookback": lookback,
+            "max_articles": max_articles,
+            "report_model": report_model,
+            "depth": depth,
+            "recs": recs,
+            "recs_model": recs_model,
+            "evidence": sorted(run_evidence) if run_evidence is not None else None,
+            "tools": sorted(set(run_tools or [])),
+            "models": selected_models,
+            "ensemble": bool(run_ensemble),
+            "ensemble_method": ens_method,
+            "ensemble_min_agree": ens_min_agree,
+            "source": (run_store or {}).get("source"),
+        }
+        try:
+            run_id = run_service.create_run(
+                kind="manual", symbols=symbols, owner_uid=owner_uid,
+                preset=scope, config=config,
+                prediction_date=cutoff_d, target_date=target_d,
+                estimate_s=int(round(estimate_s)) if estimate_s else None)
+        except Exception as e:
+            # No row, no run: the stages key everything on the id.
+            logger.error("Run dialog: run row not created: %s", e)
+            return refuse(f"Could not record the run: {str(e)[:120]}")
         # Mark the feed active NOW: the stage that calls start_run is a
         # separate callback, and the fast tick below must not see an idle
         # feed and drop straight back to the slow rate.
-        from services import progress_service as prog
-        prog.mark_run_pending()
-        scope = run_scope or "full"
-        toast_msg = {
-            "models": "Run started: predictions will appear on Home "
-                      "and Analyze.",
-            "report": "Report started: it will appear under Reports.",
-        }.get(scope, "Run started: predictions will appear on Home and "
-                     "Analyze, the report under Reports.")
+        prog.mark_run_pending(run_id)
+
+        panel = dict(panel_state or {})
+        panel.setdefault("mode", "normal")
+        panel["closed"] = False
+        where = {
+            "models": "predictions will appear on Home and Analyze",
+            "report": "the report will appear under Reports",
+        }.get(scope, "predictions on Home and Analyze, the report under Reports")
+        toast_msg = (f"{', '.join(symbols)} · {_fmt_duration(estimate_s)}"
+                     f" · {where}.")
+        run_data = {
+            "run_id": run_id,
+            "started": datetime.now().isoformat(),
+            "scope": scope,
+            "symbols": list(symbols),
+            "owner_uid": owner_uid,
+            "kind": "manual",
+        }
         return (False, dash.no_update, dash.no_update) + no_sym_update \
             + ("", panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS) \
-            + no_picker
+            + no_picker + (run_data,)
 
     is_context_btn = (isinstance(triggered, dict)
                       and triggered.get("type") == "new-report-btn")
@@ -5193,7 +5509,55 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         _run_source_options(watchlist, cohort_syms),
         source,
         "",
-    ) + no_feedback + picker
+    ) + no_feedback + picker + no_run
+
+
+@callback(
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    # A cancelled full run leaves the synthesis flag armed: its killed
+    # model stage returns nothing and its report lands on a run_seq the
+    # synthesis callback no longer pairs, so neither of the two writers
+    # that disarm it ever fires. The next models-only run would then hand
+    # off to a synthesis that never comes and never close its row.
+    Output("full-analysis-requested", "data", allow_duplicate=True),
+    # The refused confirm lives in the still-open dialog, so the button is
+    # only mounted while a run is in flight for this owner.
+    Input("run-cancel-active-btn", "n_clicks", allow_optional=True),
+    prevent_initial_call=True,
+)
+def cancel_active_run(n_clicks):
+    """Cancel this owner's run in flight so a new confirm can go through.
+
+    The worker pid the model stage recorded is terminated; the row is
+    marked cancelled (sticky, so a stage finishing late cannot flip it to
+    done) and its feed closed. A stage still running in the server process
+    (the report) finishes on its own; its late close is ignored by the row.
+    """
+    if not n_clicks:
+        raise PreventUpdate
+    from services import progress_service as prog
+    from services import run_service
+
+    active = run_service.active_run_for(_run_owner_uid())
+    if active is None:
+        return "No run in progress. You can start one.", dash.no_update
+    if active.get("kind") == "scheduled":
+        # The scheduler owns a live scheduled run; only one whose process is
+        # provably gone (its job finalized, or past the ceiling with nothing
+        # reporting) may be cleared from the dialog.
+        if prog.fail_orphan(active):
+            return ("Stale scheduled run cleared. You can start another.",
+                    dash.no_update)
+        return ("A scheduled run is in progress; it cannot be cancelled "
+                "from here.", dash.no_update)
+    run_id = active["run_id"]
+    pid = prog.terminate_run_worker(run_id)
+    run_service.cancel_run(run_id)
+    prog.emit("action", "Run cancelled by user"
+              + (f" (worker pid {pid} terminated)" if pid else ""),
+              run_id=run_id)
+    prog.finish_run("Cancelled", run_id=run_id)
+    return "Run cancelled. You can start another.", False
 
 
 @callback(
@@ -5388,22 +5752,35 @@ def run_preflight(is_open, scope, run_symbols, _model_checks, report_model,
 
 @callback(
     Output("full-analysis-requested", "data"),
-    Input("run-confirm-btn", "n_clicks"),
+    Input("run-store", "data"),
     State("run-scope", "value"),
     State("run-symbols-store", "data"),
+    State("run-dispatched", "data"),
     prevent_initial_call=True,
 )
-def set_full_analysis_flag(n_clicks, scope, run_symbols):
+def set_full_analysis_flag(run_store, scope, run_symbols, dispatched):
     """Arm the synthesis stage, but only for a full-pipeline run.
 
-    An empty symbol set never arms: the run dialog rejects it inline and no
-    stage will fire, so an armed flag would just lie in wait for the next
-    unrelated store update.
+    The armed value is the run's id, not a bare True: the stages that read
+    it (persist_predictions, the synthesis callback) treat it as armed only
+    for the run it names, so a flag left behind by a run that ended without
+    disarming it cannot make a later run wait for a synthesis that never
+    comes. An empty symbol set never arms: the run dialog rejects it inline
+    and no stage will fire.
     """
-    if n_clicks and (scope or "full") == "full" \
-            and ((run_symbols or {}).get("symbols") or []):
-        return True
+    run_id = _dispatch_run_id(run_store, dispatched)
+    scope = (run_store or {}).get("scope") or scope or "full"
+    symbols = ((run_store or {}).get("symbols")
+               or (run_symbols or {}).get("symbols") or [])
+    if scope == "full" and symbols:
+        return run_id
     raise PreventUpdate
+
+
+def _synthesis_armed(flag, run_id) -> bool:
+    """Whether full-analysis-requested is armed FOR this run. A bare True
+    is a session store written before the flag carried the id."""
+    return flag is True or (bool(flag) and flag == run_id)
 
 
 # Shared with the scheduled runner (scripts/daily_analysis.py) so the UI and
@@ -5449,11 +5826,32 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
 
     from services import progress_service as prog
 
+    # The run this synthesis belongs to: the report's own stamp, else the
+    # signals' (a models-only payload never reaches synthesis, so the report
+    # is the authority when both are present).
+    sig_meta = (model_signals or {}).get("_meta") or {}
+    run_id = (ai_analysis or {}).get("run_id") or sig_meta.get("run_id")
+
+    # A cancelled run must not synthesize: its report can still land after
+    # the cancel (the report stage cannot be killed), and the cancel has
+    # already disarmed the flag, so this landing would otherwise read as a
+    # report-only run with recommendations still to produce.
+    if run_id:
+        try:
+            from services import run_service
+            row = run_service.get_run(run_id)
+        except Exception as e:
+            logger.warning("run %s: run row unreadable: %s", run_id[:8], e)
+            row = None
+        if row is not None and row["status"] == "cancelled":
+            raise PreventUpdate
+
     # A report-scope payload never gets model signals, so a lingering
-    # requested flag must not make it wait for them.
-    is_full_run = bool(requested) and (ai_analysis or {}).get("scope") != "report"
+    # requested flag must not make it wait for them. The flag carries the
+    # run it was armed for; one left by another run is not armed here.
+    is_full_run = (_synthesis_armed(requested, run_id)
+                   and (ai_analysis or {}).get("scope") != "report")
     if is_full_run:
-        sig_meta = (model_signals or {}).get("_meta") or {}
         run_seq = (ai_analysis or {}).get("run_seq")
         if run_seq is None or run_seq != sig_meta.get("run_seq"):
             raise PreventUpdate
@@ -5476,8 +5874,9 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
         if is_full_run:
             # The report is a synthesis input; without it this run cannot
             # produce recommendations. Close the run honestly.
-            prog.finish_run("Full Analysis finished with errors, report "
-                            "failed")
+            _close_run(run_id, "Full Analysis finished with errors, report "
+                               "failed", "failed",
+                       error=ai_analysis.get("error") or "AI report failed")
             return {"error": "AI report failed, recommendations skipped",
                     "generated_at": datetime.now().isoformat()}, False
         # Report-only failures are closed by the report callback itself.
@@ -5488,7 +5887,8 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     # (and close the progress run once predictions have landed).
     if ai_analysis.get("recs_off"):
         if is_full_run:
-            prog.finish_run("Full Analysis complete (recommendations off)")
+            prog.emit_progress("synthesis", state="skipped", run_id=run_id)
+            _close_run(run_id, "Full Analysis complete (recommendations off)")
             return dash.no_update, False
         raise PreventUpdate
 
@@ -5504,13 +5904,15 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
             # Predictions-only synthesis with no predictions is a no-op. 
             # say so instead of silently doing nothing.
             prog.emit("error", "Recommendations (predictions only) skipped, "
-                               "no model predictions in this session. Run Predict first.")
+                               "no model predictions in this session. Run Predict first.",
+                      run_id=run_id)
             if is_full_run:
-                prog.finish_run("Full Analysis finished with errors, "
-                                "no model predictions")
+                _close_run(run_id, "Full Analysis finished with errors, "
+                                   "no model predictions", "failed",
+                           error="no model predictions to synthesize")
                 return dash.no_update, False
-            prog.finish_run("Report complete: recommendations skipped "
-                            "(no predictions this session)")
+            _close_run(run_id, "Report complete: recommendations skipped "
+                               "(no predictions this session)")
             raise PreventUpdate
         # Text-based bases can proceed without signals; Luna sees the gap.
         valid_signals = {}
@@ -5526,22 +5928,24 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     # the one used even after a dialog override or provider fallback.
     from services.analysis_runner import run_recommendations
     result = await asyncio.to_thread(
-        run_recommendations, ai_analysis, model_signals, symbols or [], trade_date)
+        run_recommendations, ai_analysis, model_signals, symbols or [], trade_date,
+        run_id=run_id)
 
     if result and result.get("from_cache"):
         # A cache-served run is still a completed run, without the finish
         # the panel spinner spun forever on a success.
-        prog.finish_run(
-            "Full Analysis complete (recommendations from cache)"
-            if is_full_run else "Report complete (recommendations from cache)")
+        _close_run(run_id,
+                   "Full Analysis complete (recommendations from cache)"
+                   if is_full_run else "Report complete (recommendations from cache)")
         return result, False
     if result:
-        prog.finish_run("Full Analysis complete" if is_full_run
-                        else "Report complete")
+        _close_run(run_id, "Full Analysis complete" if is_full_run
+                           else "Report complete")
         return result, False
 
-    prog.finish_run(("Full Analysis" if is_full_run else "Report")
-                    + " finished with errors")
+    _close_run(run_id, ("Full Analysis" if is_full_run else "Report")
+                       + " finished with errors", "failed",
+               error="recommendations model unavailable or returned empty response")
     return {"error": "Recommendations model unavailable or returned empty response",
             "generated_at": datetime.now().isoformat()}, False
 

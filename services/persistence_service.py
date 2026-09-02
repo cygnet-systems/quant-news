@@ -319,13 +319,24 @@ def store_recommendation(
     model_used: str,
     provider_used: str,
     duration_ms: int | None = None,
+    run_id: str | None = None,
 ) -> None:
-    """Store a recommendation result."""
-    try:
-        from services import progress_service as prog
-        run_id = prog.current_run_id()
-    except Exception:
-        run_id = None
+    """Store a recommendation result.
+
+    ``run_id`` is the analysis_runs row the synthesis belongs to; every UI
+    and scheduled caller passes it. The process-local fallback exists for
+    headless scripts only and is logged, because it cannot name a run that
+    started in another process.
+    """
+    if run_id is None:
+        try:
+            from services import progress_service as prog
+            run_id = prog.current_run_id()
+        except Exception:
+            run_id = None
+        logger.warning("recommendation %s written without an explicit run_id; "
+                       "falling back to the process-local run %r",
+                       trade_date, run_id)
     with get_session() as session:
         session.merge(RecommendationRun(
             trade_date=trade_date,
