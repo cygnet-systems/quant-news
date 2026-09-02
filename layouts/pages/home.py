@@ -20,6 +20,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from layouts.formatters import MODEL_DISPLAY
+from layouts.report_view import build_report_view
 
 DECISION_CLASS = {"BUY": "positive", "SELL": "negative", "HOLD": "neutral"}
 
@@ -185,8 +186,12 @@ def _report_tab(symbol: str, reports: list[dict]) -> html.Div:
         [
             header,
             html.Div(
-                dcc.Markdown(latest.get("report_text", ""),
-                             className="ta-report-body"),
+                build_report_view(
+                    latest.get("report_text", ""),
+                    symbol=symbol, decision=decision, weight=conf,
+                    trade_date=latest.get("trade_date", ""),
+                    model_name=latest.get("model_name", ""),
+                ),
                 className="home-report-body",
             ),
         ],

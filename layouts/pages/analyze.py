@@ -886,13 +886,12 @@ def build_tab_content(
 
     # -- Research Report: the verdict-first full report (either source) --
     if research.get("raw_response"):
-        from models.single_agent import extract_confidence, render_report_markdown
+        from models.single_agent import extract_confidence
+        from layouts.report_view import build_report_view
         r_dec = research.get("decision", "HOLD")
         r_cls = ("positive" if r_dec == "BUY"
                  else "negative" if r_dec == "SELL" else "neutral")
-        # Verdict fields become list items here too. A single newline between
-        # them folds into one paragraph in every markdown renderer.
-        body = render_report_markdown(research["raw_response"])
+        body = research["raw_response"]
         r_stated = research.get("stated_conviction")
         if r_stated is None:
             r_stated = extract_confidence(research["raw_response"])
@@ -919,11 +918,12 @@ def build_tab_content(
                     ],
                     className="research-report-header",
                 ),
-                dcc.Markdown(
-                    body,
-                    className="ta-report-body",
-                    style={"maxHeight": "420px", "overflowY": "auto",
-                           "fontSize": "0.82rem", "lineHeight": "1.55"},
+                html.Div(
+                    build_report_view(
+                        body, symbol=(symbols[0] if symbols else ""), decision=r_dec,
+                        weight=research.get("confidence"),
+                        model_name=research.get("model", ""), compact=True),
+                    style={"maxHeight": "480px", "overflowY": "auto"},
                 ),
                 html.Div(footnote, className="research-report-footnote"),
             ],

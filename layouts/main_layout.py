@@ -229,6 +229,7 @@ def create_layout() -> html.Div:
                 [
                     dbc.ModalHeader(dbc.ModalTitle(id="ta-report-modal-title"), close_button=True),
                     dbc.ModalBody(id="ta-report-modal-body"),
+                    dbc.ModalFooter(id="ta-report-modal-footer"),
                 ],
                 id="ta-report-modal", is_open=False, size="xl", scrollable=True,
             ),

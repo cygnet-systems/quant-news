@@ -195,18 +195,61 @@ def _build_ta_recommendation_section(recommendation: dict) -> str:
     return "\n".join(rows)
 
 
+def _ta_page_css() -> str:
+    """Print stylesheet for the research note. xhtml2pdf understands a
+    small CSS subset (no flex/grid), so the term sheet is a table."""
+    return """
+    @page { size: A4; margin: 1.8cm 2.2cm; }
+    body { font-family: Helvetica, Arial, sans-serif; font-size: 10pt; line-height: 1.5; color: #17211F; }
+    .mast { font-family: Courier, monospace; font-size: 7.5pt; color: #7B8884; border-bottom: 1px solid #B9C2BD; padding-bottom: 4pt; }
+    h1 { font-family: Times, "Times New Roman", serif; font-weight: normal; font-size: 22pt; margin: 12pt 0 2pt; color: #17211F; }
+    .sub { color: #4E5B57; font-size: 9.5pt; margin: 0 0 12pt; }
+    table.verdict { width: 100%; border-collapse: collapse; background: #FBFBF9; border: 1px solid #D6DBD6; border-top: 3px solid #8A6D1F; margin-bottom: 0; }
+    table.verdict.buy { border-top-color: #1F7A4A; } table.verdict.sell { border-top-color: #A8382B; }
+    table.verdict td { padding: 10pt 12pt 8pt; vertical-align: top; }
+    table.sheet { width: 100%; border-collapse: collapse; background: #FBFBF9; border: 1px solid #D6DBD6; border-top: 0; margin-bottom: 12pt; }
+    table.sheet td { padding: 6pt 12pt; vertical-align: top; }
+    .label { font-family: Courier, monospace; font-size: 7.5pt; letter-spacing: 0.5pt; color: #7B8884; text-transform: uppercase; }
+    .call { font-family: Times, "Times New Roman", serif; font-size: 26pt; line-height: 1; }
+    .call.buy { color: #1F7A4A; } .call.sell { color: #A8382B; } .call.hold { color: #8A6D1F; }
+    .conv { font-family: Courier, monospace; font-size: 15pt; color: #17211F; }
+    .note { color: #4E5B57; font-size: 8.5pt; }
+    table.fields { width: 100%; border-collapse: collapse; }
+    table.fields td { padding: 5pt 12pt; vertical-align: top; font-size: 9pt; border-top: 1px solid #E4E8E3; }
+    table.fields td.k { width: 24%; white-space: nowrap; }
+    ul.why { margin: 0; padding: 4pt 0 2pt 14pt; color: #4E5B57; font-size: 9pt; }
+    h2 { font-family: Times, "Times New Roman", serif; font-weight: normal; font-size: 14pt; margin: 18pt 0 4pt; padding-top: 8pt; border-top: 1px solid #B9C2BD; color: #17211F; }
+    h2 .num { font-family: Courier, monospace; font-size: 8pt; color: #7B8884; }
+    .take { color: #4E5B57; font-size: 9.5pt; margin: 0 0 6pt; }
+    .body p { margin: 0 0 6pt; } .body ul, .body ol { margin: 2pt 0 6pt; padding-left: 16pt; }
+    .read { border-left: 3px solid #0F6E63; background: #E2EFEC; padding: 5pt 8pt; margin: 6pt 0 2pt; }
+    .read .label { color: #0F6E63; }
+    .footer { margin-top: 18pt; padding-top: 8pt; border-top: 1px solid #B9C2BD; font-family: Courier, monospace; font-size: 7.5pt; line-height: 1.5; color: #7B8884; }
+    .aux h3 { font-size: 11pt; margin: 14pt 0 4pt; }
+    table.aux { width: 100%; border-collapse: collapse; margin: 4pt 0 8pt; font-size: 8.5pt; }
+    table.aux th { background: #F3F4F1; border-bottom: 1px solid #D6DBD6; text-align: left; padding: 4pt 6pt; }
+    table.aux td { border-bottom: 1px solid #EEF0EC; padding: 4pt 6pt; vertical-align: top; }
+    """
+
+
+def _md_inline(text: str) -> str:
+    """Markdown for a field value or a section body, escaped first."""
+    import markdown as md
+    return md.markdown(text or "", extensions=["tables"])
+
+
 def generate_ta_report_pdf(
     report: dict,
     predictions: list[dict] | None = None,
     recommendation: dict | None = None,
 ) -> Optional[bytes]:
-    """Render a single TradingAgents report (Markdown text) as a PDF.
-
-    Optionally includes the symbol's model prediction signals and the
-    recommendation-model reasoning alongside the full agent analysis.
+    """Render a research report as a PDF with the same structure the app
+    shows: masthead, verdict term sheet, numbered sections with their
+    takeaways and Read lines, provenance footer. Model signals and the
+    synthesis reasoning, when supplied, follow as an appendix.
     Returns PDF bytes or None on failure.
     """
-    from models.single_agent import extract_confidence, parse_epilogue
+    from services.report_parse import parse_research_report, tone_for
 
     symbol = report.get("symbol", "UNKNOWN")
     decision = report.get("decision", "HOLD")
@@ -216,92 +259,70 @@ def generate_ta_report_pdf(
     model_name = report.get("model_name", "")
     created_at = str(report.get("created_at", ""))[:19]
 
-    # Two different numbers, and the header used to conflate them: the stored
-    # confidence is the track-record-grounded reliability weight (0.5 until a
-    # record exists: it is NOT the model saying "50% sure"), while the LLM's
-    # own conviction lives in the report text's CONFIDENCE line.
-    conf_pct = int((confidence or 0) * 100)
-    stated = extract_confidence(report_text)
-    stated_pct = int(round(stated * 100)) if stated is not None else None
+    parsed = parse_research_report(report_text)
+    call = parsed.call or decision
+    tone = tone_for(call)
+    weight = ("unrated (fewer than 20 scored calls)"
+              if confidence in (None, 0.5) else f"{int((confidence or 0) * 100)}%")
 
-    # The machine-read epilogue is rendered as a proper panel, not raw JSON.
-    structured = parse_epilogue(report_text) or {}
-    body_html = _render_markdown_report(report_text)
+    if parsed.structured:
+        conv = f"{parsed.conviction:.2f}" if parsed.conviction is not None else "n/a"
+        fields = "".join(
+            f"<tr><td class='k label'>{_esc(k)}</td><td>{_md_inline(v)}</td></tr>"
+            for k, v in (("Since last report", parsed.since),
+                         ("Reassess to buy", parsed.reassess),
+                         ("Move to sell", parsed.move)) if v)
+        why = ("<ul class='why'>" + "".join(f"<li>{_md_inline(w)}</li>" for w in parsed.why)
+               + "</ul>") if parsed.why else ""
+        verdict_html = f"""
+<table class="verdict {tone}"><tr>
+  <td style="width:26%"><div class="label">Call</div><div class="call {tone}">{_esc(call)}</div></td>
+  <td><div class="conv">{_esc(conv)}</div>
+      <div class="note">{_esc(parsed.conviction_note or "conviction, the report's own probability that the direction is right")}.
+      Track-record weight (measured): {_esc(weight)}.</div>
+      {f'<div class="note">{_esc(parsed.measured)}</div>' if parsed.measured else ''}</td>
+</tr></table>
+<table class="sheet"><tr><td style="padding:0">
+  <table class="fields">{fields}</table>
+</td></tr>{f"<tr><td>{why}</td></tr>" if why else ""}</table>"""
+        sections_html = []
+        for sec in parsed.sections:
+            num = f"<span class='num'>{_esc(sec.num)}&nbsp;&nbsp;</span>" if sec.num else ""
+            sections_html.append(
+                f"<h2>{num}{_esc(sec.name)}</h2>"
+                + (f"<p class='take'>{_esc(sec.takeaway)}</p>" if sec.takeaway else "")
+                + f"<div class='body'>{_md_inline(sec.body_md)}</div>"
+                + (f"<p class='read'><span class='label'>Read</span>&nbsp;&nbsp;{_esc(sec.read)}</p>"
+                   if sec.read else ""))
+        body_html = "".join(sections_html)
+        footer_html = _md_inline(parsed.footer) if parsed.footer else ""
+    else:
+        verdict_html = (f"<table class='verdict {tone}'><tr><td><div class='label'>Call</div>"
+                        f"<div class='call {tone}'>{_esc(call)}</div></td><td class='note'>"
+                        f"Track-record weight (measured): {_esc(weight)}</td></tr></table>")
+        body_html = _render_markdown_report(report_text)
+        footer_html = ""
 
-    epilogue_html = ""
-    # The two numbers lead the At a Glance panel, each named. A reader who
-    # opens only this panel must not have to guess which percentage is which.
-    ep_bits = [
-        "<p><strong>Conviction (this report's own):</strong> "
-        + (f"{stated:.2f}" if stated is not None else "not stated")
-        + " &nbsp;&nbsp; <strong>Track-record weight (measured):</strong> "
-        + ("unrated: not enough resolved calls yet"
-           if confidence in (None, 0.5) else f"{conf_pct}%")
-        + "</p><p class='meta'>Conviction is the report's own estimate and has "
-          "never been scored; the track-record weight is this model's measured "
-          "hit rate on resolved calls.</p>"
-    ]
-    stance = structured.get("stance")
-    if stance:
-        ep_bits.append(f"<p><strong>Stance:</strong> {_esc(stance)}</p>")
-    if structured.get("sentiment_alignment"):
-        ep_bits.append(f"<p><strong>News vs. Technicals:</strong> "
-                       f"{_esc(structured['sentiment_alignment'])}</p>")
-    watch = structured.get("watch_items") or []
-    if isinstance(watch, list) and watch:
-        ep_bits.append("<p><strong>Watch Items:</strong></p><ul>"
-                       + "".join(f"<li>{_esc(w)}</li>" for w in watch[:4])
-                       + "</ul>")
-    thesis = structured.get("company_thesis") or {}
-    if isinstance(thesis, dict) and thesis:
-        ep_bits.extend(_sym_thesis_html(thesis))
-    if ep_bits:
-        epilogue_html = "<h2>At a Glance</h2>" + "\n".join(ep_bits) + "<hr/>"
-
-    sections = []
+    aux = []
     if predictions:
-        sections.append(_build_ta_predictions_section(predictions))
+        aux.append(_build_ta_predictions_section(predictions))
     if recommendation:
-        sections.append(_build_ta_recommendation_section(recommendation))
+        aux.append(_build_ta_recommendation_section(recommendation))
+    aux_html = ("<div class='aux'><h2>Appendix: model signals and synthesis</h2>"
+                + "\n".join(aux) + "</div>") if aux else ""
 
-    extra_sections = "\n".join(sections)
-    analysis_heading = ("<h2>Research Analysis</h2>"
-                        if (sections or epilogue_html) else "")
-
-    model_line = f"&nbsp;&nbsp;<strong>Model:</strong> {model_name}" if model_name else ""
     html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<style>
-{_get_pdf_css()}
-</style>
-</head>
+<html><head><meta charset="utf-8"/><style>{_ta_page_css()}</style></head>
 <body>
-<div class="header">
-    <div class="header-meta">
-        <span class="filename">{symbol}_trading_agents_{trade_date}.pdf</span>
-        <span class="date">{trade_date}</span>
-    </div>
-    <h1>{symbol} TradingAgents Report</h1>
-    <div class="subtitle">
-        <strong>Decision:</strong> {decision}
-        {f'&nbsp;&nbsp;<strong>Conviction (report&#39;s own):</strong> {stated_pct}%' if stated_pct is not None else ''}
-        &nbsp;&nbsp;<strong>Track-record weight (measured):</strong> {'unrated' if confidence in (None, 0.5) else f'{conf_pct}%'}
-        &nbsp;&nbsp;<strong>Trade Date:</strong> {trade_date}
-        {model_line}
-    </div>
-    <hr/>
-</div>
-{epilogue_html}
-{extra_sections}
-{analysis_heading}
+<div class="mast">{_esc(symbol)} · RESEARCH NOTE &nbsp;&nbsp;|&nbsp;&nbsp; AS OF {_esc(trade_date)}
+  &nbsp;&nbsp;|&nbsp;&nbsp; {_esc(model_name or "")}</div>
+<h1>{_esc(symbol)} next-session research note</h1>
+<p class="sub">Written from point-in-time data through the {_esc(trade_date)} close. Every figure comes from the data blocks the model was shown.</p>
+{verdict_html}
 {body_html}
-<div class="footer">
-    <em>Generated {created_at} by QuantNews TradingAgents</em>
-</div>
-</body>
-</html>"""
+{aux_html}
+<div class="footer">{footer_html}<br/>Generated {_esc(created_at)} by QuantNews.</div>
+</body></html>"""
     return _html_to_pdf(html)
 
 

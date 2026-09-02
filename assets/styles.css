@@ -5388,3 +5388,88 @@ body {
     color: var(--text-secondary, #aaa);
     margin: 0 0 4px;
 }
+
+/* ---------------------------------------------------------------------------
+   Research report as a page (layouts/report_view.py): verdict term sheet,
+   numbered sections with takeaways, Read lines pulled out, mono footer.
+   Same structure as the PDF (services/report_service.py). */
+.rr {
+    --rr-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+    --rr-buy: var(--positive, #00C805);
+    --rr-sell: var(--negative, #FF5000);
+    --rr-hold: var(--neutral, #FFD700);
+    --rr-accent: var(--accent-primary, #00D4AA);
+    --rr-accent-soft: rgba(0, 212, 170, 0.10);
+    max-width: 780px;
+    color: var(--text-primary, #FFFFFF);
+    font-size: 0.9rem;
+    line-height: 1.55;
+}
+.rr-masthead {
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--text-muted, #666666);
+    border-bottom: 1px solid var(--border-focus, #3D3D3D); padding-bottom: 8px;
+    margin-bottom: 16px;
+}
+.rr-verdict {
+    display: grid; grid-template-columns: auto 1fr; gap: 12px 24px; align-items: start;
+    background: var(--bg-secondary, #1A1A1A); border: 1px solid var(--border-subtle, #2A2A2A);
+    border-top: 3px solid var(--rr-hold); padding: 16px 18px; border-radius: var(--radius-sm, 6px);
+}
+.rr-verdict-buy { border-top-color: var(--rr-buy); }
+.rr-verdict-sell { border-top-color: var(--rr-sell); }
+.rr-label, .rr-fields dt, .rr-read-label, .rr-toc-num, .rr-num {
+    font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--text-muted, #666666);
+}
+.rr-call { display: block; font-family: var(--rr-serif); font-size: 2.3rem; line-height: 1; margin-top: 6px; }
+.rr-buy { color: var(--rr-buy); } .rr-sell { color: var(--rr-sell); } .rr-hold { color: var(--rr-hold); }
+.rr-conv-cell { display: grid; gap: 2px; font-size: 0.8rem; color: var(--text-secondary, #A0A0A0); }
+.rr-conv-num { font-family: var(--font-mono); font-size: 1.35rem; color: var(--text-primary, #FFFFFF); font-variant-numeric: tabular-nums; }
+.rr-measured { margin-top: 4px; }
+.rr-fields {
+    grid-column: 1 / -1; margin: 4px 0 0; display: grid; grid-template-columns: max-content 1fr;
+    gap: 6px 16px; border-top: 1px solid var(--border-subtle, #2A2A2A); padding-top: 12px;
+}
+.rr-fields dt { padding-top: 3px; }
+.rr-fields dd { margin: 0; }
+.rr-why { grid-column: 1 / -1; margin: 4px 0 0; padding: 10px 0 0 18px; border-top: 1px solid var(--border-subtle, #2A2A2A); color: var(--text-secondary, #A0A0A0); }
+.rr-why li { margin: 3px 0; }
+.rr-inline p { margin: 0; display: inline; }
+.rr-toc {
+    list-style: none; margin: 20px 0 4px; padding: 0; display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 2px 16px; font-size: 0.8rem;
+}
+.rr-toc a { color: var(--text-secondary, #A0A0A0); text-decoration: none; display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--border-subtle, #2A2A2A); }
+.rr-toc a:hover, .rr-toc a:focus-visible { color: var(--rr-accent); outline: none; }
+.rr-toc-num { min-width: 1.6em; }
+.rr-section h2 {
+    font-family: var(--rr-serif); font-weight: 500; font-size: 1.25rem; line-height: 1.25;
+    margin: 34px 0 10px; padding-top: 14px; border-top: 1px solid var(--border-focus, #3D3D3D);
+    color: var(--text-primary, #FFFFFF); text-wrap: balance;
+}
+.rr-num { margin-right: 10px; vertical-align: middle; }
+.rr-name { margin-right: 8px; }
+.rr-take { display: block; font-family: var(--font-primary); font-weight: 400; font-size: 0.9rem; color: var(--text-secondary, #A0A0A0); margin-top: 3px; }
+.rr-body p { max-width: 68ch; margin: 0 0 10px; }
+.rr-body ul { max-width: 68ch; padding-left: 20px; margin: 4px 0 10px; }
+.rr-body li { margin: 4px 0; }
+.rr-read {
+    border-left: 3px solid var(--rr-accent); background: var(--rr-accent-soft);
+    padding: 8px 12px; margin: 8px 0 0; max-width: 68ch; color: var(--text-primary, #FFFFFF);
+}
+.rr-read-label { color: var(--rr-accent); margin-right: 10px; }
+.rr-footer {
+    margin-top: 36px; padding-top: 12px; border-top: 1px solid var(--border-focus, #3D3D3D);
+    font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.6; color: var(--text-muted, #666666);
+}
+.rr-footer strong { color: var(--text-secondary, #A0A0A0); }
+/* Compact: the Analyze tab card, where the report sits under a header row. */
+.rr-compact { font-size: 0.82rem; }
+.rr-compact .rr-call { font-size: 1.7rem; }
+.rr-compact .rr-section h2 { font-size: 1.05rem; margin-top: 22px; }
+.rr-compact .rr-masthead { display: none; }
+@media (max-width: 600px) {
+    .rr-verdict, .rr-fields { grid-template-columns: 1fr; }
+}
