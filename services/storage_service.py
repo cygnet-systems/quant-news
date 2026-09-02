@@ -28,7 +28,14 @@ def _get_client():
             aws_access_key_id=STORAGE.ACCESS_KEY,
             aws_secret_access_key=STORAGE.SECRET_KEY,
             region_name=STORAGE.REGION,
-            config=BotoConfig(signature_version="s3v4"),
+            # Bounded, always: an object-store stall without timeouts blocks
+            # the archive step — and with it the whole run — indefinitely
+            # (prime suspect in the 2026-09-01 54-minute tail hang). Better
+            # to fail the archive, mark the run partial, and keep the data
+            # that is already in Postgres.
+            config=BotoConfig(signature_version="s3v4",
+                              connect_timeout=10, read_timeout=60,
+                              retries={"max_attempts": 3}),
         )
     return _client
 
@@ -143,14 +150,3 @@ def list_reports(prefix: str = "reports/", max_keys: int = 1000) -> list[dict]:
         return []
 
 
-def generate_presigned_url(storage_key: str, expires_in: int = 3600) -> Optional[str]:
-    """Generate a presigned URL for temporary access to a report."""
-    client = _get_client()
-    try:
-        return client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": STORAGE.BUCKET_NAME, "Key": storage_key},
-            ExpiresIn=expires_in,
-        )
-    except ClientError:
-        return None

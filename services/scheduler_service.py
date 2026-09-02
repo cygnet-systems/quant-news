@@ -33,6 +33,8 @@ import logging
 import os
 import re
 import subprocess
+
+from config import MODEL
 import sys
 import threading
 from dataclasses import dataclass
@@ -109,6 +111,12 @@ JOB_TYPES: dict[str, JobType] = {
         needs_symbols=True,
         default_hour=7,
         default_minute=0,
+        params_spec=(
+            ("lookback", "News window (days)", MODEL.NEWS_LOOKBACK_DAYS,
+             "Point-in-time news window ending at the data cutoff"),
+            ("max_articles", "Article cap per symbol", 500,
+             "Keep the newest N of the window; 0 = all"),
+        ),
     ),
     "evaluation": JobType(
         kind="evaluation",
@@ -183,7 +191,8 @@ DEFAULT_JOBS = (
         "days_of_week": "mon-fri",
         "symbols_csv": ("PANW,BAC,VZ,HWM,DOC,HPQ,LUV,TPL,MPWR,MCD,"
                         "ROP,ETR,CMS,XYZ,HIG,IP,FLEX,MET,FIS,TYL"),
-        "params_json": {"only_trading_days": True, "lookback": 7},
+        "params_json": {"only_trading_days": True,
+                        "lookback": MODEL.NEWS_LOOKBACK_DAYS},
     },
     {
         "id": EVALUATION_JOB,
@@ -264,6 +273,11 @@ def list_jobs() -> list[dict]:
             "timezone": r.timezone,
             "symbols_csv": r.symbols_csv,
             "params": r.params_json or {},
+            "params_spec": [
+                {"key": k, "label": lbl, "default": dflt, "help": hlp}
+                for k, lbl, dflt, hlp in
+                (JOB_TYPES[r.kind].params_spec if r.kind in JOB_TYPES else ())
+            ],
             "last_run_at": r.last_run_at,
             "last_status": r.last_status,
             "last_detail": r.last_detail,
@@ -366,9 +380,11 @@ def delete_job(job_id: str) -> bool:
 
 
 def _owner_uid():
+    """Same attribution rule as every other writer (auth_service.effective_uid):
+    the signed-in user, else the owner a scheduled subprocess runs as."""
     try:
-        from services.auth_service import current_uid
-        return current_uid()
+        from services.auth_service import effective_uid
+        return effective_uid()
     except Exception:
         return None
 
@@ -452,7 +468,7 @@ def reap_abandoned_runs() -> int:
     """
     from datetime import timedelta
 
-    from db.models import JobRun
+    from db.models import JobRun, ScheduledJob
     from db.session import get_session
     from sqlalchemy import select
 
@@ -465,6 +481,15 @@ def reap_abandoned_runs() -> int:
         ).scalars().all()
         for run in stale:
             run.status = "interrupted"
+            job = session.get(ScheduledJob, run.job_id)
+            if job is not None and job.last_run_at is not None and (
+                    job.last_run_at <= run.started_at):
+                # The card showed the PREVIOUS run's green "success" next
+                # to an "interrupted" row in the table.
+                job.last_status = "interrupted"
+                job.last_detail = (f"run started {run.started_at:%Y-%m-%d %H:%M} "
+                                   f"never reported back (process died or "
+                                   f"deploy restarted it)")
             run.finished_at = datetime.now(timezone.utc)
             run.detail = ((run.detail or "") +
                           "\nProcess ended before the run finished "
@@ -502,11 +527,16 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
     if params.get("only_trading_days", True):
         cmd.append("--only-trading-days")
     if params.get("lookback"):
-        cmd += ["--lookback", str(params["lookback"])]
+        cmd += ["--lookback", str(int(params["lookback"]))]
+    # `is not None`, not truthiness: 0 is a real value here (no cap).
+    if params.get("max_articles") is not None:
+        cmd += ["--max-articles", str(int(params["max_articles"]))]
     if params.get("report_model"):
         cmd += ["--report-model", params["report_model"]]
     if params.get("recs_model"):
         cmd += ["--recs-model", params["recs_model"]]
+    if params.get("models"):
+        cmd += ["--models", str(params["models"])]
     if params.get("force"):
         cmd.append("--force")
     return cmd
@@ -548,9 +578,18 @@ def run_job(job_id: str, trigger: str = "schedule",
         session.flush()
         run_pk = run.id
 
-    prog.emit("run", f"Scheduled job started: {job_id} ({trigger})")
-    cmd = _build_command(job, overrides)
+    job_run_id = f"job:{job_id}:{run_pk}"
+    prog.emit("run", f"Scheduled job started: {job_id} ({trigger})",
+              feed=False, run_id=job_run_id, run_title=f"Scheduled job {job_id}")
     status, detail, summary = "success", "", {}
+    # Inside the guarded region: a bad params_json value (e.g. a non-numeric
+    # lookback) used to raise here, BEFORE the try/finally, leaving the run
+    # row "running" forever and the advisory lock held.
+    try:
+        cmd = _build_command(job, overrides)
+    except Exception as e:
+        cmd = None
+        status, detail = "failed", f"could not build command: {e}"
     # Run under the job owner's identity: the subprocess has no request
     # context, so the uid travels by env. Everything the run writes
     # (predictions, reports, activity rows) is attributed to the owner, and
@@ -562,30 +601,53 @@ def run_job(job_id: str, trigger: str = "schedule",
         run_env["QUANTNEWS_USER"] = job["owner_uid"]
     run_env["QUANTNEWS_RUN_PUBLIC"] = "1" if job["is_public"] else "0"
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True,
-            timeout=JOB_TIMEOUT_SECONDS,
-            env=run_env,
+        if cmd is None:
+            raise RuntimeError(detail)
+        # Popen + its own session, NOT subprocess.run: on timeout, run() kills
+        # only the direct child and then drains its pipes with no timeout —
+        # but the CLI spawns model workers that inherit those pipes, so a
+        # surviving grandchild wedges the drain (and this thread, and the
+        # bookkeeping below) forever. Seen live 2026-09-01: a manual run
+        # stuck "running" for 6h40m past a 75-minute ceiling. Killing the
+        # whole process group closes every pipe holder, so the second
+        # communicate() below always returns.
+        proc = subprocess.Popen(
+            cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=run_env,
+            start_new_session=True,
         )
-        # Parse the summary from the WHOLE of stdout, never from the stored
-        # tail. A 20-symbol summary is 53 lines of indented JSON, so a 25-line
-        # tail cannot contain a parseable object — which is why every
-        # scheduled run mailed "produced no recommendations" while having
-        # stored 20 calls and exited zero (2026-08-06).
-        summary = _parse_summary(proc.stdout)
-        detail = _run_log(proc.stdout, proc.stderr)
-        if proc.returncode == 2:
-            # Ran and stored something, but not everything it was asked for.
-            status = "partial"
-        elif proc.returncode != 0:
+        try:
+            out, err = proc.communicate(timeout=JOB_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            import signal as _signal
+            try:
+                # start_new_session makes the child its own group leader, so
+                # its pid is the pgid.
+                os.killpg(proc.pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            out, err = proc.communicate()
             status = "error"
-    except subprocess.TimeoutExpired as e:
-        status = "error"
-        # The output it managed before the kill is the only evidence of where
-        # it hung, so keep it rather than reporting the ceiling alone.
-        detail = _run_log(e.stdout, e.stderr,
-                          header=f"TIMED OUT: exceeded {JOB_TIMEOUT_SECONDS}s "
-                                 f"wall clock and was killed.")
+            # The output it managed before the kill is the only evidence of
+            # where it hung, so keep it rather than reporting the ceiling
+            # alone.
+            detail = _run_log(out, err,
+                              header=f"TIMED OUT: exceeded "
+                                     f"{JOB_TIMEOUT_SECONDS}s wall clock; "
+                                     f"process group killed.")
+        else:
+            # Parse the summary from the WHOLE of stdout, never from the
+            # stored tail. A 20-symbol summary is 53 lines of indented JSON,
+            # so a 25-line tail cannot contain a parseable object — which is
+            # why every scheduled run mailed "produced no recommendations"
+            # while having stored 20 calls and exited zero (2026-08-06).
+            summary = _parse_summary(out)
+            detail = _run_log(out, err)
+            if proc.returncode == 2:
+                # Ran and stored something, but not everything asked for.
+                status = "partial"
+            elif proc.returncode != 0:
+                status = "error"
     except Exception as e:
         status, detail = "error", str(e)
     finally:
@@ -630,7 +692,8 @@ def run_job(job_id: str, trigger: str = "schedule",
             lock.release()
 
     prog.emit("done" if status == "success" else "error",
-              f"Scheduled job {job_id}: {status} in {duration_ms // 1000}s")
+              f"Scheduled job {job_id}: {status} in {duration_ms // 1000}s",
+              feed=False, run_id=job_run_id, run_title=f"Scheduled job {job_id}")
     logger.info(f"Scheduled job {job_id} finished: {status} ({duration_ms}ms)")
 
     # A run that finishes just inside the ceiling is a failure waiting for a
@@ -641,7 +704,8 @@ def run_job(job_id: str, trigger: str = "schedule",
                 f"{JOB_TIMEOUT_SECONDS}s ceiling — raise the timeout or "
                 f"shorten the watchlist before it gets killed mid-run")
         logger.warning(near)
-        prog.emit("error", near)
+        prog.emit("error", near, feed=False, run_id=job_run_id,
+                  run_title=f"Scheduled job {job_id}")
 
     _notify(job, status, summary, detail, started, duration_ms)
     return {"status": status, "detail": detail, "duration_ms": duration_ms}
@@ -939,17 +1003,25 @@ def _backfill_missed_sessions() -> None:
         if is_trading_day(d)
     ][:BACKFILL_MAX_SESSIONS]
 
-    missing: list[date] = []
+    # Per job, not per date: one ad-hoc single-symbol backtest used to mark
+    # the whole session as analysed and suppress the watchlist backfill.
+    missing_by_job: dict[str, list[date]] = {}
     with get_session() as session:
-        for d in sessions:
-            count = session.execute(
-                select(func.count()).select_from(ModelPrediction)
-                .where(func.date(ModelPrediction.target_date) == d)
-            ).scalar()
-            if not count:
-                missing.append(d)
+        for job in analysis_jobs:
+            syms = [x.strip().upper() for x in (job.get("symbols_csv") or "").split(",")
+                    if x.strip()]
+            for d in sessions:
+                q = (select(func.count()).select_from(ModelPrediction)
+                     .where(func.date(ModelPrediction.target_date) == d))
+                if syms:
+                    q = q.where(ModelPrediction.symbol.in_(syms))
+                if job.get("owner_uid"):
+                    q = q.where(ModelPrediction.owner_uid == job["owner_uid"])
+                if not session.execute(q).scalar():
+                    missing_by_job.setdefault(job["id"], []).append(d)
 
     for job in analysis_jobs:
+        missing = missing_by_job.get(job["id"], [])
         for d in sorted(missing):
             logger.warning(f"Backfill: no predictions target {d} — running "
                            f"{job['id']} with --target {d}")
@@ -1042,6 +1114,18 @@ def _is_overdue(job: dict, tz) -> bool:
 def _watchdog() -> None:
     """Log and record a job that should have run today and has not."""
     from services import progress_service as prog
+
+    # Reaping used to happen only at boot, so a run whose thread wedged
+    # mid-life stayed "running" until the next deploy (2026-09-01: 6h40m).
+    # A row past the job ceiling is dead by definition — close it here too.
+    try:
+        reaped = reap_abandoned_runs()
+        if reaped:
+            logger.warning(f"watchdog reaped {reaped} stale run(s)")
+            prog.emit("error", f"Reaped {reaped} run(s) stuck past the "
+                               f"{JOB_TIMEOUT_SECONDS // 60}-minute ceiling")
+    except Exception as e:
+        logger.debug(f"watchdog reap skipped: {e}")
 
     try:
         state = health()
