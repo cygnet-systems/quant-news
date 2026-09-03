@@ -69,14 +69,20 @@ NOW = datetime(2026, 9, 2, 14, 0, tzinfo=timezone.utc)
 
 def _run(run_id="r1", kind="manual", status="running", owner="u1",
          symbols=("NVDA", "AMD"), stages=None, estimate_s=None,
-         started_ago_s=0, error=None):
+         started_ago_s=0, finished_ago_s=None, error=None):
+    # A terminal row always carries finished_at (set_status stamps it);
+    # by default it ended when it started, i.e. "just now" against NOW.
+    if finished_ago_s is None and status in rs.TERMINAL_STATUSES:
+        finished_ago_s = started_ago_s
+    finished = (NOW - timedelta(seconds=finished_ago_s)).isoformat() \
+        if finished_ago_s is not None else None
     return {
         "run_id": run_id, "kind": kind, "status": status, "owner_uid": owner,
         "preset": "standard", "config": {"scope": "full"},
         "symbols": list(symbols), "stages": stages or {}, "counters": {},
         "estimate_s": estimate_s,
         "started_at": (NOW - timedelta(seconds=started_ago_s)).isoformat(),
-        "finished_at": None, "error": error, "job_run_id": None,
+        "finished_at": finished, "error": error, "job_run_id": None,
         "is_public": True, "active": status in rs.ACTIVE_STATUSES,
     }
 
@@ -204,13 +210,41 @@ class TestPrecedence:
 
     def test_finished_view_ignores_what_the_pill_shows(self):
         done = _run("d1", status="done")
-        assert rp.finished_view(done, "u1")["state"] == "ready"
-        assert rp.finished_view(done, "u1", seen={"run_id": "d1"}) is None
-        assert rp.finished_view(done, "u2") is None
-        assert rp.finished_view(_run("q1", status="queued"), "u1") is None
-        assert rp.finished_view(_run("c1", status="cancelled"), "u1") is None
-        assert rp.finished_view(None, "u1") is None
-        assert rp.done_toast(rp.finished_view(done, "u1"), None)["run_id"] == "d1"
+        assert rp.finished_view(done, "u1", now=NOW)["state"] == "ready"
+        assert rp.finished_view(done, "u1", seen={"run_id": "d1"}, now=NOW) is None
+        assert rp.finished_view(done, "u2", now=NOW) is None
+        assert rp.finished_view(_run("q1", status="queued"), "u1", now=NOW) is None
+        assert rp.finished_view(_run("c1", status="cancelled"), "u1", now=NOW) is None
+        assert rp.finished_view(None, "u1", now=NOW) is None
+        assert rp.done_toast(rp.finished_view(done, "u1", now=NOW), None,
+                             now=NOW)["run_id"] == "d1"
+
+    def test_unseen_finished_run_expires_after_a_day(self):
+        # Ready/Failed stay up unseen for PILL_TTL_S after the END of the
+        # run, then the pill lets go on its own; the run page keeps it.
+        fresh = _run("d1", status="done", started_ago_s=rp.PILL_TTL_S + 600,
+                     finished_ago_s=rp.PILL_TTL_S - 60)
+        assert _view([], latest=fresh)["state"] == "ready"
+        old = _run("d1", status="done", finished_ago_s=rp.PILL_TTL_S + 60)
+        assert _view([], latest=old) is None
+        assert rp.finished_view(old, "u1", now=NOW) is None
+        old_fail = _run("f1", status="failed", error="x",
+                        finished_ago_s=rp.PILL_TTL_S + 60)
+        assert _view([], latest=old_fail) is None
+        # A terminal row with no end stamp is judged by its start.
+        stampless = _run("d2", status="done", started_ago_s=rp.PILL_TTL_S + 60)
+        stampless["finished_at"] = None
+        assert _view([], latest=stampless) is None
+        # Expired but unseen: the scheduled job shows again beneath it.
+        sched = _run("s1", kind="scheduled", owner=None)
+        assert _view([sched], latest=old)["state"] == "scheduled"
+
+    def test_pin_carries_the_end_stamp(self):
+        done = _run("d1", status="done", started_ago_s=300, finished_ago_s=10)
+        pin = _view([], latest=done)["pin"]
+        assert pin["started"] == done["started_at"]
+        assert pin["finished"] == done["finished_at"]
+        assert _view([_run()])["pin"]["finished"] is None
 
     def test_another_owners_run_alone_shows_nothing(self):
         assert _view([_run("t1", owner="u2")]) is None
@@ -287,6 +321,9 @@ def runs(monkeypatch):
     monkeypatch.setattr(rs, "active_runs", _active)
     monkeypatch.setattr(rs, "list_runs", _list)
     monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+    # The stubbed rows are stamped against NOW; the pill's windows (ETA,
+    # toast, pill TTL) must read the same clock, not the wall clock.
+    monkeypatch.setattr(rp, "now_utc", lambda: NOW)
     return state
 
 
@@ -471,6 +508,28 @@ class TestDoneToast:
         out = _tick(notified={"run_id": "d1"})
         assert out[TOAST_HEADER] == "Run failed" and out[NOTIFIED] == {"run_id": "f1"}
 
+    def test_a_run_that_ended_over_an_hour_ago_is_not_announced(self, runs):
+        # A browser with an empty notified store (fresh profile, cleared
+        # storage) still shows the Ready pill for an old unseen run, but is
+        # not greeted with a "Report ready" for it.
+        runs.latest = _run("d1", status="done", started_ago_s=4000,
+                           finished_ago_s=rp.TOAST_WINDOW_S + 60)
+        out = _tick()
+        assert out[CLASS] == "run-pill run-pill-ready"
+        assert out[TOAST_OPEN] is dash.no_update
+        assert out[NOTIFIED] is dash.no_update
+        # Within the window it is announced, counted from the end, not the
+        # start (a long run that ended a minute ago).
+        runs.latest = _run("d2", status="done", started_ago_s=4000,
+                           finished_ago_s=60)
+        out = _tick()
+        assert out[TOAST_OPEN] is True and out[NOTIFIED] == {"run_id": "d2"}
+        # The pure rule, for the record.
+        fresh = rp.finished_view(_run("d3", status="done"), "u1", now=NOW)
+        assert rp.done_toast(fresh, None, now=NOW) is not None
+        assert rp.done_toast(
+            fresh, None, now=NOW + timedelta(seconds=rp.TOAST_WINDOW_S + 1)) is None
+
     def test_another_owners_finished_run_is_not_announced(self, runs):
         runs.latest = _run("d1", status="done", owner="u2")
         out = _tick()
@@ -523,16 +582,42 @@ class TestPillClick:
         panel, store = app_module.open_run_from_pill(
             1, fp, {"run_id": "mine"}, {"mode": "normal", "closed": True})
         assert panel == {"mode": "normal", "closed": False}
-        assert store == fp["pin"]
+        assert store == {**fp["pin"], "pinned": True}
 
-    def test_click_on_own_run_keeps_run_store(self):
+    def test_click_on_own_run_pins_it_once(self):
         fp = {"fp": ["m1"], "pin": {"run_id": "m1"}}
-        panel, store = app_module.open_run_from_pill(1, fp, {"run_id": "m1"}, None)
+        own = {"run_id": "m1", "started": "2026-09-02T10:00:00+00:00",
+               "scope": "full"}
+        panel, store = app_module.open_run_from_pill(1, fp, own, None)
         assert panel["closed"] is False
+        # The confirm's own store is kept (its fields are the retry's
+        # source), only the flag is added.
+        assert store == {**own, "pinned": True}
+        panel, store = app_module.open_run_from_pill(1, fp, store, None)
         assert store is dash.no_update
         # No pin at all (pill hidden, stale click): still just opens.
         panel, store = app_module.open_run_from_pill(1, None, None, None)
         assert panel["closed"] is False and store is dash.no_update
+
+    def test_pinned_store_holds_the_panel_on_an_old_run(self):
+        # The carried minor: a Ready pill for a run that ended hours ago
+        # must open the panel on THAT run, not the rolling log.
+        from layouts import progress_panel as pp
+        done = _run("d1", status="done", started_ago_s=5 * 3600,
+                    finished_ago_s=4 * 3600)
+        fp = {"fp": ["d1"], "pin": _view([], latest=done)["pin"]}
+        _panel, store = app_module.open_run_from_pill(1, fp, None, None)
+        assert store["pinned"] is True
+        assert pp.pin_target(store, [], NOW) == "d1"
+        assert pp.pin_target(store, ["theirs"], NOW) == "d1"
+        assert pp.pin_holds(done, [], NOW, store)
+        # The same store without the flag is stale for the panel.
+        unpinned = {k: v for k, v in store.items() if k != "pinned"}
+        assert pp.pin_target(unpinned, ["theirs"], NOW) == "theirs"
+        assert not pp.pin_holds(done, [], NOW, unpinned)
+        # A fresh confirm replaces the store, and with it the flag.
+        assert pp.pin_target({"run_id": "n1", "started": NOW.isoformat()},
+                             [], NOW) == "n1"
 
     def test_no_click_is_no_call(self):
         with pytest.raises(PreventUpdate):
@@ -550,13 +635,19 @@ class TestPillClick:
         assert rs.list_runs(kind="manual") == []
 
 
+def _pill_fp(run_id):
+    """run-pill-fp as the poll leaves it for a run: the pin names the run."""
+    return {"fp": [run_id, "running", None, None, None, None],
+            "pin": {"run_id": run_id, "kind": "manual"}}
+
+
 class TestPillCancel:
     def test_cancel_from_the_pill_is_the_dialogs_cancel(self, db, feed, monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
         run_id = rs.create_run("manual", ["NVDA"], "u1")
         feed.mark_run_pending(run_id)
 
-        hidden, fp, flag = app_module.cancel_run_from_pill(1)
+        hidden, fp, flag = app_module.cancel_run_from_pill(1, _pill_fp(run_id), None)
 
         assert (hidden, fp, flag) == (True, None, False)
         assert rs.get_run(run_id)["status"] == "cancelled"
@@ -565,12 +656,64 @@ class TestPillCancel:
         # The next tick shows nothing for it: a cancelled run is hidden.
         assert rp.pill_view([], rs.get_run(run_id), "u1") is None
 
+    def test_cancel_aims_at_the_pills_run(self, db, feed, monkeypatch):
+        # The pill shows the run this session confirmed (run-store names
+        # it) while the signed-in owner has another run in flight: the
+        # click must cancel the one on the pill, never the owner's.
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        shown = rs.create_run("manual", ["NVDA"], None)
+        owners = rs.create_run("manual", ["AMD"], "u1")
+        feed.mark_run_pending(shown)
+        feed.mark_run_pending(owners)
+        assert rs.active_run_for("u1")["run_id"] == owners
+
+        out = app_module.cancel_run_from_pill(1, _pill_fp(shown), {"run_id": shown})
+
+        assert out == (True, None, False)
+        assert rs.get_run(shown)["status"] == "cancelled"
+        assert rs.get_run(owners)["status"] == "queued"
+        assert owners in feed._active_runs()
+
+    def test_cancel_refuses_a_run_that_is_not_the_viewers(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        theirs = rs.create_run("manual", ["NVDA"], "u2")
+        mine = rs.create_run("manual", ["AMD"], "u1")
+        feed.mark_run_pending(theirs)
+        feed.mark_run_pending(mine)
+        # Not the owner's and not this session's: nothing is cancelled,
+        # least of all the owner's own run.
+        with pytest.raises(PreventUpdate):
+            app_module.cancel_run_from_pill(1, _pill_fp(theirs), {"run_id": "other"})
+        assert rs.get_run(theirs)["status"] == "queued"
+        assert rs.get_run(mine)["status"] == "queued"
+        msg, run_id = app_module._cancel_own_run(theirs, None)
+        assert run_id is None and "not yours" in msg
+        # A scheduled run is nobody's to cancel from the UI.
+        sched = rs.create_run("scheduled", ["TSLA"], None)
+        feed.mark_run_pending(sched)
+        with pytest.raises(PreventUpdate):
+            app_module.cancel_run_from_pill(1, _pill_fp(sched), {"run_id": sched})
+        assert rs.get_run(sched)["status"] == "queued"
+
     def test_cancel_with_nothing_in_flight(self, db, feed, monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        # No pin (the poll already emptied the pill): nothing is aimed at,
+        # even with an own run in flight.
+        mine = rs.create_run("manual", ["AMD"], "u1")
+        feed.mark_run_pending(mine)
         with pytest.raises(PreventUpdate):
-            app_module.cancel_run_from_pill(1)
+            app_module.cancel_run_from_pill(1, None, None)
         with pytest.raises(PreventUpdate):
-            app_module.cancel_run_from_pill(None)
+            app_module.cancel_run_from_pill(None, _pill_fp(mine), None)
+        assert rs.get_run(mine)["status"] == "queued"
+        # A pin naming a run that already ended: nothing to cancel.
+        rs.set_status(mine, "done")
+        feed.finish_run("done", run_id=mine)
+        with pytest.raises(PreventUpdate):
+            app_module.cancel_run_from_pill(1, _pill_fp(mine), None)
+        assert rs.get_run(mine)["status"] == "done"
+        with pytest.raises(PreventUpdate):
+            app_module.cancel_run_from_pill(1, _pill_fp("nope"), None)
 
     def test_both_buttons_share_the_helper(self, db, feed, monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
@@ -663,7 +806,27 @@ class TestWiring:
         assert len(cancel) == 1
         btn = next(i for i in cancel[0]["inputs"] if i["id"] == "run-pill-cancel")
         assert btn.get("allow_optional") is True
+        # The cancel reads the pill's pin and the session's store to aim.
+        assert [(st["id"], st["property"]) for st in cancel[0]["state"]] == \
+            [("run-pill-fp", "data"), ("run-store", "data")]
         seen = next(c for c in GLOBAL_CALLBACK_LIST
                     if str(c["output"]) == "run-seen-store.data")
         assert seen["clientside_function"] is not None
         assert [i["id"] for i in seen["inputs"]] == ["url"]
+
+    def test_snap_to_newest_scrolls_the_newest_log_row(self):
+        # The lines wrapper sits under the stepper's Details when a run is
+        # pinned, so the container's last child is no longer a log row.
+        from dash._callback import GLOBAL_CALLBACK_LIST, GLOBAL_INLINE_SCRIPTS
+        snap = next(c for c in GLOBAL_CALLBACK_LIST
+                    if str(c["output"]) == "progress-snap-sink.children")
+        assert [(i["id"], i["property"]) for i in snap["inputs"]] == \
+            [("progress-snap-store", "data")]
+        script = next(s for s in GLOBAL_INLINE_SCRIPTS
+                      if "_quantnewsSnap" in s)
+        assert '"#progress-feed-scroll .progress-feed-lines > :last-child"' in script
+        # A row with no box (folded Details) or no row at all: the
+        # container's own last child, as before.
+        assert "getClientRects().length" in script
+        assert "row = feed.lastElementChild" in script
+        assert "row.scrollIntoView" in script

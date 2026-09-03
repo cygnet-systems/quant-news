@@ -336,6 +336,44 @@ def _news_flag(row: dict) -> html.Span | None:
     )
 
 
+def board_headers(models: list[str], extra: list | None = None) -> list:
+    """The board's column heads: symbol, prev close, one per model,
+    synthesis, outcome, then whatever the page appends."""
+    return (
+        [html.Th("Symbol"), html.Th("Prev close")]
+        + [html.Th(MODEL_DISPLAY.get(m, m), title=m) for m in models]
+        + [html.Th("Synthesis",
+                   title="The synthesis model's verdict over the models, "
+                         "stored as a prediction so it is scored the same "
+                         "way. It is a synthesis of the others, not a peer "
+                         "model."),
+           html.Th("Outcome")]
+        + list(extra or [])
+    )
+
+
+def symbol_row(row: dict, models: list[str], extra_cells: list | None = None,
+               **tr_props) -> html.Tr:
+    """One board row for one symbol, in board_headers order.
+
+    Shared by the Home board and the run page so a chip or an outcome
+    reads identically on both; a page adds its own trailing cells.
+    """
+    prev = row.get("previous_close")
+    return html.Tr(
+        [
+            html.Td([row["symbol"], _news_flag(row)], className="home-symbol"),
+            html.Td(f"{prev:.2f}" if prev is not None else "n/a",
+                    className="num"),
+        ]
+        + [html.Td(_decision_chip(row["models"].get(m))) for m in models]
+        + [html.Td(_decision_chip(row.get("synthesis"))),
+           _resolution_cell(row)]
+        + list(extra_cells or []),
+        **tr_props,
+    )
+
+
 def cohort_table(cohort: dict, active_symbol: str | None = None,
                  symbol_reports: list[dict] | None = None,
                  symbol_detail: dict | None = None) -> html.Div:
@@ -347,16 +385,7 @@ def cohort_table(cohort: dict, active_symbol: str | None = None,
     it without rebuilding the whole page.
     """
     models = cohort["model_names"]
-    header = html.Thead(html.Tr(
-        [html.Th("Symbol"), html.Th("Prev close")]
-        + [html.Th(MODEL_DISPLAY.get(m, m), title=m) for m in models]
-        + [html.Th("Synthesis",
-                   title="The synthesis model's verdict over the models, "
-                         "stored as a prediction so it is scored the same "
-                         "way. It is a synthesis of the others, not a peer "
-                         "model."),
-           html.Th("Outcome")]
-    ))
+    header = html.Thead(html.Tr(board_headers(models)))
 
     symbols = cohort["symbols"]
     in_cohort = True
@@ -364,20 +393,7 @@ def cohort_table(cohort: dict, active_symbol: str | None = None,
         symbols = [r for r in symbols if r["symbol"] == active_symbol]
         in_cohort = bool(symbols)
 
-    rows = []
-    for row in symbols:
-        prev = row.get("previous_close")
-        rows.append(html.Tr(
-            [
-                html.Td([row["symbol"], _news_flag(row)],
-                        className="home-symbol"),
-                html.Td(f"{prev:.2f}" if prev is not None else "n/a",
-                        className="num"),
-            ]
-            + [html.Td(_decision_chip(row["models"].get(m))) for m in models]
-            + [html.Td(_decision_chip(row.get("synthesis"))),
-               _resolution_cell(row)]
-        ))
+    rows = [symbol_row(row, models) for row in symbols]
 
     children = []
     if active_symbol:

@@ -8,7 +8,8 @@ precedence and text patterns can be pinned by tests without a browser.
 Precedence, first match wins:
   1. the viewer's own manual run in flight  -> Running (cancellable)
   2. the viewer's newest finished manual run -> Ready / Failed, with a View
-     link to its run page, until that page is visited (run-seen-store)
+     link to its run page, until that page is visited (run-seen-store) or
+     the run is a day old (PILL_TTL_S)
   3. any scheduled run in flight             -> Scheduled (calendar glyph)
   4. nothing                                 -> hidden
 
@@ -16,7 +17,10 @@ The viewer's own result outranks the daily job's progress: the scheduled
 run takes tens of minutes and a Ready that waited for it would arrive
 long after the report did. Once the run page has been visited the
 scheduled run shows again. The completion toast is decided from the
-finished run alone (finished_view), never from what the pill displays.
+finished run alone (finished_view), never from what the pill displays,
+and only for a run that ended within the hour (TOAST_WINDOW_S): a
+browser that never recorded the announcement (a fresh profile, cleared
+storage) must not greet the viewer with last week's report.
 
 A cancelled run is never shown: the user asked for it to go away.
 """
@@ -25,6 +29,7 @@ from datetime import datetime, timezone
 
 from dash import dcc, html
 
+from layouts.progress_panel import within_window
 from services.run_service import STAGES
 
 # Symbols named on the pill before the rest collapse into "+n".
@@ -32,6 +37,12 @@ MAX_SYMBOLS = 3
 # Below this many seconds left the ETA reads "finishing up": a minute
 # count that small is noise, and a run past its estimate is still ending.
 FINISHING_S = 30
+# How long an unseen Ready/Failed pill stays up after the run ended. A
+# result nobody opened in a day is not news any more; the run page and
+# the Runs archive still have it.
+PILL_TTL_S = 24 * 3600
+# How long after a run ends its completion may still be announced.
+TOAST_WINDOW_S = 3600
 
 _STATE_CLASS = {
     "running": "run-pill run-pill-running",
@@ -60,6 +71,17 @@ def _parse_ts(value) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def ended_at(run: dict):
+    """When the run ended, for the windows below: finished_at, or the start
+    when a terminal row carries no end (never written by set_status, but a
+    stamp is better than showing it forever)."""
+    return run.get("finished_at") or run.get("started_at")
+
+
 def eta_label(estimate_s, started_at, now=None) -> str | None:
     """'~3 min', 'finishing up' under FINISHING_S, None without an estimate.
 
@@ -69,7 +91,7 @@ def eta_label(estimate_s, started_at, now=None) -> str | None:
     if estimate_s is None:
         return None
     started = _parse_ts(started_at)
-    now = now or datetime.now(timezone.utc)
+    now = now or now_utc()
     elapsed = (now - started).total_seconds() if started else 0.0
     remaining = max(0.0, float(estimate_s) - elapsed)
     if remaining < FINISHING_S:
@@ -120,6 +142,8 @@ def _pin(run: dict) -> dict:
     return {
         "run_id": run["run_id"],
         "started": run.get("started_at"),
+        # The panel's pin window counts from the end, not the start.
+        "finished": run.get("finished_at"),
         "scope": config.get("scope") or "full",
         "preset": run.get("preset"),
         "symbols": list(run.get("symbols") or []),
@@ -186,9 +210,11 @@ def _terminal_view(run: dict) -> dict | None:
     return None
 
 
-def finished_view(latest, owner_uid, run_store=None, seen=None) -> dict | None:
+def finished_view(latest, owner_uid, run_store=None, seen=None,
+                  now=None) -> dict | None:
     """The Ready/Failed view of the viewer's newest manual run, or None
-    when it is not theirs, still open, already seen or cancelled.
+    when it is not theirs, still open, already seen, cancelled or older
+    than PILL_TTL_S.
 
     Kept apart from pill_view so the completion toast is decided by the
     finished run alone: whatever the pill chooses to display (a scheduled
@@ -199,6 +225,8 @@ def finished_view(latest, owner_uid, run_store=None, seen=None) -> dict | None:
     if not is_own(latest, owner_uid, run_store):
         return None
     if latest.get("run_id") == (seen or {}).get("run_id"):
+        return None
+    if not within_window(ended_at(latest), now or now_utc(), PILL_TTL_S):
         return None
     return _terminal_view(latest)
 
@@ -211,7 +239,7 @@ def pill_view(active, latest, owner_uid, run_store=None, seen=None,
     viewer's newest manual run of any status (or None), ``seen`` the
     run-seen-store dict naming the last run page visited.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or now_utc()
     own = [r for r in (active or []) if is_own(r, owner_uid, run_store)]
     if own:
         return _active_view(own[-1], owner_uid, run_store, now)
@@ -219,7 +247,7 @@ def pill_view(active, latest, owner_uid, run_store=None, seen=None,
         # Not in the active list this tick but still open on the row: a
         # row created between the two reads. Treat it as in flight.
         return _active_view(latest, owner_uid, run_store, now)
-    finished = finished_view(latest, owner_uid, run_store, seen)
+    finished = finished_view(latest, owner_uid, run_store, seen, now)
     if finished:
         return finished
     scheduled = [r for r in (active or []) if r.get("kind") == "scheduled"]
@@ -228,17 +256,23 @@ def pill_view(active, latest, owner_uid, run_store=None, seen=None,
     return None
 
 
-def done_toast(view, notified) -> dict | None:
+def done_toast(view, notified, now=None) -> dict | None:
     """The completion toast for a Ready/Failed view (finished_view), or None.
 
     ``notified`` is the run-notified-store dict naming the run last
     announced; the same run is never announced twice, whatever the
-    fingerprint does. Done: "Report ready" over the symbols; failed: "Run
-    failed" over the error's first line. Both link to the run page.
+    fingerprint does, and a run that ended more than TOAST_WINDOW_S ago is
+    not announced at all (the pill still shows it). Done: "Report ready"
+    over the symbols; failed: "Run failed" over the error's first line.
+    Both link to the run page.
     """
     if not view or view.get("state") not in ("ready", "failed"):
         return None
     if view["run_id"] == (notified or {}).get("run_id"):
+        return None
+    pin = view.get("pin") or {}
+    if not within_window(pin.get("finished") or pin.get("started"),
+                         now or now_utc(), TOAST_WINDOW_S):
         return None
     failed = view["state"] == "failed"
     text = (view.get("title") or "unknown error") if failed \

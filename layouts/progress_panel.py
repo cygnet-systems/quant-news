@@ -9,10 +9,12 @@ the answer is a glance. The log keeps everything it had, folded under
 
 Which run the panel follows is decided here too, from the session's pin
 and the feed's active list, before the callback spends its single row
-read: the viewer's own run while it is in flight or for an hour after it
-ended, else the newest run in flight, else nothing (the rolling log).
-Everything in this module is plain data in, Dash components out, so the
-tests need no browser and no database.
+read: the viewer's own run while it is in flight, for an hour after it
+ended, or for as long as they pinned it by hand (a click on the pill),
+else the newest run in flight, else nothing (the rolling log). One rule,
+``pinnable``, answers on both sides of the row read. Everything in this
+module is plain data in, Dash components out, so the tests need no
+browser and no database.
 """
 
 import hashlib
@@ -61,7 +63,10 @@ def _parse_ts(value) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
-def _within(value, now: datetime, window_s: int = PIN_WINDOW_S) -> bool:
+def within_window(value, now: datetime, window_s: int = PIN_WINDOW_S) -> bool:
+    """Whether an ISO stamp lies in the last ``window_s`` seconds. A stamp
+    in the future (clock skew between the row writer and this process)
+    is not "recent": it never counts."""
     ts = _parse_ts(value)
     return ts is not None and 0 <= (now - ts).total_seconds() <= window_s
 
@@ -70,34 +75,62 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def pin_target(run_store, active_ids, now=None) -> str | None:
+def pinnable(run_id, active_ids, now, *, active=False, pinned=False,
+             finished_at=None, started_at=None, ceiling_s=0) -> bool:
+    """The one rule for whether a run is worth the panel's attention:
+    in flight (the feed lists it, or its row says so), pinned by hand (a
+    pill click; the flag lives in run-store until the next confirm
+    replaces the store, so age never unpins it), or ended within
+    PIN_WINDOW_S.
+
+    The end is ``finished_at``; ``started_at`` stands in when the end is
+    not known. run-store only ever knows when its run started, so for that
+    side ``ceiling_s`` (the longest a run may live before the watchdog
+    kills it) widens the start-based window: a run that started 70 minutes
+    ago and finished 10 minutes ago is still recent, and only the row read
+    that follows can tell. With the end known the window is exact.
+    """
+    if pinned or active:
+        return True
+    if run_id and run_id in (active_ids or []):
+        return True
+    if finished_at is not None:
+        return within_window(finished_at, now)
+    return within_window(started_at, now, PIN_WINDOW_S + max(0, ceiling_s or 0))
+
+
+def pin_target(run_store, active_ids, now=None, ceiling_s=0) -> str | None:
     """The run id the panel should read this tick, or None for the log.
 
-    The session's own run wins while the feed lists it or while it was
-    started within the pin window (a run that ended is still this
-    session's result for a while); otherwise the newest run in flight.
-    Decided from the feed and the store alone so the callback reads one
-    row, never two.
+    The session's own run (run-store) wins while ``pinnable`` says so from
+    what the store knows: the feed's active list, the pinned flag, the
+    stamps it carries. Otherwise the newest run in flight. Decided from
+    the feed and the store alone so the callback reads one row, never two.
     """
     now = now or now_utc()
     store = run_store or {}
     own = store.get("run_id")
-    if own and (own in (active_ids or []) or _within(store.get("started"), now)):
+    if own and pinnable(own, active_ids, now, pinned=bool(store.get("pinned")),
+                        finished_at=store.get("finished"),
+                        started_at=store.get("started"), ceiling_s=ceiling_s):
         return own
     return active_ids[-1] if active_ids else None
 
 
-def pin_holds(run, active_ids, now=None) -> bool:
-    """Whether a row read for the pin is still worth showing: in flight
-    (by the feed or by its status) or finished within the pin window."""
+def pin_holds(run, active_ids, now=None, run_store=None) -> bool:
+    """Whether the row read for the pin is still worth showing: the same
+    rule as pin_target, now with the row's own status and end stamp (and
+    the store's pinned flag, when the store names this run)."""
     if not run:
         return False
     now = now or now_utc()
-    if run.get("run_id") in (active_ids or []):
-        return True
-    if run.get("active") or run.get("status") in ACTIVE_STATUSES:
-        return True
-    return _within(run.get("finished_at"), now)
+    store = run_store or {}
+    pinned = bool(store.get("pinned")) and store.get("run_id") == run.get("run_id")
+    return pinnable(run.get("run_id"), active_ids, now,
+                    active=bool(run.get("active"))
+                    or run.get("status") in ACTIVE_STATUSES,
+                    pinned=pinned, finished_at=run.get("finished_at"),
+                    started_at=run.get("started_at"))
 
 
 def stage_state(stages, stage) -> str:

@@ -5721,3 +5721,176 @@ body {
 @media (max-width: 600px) {
     .rr-verdict, .rr-fields { grid-template-columns: 1fr; }
 }
+
+/* --- Run page: /runs/<id> ---------------------------------------------- */
+/* The board cells are Home's (home-chip, home-resolution); only the
+   header, the banner, the two extra cells and the synthesis card are new. */
+
+.page-run {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+.run-banner {
+    display: flex;
+    align-items: center;
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+}
+
+.run-banner-label { font-weight: 600; margin-right: 4px; }
+
+.run-banner-failed {
+    color: var(--negative);
+    border-color: var(--negative);
+    background: rgba(255, 80, 0, 0.08);
+}
+
+.run-banner-cancelled {
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+}
+
+.run-header {
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--card-radius);
+    padding: var(--space-3) var(--space-5);
+}
+
+.run-titlerow {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin-bottom: var(--space-2);
+}
+
+.run-kind-badge {
+    padding: 1px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    text-transform: capitalize;
+    white-space: nowrap;
+}
+
+.run-kind-scheduled { color: var(--accent-primary); border-color: var(--accent-primary); }
+
+.run-preset { font-size: var(--text-xs); color: var(--text-muted); }
+
+.run-symbols { font-weight: 600; font-size: var(--text-md); }
+
+.run-status {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.run-status-running, .run-status-queued { color: var(--accent-primary); }
+.run-status-done { color: var(--positive); }
+.run-status-failed { color: var(--negative); }
+
+.run-facts { flex-wrap: wrap; row-gap: var(--space-1); }
+
+.run-meta { white-space: nowrap; }
+
+.run-report-cell {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    white-space: nowrap;
+}
+
+.run-report-none, .run-on-watchlist {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+}
+
+.run-report-open { padding: 2px 8px; }
+
+.run-add-btn {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--accent-primary);
+    font-size: var(--text-xs);
+    padding: 2px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.run-add-btn:hover { border-color: var(--accent-primary); color: var(--accent-hover); }
+
+.run-row-opened td:first-child { box-shadow: inset 3px 0 0 var(--accent-primary); }
+
+.run-empty { padding: var(--space-2) 0; }
+
+.run-card-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+}
+
+.run-card-title {
+    font-weight: 600;
+    font-size: var(--text-md);
+    color: var(--text-primary);
+}
+
+.run-syn-meta {
+    display: flex;
+    gap: var(--space-3);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+}
+
+.run-syn-body { display: flex; flex-direction: column; gap: var(--space-3); }
+
+.run-syn-action { font-weight: 600; color: var(--text-primary); }
+
+.run-syn-summary, .run-syn-risk, .run-pos-reasoning {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    max-width: 80ch;
+}
+
+.run-positions { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.run-pos {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+}
+
+.run-pos-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    font-size: var(--text-sm);
+}
+
+.run-pos-symbol { font-weight: 600; }
+
+.run-pos-fact { color: var(--text-secondary); font-size: var(--text-xs); }
+
+.run-pos-reasoning { margin-top: var(--space-1); }
+
+.run-syn-watch { margin: 0; padding-left: 18px; font-size: var(--text-sm); color: var(--text-secondary); }
+
+/* Runs section on Reports: the run page's badge and status pill inside
+   table cells, where the pill's auto margin would push it out of its cell. */
+.runs-table .run-status { margin-left: 0; }
+.runs-table .runs-symbols { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+.runs-more { margin-left: 4px; color: var(--text-muted); font-size: var(--text-xs); }

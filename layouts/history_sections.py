@@ -15,6 +15,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html
 
 from layouts.formatters import confidence_tooltip, conviction_label, weight_label
+from services.progress_service import format_stamp, to_display_tz
 
 
 def filter_items(items, filter_symbols, filter_date_range, specific_date=None, sym_key="symbol", date_key="trade_date"):
@@ -35,6 +36,32 @@ def filter_items(items, filter_symbols, filter_date_range, specific_date=None, s
             cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
             items = [i for i in items if (i.get(date_key, "") or "") >= cutoff]
     return items
+
+
+def csv_symbols(csv) -> list[str]:
+    """symbols_csv as a list; recommendation and run rows store one."""
+    return [s.strip() for s in (csv or "").split(",") if s.strip()]
+
+
+def run_started_date(run: dict) -> str:
+    """The ET calendar date a run started, "YYYY-MM-DD" or "".
+
+    started_at is stored in UTC, so an evening ET run would otherwise be
+    filed under tomorrow's date and miss a "today" filter.
+    """
+    dt = to_display_tz(run.get("started_at"))
+    return dt.strftime("%Y-%m-%d") if dt else ""
+
+
+def filter_runs(runs, filter_symbols, filter_date_range, specific_date=None):
+    """Analysis runs: a run stays visible if any of its symbols matches,
+    and dates apply to the ET day it started."""
+    if filter_symbols:
+        filter_set = set(filter_symbols)
+        runs = [r for r in runs if set(csv_symbols(r.get("symbols_csv"))) & filter_set]
+    stamped = [dict(r, started_date=run_started_date(r)) for r in runs]
+    return filter_items(stamped, [], filter_date_range, specific_date,
+                        date_key="started_date")
 
 
 def current_session():
@@ -98,10 +125,9 @@ def build_history_filter_bar(history_data: dict, filter_symbols=None,
         if p.get("symbol"):
             all_symbols.add(p["symbol"])
     for rec in history_data.get("recommendations", []):
-        for sym in (rec.get("symbols_csv", "") or "").split(","):
-            sym = sym.strip()
-            if sym:
-                all_symbols.add(sym)
+        all_symbols.update(csv_symbols(rec.get("symbols_csv")))
+    for run in history_data.get("runs", []):
+        all_symbols.update(csv_symbols(run.get("symbols_csv")))
 
     sorted_symbols = sorted(all_symbols)
 
@@ -291,9 +317,9 @@ def filter_history_data(history_data, filter_symbols, filter_date_range,
                         specific_date=None):
     """Apply the shared symbol and date filters to every bucket.
 
-    Recommendations are filtered separately: they carry symbols_csv (a run
-    covers a set of tickers) rather than one symbol, so a run stays visible if
-    any of its symbols matches.
+    Recommendations and runs are filtered separately: they carry symbols_csv
+    (a run covers a set of tickers) rather than one symbol, so a run stays
+    visible if any of its symbols matches.
     """
     if isinstance(history_data, list):
         history_data = {"trading_agent_reports": history_data}
@@ -315,8 +341,7 @@ def filter_history_data(history_data, filter_symbols, filter_date_range,
         filter_set = set(filter_symbols)
         recommendations = [
             rec for rec in raw_recs
-            if {s.strip() for s in (rec.get("symbols_csv", "") or "").split(",")
-                if s.strip()} & filter_set
+            if set(csv_symbols(rec.get("symbols_csv"))) & filter_set
         ]
     else:
         recommendations = raw_recs
@@ -332,6 +357,8 @@ def filter_history_data(history_data, filter_symbols, filter_date_range,
         "predictions": predictions,
         "trading_agent_reports": ta_reports,
         "recommendations": recommendations,
+        "runs": filter_runs(history_data.get("runs", []), filter_symbols,
+                            filter_date_range, specific_date),
     }
 
 
@@ -535,7 +562,8 @@ def build_saved_reports_section(reports, page=None):
 # Rows per page per archive bucket. Everything in scope is reachable through
 # the pager; nothing is silently cut off any more (the log used to keep the
 # 12 most recently active symbols and the loaders the newest N rows).
-PAGE_SIZE = {"predictions": 300, "ta": 24, "reports": 50, "recommendations": 50}
+PAGE_SIZE = {"predictions": 300, "ta": 24, "reports": 50, "recommendations": 50,
+             "runs": 50}
 
 
 def page_slice(items: list, bucket: str, page_state: dict | None):
@@ -775,6 +803,77 @@ def build_recommendations_section(recommendations, page=None):
         ], className="history-table-wrap"),
         # Open on arrival: a collapsed archive reads as an empty one.
         icon_class="bi-lightning", default_open=True, count=total,
+    )
+
+
+# Symbols named in a run row before the rest collapse into "+n". A scheduled
+# run lists the whole watchlist; the row is for telling runs apart, the run
+# page lists every name.
+RUN_ROW_SYMBOLS = 5
+
+
+def build_runs_section(runs, page=None):
+    """Every analysis run, newest first, each linking to its page.
+
+    The archive below is grouped by symbol; this is the other axis, one row
+    per confirm or scheduled job, so a run that never produced a report
+    (still running, failed at the models stage, cancelled) is still
+    findable, and a twenty-symbol scheduled run is one row, not twenty.
+    """
+    if not runs:
+        return None
+    # Lazy: layouts.pages.run pulls in the Home board builders, which the
+    # Performance page (also importing this module) never needs.
+    from layouts.pages.run import STATUS_LABEL, duration_label
+    from services.run_service import ACTIVE_STATUSES, first_line
+
+    total = len(runs)
+    runs, pager = page_slice(runs, "runs", page)
+    rows = []
+    for run in runs:
+        kind = run.get("kind") or "manual"
+        status = run.get("status") or "queued"
+        preset = run.get("preset") or ""
+        symbols = csv_symbols(run.get("symbols_csv"))
+        hidden = len(symbols) - RUN_ROW_SYMBOLS
+        sym_cell = [html.Span(", ".join(symbols[:RUN_ROW_SYMBOLS]))]
+        if hidden > 0:
+            sym_cell.append(html.Span(f"+{hidden}", className="runs-more"))
+        duration = ("running" if status in ACTIVE_STATUSES
+                    else duration_label(run) or "n/a")
+        rows.append(html.Tr([
+            html.Td(format_stamp(run.get("started_at")), className="num"),
+            html.Td(html.Span(kind, className=f"run-kind-badge run-kind-{kind}")),
+            html.Td(preset.capitalize(), className="run-preset"),
+            html.Td(sym_cell, title=", ".join(symbols), className="runs-symbols"),
+            html.Td(html.Span(
+                STATUS_LABEL.get(status, status),
+                className=f"run-status run-status-{status}",
+                title=first_line(run.get("error")) if status == "failed" else None,
+            )),
+            html.Td(duration, className="num"),
+            html.Td(run.get("owner_uid") or "anonymous"),
+            html.Td(dcc.Link(
+                [html.I(className="bi bi-box-arrow-up-right me-1"), "Open"],
+                href=f"/runs/{run.get('run_id', '')}",
+                className="history-dl-btn runs-open",
+            )),
+        ]))
+
+    return collapsible_section(
+        "Runs", "runs",
+        html.Div([
+            pager,
+            html.Table([
+                html.Thead(html.Tr([html.Th("Started"), html.Th("Kind"),
+                                    html.Th("Preset"), html.Th("Symbols"),
+                                    html.Th("Status"), html.Th("Duration"),
+                                    html.Th("Owner"), html.Th("")])),
+                html.Tbody(rows),
+            ], className="history-data-table runs-table"),
+            pager,
+        ], className="history-table-wrap"),
+        icon_class="bi-play-circle", default_open=True, count=total,
     )
 
 

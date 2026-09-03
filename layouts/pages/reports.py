@@ -1,8 +1,8 @@
 """Reports page: the artifact archive.
 
-Research reports, saved report files and portfolio synthesis runs. These three
-are one section because they are all "something a run wrote down", as opposed
-to Performance, which is "how the calls turned out".
+Analysis runs, research reports, saved report files and portfolio synthesis
+runs. These are one page because they are all "something a run wrote down",
+as opposed to Performance, which is "how the calls turned out".
 """
 
 import dash_bootstrap_components as dbc
@@ -11,6 +11,7 @@ from dash import html
 from layouts.history_sections import (
     build_history_filter_bar,
     build_recommendations_section,
+    build_runs_section,
     build_saved_reports_section,
     build_ta_reports_section,
     empty_history_message,
@@ -30,8 +31,8 @@ def _action_bar() -> html.Div:
             html.Div(
                 [
                     html.Div("Research reports", className="reports-bar-title"),
-                    html.Div("Generate a new report for the watchlist, or "
-                             "reopen any past one below.",
+                    html.Div("Generate a report for any symbols, or reopen "
+                             "a past run or report below.",
                              className="reports-bar-sub"),
                 ],
             ),
@@ -71,7 +72,10 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
 
+    # Runs first: the newest thing the user did is what they came back for,
+    # and a run with no report yet only exists in this section.
     sections = [
+        build_runs_section(buckets["runs"], page=page),
         build_ta_reports_section(buckets["trading_agent_reports"], page=page),
         build_saved_reports_section(buckets["reports"], page=page),
         build_recommendations_section(buckets["recommendations"], page=page),

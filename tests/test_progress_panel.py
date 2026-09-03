@@ -177,6 +177,50 @@ class TestPinTarget:
         assert not pp.pin_holds(_run(status="done", finished_at=_ago(7200, NOW)), [], NOW)
         assert not pp.pin_holds(None, [], NOW)
 
+    def test_one_rule_on_both_sides_of_the_row_read(self):
+        # A run that started over an hour ago and ended ten minutes ago:
+        # the store knows the start only, so with the watchdog's ceiling
+        # as grace it is still read, and the row's end stamp holds it.
+        row = _run(status="done", finished_at=_ago(600, NOW))
+        row["started_at"] = _ago(pp.PIN_WINDOW_S + 900, NOW)
+        store = {"run_id": "r1", "started": row["started_at"]}
+        assert pp.pin_target(store, [], NOW) is None
+        assert pp.pin_target(store, [], NOW, ceiling_s=3600) == "r1"
+        assert pp.pin_holds(row, [], NOW, store)
+        # The end stamp is exact: no grace on the row side.
+        row["finished_at"] = _ago(pp.PIN_WINDOW_S + 1, NOW)
+        assert not pp.pin_holds(row, [], NOW, store)
+        assert pp.pin_target({"run_id": "r1", "finished": row["finished_at"],
+                              "started": _ago(60, NOW)}, [], NOW,
+                             ceiling_s=3600) is None
+        # Past start + ceiling + window the store is not even read.
+        assert pp.pin_target(store, ["new"], NOW, ceiling_s=600) == "new"
+        # pinnable itself, the shared rule.
+        assert pp.pinnable("x", [], NOW, active=True)
+        assert pp.pinnable("x", ["x"], NOW)
+        assert pp.pinnable("x", [], NOW, pinned=True, finished_at=_ago(9e6, NOW))
+        assert pp.pinnable("x", [], NOW, finished_at=_ago(10, NOW))
+        assert not pp.pinnable("x", [], NOW, finished_at=_ago(pp.PIN_WINDOW_S + 1, NOW))
+        assert pp.pinnable("x", [], NOW, started_at=_ago(10, NOW))
+        assert not pp.pinnable("x", [], NOW, started_at=_ago(pp.PIN_WINDOW_S + 1, NOW))
+        assert pp.pinnable("x", [], NOW, started_at=_ago(pp.PIN_WINDOW_S + 1, NOW),
+                           ceiling_s=60)
+        assert not pp.pinnable("x", [], NOW)
+
+    def test_pinned_store_wins_whatever_the_age(self):
+        # A click on the pill writes the flag; age never unpins, only a
+        # fresh store (the next confirm) does.
+        store = {"run_id": "old", "started": _ago(48 * 3600, NOW),
+                 "finished": _ago(47 * 3600, NOW), "pinned": True}
+        assert pp.pin_target(store, ["theirs"], NOW) == "old"
+        row = _run("old", status="done", finished_at=store["finished"])
+        assert pp.pin_holds(row, [], NOW, store)
+        # The flag is the store's, for the run the store names only.
+        assert not pp.pin_holds(_run("other", status="done",
+                                     finished_at=store["finished"]), [], NOW, store)
+        assert not pp.pin_holds(row, [], NOW, {**store, "pinned": False})
+        assert not pp.pin_holds(row, [], NOW, None)
+
 
 class TestSymbolState:
     def test_recorded_state_wins(self):
@@ -416,14 +460,55 @@ class TestPanelCallback:
         assert _find(out[BODY][0], className="progress-run-caption").children == \
             "manual run · failed · worker pid 4242 died"
 
+    def _end_at(self, run_id, finished_at):
+        """Backdate a row's end (set_status stamps now)."""
+        from datetime import datetime as dt
+        from sqlalchemy import update
+        from db.session import get_session
+        with get_session() as session:
+            session.execute(update(AnalysisRun)
+                            .where(AnalysisRun.run_id == run_id)
+                            .values(finished_at=dt.fromisoformat(finished_at)))
+
     def test_stale_pin_falls_back_to_the_rolling_log(self, pinned, feed):
         rs.set_status(pinned, "done")
         feed.finish_run("Pipeline complete", run_id=pinned)
-        out = _panel({"run_id": pinned, "started": _ago(pp.PIN_WINDOW_S + 60)})
+        # Stale means ENDED over an hour ago, not started: the row's end
+        # stamp decides, whatever the store's start says.
+        self._end_at(pinned, _ago(pp.PIN_WINDOW_S + 60))
+        out = _panel({"run_id": pinned, "started": _ago(pp.PIN_WINDOW_S + 120)})
         (lines,) = out[BODY]
         assert lines.className == "progress-feed-lines"
         assert "Pipeline complete" in _text(lines)
         assert "progress-header-done" in out[ICON].className
+
+    def test_long_run_that_ended_recently_stays_pinned(self, pinned, feed):
+        # Started over an hour ago, finished ten minutes ago: the store's
+        # start alone would have dropped it (the two halves disagreed).
+        rs.set_status(pinned, "done")
+        feed.finish_run("Pipeline complete", run_id=pinned)
+        self._end_at(pinned, _ago(600))
+        out = _panel({"run_id": pinned, "started": _ago(pp.PIN_WINDOW_S + 600)})
+        stepper = out[BODY][0]
+        assert stepper.className == "progress-stepper"
+        assert out[FP][-1] == pinned
+
+    def test_pinned_store_shows_an_old_run(self, pinned, feed):
+        # The pill click's pin: the run ended hours ago, the panel still
+        # opens on its stepper, not the rolling log.
+        rs.set_status(pinned, "failed", error="worker died")
+        feed.finish_run("Run failed", run_id=pinned)
+        self._end_at(pinned, _ago(5 * 3600))
+        store = {"run_id": pinned, "started": _ago(6 * 3600),
+                 "finished": _ago(5 * 3600), "pinned": True}
+        out = _panel(store)
+        assert _find(out[BODY][0], className="progress-run-caption").children == \
+            "manual run · failed · worker died"
+        assert "progress-header-failed" in out[ICON].className
+        # Without the flag the same store is the rolling log.
+        del store["pinned"]
+        (lines,) = _panel(store)[BODY]
+        assert lines.className == "progress-feed-lines"
 
     def test_newest_run_in_flight_without_a_pin(self, pinned, db, feed):
         theirs = rs.create_run("scheduled", ["TSLA"], None)

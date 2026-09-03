@@ -551,7 +551,8 @@ def _build_route(path, history_data, filter_symbols, filter_range,
                 filter_symbols, filter_range, filter_specific, outcome, model)
         return reports_page.layout(
             fetch_report_history(
-                only={"reports", "recommendations", "trading_agent_reports"}),
+                only={"reports", "recommendations", "trading_agent_reports",
+                      "runs"}),
             filter_symbols, filter_range, filter_specific)
     if path == "/schedule":
         return schedule_page.layout()
@@ -743,6 +744,37 @@ HOME_ROLLING_DAYS = 30
 _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule",
            "/activity", "/trace"]
 
+# /runs/<uuid>: the page the completion toast and the pill link to. The
+# same pattern the run-seen-store clientside callback matches, so a visit
+# that renders the page is the visit that clears the pill.
+_RUN_PATH_RE = re.compile(r"^/runs/([0-9a-fA-F-]{36})$")
+RUN_PAGE_TITLE = "Run"
+
+
+def _run_route(pathname) -> str | None:
+    """The run id in a /runs/<uuid> path, else None."""
+    m = _RUN_PATH_RE.match((pathname or "").rstrip("/"))
+    return m.group(1) if m else None
+
+
+def _wants_first_report(search) -> bool:
+    """True when the query string carries open=first (the toast/pill link)."""
+    from urllib.parse import parse_qs
+    if not search:
+        return False
+    values = parse_qs(str(search).lstrip("?")).get("open") or []
+    return "first" in values
+
+
+def _build_run_page(run_id: str, watchlist, open_first: bool):
+    from layouts.pages import run as run_page
+    from services import dashboard_service as ds
+
+    view = ds.get_run_view(run_id)
+    if view is None:
+        return run_page.not_found(run_id)
+    return run_page.layout(view, watchlist or [], open_first=open_first)
+
 
 @callback(
     Output("page-content", "children"),
@@ -760,10 +792,12 @@ _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule",
     State("selected-symbols", "data"),
     State("current-period", "data"),
     State("home-cutoff-date", "data"),
+    State("url", "search"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
                 filter_specific, activity_scope, activity_since, outcome,
-                model, home_symbol, watchlist, period, home_cutoff):
+                model, home_symbol, watchlist, period, home_cutoff,
+                search=None):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -773,8 +807,28 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     instead (render_archive_body), which cannot outrank a route change.
 
     Unknown paths fall back to Home rather than erroring, so a stale bookmark
-    from the pre-routing single page still lands somewhere useful.
+    from the pre-routing single page still lands somewhere useful. A run
+    path with an unknown id is the one exception: that link came from a
+    toast or a pill, and "not found" is the honest answer.
     """
+    run_id = _run_route(pathname)
+    if run_id:
+        try:
+            return (_build_run_page(run_id, watchlist,
+                                    _wants_first_report(search)),
+                    RUN_PAGE_TITLE)
+        except Exception as e:
+            logger.exception("Failed to render run %s", run_id)
+            return (
+                html.Div(
+                    [html.Div("This run failed to load.",
+                              className="empty-state-title"),
+                     html.Div(str(e), className="empty-state-note")],
+                    className="empty-state",
+                ),
+                RUN_PAGE_TITLE,
+            )
+
     path = (pathname or "/").rstrip("/") or "/"
     if path not in _ROUTES:
         logger.info("Unknown route %s, falling back to Home", path)
@@ -799,6 +853,32 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
             ),
             SECTION_TITLES.get(path, "QuantNews"),
         )
+
+
+@callback(
+    Output("run-symbol-table", "children"),
+    Input("selected-symbols", "data"),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def refresh_run_watchlist_cells(watchlist, pathname):
+    """Swap a run page's "+ watchlist" buttons as the watchlist changes.
+
+    The button adds through the global manage_symbols callback, which only
+    writes selected-symbols; without this the button would stay after the
+    add. Off the run page the Output is not mounted and the callback
+    returns nothing.
+    """
+    run_id = _run_route(pathname)
+    if not run_id:
+        raise PreventUpdate
+    from layouts.pages import run as run_page
+    from services import dashboard_service as ds
+
+    view = ds.get_run_view(run_id)
+    if view is None:
+        raise PreventUpdate
+    return run_page.symbol_table(view, watchlist or [])
 
 
 @callback(
@@ -882,7 +962,7 @@ def render_archive_body(history_data, filter_symbols, filter_range,
         return performance_page.body(data, filter_symbols, filter_range,
                                      filter_specific, outcome, model, page=page)
     data = fetch_report_history(
-        only={"reports", "recommendations", "trading_agent_reports"})
+        only={"reports", "recommendations", "trading_agent_reports", "runs"})
     return reports_page.body(data, filter_symbols, filter_range, filter_specific,
                              page=page)
 
@@ -3631,6 +3711,7 @@ def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
         "predictions": [],
         "recommendations": [],
         "trading_agent_reports": [],
+        "runs": [],
     }
     try:
         cache = get_cache()
@@ -3663,6 +3744,9 @@ def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
                 outcome=filters.get("outcome"))
         if wanted("recommendations"):
             result["recommendations"] = cache.list_recommendation_runs(limit=None)
+        if wanted("runs"):
+            from services import run_service
+            result["runs"] = run_service.list_runs(limit=100)
 
         _history_memo[key] = (time.monotonic(), result)
         return result
@@ -3718,21 +3802,26 @@ def render_progress_panel(_n, last_snap, last_fp, run_store=None):
 
     # Which run to follow is decided from the feed's active list and the
     # session's pin BEFORE the row read, so there is exactly one: this
-    # viewer's own run while it is in flight or for an hour after it ended
-    # (its result stays in front of them), else the newest run in flight
-    # (a scheduled job, another session's run), else the rolling log.
+    # viewer's own run while it is in flight, for an hour after it ended
+    # (its result stays in front of them) or while they pinned it by
+    # clicking the pill, else the newest run in flight (a scheduled job,
+    # another session's run), else the rolling log.
     # Without the pin, confirming a run in another session (or a scheduled
     # job starting) switched every open panel to that run's feed.
     now = pp.now_utc()
     active_ids = prog.active_run_ids()
-    target = pp.pin_target(run_store, active_ids, now)
+    # The store knows only when its run started; the watchdog's ceiling
+    # bounds how much later it can have ended, so the pre-check errs on
+    # reading the row and pin_holds decides on the real finished_at.
+    target = pp.pin_target(run_store, active_ids, now,
+                           ceiling_s=run_service.run_ceiling_s())
     run = None
     if target:
         try:
             run = run_service.get_run(target)
         except Exception as e:
             logger.warning("activity panel: run %s unreadable: %s", target, e)
-        if run is not None and not pp.pin_holds(run, active_ids, now):
+        if run is not None and not pp.pin_holds(run, active_ids, now, run_store):
             run = None
     feed = prog.get_feed(run["run_id"] if run else None)
     events = feed.get("events") or []
@@ -3787,8 +3876,21 @@ clientside_callback(
         }
         ns.last = token;
         var feed = document.getElementById("progress-feed-scroll");
-        if (feed && feed.lastElementChild) {
-            feed.lastElementChild.scrollIntoView({block: "nearest"});
+        if (!feed) {
+            return "";
+        }
+        // The newest row lives in the lines wrapper (under the stepper's
+        // Details when a run is pinned); the container's own last child is
+        // then the Details element, not a row. A row inside a folded
+        // Details has no box to scroll to, so fall back to the container's
+        // last child then as well.
+        var row = document.querySelector(
+            "#progress-feed-scroll .progress-feed-lines > :last-child");
+        if (!row || !row.getClientRects().length) {
+            row = feed.lastElementChild;
+        }
+        if (row) {
+            row.scrollIntoView({block: "nearest"});
         }
         return "";
     }
@@ -3969,7 +4071,11 @@ def open_run_from_pill(n_clicks, fp, run_store, panel_state):
     The panel pins its feed to run-store, so a pill showing a run this
     session did not confirm (a scheduled job, or the viewer's run from
     another tab) hands the panel that run's dict. The pin was written by
-    the poll with the pill, so no query here.
+    the poll with the pill, so no query here. The store is stamped
+    ``pinned``: the click is an explicit ask, so the panel follows that
+    run whatever its age (a Ready pill for a run that ended hours ago
+    must open on that run's stepper, not the rolling log) until the next
+    confirm writes a fresh store.
     """
     if not n_clicks:
         raise PreventUpdate
@@ -3977,9 +4083,14 @@ def open_run_from_pill(n_clicks, fp, run_store, panel_state):
     panel.setdefault("mode", "normal")
     panel["closed"] = False
     pin = (fp or {}).get("pin") or {}
-    if not pin.get("run_id") or pin["run_id"] == (run_store or {}).get("run_id"):
+    store = run_store or {}
+    if not pin.get("run_id"):
         return panel, dash.no_update
-    return panel, pin
+    if pin["run_id"] == store.get("run_id"):
+        if store.get("pinned"):
+            return panel, dash.no_update
+        return panel, {**store, "pinned": True}
+    return panel, {**pin, "pinned": True}
 
 
 @callback(
@@ -3990,16 +4101,29 @@ def open_run_from_pill(n_clicks, fp, run_store, panel_state):
     Output("full-analysis-requested", "data", allow_duplicate=True),
     # The button is only rendered while the pill shows the viewer's own run.
     Input("run-pill-cancel", "n_clicks", allow_optional=True),
+    State("run-pill-fp", "data"),
+    State("run-store", "data"),
     prevent_initial_call=True,
 )
-def cancel_run_from_pill(n_clicks):
-    """The pill's cancel: the same cancel the dialog offers, then the pill
+def cancel_run_from_pill(n_clicks, fp=None, run_store=None):
+    """The pill's cancel: the same cancel the dialog offers, aimed at the
+    run the pill is showing (the poll's pin in run-pill-fp), then the pill
     goes away (a cancelled run is never shown; the next tick brings back
-    whatever else is in flight)."""
+    whatever else is in flight).
+
+    Aimed, not "this owner's active run": the pill can show a run this
+    session confirmed under another identity (is_own matches run-store),
+    while active_run_for(owner) would name a different run of the signed-
+    in user's. The helper still refuses anything that is not the viewer's.
+    """
     if not n_clicks:
         raise PreventUpdate
-    _message, run_id = _cancel_own_run()
-    if run_id is None:
+    run_id = ((fp or {}).get("pin") or {}).get("run_id")
+    if not run_id:
+        # A click on a pill the poll has already emptied: nothing to aim at.
+        raise PreventUpdate
+    _message, cancelled = _cancel_own_run(run_id, run_store)
+    if cancelled is None:
         # Already gone; the poll hides the pill on its own.
         raise PreventUpdate
     return True, None, False
@@ -4352,6 +4476,16 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
         logger.info("No research report body for %s", triggered)
         raise PreventUpdate
 
+    title, body, footer = _report_modal_parts(report)
+    return True, title, body, footer
+
+
+def _report_modal_parts(report: dict) -> tuple:
+    """(title, body, footer) of the reader modal for one full report dict.
+
+    Shared by the click path (ta-view-btn) and the arrival path
+    (/runs/<id>?open=first) so both open the identical reader.
+    """
     from models.single_agent import extract_confidence
     from layouts.formatters import conviction_label, weight_label
     from layouts.report_view import build_report_view
@@ -4382,7 +4516,69 @@ def jump_to_full_report(view_clicks, ta_view_clicks):
         className="btn btn-sm btn-outline-info",
         title="The same report as a PDF, formatted like this page",
     )
+    return title, body, footer
+
+
+@callback(
+    Output("ta-report-modal", "is_open", allow_duplicate=True),
+    Output("ta-report-modal-title", "children", allow_duplicate=True),
+    Output("ta-report-modal-body", "children", allow_duplicate=True),
+    Output("ta-report-modal-footer", "children", allow_duplicate=True),
+    Input("url", "search"),
+    Input("url", "pathname"),
+    prevent_initial_call="initial_duplicate",
+)
+def open_first_report(search, pathname):
+    """Arriving on /runs/<id>?open=first opens the run's first report.
+
+    The toast and the pill link here. Nothing to open (no such run, no
+    report yet, a different page) leaves the modal alone. The URL is
+    cleaned of the query once the reader closes (clientside below), so the
+    same link opens it again next time.
+    """
+    run_id = _run_route(pathname)
+    if not run_id or not _wants_first_report(search):
+        raise PreventUpdate
+    from layouts.pages import run as run_page
+    from services import dashboard_service as ds
+
+    try:
+        view = ds.get_run_view(run_id)
+        headline = run_page.first_report(view) if view else None
+        report = (get_cache().get_trading_agent_report(str(headline["id"]))
+                  if headline else None)
+    except Exception as e:
+        logger.warning("Could not open the first report of run %s: %s",
+                       run_id, e)
+        raise PreventUpdate
+    if not report or not report.get("report_text"):
+        raise PreventUpdate
+    title, body, footer = _report_modal_parts(report)
     return True, title, body, footer
+
+
+# Closing the reader on a run page drops ?open=first from the URL, so the
+# page stays put (no navigation) and the next click on the same link is a
+# URL change again, which is what re-opens the reader.
+clientside_callback(
+    """
+    function(is_open, pathname, search) {
+        if (is_open) {
+            return window.dash_clientside.no_update;
+        }
+        var onRun = /^[/]runs[/][0-9a-fA-F-]{36}[/]?$/.test(pathname || "");
+        if (!onRun || !/(^|[?&])open=first(&|$)/.test(search || "")) {
+            return window.dash_clientside.no_update;
+        }
+        return "";
+    }
+    """,
+    Output("url", "search"),
+    Input("ta-report-modal", "is_open"),
+    State("url", "pathname"),
+    State("url", "search"),
+    prevent_initial_call=True,
+)
 
 
 # =============================================================================
@@ -5903,9 +6099,15 @@ def cancel_active_run(n_clicks):
     return message, (False if run_id else dash.no_update)
 
 
-def _cancel_own_run() -> tuple:
+def _cancel_own_run(run_id=None, run_store=None) -> tuple:
     """Cancel this owner's manual run in flight; ``(message, run_id)``,
     run_id None when there was nothing to cancel.
+
+    Without ``run_id`` the target is this owner's active run (the dialog's
+    button). With one (the pill's button) it is that run, and only when it
+    is the viewer's: same owner, or the run this session confirmed
+    (run-store), the same test the pill used to render the button. Another
+    user's run, or one already closed, is left alone.
 
     The worker pid the model stage recorded is terminated; the row is
     marked cancelled (sticky, so a stage finishing late cannot flip it to
@@ -5914,10 +6116,19 @@ def _cancel_own_run() -> tuple:
     Manual runs only: a scheduled run belongs to the scheduler, never locks
     this owner, and cannot be cancelled from the UI.
     """
+    from layouts.run_pill import is_own
     from services import progress_service as prog
     from services import run_service
 
-    active = run_service.active_run_for(_run_owner_uid())
+    owner_uid = _run_owner_uid()
+    if run_id:
+        active = run_service.get_run(run_id)
+        if active is not None and not is_own(active, owner_uid, run_store):
+            return "That run is not yours to cancel.", None
+        if active is not None and not active.get("active"):
+            active = None
+    else:
+        active = run_service.active_run_for(owner_uid)
     if active is None:
         return "No run in progress. You can start one.", None
     run_id = active["run_id"]

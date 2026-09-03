@@ -1243,6 +1243,60 @@ class CacheService:
                 for r in rows
             ]
 
+    def get_trading_agent_report(self, report_id: str) -> dict | None:
+        """One research report, body included, or None when it is missing
+        or not visible to the viewer."""
+        from db.models import TradingAgentReport
+        if not report_id:
+            return None
+        with get_session() as session:
+            r = session.execute(
+                select(TradingAgentReport)
+                .where(TradingAgentReport.id == str(report_id))
+                .where(_visible(TradingAgentReport))
+            ).scalars().first()
+            if r is None:
+                return None
+            return {
+                "id": r.id, "symbol": r.symbol,
+                "trade_date": str(r.trade_date),
+                "decision": r.decision, "confidence": r.confidence,
+                "report_text": r.report_text, "model_name": r.model_name,
+                "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
+                "run_id": r.run_id,
+                "created_at": str(r.created_at),
+                "owner_uid": r.owner_uid,
+            }
+
+    def get_trading_agent_reports_for_run(self, run_id: str) -> list[dict]:
+        """Headline fields of every visible report a run wrote, newest
+        first. No body: the run page lists verdicts and opens the reader
+        for the text (ix_trading_agent_report_run)."""
+        from db.models import TradingAgentReport
+        if not run_id:
+            return []
+        with get_session() as session:
+            rows = session.execute(
+                select(TradingAgentReport.id, TradingAgentReport.symbol,
+                       TradingAgentReport.trade_date, TradingAgentReport.decision,
+                       TradingAgentReport.confidence, TradingAgentReport.model_name,
+                       TradingAgentReport.created_at, TradingAgentReport.owner_uid)
+                .where(TradingAgentReport.run_id == run_id)
+                .where(_visible(TradingAgentReport))
+                .order_by(TradingAgentReport.created_at.desc())
+            ).all()
+            return [
+                {
+                    "id": r.id, "symbol": r.symbol,
+                    "trade_date": str(r.trade_date),
+                    "decision": r.decision, "confidence": r.confidence,
+                    "model_name": r.model_name,
+                    "created_at": str(r.created_at),
+                    "owner_uid": r.owner_uid,
+                }
+                for r in rows
+            ]
+
     def get_model_accuracy(self, model_name: str, symbol: Optional[str] = None) -> dict:
         """Accuracy for a model.
 
@@ -1653,6 +1707,50 @@ class CacheService:
                 }
                 for r in rows
             ]
+
+    def get_recommendation_for_run(self, run_id: str) -> dict | None:
+        """The newest visible synthesis a run stored, or None
+        (ix_recommendation_run)."""
+        from db.models import RecommendationRun
+        if not run_id:
+            return None
+        with get_session() as session:
+            r = session.execute(
+                select(RecommendationRun)
+                .where(RecommendationRun.run_id == run_id)
+                .where(_visible(RecommendationRun))
+                .order_by(RecommendationRun.created_at.desc())
+                .limit(1)
+            ).scalars().first()
+            if r is None:
+                return None
+            return {
+                "id": r.id,
+                "trade_date": r.trade_date,
+                "symbols_csv": r.symbols_csv,
+                "model_used": r.model_used,
+                "provider_used": r.provider_used,
+                "result_json": r.result_json,
+                "duration_ms": r.duration_ms,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+
+    def get_predictions_for_run(self, run_id: str,
+                                include_details: bool = False) -> list[dict]:
+        """Every visible prediction a run stored, by symbol then model
+        (ix on model_predictions.run_id). The run page's one prediction
+        read; the same dict shape get_predictions_between returns."""
+        from db.models import ModelPrediction
+        if not run_id:
+            return []
+        with get_session() as session:
+            rows = session.execute(
+                select(ModelPrediction)
+                .where(ModelPrediction.run_id == run_id,
+                       _visible(ModelPrediction))
+                .order_by(ModelPrediction.symbol, ModelPrediction.model_name)
+            ).scalars().all()
+            return [_pred_to_dict(r, include_details) for r in rows]
 
     def list_all_predictions(
         self, symbol: str | None = None, limit: int = 100,

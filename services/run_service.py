@@ -316,7 +316,7 @@ def cancel_run(run_id: str) -> dict | None:
     return set_status(run_id, "cancelled")
 
 
-def _run_ceiling_s() -> int:
+def run_ceiling_s() -> int:
     """The scheduler's wall-clock ceiling, the longest any run is allowed to
     take before its process is killed; read lazily so this module stays
     importable without the scheduler's dependencies."""
@@ -404,7 +404,7 @@ def orphan_reason(run: dict, live=(), max_age_s: float | None = -1,
     scheduler's ceiling and ``queued_stall_s`` to the feed's stall window.
     ``live`` is the progress feed's active list."""
     if max_age_s == -1:
-        max_age_s = _run_ceiling_s()
+        max_age_s = run_ceiling_s()
     with get_session() as session:
         statuses = _job_run_statuses(session, [run.get("job_run_id")])
     return _orphan_reason(run, live, max_age_s, statuses, _now(),
@@ -426,7 +426,7 @@ def reap_orphans(live=(), max_age_s: float | None = -1,
     from db.models import AnalysisRun
 
     if max_age_s == -1:
-        max_age_s = _run_ceiling_s()
+        max_age_s = run_ceiling_s()
     now = _now()
     with get_session() as session:
         rows = session.execute(

@@ -255,6 +255,59 @@ def get_available_cutoffs(limit: int = 90) -> list[str]:
                               get_cache().get_prediction_dates(limit=limit)])
 
 
+def _new_row(symbol: str, previous_close=None, target_date=None) -> dict:
+    return {
+        "symbol": symbol,
+        "previous_close": previous_close,
+        "target_date": target_date,
+        "models": {},
+        "synthesis": None,
+    }
+
+
+def shape_symbol_rows(preds: list[dict]) -> dict:
+    """Fold prediction rows into one row per symbol.
+
+    The one shaping both the Home board and a run page use, so a model chip
+    or an outcome cell reads the same on either. Each prediction gains its
+    resolution ``state``; the synthesis verdict takes the row's own slot
+    instead of a model column. Returns ``by_symbol`` (insertion order of
+    first sight), the sorted ``model_names`` seen, the resolution ``counts``,
+    the summed ``pnl`` and the first ``target_date``.
+    """
+    by_symbol: dict[str, dict] = {}
+    model_names: set[str] = set()
+    counts = {"resolved": 0, "held": 0, "pending": 0}
+    pnl = 0.0
+    target_date = None
+
+    for p in preds:
+        state = resolution_state(p)
+        counts[state] += 1
+        if p.get("pnl_dollars") is not None:
+            pnl += p["pnl_dollars"]
+        target_date = target_date or p.get("target_date")
+
+        row = by_symbol.setdefault(p["symbol"], _new_row(
+            p["symbol"], p.get("previous_close"), p.get("target_date")))
+        entry = {**p, "state": state}
+        if p["model_name"] == SYNTHESIS_MODEL:
+            row["synthesis"] = entry
+        else:
+            model_names.add(p["model_name"])
+            row["models"][p["model_name"]] = entry
+        if row["previous_close"] is None:
+            row["previous_close"] = p.get("previous_close")
+
+    return {
+        "by_symbol": by_symbol,
+        "model_names": sorted(model_names),
+        "counts": counts,
+        "pnl": pnl,
+        "target_date": target_date,
+    }
+
+
 def _cohort_uncached(prediction_date: str | None = None) -> dict:
     """One prediction cutoff, shaped one row per symbol.
 
@@ -271,45 +324,97 @@ def _cohort_uncached(prediction_date: str | None = None) -> dict:
                 "counts": {"resolved": 0, "held": 0, "pending": 0},
                 "pnl": 0.0, "target_date": None}
 
-    preds = cache.get_predictions_between(latest, latest)
-
-    by_symbol: dict[str, dict] = {}
-    model_names: set[str] = set()
-    counts = {"resolved": 0, "held": 0, "pending": 0}
-    pnl = 0.0
-    target_date = None
-
-    for p in preds:
-        state = resolution_state(p)
-        counts[state] += 1
-        if p.get("pnl_dollars") is not None:
-            pnl += p["pnl_dollars"]
-        target_date = target_date or p.get("target_date")
-
-        row = by_symbol.setdefault(p["symbol"], {
-            "symbol": p["symbol"],
-            "previous_close": p.get("previous_close"),
-            "target_date": p.get("target_date"),
-            "models": {},
-            "synthesis": None,
-        })
-        entry = {**p, "state": state}
-        if p["model_name"] == SYNTHESIS_MODEL:
-            row["synthesis"] = entry
-        else:
-            model_names.add(p["model_name"])
-            row["models"][p["model_name"]] = entry
-        if row["previous_close"] is None:
-            row["previous_close"] = p.get("previous_close")
-
+    shaped = shape_symbol_rows(cache.get_predictions_between(latest, latest))
+    by_symbol = shaped["by_symbol"]
     return {
         "prediction_date": str(latest),
-        "target_date": target_date,
+        "target_date": shaped["target_date"],
         "symbols": [by_symbol[s] for s in sorted(by_symbol)],
-        "model_names": sorted(model_names),
-        "counts": counts,
-        "pnl": pnl,
+        "model_names": shaped["model_names"],
+        "counts": shaped["counts"],
+        "pnl": shaped["pnl"],
     }
+
+
+def _report_headline(report: dict) -> dict:
+    return {
+        "id": report.get("id"),
+        "decision": report.get("decision"),
+        "confidence": report.get("confidence"),
+        "trade_date": report.get("trade_date"),
+        "model_name": report.get("model_name"),
+    }
+
+
+def _run_artifacts_uncached(run: dict) -> dict:
+    """Everything a run wrote, one indexed query per table.
+
+    Rows follow the run's own symbol order (the dialog's chips or the
+    watchlist), then any symbol an artifact names that the row does not,
+    so a cancelled or still-running run lists every symbol it was asked
+    for with empty cells rather than only the ones that finished.
+    """
+    cache = get_cache()
+    run_id = run["run_id"]
+    shaped = shape_symbol_rows(cache.get_predictions_for_run(run_id))
+    by_symbol = shaped["by_symbol"]
+
+    reports_by_symbol: dict[str, dict] = {}
+    for r in cache.get_trading_agent_reports_for_run(run_id):
+        # Newest first from the query, so the first hit per symbol wins.
+        reports_by_symbol.setdefault(r["symbol"], _report_headline(r))
+
+    ordered = list(run.get("symbols") or [])
+    for sym in list(by_symbol) + sorted(reports_by_symbol):
+        if sym not in ordered:
+            ordered.append(sym)
+
+    target_date = shaped["target_date"] or run.get("target_date")
+    rows = []
+    for sym in ordered:
+        row = by_symbol.get(sym) or _new_row(sym, target_date=target_date)
+        row["report"] = reports_by_symbol.get(sym)
+        rows.append(row)
+
+    rec = cache.get_recommendation_for_run(run_id)
+    recommendation = None
+    if rec is not None:
+        recommendation = {
+            "result_json": rec.get("result_json") or {},
+            "model_used": rec.get("model_used"),
+            "duration_ms": rec.get("duration_ms"),
+            "created_at": rec.get("created_at"),
+        }
+
+    return {
+        "symbols": rows,
+        "model_names": shaped["model_names"],
+        "counts": shaped["counts"],
+        "pnl": shaped["pnl"],
+        "target_date": target_date,
+        "recommendation": recommendation,
+    }
+
+
+def get_run_view(run_id: str) -> dict | None:
+    """The run page's data: the run row plus everything it wrote.
+
+    None when there is no such run. The artifact reads are memoized only
+    once the run is terminal; a run in flight is re-read on every visit so
+    rows fill in as stages land. The row itself is always read live (it is
+    one PK lookup) so the header never shows a stale status.
+    """
+    from services import run_service
+
+    run = run_service.get_run(run_id) if run_id else None
+    if run is None:
+        return None
+    if run["status"] in run_service.TERMINAL_STATUSES:
+        artifacts = _memoized(f"run:{run_id}",
+                              lambda: _run_artifacts_uncached(run))
+    else:
+        artifacts = _run_artifacts_uncached(run)
+    return {"run": run, **artifacts}
 
 
 def get_open_predictions(limit: int = 200) -> dict:
