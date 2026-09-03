@@ -57,11 +57,13 @@ def _memo_key(name: str) -> str | None:
     return f"{name}|{uid}|{latest}|{PIPELINE_EPOCH}"
 
 
-def _memoized(name: str, build):
+def _memoized(name: str, build, cacheable=None):
     """Read-through cache around a pure query, best-effort.
 
     Any cache failure falls through to a live read: a dashboard that is slow
-    is better than one that errors.
+    is better than one that errors. ``cacheable(value)`` may veto storing a
+    result that is still changing (a run in flight) so the next read sees
+    the live rows instead of the snapshot.
     """
     c = _cache_handle()
     if c is None:
@@ -76,6 +78,8 @@ def _memoized(name: str, build):
     except Exception:
         return build()
     value = build()
+    if cacheable is not None and not cacheable(value):
+        return value
     try:
         c.set(key, value, expire=_MEMO_TTL_S)
     except Exception:
@@ -104,6 +108,10 @@ def invalidate_memo() -> None:
 # The name is still special-cased where the LAYOUT differs: the Home cohort
 # board gives it its own slot instead of a column in the models grid.
 SYNTHESIS_MODEL = "recommendation_synthesis"
+
+# Run statuses whose artifacts are settled enough to cache. A cancelled run
+# is not one of them (see get_run_view).
+MEMOIZED_RUN_STATUSES = ("done", "failed")
 
 
 def resolution_state(pred: dict) -> str:
@@ -221,38 +229,67 @@ def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
     return out
 
 
-def get_rolling_performance(days: int = 30, group_key: str = "model_name",
-                            symbols: list[str] | None = None) -> list[dict]:
-    """Trailing-window scorecard, newest `days` of prediction cutoffs."""
+def _symbols_key(symbols) -> str:
+    """Memo-key fragment for a symbol filter: 'any' for no filter, else the
+    sorted upper-cased names so two spellings of one watchlist share a hit."""
     if symbols is None:
-        return _memoized(f"rolling|{days}|{group_key}",
-                         lambda: _rolling_uncached(days, group_key, None))
-    return _rolling_uncached(days, group_key, symbols)
+        return "any"
+    return ",".join(sorted({str(s).upper() for s in symbols})) or "none"
 
 
-def _rolling_uncached(days, group_key, symbols):
+def get_rolling_performance(days: int = 30, group_key: str = "model_name",
+                            symbols: list[str] | None = None,
+                            kind: str | None = None) -> list[dict]:
+    """Trailing-window scorecard, newest `days` of prediction cutoffs.
+
+    ``kind='scheduled'`` is what the Home strip asks for, so an ad-hoc
+    experiment never moves the number the user tracks day to day.
+    """
+    if symbols is None:
+        return _memoized(f"rolling|{days}|{group_key}|{kind or 'any'}",
+                         lambda: _rolling_uncached(days, group_key, None, kind))
+    return _rolling_uncached(days, group_key, symbols, kind)
+
+
+def _rolling_uncached(days, group_key, symbols, kind=None):
     end = datetime.now().date()
     start = end - timedelta(days=days)
-    preds = get_cache().get_predictions_between(start, end, symbols=symbols)
+    preds = get_cache().get_predictions_between(start, end, symbols=symbols,
+                                                kind=kind)
     return aggregate_predictions(preds, group_key)
 
 
-def get_latest_cohort() -> dict:
-    """The latest cutoff's cohort (memoized)."""
-    return get_cohort(None)
+def get_latest_cohort(kind: str | None = "scheduled",
+                      symbols: list[str] | None = None) -> dict:
+    """The latest cutoff's cohort (memoized): the Scheduled tab's source.
+
+    With the default kind the cutoff is the newest one a scheduled run
+    wrote, so an ad-hoc run landing later in the day never displaces the
+    board; pass the watchlist as ``symbols`` to keep it to those names.
+    """
+    return get_cohort(None, kind=kind, symbols=symbols)
 
 
-def get_cohort(prediction_date: str | None = None) -> dict:
-    """Memoized wrapper: see _cohort_uncached. None means the latest cutoff."""
-    key = f"cohort:{prediction_date or 'latest'}"
-    return _memoized(key, lambda: _cohort_uncached(prediction_date))
+def get_cohort(prediction_date: str | None = None, kind: str | None = None,
+               symbols: list[str] | None = None) -> dict:
+    """Memoized wrapper: see _cohort_uncached. None means the latest cutoff
+    (of ``kind`` when one is given)."""
+    key = (f"cohort:{prediction_date or 'latest'}|{kind or 'any'}"
+           f"|{_symbols_key(symbols)}")
+    return _memoized(key, lambda: _cohort_uncached(prediction_date, kind, symbols))
 
 
-def get_available_cutoffs(limit: int = 90) -> list[str]:
-    """Distinct prediction cutoffs, newest first, as ISO strings."""
-    return _memoized(f"cutoffs:{limit}",
+def get_available_cutoffs(limit: int = 90,
+                          kind: str | None = "scheduled") -> list[str]:
+    """Distinct prediction cutoffs, newest first, as ISO strings.
+
+    Defaults to the scheduled runs' cutoffs: the Home dropdown pairs with
+    the Scheduled tab, and a manual run's cutoff belongs to This session.
+    """
+    return _memoized(f"cutoffs:{limit}|{kind or 'any'}",
                      lambda: [str(d) for d in
-                              get_cache().get_prediction_dates(limit=limit)])
+                              get_cache().get_prediction_dates(limit=limit,
+                                                               kind=kind)])
 
 
 def _new_row(symbol: str, previous_close=None, target_date=None) -> dict:
@@ -308,23 +345,28 @@ def shape_symbol_rows(preds: list[dict]) -> dict:
     }
 
 
-def _cohort_uncached(prediction_date: str | None = None) -> dict:
+def _cohort_uncached(prediction_date: str | None = None,
+                     kind: str | None = None,
+                     symbols: list[str] | None = None) -> dict:
     """One prediction cutoff, shaped one row per symbol.
 
-    Predictions carry no run id, so the cutoff date is the only grouping the
-    schema guarantees. For the launch screen that is also the more truthful
-    unit: it answers "what was the call on each name as of this cutoff",
-    which survives a run being re-executed or topped up symbol by symbol.
-    ``prediction_date=None`` means the most recent cutoff.
+    The cutoff date is the grouping the launch screen is built on: it
+    answers "what was the call on each name as of this cutoff", which
+    survives a run being re-executed or topped up symbol by symbol.
+    ``prediction_date=None`` means the most recent cutoff. ``kind`` keeps
+    the board to what scheduled (or manual) runs wrote, the newest cutoff
+    included, so a manual run on a watchlist name never enters the
+    Scheduled tab; ``symbols`` narrows the rows to those names.
     """
     cache = get_cache()
-    latest = prediction_date or cache.get_latest_prediction_date()
+    latest = prediction_date or cache.get_latest_prediction_date(kind=kind)
     if latest is None:
         return {"prediction_date": None, "symbols": [], "model_names": [],
                 "counts": {"resolved": 0, "held": 0, "pending": 0},
                 "pnl": 0.0, "target_date": None}
 
-    shaped = shape_symbol_rows(cache.get_predictions_between(latest, latest))
+    shaped = shape_symbol_rows(cache.get_predictions_between(
+        latest, latest, symbols=symbols, kind=kind))
     by_symbol = shaped["by_symbol"]
     return {
         "prediction_date": str(latest),
@@ -346,6 +388,20 @@ def _report_headline(report: dict) -> dict:
     }
 
 
+def _run_rows(run: dict, shaped: dict, target_date, extra=()) -> list[dict]:
+    """The run's rows in its own symbol order (the dialog's chips or the
+    watchlist), then any symbol in ``shaped`` or ``extra`` the row does not
+    name. A configured symbol nothing was written for still gets a row, so
+    a cancelled or in-flight run lists what it was asked for."""
+    by_symbol = shaped["by_symbol"]
+    ordered = list(run.get("symbols") or [])
+    for sym in list(by_symbol) + list(extra):
+        if sym not in ordered:
+            ordered.append(sym)
+    return [by_symbol.get(sym) or _new_row(sym, target_date=target_date)
+            for sym in ordered]
+
+
 def _run_artifacts_uncached(run: dict) -> dict:
     """Everything a run wrote, one indexed query per table.
 
@@ -357,24 +413,16 @@ def _run_artifacts_uncached(run: dict) -> dict:
     cache = get_cache()
     run_id = run["run_id"]
     shaped = shape_symbol_rows(cache.get_predictions_for_run(run_id))
-    by_symbol = shaped["by_symbol"]
 
     reports_by_symbol: dict[str, dict] = {}
     for r in cache.get_trading_agent_reports_for_run(run_id):
         # Newest first from the query, so the first hit per symbol wins.
         reports_by_symbol.setdefault(r["symbol"], _report_headline(r))
 
-    ordered = list(run.get("symbols") or [])
-    for sym in list(by_symbol) + sorted(reports_by_symbol):
-        if sym not in ordered:
-            ordered.append(sym)
-
     target_date = shaped["target_date"] or run.get("target_date")
-    rows = []
-    for sym in ordered:
-        row = by_symbol.get(sym) or _new_row(sym, target_date=target_date)
-        row["report"] = reports_by_symbol.get(sym)
-        rows.append(row)
+    rows = _run_rows(run, shaped, target_date, extra=sorted(reports_by_symbol))
+    for row in rows:
+        row["report"] = reports_by_symbol.get(row["symbol"])
 
     rec = cache.get_recommendation_for_run(run_id)
     recommendation = None
@@ -400,21 +448,86 @@ def get_run_view(run_id: str) -> dict | None:
     """The run page's data: the run row plus everything it wrote.
 
     None when there is no such run. The artifact reads are memoized only
-    once the run is terminal; a run in flight is re-read on every visit so
-    rows fill in as stages land. The row itself is always read live (it is
-    one PK lookup) so the header never shows a stale status.
+    once the run has finished or failed; a run in flight is re-read on
+    every visit so rows fill in as stages land. Cancelled is deliberately
+    not memoized: cancelling closes the row but the in-process research
+    stage is not killable, so it can still write a report afterwards, and
+    a memo taken at cancel time would hide it. The row itself is always
+    read live (it is one PK lookup) so the header never shows a stale
+    status.
     """
     from services import run_service
 
     run = run_service.get_run(run_id) if run_id else None
     if run is None:
         return None
-    if run["status"] in run_service.TERMINAL_STATUSES:
+    if run["status"] in MEMOIZED_RUN_STATUSES:
         artifacts = _memoized(f"run:{run_id}",
                               lambda: _run_artifacts_uncached(run))
     else:
         artifacts = _run_artifacts_uncached(run)
     return {"run": run, **artifacts}
+
+
+def get_session_runs(prediction_date: str | None = None,
+                     limit: int = 20) -> list[dict]:
+    """This session's ad-hoc runs, newest first, each with its own rows.
+
+    A "session" is one prediction cutoff: the newest one any manual run
+    has, or ``prediction_date``. Every manual run at that cutoff is listed,
+    queued and cancelled ones included, so the tab is the answer to "what
+    did I run today" rather than "what finished". Each entry is
+    ``{run, symbols, model_names, counts, pnl, target_date}`` with the rows
+    shaped exactly like a cohort's (see shape_symbol_rows), in the run's
+    symbol order. Memoized like the cohorts, except that a list holding a
+    run still in flight is read live so its rows fill in.
+
+    The key carries the runs table's own generation because the shared memo
+    key cannot see a run row: without it a run started after the last Home
+    render would be missing from this tab for the whole time it is in
+    flight, and a report-only run (which writes no prediction) for the
+    whole TTL after it finished.
+    """
+    from services import run_service
+
+    key = (f"session_runs:{prediction_date or 'latest'}|{limit}"
+           f"|{run_service.runs_generation('manual')}")
+    return _memoized(key, lambda: _session_runs_uncached(prediction_date, limit),
+                     cacheable=lambda runs: not any(r["run"]["active"]
+                                                    for r in runs))
+
+
+def _session_runs_uncached(prediction_date, limit) -> list[dict]:
+    from services import run_service
+
+    # Newest first by start; the row limit is generous because one day's
+    # ad-hoc runs are a handful and the cutoff filter below does the rest.
+    runs = run_service.list_runs(limit=max(limit * 10, 100), kind="manual")
+    session_date = prediction_date or max(
+        (r["prediction_date"] for r in runs if r.get("prediction_date")),
+        default=None)
+    if session_date is None:
+        return []
+    session_date = str(session_date)[:10]
+
+    cache = get_cache()
+    out = []
+    for run in runs:
+        if run.get("prediction_date") != session_date:
+            continue
+        shaped = shape_symbol_rows(cache.get_predictions_for_run(run["run_id"]))
+        target_date = shaped["target_date"] or run.get("target_date")
+        out.append({
+            "run": run,
+            "symbols": _run_rows(run, shaped, target_date),
+            "model_names": shaped["model_names"],
+            "counts": shaped["counts"],
+            "pnl": shaped["pnl"],
+            "target_date": target_date,
+        })
+        if len(out) >= limit:
+            break
+    return out
 
 
 def get_open_predictions(limit: int = 200) -> dict:

@@ -84,6 +84,10 @@ def create_layout() -> html.Div:
             # the same reason: "what did we call last Tuesday" is a question
             # for now, and tomorrow's launch screen should open on today.
             dcc.Store(id="home-cutoff-date", data=None),
+            # Which Home tab is open (scheduled | session). Local, not
+            # session: someone who works from This session wants it back
+            # tomorrow too.
+            dcc.Store(id="home-tab-store", data=None, storage_type="local"),
             dcc.Store(id="current-period", data="1y", storage_type="local"),
             dcc.Store(id="stock-data-store", data={}),
             dcc.Store(id="news-data-store", data={}),

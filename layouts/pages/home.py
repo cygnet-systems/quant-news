@@ -4,16 +4,20 @@ Opening the app used to show empty charts. The question it should answer on
 arrival is the one you actually have: what is the current call on each name,
 what did it cost or make, and what is still in flight.
 
-Two panes, one viewport. The left pane is the symbol index, every name in
-the latest cohort with its synthesis call and newest research report, one
-click from the report itself. The right pane is the prediction board for the
-same cohort. Clicking a symbol on the left narrows the board to that name;
-clicking it again widens back out. Neither pane scrolls the page, each
-scrolls internally, so the layout holds at any watchlist size.
+Two panes, one viewport. The left pane is the symbol index: the watchlist,
+each name with its synthesis call and newest research report, then the
+names only today's ad-hoc runs touched. The right pane is two tabs. The
+Scheduled tab is the daily job's board at its newest cutoff (or a picked
+earlier one), watchlist names only, one row per symbol reading call, actual,
+result and P&L with the per-model chips behind an expander; it never moves
+when an ad-hoc run lands. The This session tab lists today's manual runs,
+newest first, each with the run page's rows and a link to it. Clicking a
+symbol on the left narrows the Scheduled board to that name; clicking it
+again widens back out. Neither pane scrolls the page, each scrolls
+internally, so the layout holds at any watchlist size.
 
-Built around the latest prediction cutoff rather than "the last run" because
-predictions carry no run id. The cutoff is also the more useful unit: it
-survives a run being re-executed or topped up one symbol at a time.
+The Scheduled board is keyed on a prediction cutoff rather than a run: a
+cutoff survives a run being re-executed or topped up one symbol at a time.
 """
 
 import dash_bootstrap_components as dbc
@@ -68,6 +72,43 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     )
 
 
+def _row_preds(row: dict) -> list[dict]:
+    preds = list((row.get("models") or {}).values())
+    if row.get("synthesis"):
+        preds.append(row["synthesis"])
+    return preds
+
+
+def resolution_summary(row: dict) -> dict:
+    """The outcome arithmetic for one symbol row, rendering-free.
+
+    ``state`` is ``none`` (nothing predicted), ``pending`` (every call still
+    awaits its target close), ``held`` (scored, but no directional call to
+    be right or wrong about) or ``resolved``. ``hits`` counts the scored
+    calls that were right out of ``directional`` (the ones with a verdict),
+    ``pnl`` sums every scored call's dollars and ``actual`` is the first
+    scored close. Shared by the run page's outcome cell and the Scheduled
+    tab's Actual/Result/P&L cells so the two can never disagree.
+    """
+    preds = _row_preds(row)
+    if not preds:
+        return {"hits": 0, "directional": 0, "pnl": 0.0, "actual": None,
+                "state": "none"}
+    if all(p["state"] == "pending" for p in preds):
+        return {"hits": 0, "directional": 0, "pnl": 0.0, "actual": None,
+                "state": "pending"}
+    scored = [p for p in preds if p["state"] != "pending"]
+    directional = [p for p in scored if p.get("was_correct") is not None]
+    return {
+        "hits": sum(1 for p in scored if p.get("was_correct") is True),
+        "directional": len(directional),
+        "pnl": sum(p.get("pnl_dollars") or 0.0 for p in scored),
+        "actual": next((p.get("actual_close") for p in scored
+                        if p.get("actual_close") is not None), None),
+        "state": "resolved" if directional else "held",
+    }
+
+
 def _resolution_cell(row: dict) -> html.Td:
     """Resolved, held, or awaiting the target close.
 
@@ -75,32 +116,26 @@ def _resolution_cell(row: dict) -> html.Td:
     next-session call cannot be scored until that session closes and the
     evaluator runs.
     """
-    preds = list(row["models"].values())
-    if row.get("synthesis"):
-        preds.append(row["synthesis"])
-    states = {p["state"] for p in preds}
-
-    if states == {"pending"}:
+    summary = resolution_summary(row)
+    if summary["state"] == "none":
+        return html.Td(html.Span("no call", className="home-chip home-chip-none"),
+                       className="home-resolution")
+    if summary["state"] == "pending":
         return html.Td(
             html.Span(f"awaiting {row.get('target_date', '')} close",
                       className="home-pending-pill"),
             className="home-resolution",
         )
 
-    scored = [p for p in preds if p["state"] != "pending"]
-    hits = sum(1 for p in scored if p.get("was_correct") is True)
-    directional = [p for p in scored if p.get("was_correct") is not None]
-    pnl = sum(p.get("pnl_dollars") or 0.0 for p in scored)
-    actual = next((p.get("actual_close") for p in scored
-                   if p.get("actual_close") is not None), None)
-
+    actual, pnl = summary["actual"], summary["pnl"]
     pnl_cls = "positive" if pnl > 0 else "negative" if pnl < 0 else ""
     return html.Td(
         [
             html.Span(f"{actual:.2f}" if actual is not None else "n/a",
                       className="num home-actual"),
-            html.Span(f"{hits}/{len(directional)} right" if directional
-                      else "held", className="home-hits"),
+            html.Span(f"{summary['hits']}/{summary['directional']} right"
+                      if summary["directional"] else "held",
+                      className="home-hits"),
             html.Span(f"${pnl:+.2f}", className=f"num {pnl_cls}"),
         ],
         className="home-resolution",
@@ -374,26 +409,198 @@ def symbol_row(row: dict, models: list[str], extra_cells: list | None = None,
     )
 
 
+def _majority_chip(models: dict) -> html.Span | None:
+    """The models' majority verdict, for a row the synthesis never called.
+
+    A tie has no majority and reads as HOLD: two models disagreeing is not
+    a call in either direction. Says "majority" in the title so the reader
+    knows this is a count, not a verdict anyone reasoned about.
+    """
+    votes: dict[str, int] = {}
+    for pred in models.values():
+        if isinstance(pred, dict) and pred.get("decision"):
+            decision = pred["decision"].upper()
+            votes[decision] = votes.get(decision, 0) + 1
+    if not votes:
+        return None
+    top = max(votes.values())
+    leaders = [d for d, n in votes.items() if n == top]
+    decision = leaders[0] if len(leaders) == 1 else "HOLD"
+    tally = ", ".join(f"{n} {d}" for d, n in sorted(votes.items(),
+                                                   key=lambda kv: -kv[1]))
+    return html.Span(
+        html.Span(decision, className="home-chip-decision"),
+        className=f"home-chip home-chip-{DECISION_CLASS.get(decision, 'neutral')}",
+        title=f"majority of {sum(votes.values())} models ({tally}); "
+              "no synthesis verdict was stored for this symbol",
+    )
+
+
+def _call_cell(row: dict) -> html.Td:
+    if row.get("synthesis"):
+        return html.Td(_decision_chip(row["synthesis"]), className="home-call")
+    chip = _majority_chip(row.get("models") or {})
+    return html.Td(chip or html.Span("no call", className="home-chip home-chip-none"),
+                   className="home-call")
+
+
+def _result_label(row: dict, summary: dict) -> tuple[str, str]:
+    """(label, css class) for the Result cell of a scored row.
+
+    Judged on the call the row shows: the synthesis verdict when there is
+    one, otherwise the models' majority (more right than wrong is a hit,
+    an even split is not).
+    """
+    syn = row.get("synthesis")
+    if syn and syn.get("state") != "pending":
+        if syn.get("was_correct") is True:
+            return "hit", "hit"
+        if syn.get("was_correct") is False:
+            return "miss", "miss"
+        return "held", "held"
+    if not summary["directional"]:
+        return "held", "held"
+    wrong = summary["directional"] - summary["hits"]
+    return ("hit", "hit") if summary["hits"] > wrong else ("miss", "miss")
+
+
+def scheduled_headers() -> list:
+    return [
+        html.Th("Symbol"),
+        html.Th("Call", title="The synthesis verdict with its calibrated "
+                              "confidence, or the models' majority when no "
+                              "synthesis was stored"),
+        html.Th("Actual", title="The target session's close and its move "
+                                "against the previous close"),
+        html.Th("Result", title="Whether the call shown was right"),
+        html.Th("P&L", title="Dollars over every scored call on the row"),
+        html.Th(""),
+    ]
+
+
+def scheduled_row(row: dict, models: list[str], expanded: bool = False) -> html.Tr:
+    """One Scheduled-tab row: Symbol, Call, Actual, Result, P&L, models.
+
+    The per-model chips sit behind a native details element in the last
+    cell, so the board stays one table and opening a row costs no
+    callback. A watchlist name the cutoff has no prediction for reads
+    "not run" rather than as a row of empty cells.
+    """
+    symbol_cell = html.Td([row["symbol"], _news_flag(row)],
+                          className="home-symbol")
+    summary = resolution_summary(row)
+    if summary["state"] == "none":
+        return html.Tr(
+            [
+                symbol_cell,
+                html.Td(html.Span("not run", className="home-not-run",
+                                  title="No prediction for this symbol at "
+                                        "this cutoff"),
+                        className="home-call"),
+                html.Td("", className="home-actual-cell"),
+                html.Td("", className="home-result"),
+                html.Td("", className="num home-pnl"),
+                html.Td("", className="home-models-cell"),
+            ],
+            className="home-row-not-run",
+        )
+
+    prev = row.get("previous_close")
+    if summary["state"] == "pending":
+        actual_cell = html.Td(
+            html.Span(f"awaiting {row.get('target_date') or ''} close",
+                      className="home-pending-pill"),
+            className="home-actual-cell",
+        )
+        result_cell = html.Td(html.Span("pending", className="home-result-pending"),
+                              className="home-result")
+        pnl_cell = html.Td("", className="num home-pnl")
+    else:
+        actual = summary["actual"]
+        bits = [html.Span(f"{actual:.2f}" if actual is not None else "n/a",
+                          className="num home-actual")]
+        if actual is not None and prev:
+            move = (actual - prev) / prev
+            move_cls = "positive" if move > 0 else "negative" if move < 0 else ""
+            bits.append(html.Span(f"{move:+.1%}", className=f"num home-move {move_cls}"))
+        actual_cell = html.Td(bits, className="home-actual-cell",
+                              title=f"previous close {prev:.2f}" if prev else "")
+        label, cls = _result_label(row, summary)
+        result_cell = html.Td(
+            html.Span(label, className=f"home-result-pill home-result-{cls}",
+                      title=f"{summary['hits']}/{summary['directional']} "
+                            "directional calls right on this row"),
+            className="home-result",
+        )
+        pnl = summary["pnl"]
+        pnl_cls = "positive" if pnl > 0 else "negative" if pnl < 0 else ""
+        pnl_cell = html.Td(f"${pnl:+.2f}", className=f"num home-pnl {pnl_cls}")
+
+    chips = [
+        html.Span(
+            [html.Span(MODEL_DISPLAY.get(m, m), className="home-model-name",
+                       title=m),
+             _decision_chip(row["models"].get(m))],
+            className="home-model-chip",
+        )
+        for m in models
+    ]
+    models_cell = html.Td(
+        html.Details(
+            [html.Summary("models", className="home-models-summary"),
+             html.Div(chips, className="home-models-body")],
+            open=expanded,
+            className="home-models-details",
+        ),
+        className="home-models-cell",
+    )
+    return html.Tr(
+        [symbol_cell, _call_cell(row), actual_cell, result_cell, pnl_cell,
+         models_cell],
+    )
+
+
+def scheduled_rows(cohort: dict, watchlist: list[str] | None = None) -> list[dict]:
+    """The Scheduled board's row dicts: watchlist names in watchlist order
+    (a name with no prediction gets an empty row), then whatever else the
+    cutoff covered, alphabetically."""
+    by_symbol = {r["symbol"]: r for r in (cohort or {}).get("symbols") or []}
+    ordered = []
+    for s in (watchlist or []):
+        s = str(s).upper()
+        if s not in ordered:
+            ordered.append(s)
+    for s in sorted(by_symbol):
+        if s not in ordered:
+            ordered.append(s)
+    target = (cohort or {}).get("target_date")
+    return [by_symbol.get(s) or {"symbol": s, "models": {}, "synthesis": None,
+                                 "previous_close": None, "target_date": target}
+            for s in ordered]
+
+
 def cohort_table(cohort: dict, active_symbol: str | None = None,
                  symbol_reports: list[dict] | None = None,
-                 symbol_detail: dict | None = None) -> html.Div:
-    """The prediction board, optionally narrowed to one symbol.
+                 symbol_detail: dict | None = None,
+                 watchlist: list[str] | None = None) -> html.Div:
+    """The Scheduled prediction board, optionally narrowed to one symbol.
 
-    Narrowed, the board compacts to that symbol's row and the remaining
-    space becomes the research pane (report / chart / news tabs).
-    Exposed (not underscored) because the symbol-filter callback re-renders
-    it without rebuilding the whole page.
+    Narrowed, the board compacts to that symbol's row (models expanded,
+    there is room) and the remaining space becomes the research pane
+    (report / chart / news tabs). Exposed (not underscored) because the
+    symbol-filter callback re-renders it without rebuilding the whole page.
     """
     models = cohort["model_names"]
-    header = html.Thead(html.Tr(board_headers(models)))
+    header = html.Thead(html.Tr(scheduled_headers()))
 
-    symbols = cohort["symbols"]
+    symbols = scheduled_rows(cohort, watchlist)
     in_cohort = True
     if active_symbol:
         symbols = [r for r in symbols if r["symbol"] == active_symbol]
         in_cohort = bool(symbols)
 
-    rows = [symbol_row(row, models) for row in symbols]
+    rows = [scheduled_row(row, models, expanded=bool(active_symbol))
+            for row in symbols]
 
     children = []
     if active_symbol:
@@ -414,8 +621,10 @@ def cohort_table(cohort: dict, active_symbol: str | None = None,
         # One row: let the research pane have the flex space instead.
         board_cls += " home-board-compact"
     if active_symbol and not in_cohort:
+        # "in the latest run" was wrong for a name that only an ad-hoc run
+        # called: it did run, it is just not on this board.
         children.append(html.Div(
-            f"No calls for {active_symbol} in the latest run.",
+            f"No scheduled calls for {active_symbol} at this cutoff.",
             className="home-empty-note",
         ))
     else:
@@ -624,15 +833,30 @@ def _symbol_row(row: dict, report: dict | None, active: bool,
     )
 
 
+def session_only_rows(session_runs: list[dict] | None,
+                      watchlist: list[str] | None = None) -> list[dict]:
+    """Rows for the names this session's ad-hoc runs covered that the
+    watchlist does not, newest run first, one row per symbol."""
+    wl = {str(s).upper() for s in (watchlist or [])}
+    out: dict[str, dict] = {}
+    for entry in session_runs or []:
+        for row in entry.get("symbols") or []:
+            sym = row["symbol"]
+            if sym not in wl and sym not in out:
+                out[sym] = row
+    return list(out.values())
+
+
 def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
                 active_symbol: str | None = None,
                 search: str = "",
-                watchlist: list[str] | None = None) -> list:
-    """The rail rows: watchlist first, then cohort names outside it.
+                watchlist: list[str] | None = None,
+                session_runs: list[dict] | None = None) -> list:
+    """The rail rows: watchlist first, then this session's ad-hoc names.
 
-    One list, membership visible, the rail is the union of the watchlist
-    (the input to the next run) and the latest cohort (the output of the
-    last one), grouped so the 5-vs-20 mismatch reads as fact, not mystery.
+    One list, membership visible: the watchlist (the input to the next
+    scheduled run, and the Scheduled tab's rows) and then the names only an
+    ad-hoc run touched today, each one click from joining the watchlist.
     Watchlist names with no calls yet still get a row, so a freshly added
     symbol is immediately researchable.
     """
@@ -648,8 +872,8 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
 
     wl_rows = [cohort_rows.get(s) or {"symbol": s, "models": {}}
                for s in watchlist if _match(s)]
-    extra_rows = [r for s, r in cohort_rows.items()
-                  if s not in watchlist and _match(s)]
+    extra_rows = [r for r in session_only_rows(session_runs, watchlist)
+                  if _match(r["symbol"])]
 
     if not wl_rows and not extra_rows:
         return [html.Div(f'No symbol matching "{needle}"'
@@ -675,9 +899,9 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
             for r in wl_rows
         )
     if extra_rows:
-        out.append(_group("Not in watchlist", len(extra_rows),
-                          "Covered by the most recent run but not on your "
-                          "watchlist: click ＋ on a row to add it"))
+        out.append(_group("This session", len(extra_rows),
+                          "Run ad hoc today but not on your watchlist: "
+                          "click ＋ on a row to add it"))
         out.extend(
             _symbol_row(r, reports_by_symbol.get(r["symbol"]),
                         active=(r["symbol"] == active_symbol),
@@ -806,20 +1030,93 @@ def _cutoff_selector(cutoffs: list[str], active: str | None) -> html.Div:
     )
 
 
+SESSION_EMPTY_TEXT = "No ad-hoc runs today. Run Analysis to add one."
+
+
+def _session_block(entry: dict) -> html.Div:
+    """One ad-hoc run: who ran what, how it stands, and its rows.
+
+    The rows use the run page's cells, so a chip read here and a chip read
+    on /runs/<id> are the same chip.
+    """
+    # Lazy: run.py imports this module for the shared cells.
+    from layouts.pages.run import STATUS_LABEL
+    from services.progress_service import format_stamp
+    from services.run_service import first_line
+
+    run = entry["run"]
+    status = run.get("status") or "queued"
+    models = entry.get("model_names") or []
+    rows = entry.get("symbols") or []
+    preset = run.get("preset")
+    head = html.Div(
+        [
+            html.Span(format_stamp(run.get("started_at")) or "not started",
+                      className="num home-session-started"),
+            html.Span(preset.capitalize(), className="run-preset")
+            if preset else "",
+            html.Span(run.get("owner_uid") or "anonymous",
+                      className="home-session-owner", title="Who ran it"),
+            html.Span(STATUS_LABEL.get(status, status),
+                      className=f"run-status run-status-{status}",
+                      title=first_line(run.get("error")) or ""),
+            dcc.Link("Open", href=f"/runs/{run['run_id']}",
+                     className="home-card-link home-session-open",
+                     title="Open this run's page"),
+        ],
+        className="home-session-head",
+    )
+    children = [head]
+    if not any(r.get("models") or r.get("synthesis") for r in rows):
+        children.append(html.Div(
+            "No predictions yet. Rows fill in as the models finish."
+            if run.get("active") else "No predictions were stored for this run.",
+            className="home-empty-note home-session-note",
+        ))
+    children.append(html.Div(
+        html.Table(
+            [html.Thead(html.Tr(board_headers(models))),
+             html.Tbody([symbol_row(row, models) for row in rows])],
+            className="history-data-table",
+        ),
+        className="history-table-wrap",
+    ))
+    return html.Div(children, className="home-session-run",
+                    id={"type": "home-session-run", "run": run["run_id"]})
+
+
+def session_tab(session_runs: list[dict] | None) -> html.Div:
+    """The This session tab body: one block per ad-hoc run, newest first.
+
+    Exposed because render_home_panes rebuilds it when a run lands.
+    """
+    if not session_runs:
+        return html.Div(SESSION_EMPTY_TEXT,
+                        className="home-empty-note home-session-empty")
+    return html.Div([_session_block(e) for e in session_runs],
+                    className="home-session-list")
+
+
+HOME_TABS = ("scheduled", "session")
+
+
 def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
            reports_by_symbol=None, active_symbol=None,
            symbol_reports=None, watchlist=None, recent_groups=None,
-           symbol_detail=None, cutoffs=None, active_cutoff=None) -> html.Div:
+           symbol_detail=None, cutoffs=None, active_cutoff=None,
+           session_runs=None, active_tab=None) -> html.Div:
     """Assemble the launch screen from already-shaped data.
 
     The left rail always renders. It is the watchlist editor now, so a
     brand-new user lands on the add box, not on an empty page telling them
-    to find the editor somewhere else.
+    to find the editor somewhere else. The right pane is two tabs: the
+    daily job's board (Scheduled) and today's ad-hoc runs (This session);
+    ``active_tab`` is whatever the browser last had open.
     """
     watchlist = watchlist or []
     has_cohort = bool(cohort and cohort.get("prediction_date"))
-    n_rail = len(set(watchlist)
-                 | {r["symbol"] for r in (cohort or {}).get("symbols") or []})
+    n_rail = len(set(s.upper() for s in watchlist)
+                 | {r["symbol"] for r in session_only_rows(session_runs, watchlist)})
 
     left = html.Div(
         [
@@ -849,7 +1146,7 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
             ),
             html.Div(
                 symbol_list(cohort, reports_by_symbol, active_symbol,
-                            watchlist=watchlist),
+                            watchlist=watchlist, session_runs=session_runs),
                 id="home-symbol-list",
                 className="home-symbol-list",
             ),
@@ -861,41 +1158,38 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
         className="home-left",
     )
 
-    if not has_cohort:
-        # The board's callback targets must exist even before the first run:
-        # render_home_panes outputs to these ids whenever it fires, and a
-        # missing Output id is a browser-console error in Dash 4. The empty
-        # state lives inside home-cohort-table so a completed run replaces it
-        # with the board in place.
-        right = html.Div(
-            [
-                html.Div(id="home-board-title"),
-                html.Div(id="home-meta-wrap"),
-                html.Div(
-                    html.Div(
-                        [
-                            html.Div("No predictions yet",
-                                     className="empty-state-title"),
-                            html.Div(
-                                "Add symbols on the left, then use Run "
-                                "analysis in the toolbar. Once a run "
-                                "completes, this page shows what it "
-                                "predicted and how those calls resolved.",
-                                className="empty-state-note",
-                            ),
-                        ],
-                        className="empty-state",
-                    ),
-                    id="home-cohort-table",
-                ),
-            ],
-            className="home-right",
-        )
-        return html.Div([left, right], className="page page-home home-split")
+    if active_tab not in HOME_TABS:
+        active_tab = "scheduled"
 
-    cutoffs = cutoffs or []
-    right = html.Div(
-        [
+    # The board's callback targets must exist even before the first
+    # scheduled run: render_home_panes outputs to these ids whenever it
+    # fires, and a missing Output id is a browser-console error in Dash 4.
+    # The empty state lives inside home-cohort-table so the first cohort
+    # replaces it with the board in place.
+    if not has_cohort:
+        scheduled_body = [
+            html.Div(id="home-board-title"),
+            html.Div(id="home-meta-wrap"),
+            html.Div(
+                html.Div(
+                    [
+                        html.Div("No scheduled calls yet",
+                                 className="empty-state-title"),
+                        html.Div(
+                            "The daily job writes this board for the "
+                            "watchlist on the left. Ad-hoc runs from "
+                            "Run analysis land under This session.",
+                            className="empty-state-note",
+                        ),
+                    ],
+                    className="empty-state",
+                ),
+                id="home-cohort-table",
+            ),
+        ]
+    else:
+        cutoffs = cutoffs or []
+        scheduled_body = [
             html.Div(
                 [
                     html.Div(board_title(cutoffs, active_cutoff),
@@ -910,8 +1204,9 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
                 [
                     html.Span(f"Last {rolling_days}d",
                               className="home-card-title-sm",
-                              title=f"Hit rate on BUY/SELL calls over the "
-                                    f"last {rolling_days} days"),
+                              title=f"Hit rate on BUY/SELL calls from "
+                                    f"scheduled runs over the last "
+                                    f"{rolling_days} days"),
                     _rolling(rolling, rolling_days),
                     dcc.Link("Performance", href="/performance",
                              className="home-card-link"),
@@ -920,10 +1215,35 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
             ),
             html.Div(cohort_table(cohort, active_symbol,
                                   symbol_reports=symbol_reports,
-                                  symbol_detail=symbol_detail),
+                                  symbol_detail=symbol_detail,
+                                  watchlist=watchlist),
                      id="home-cohort-table"),
             _inflight_strip(open_preds),
-        ],
+        ]
+
+    # dbc.Tabs renders no element of its own: the class it is given lands on
+    # the nav <ul> and the pane container is that ul's sibling. The wrapper
+    # is what the flex chain hangs off, so the strip keeps its own height
+    # and the active pane inherits the column's scroll.
+    right = html.Div(
+        html.Div(
+            dbc.Tabs(
+                [
+                    dbc.Tab(html.Div(scheduled_body, className="home-tab-body"),
+                            label="Scheduled", tab_id="scheduled",
+                            tab_class_name="home-board-tab"),
+                    dbc.Tab(html.Div(session_tab(session_runs),
+                                     id="home-session-runs",
+                                     className="home-tab-body"),
+                            label="This session", tab_id="session",
+                            tab_class_name="home-board-tab"),
+                ],
+                id="home-board-tabs",
+                active_tab=active_tab,
+                className="home-board-tabs",
+            ),
+            className="home-board-tabs-wrap",
+        ),
         className="home-right",
     )
 

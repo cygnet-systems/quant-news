@@ -309,6 +309,28 @@ def list_runs(limit: int = 50, kind: str | None = None,
         return [_to_dict(r) for r in rows]
 
 
+def runs_generation(kind: str | None = None) -> str:
+    """A token that moves whenever this kind's run list could have moved.
+
+    Readers that cache a list of runs cannot key on the prediction data
+    alone: inserting a run row changes nothing they can see, so a run
+    started after the last render would stay hidden for the whole of their
+    TTL. The row count plus the newest start and finish covers a run being
+    created, one finishing, and a re-run at a cutoff already listed, in a
+    single aggregate.
+    """
+    from db.models import AnalysisRun
+
+    with get_session() as session:
+        q = select(func.count(AnalysisRun.run_id),
+                   func.max(AnalysisRun.started_at),
+                   func.max(AnalysisRun.finished_at))
+        if kind:
+            q = q.where(AnalysisRun.kind == kind)
+        n, started, finished = session.execute(q).one()
+    return f"{n or 0}:{started or '-'}:{finished or '-'}"
+
+
 def cancel_run(run_id: str) -> dict | None:
     """Mark the run cancelled and return it. Killing the worker is the
     caller's job (progress_service tracks the pid); this only records the

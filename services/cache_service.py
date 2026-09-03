@@ -141,6 +141,60 @@ def _visible(model_cls):
     return cond
 
 
+def _by_run_kind(q, kind: str | None):
+    """Restrict a model_predictions select to rows written by runs of one
+    kind (scheduled | manual), through a LEFT JOIN on analysis_runs.
+
+    A prediction with no run row (run_id NULL, or an id from before
+    analysis_runs existed) counts as scheduled: every prediction written
+    before that table was the daily job's, and the Home board must keep
+    showing them under the scheduled cutoffs. None leaves the query alone.
+    """
+    if not kind:
+        return q
+    from db.models import AnalysisRun, ModelPrediction
+    return (q.outerjoin(AnalysisRun, AnalysisRun.run_id == ModelPrediction.run_id)
+             .where(func.coalesce(AnalysisRun.kind, "scheduled") == kind))
+
+
+def _run_kind(session, run_id: str | None) -> str:
+    """The kind of the run a write belongs to.
+
+    No run row means scheduled, the same COALESCE `_by_run_kind` reads with:
+    the headless writers and every row written before analysis_runs existed
+    belong to the daily board.
+    """
+    if not run_id:
+        return "scheduled"
+    from db.models import AnalysisRun
+    kind = session.execute(
+        select(AnalysisRun.kind).where(AnalysisRun.run_id == run_id)
+    ).scalar_one_or_none()
+    return kind or "scheduled"
+
+
+def _prediction_id(symbol: str, model_name: str, pred_date: date,
+                   run_id: str | None, kind: str) -> str:
+    """Primary key for a prediction row, run-scoped for manual runs.
+
+    An ad-hoc run of a watchlist name lands on the same (symbol, model,
+    cutoff) as the daily job, and one shared id made the merge REPLACE the
+    scheduled row: its run_id was re-stamped manual, so `_by_run_kind`
+    dropped it from the Scheduled board (the name read "not run" for a day
+    the job did call it) and the merge's deliberate score reset threw away
+    that day's evaluation. Manual rows therefore get their own id space and
+    the scheduled row stays exactly as the job wrote it. Scheduled ids keep
+    the historic shape, so every stored row and its evaluation stay where
+    the evaluator and the backtests already look for them.
+    """
+    pred_id = f"{symbol}_{model_name}_{pred_date:%Y%m%d}"
+    if kind == "manual" and run_id:
+        # The whole id, not a prefix: this is a primary key, and a collision
+        # would silently overwrite another run's call.
+        return f"{pred_id}_{run_id}"
+    return pred_id
+
+
 def _fallback_run_id(what: str):
     """Run identity for a write whose caller passed no run_id.
 
@@ -676,7 +730,9 @@ class CacheService:
         symbol = symbol.upper()
         pred_date = date.fromisoformat(prediction_date_str) if prediction_date_str else date.today()
         target = get_next_trading_day(pred_date)
-        pred_id = f"{symbol}_{model_name}_{pred_date:%Y%m%d}"
+        if run_id is None:
+            run_id = _fallback_run_id(
+                f"prediction {symbol}/{model_name} at {pred_date}")
 
         details = result.get("details", {})
         feature_values = _sanitize_json(details.get("feature_values"))
@@ -691,6 +747,9 @@ class CacheService:
         ).hexdigest()
 
         with get_session() as session:
+            pred_id = _prediction_id(symbol, model_name, pred_date, run_id,
+                                     _run_kind(session, run_id))
+
             # Most recent USABLE close, not merely the most recent row: a
             # partial pre-market bar can sit at the top with a NaN close, and
             # storing that as previous_close makes the row unscorable (and
@@ -737,8 +796,7 @@ class CacheService:
                 input_data_hash=data_hash,
                 # The run that produced this row, and how long the model took
                 #: what lets the Trace page join a run to its predictions.
-                run_id=(run_id if run_id is not None
-                        else _fallback_run_id(f"prediction {pred_id}")),
+                run_id=run_id,
                 duration_ms=result.get("duration_ms"),
                 created_at=datetime.now(timezone.utc),
                 # Re-storing a prediction id invalidates any prior evaluation:
@@ -782,6 +840,11 @@ class CacheService:
                     ModelPrediction.symbol == symbol.upper(),
                     ModelPrediction.prediction_date == target_day,
                 )
+                # A scheduled and a manual run each keep their own row for
+                # one (symbol, model, cutoff), so the reuse check has to
+                # choose: oldest first means the newest analysis wins the
+                # slot below. Legacy rows carry no stamp and lose.
+                .order_by(ModelPrediction.created_at.asc().nullsfirst())
             ).scalars().all()
 
             results = {}
@@ -1786,36 +1849,39 @@ class CacheService:
                 for r in rows
             ]
 
-    def get_latest_prediction_date(self) -> "date | None":
+    def get_latest_prediction_date(self, kind: str | None = None) -> "date | None":
         """The most recent data cutoff any visible prediction was made from.
 
         The launch screen is built around this cohort rather than around a run,
         because predictions carry no run id -- the date is the only grouping
-        the schema actually guarantees.
+        the schema actually guarantees. ``kind`` narrows it to cutoffs written
+        by scheduled or manual runs (see _by_run_kind).
         """
         from db.models import ModelPrediction
         with get_session() as session:
-            return session.execute(
-                select(func.max(ModelPrediction.prediction_date))
-                .where(_visible(ModelPrediction))
-            ).scalar()
+            q = (select(func.max(ModelPrediction.prediction_date))
+                 .where(_visible(ModelPrediction)))
+            return session.execute(_by_run_kind(q, kind)).scalar()
 
-    def get_prediction_dates(self, limit: int = 90) -> list["date"]:
+    def get_prediction_dates(self, limit: int = 90,
+                             kind: str | None = None) -> list["date"]:
         """Every distinct prediction cutoff, newest first.
 
         Feeds the Home cutoff selector: the board can be pointed at any past
         cutoff, not only the latest, so "what did we call that morning" is
         one dropdown away instead of a Performance-page filter safari.
+        ``kind`` lists only the cutoffs a scheduled (or manual) run wrote.
         """
         from db.models import ModelPrediction
         with get_session() as session:
-            rows = session.execute(
+            q = (
                 select(ModelPrediction.prediction_date)
                 .where(_visible(ModelPrediction))
                 .distinct()
                 .order_by(ModelPrediction.prediction_date.desc())
                 .limit(limit)
-            ).scalars().all()
+            )
+            rows = session.execute(_by_run_kind(q, kind)).scalars().all()
             return list(rows)
 
     def get_predictions_between(
@@ -1824,6 +1890,7 @@ class CacheService:
         end: "date",
         symbols: list[str] | None = None,
         include_details: bool = False,
+        kind: str | None = None,
     ) -> list[dict]:
         """Visible predictions with a cutoff in [start, end], inclusive.
 
@@ -1831,10 +1898,17 @@ class CacheService:
         Python; hits the (symbol, prediction_date) index. Serves both the
         single-day cohort (start == end) and trailing-window aggregates.
 
+        ``symbols`` None means every symbol; a list restricts to those names,
+        and an empty list is an empty answer (a board over an empty watchlist
+        has no rows, not every row). ``kind`` keeps only rows written by
+        scheduled or manual runs (see _by_run_kind).
+
         details_json is opt-in because it carries per-model payloads that are
         pure weight on a multi-week range scan.
         """
         from db.models import ModelPrediction
+        if symbols is not None and not symbols:
+            return []
         with get_session() as session:
             q = (
                 select(ModelPrediction)
@@ -1852,7 +1926,7 @@ class CacheService:
             if symbols:
                 q = q.where(ModelPrediction.symbol.in_([s.upper() for s in symbols]))
             return [_pred_to_dict(r, include_details) for r in
-                    session.execute(q).scalars().all()]
+                    session.execute(_by_run_kind(q, kind)).scalars().all()]
 
     def query_predictions(
         self,

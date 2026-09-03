@@ -217,6 +217,29 @@ class TestListRuns:
         assert [r["run_id"] for r in rs.list_runs(limit=1)] == [m2]
 
 
+class TestRunsGeneration:
+    """What a reader caching a list of runs keys on. It has to move for a
+    create and for a finish, or a run that started (or ended) after the last
+    render stays hidden behind the cache."""
+
+    def test_moves_on_create_and_on_finish(self, db):
+        empty = rs.runs_generation("manual")
+        run_id = rs.create_run("manual", ["AAPL"], None)
+        created = rs.runs_generation("manual")
+        assert created != empty
+        assert rs.runs_generation("manual") == created
+        rs.update_progress(run_id, "models", state="running")
+        assert rs.runs_generation("manual") == created
+        rs.set_status(run_id, "done")
+        assert rs.runs_generation("manual") != created
+
+    def test_the_kind_filter_isolates_the_other_kind(self, db):
+        manual = rs.runs_generation("manual")
+        rs.create_run("scheduled", ["AAPL"], None)
+        assert rs.runs_generation("manual") == manual
+        assert rs.runs_generation() != manual
+
+
 def _age(run_id, seconds):
     """Back-date a run so the age rule can be exercised."""
     with rs.get_session() as session:

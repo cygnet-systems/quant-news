@@ -392,8 +392,12 @@ def _ta_report_card(report):
     decision = report.get("decision", "HOLD")
     confidence = report.get("confidence", 0)
     trade_date = report.get("trade_date", "")
-    input_tokens = report.get("input_tokens", 0)
-    output_tokens = report.get("output_tokens", 0)
+    # NULL columns come back as None, not absent, so `.get(k, 0)` still
+    # yields None and the sum below raised TypeError, taking the whole
+    # Reports page down with it.
+    input_tokens = report.get("input_tokens") or 0
+    output_tokens = report.get("output_tokens") or 0
+    tokens = input_tokens + output_tokens
 
     dec_cls = "positive" if decision == "BUY" else "negative" if decision == "SELL" else "neutral"
 
@@ -420,7 +424,9 @@ def _ta_report_card(report):
             html.Div(
                 [
                     html.Span(trade_date, className="ta-card-date"),
-                    html.Span(f"{input_tokens + output_tokens:,} tokens", className="ta-card-meta"),
+                    # No token counts recorded is not "0 tokens": say nothing.
+                    html.Span(f"{tokens:,} tokens", className="ta-card-meta")
+                    if tokens else "",
                 ],
                 className="ta-card-meta-row",
             ),

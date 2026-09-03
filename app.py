@@ -535,7 +535,8 @@ def _init_s3():
 def _build_route(path, history_data, filter_symbols, filter_range,
                  filter_specific, activity_scope, activity_since,
                  outcome="all", model="all", home_symbol=None,
-                 watchlist=None, period=None, home_cutoff=None):
+                 watchlist=None, period=None, home_cutoff=None,
+                 home_tab=None):
     """Build one section. Each page reads only the state it renders."""
     if path == "/analyze":
         return analyze_page.layout(period or "1y")
@@ -579,11 +580,13 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         recent = watchlist_service.recent_groups(limit=5)
     except Exception as e:
         logger.warning("Could not read recent groups for Home: %s", e)
-    cutoffs = ds.get_available_cutoffs()
+    cutoffs = ds.get_available_cutoffs(kind="scheduled")
+    session_runs = _home_session_runs()
     return home_page.layout(
-        cohort=ds.get_cohort(home_cutoff),
+        cohort=_home_cohort(home_cutoff, watchlist),
         open_preds=ds.get_open_predictions(),
-        rolling=ds.get_rolling_performance(days=HOME_ROLLING_DAYS),
+        rolling=ds.get_rolling_performance(days=HOME_ROLLING_DAYS,
+                                           kind="scheduled"),
         last_run=ds.get_last_run() if not home_cutoff else None,
         jobs=jobs,
         rolling_days=HOME_ROLLING_DAYS,
@@ -595,7 +598,35 @@ def _build_route(path, history_data, filter_symbols, filter_range,
         symbol_detail=_home_symbol_detail(home_symbol),
         cutoffs=cutoffs,
         active_cutoff=home_cutoff or (cutoffs[0] if cutoffs else None),
+        session_runs=session_runs,
+        active_tab=home_tab,
     )
+
+
+def _home_cohort(cutoff, watchlist) -> dict:
+    """The Scheduled tab's cohort: scheduled runs only, watchlist names.
+
+    An empty watchlist shows every name the scheduled run wrote rather
+    than an empty board: a browser that has not built a watchlist yet
+    still gets to see what the daily job called.
+    """
+    from services import dashboard_service as ds
+    return ds.get_cohort(cutoff, kind="scheduled",
+                         symbols=[s.upper() for s in watchlist] or None)
+
+
+def _home_session_runs() -> list[dict]:
+    """Today's ad-hoc runs for the This session tab and the rail.
+
+    Best-effort: Home must render when the runs table is unreachable, the
+    Scheduled tab does not depend on it.
+    """
+    from services import dashboard_service as ds
+    try:
+        return ds.get_session_runs()
+    except Exception as e:
+        logger.warning("Could not read session runs for Home: %s", e)
+        return []
 
 
 def _serialize_articles(articles) -> list[dict]:
@@ -744,15 +775,18 @@ HOME_ROLLING_DAYS = 30
 _ROUTES = ["/", "/analyze", "/performance", "/reports", "/schedule",
            "/activity", "/trace"]
 
-# /runs/<uuid>: the page the completion toast and the pill link to. The
-# same pattern the run-seen-store clientside callback matches, so a visit
-# that renders the page is the visit that clears the pill.
-_RUN_PATH_RE = re.compile(r"^/runs/([0-9a-fA-F-]{36})$")
+# /runs/<id>: the page the completion toast and the pill link to. Any
+# single segment counts as an id, not uuids only: a malformed or stale
+# link must reach the run page and get "Run not found", not fall through
+# to Home as if the reader had asked for the dashboard. The run-seen-store
+# clientside writer stays uuid-only on purpose - only a real run id is
+# worth recording as seen.
+_RUN_PATH_RE = re.compile(r"^/runs/([^/]+)$")
 RUN_PAGE_TITLE = "Run"
 
 
 def _run_route(pathname) -> str | None:
-    """The run id in a /runs/<uuid> path, else None."""
+    """The run id in a /runs/<id> path, else None."""
     m = _RUN_PATH_RE.match((pathname or "").rstrip("/"))
     return m.group(1) if m else None
 
@@ -793,11 +827,12 @@ def _build_run_page(run_id: str, watchlist, open_first: bool):
     State("current-period", "data"),
     State("home-cutoff-date", "data"),
     State("url", "search"),
+    State("home-tab-store", "data"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
                 filter_specific, activity_scope, activity_since, outcome,
                 model, home_symbol, watchlist, period, home_cutoff,
-                search=None):
+                search=None, home_tab=None):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -838,7 +873,7 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
                             filter_specific, activity_scope, activity_since,
                             outcome, model, home_symbol=home_symbol,
                             watchlist=watchlist, period=period,
-                            home_cutoff=home_cutoff)
+                            home_cutoff=home_cutoff, home_tab=home_tab)
         return page, SECTION_TITLES.get(path, "QuantNews")
     except Exception as e:
         logger.exception("Failed to render %s", path)
@@ -879,6 +914,58 @@ def refresh_run_watchlist_cells(watchlist, pathname):
     if view is None:
         raise PreventUpdate
     return run_page.symbol_table(view, watchlist or [])
+
+
+@callback(
+    Output("run-symbol-table", "children", allow_duplicate=True),
+    Output("run-status-pill", "children"),
+    Output("run-status-pill", "className"),
+    Output("run-live-fp", "data"),
+    Input("progress-interval", "n_intervals"),
+    State("url", "pathname"),
+    State("selected-symbols", "data"),
+    # Page-local: only mounted while a run page is on screen.
+    State("run-live-fp", "data", allow_optional=True),
+    prevent_initial_call=True,
+)
+def refresh_live_run(_n, pathname, watchlist, last_fp=None):
+    """Fill a live run's rows in as its stages land.
+
+    The page is built once per visit, so without this a run watched from
+    its own URL would sit at whatever had been stored when it loaded. It
+    rides the progress poll rather than a timer of its own, and it stops
+    reading the moment the run is terminal: the stored fingerprint carries
+    the status, so a finished run costs a dict lookup per tick and no
+    query. While the run is live it is one get_run_view (the run row plus
+    one indexed select per artifact table) and nothing else.
+    """
+    run_id = _run_route(pathname)
+    if not run_id:
+        raise PreventUpdate
+    from services import run_service
+
+    if (isinstance(last_fp, dict)
+            and last_fp.get("status") in run_service.TERMINAL_STATUSES):
+        raise PreventUpdate
+
+    from layouts.pages import run as run_page
+    from services import dashboard_service as ds
+
+    try:
+        view = ds.get_run_view(run_id)
+    except Exception as e:
+        # A DB hiccup must not blank a page the reader is watching.
+        logger.warning("run %s not refreshable: %s", run_id, e)
+        raise PreventUpdate
+    if view is None:
+        raise PreventUpdate
+    run = view["run"]
+    fp = run_page.live_fingerprint(run)
+    if fp == last_fp:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    pill = run_page.status_pill(run)
+    return (run_page.symbol_table(view, watchlist or []),
+            pill.children, pill.className, fp)
 
 
 @callback(
@@ -1068,6 +1155,9 @@ def set_model_filter(value, current):
 
 @callback(
     Output("home-symbol-filter", "data"),
+    # Both this and the tabs live on Home only, and the buttons that trigger
+    # this callback are the rail's, so the tabs are mounted whenever it runs.
+    Output("home-board-tabs", "active_tab"),
     Input({"type": "home-sym-btn", "symbol": ALL}, "n_clicks"),
     State("home-symbol-filter", "data"),
     prevent_initial_call=True,
@@ -1078,11 +1168,18 @@ def toggle_home_symbol(clicks, current):
     The symbol rows on the left ARE the filter control, clicking the active
     one (or the board's own "Show all" chip, which reuses the same pattern
     id) clears the narrow.
+
+    Opening a symbol also pulls the board back to the Scheduled tab: the
+    research pane is rendered inside it (home-cohort-table), so a click made
+    while This session was open otherwise wrote the pane into a hidden tab
+    and read as a dead control. Clearing the narrow leaves the tab alone.
     """
     if not clicks or not any(c for c in clicks if c):
         raise PreventUpdate
     sym = ctx.triggered_id["symbol"]
-    return None if sym == current else sym
+    if sym == current:
+        return None, dash.no_update
+    return sym, "scheduled"
 
 
 @callback(
@@ -1102,7 +1199,7 @@ def set_home_cutoff(value, current):
     if not value:
         raise PreventUpdate
     from services import dashboard_service as ds
-    cutoffs = ds.get_available_cutoffs()
+    cutoffs = ds.get_available_cutoffs(kind="scheduled")
     normalized = None if (cutoffs and value == cutoffs[0]) else value
     if normalized == (current or None):
         raise PreventUpdate
@@ -1110,31 +1207,49 @@ def set_home_cutoff(value, current):
 
 
 @callback(
+    Output("home-tab-store", "data"),
+    # home-board-tabs exists on Home only.
+    Input("home-board-tabs", "active_tab", allow_optional=True),
+    State("home-tab-store", "data"),
+    prevent_initial_call=True,
+)
+def track_home_tab(active_tab, current):
+    """Remember which Home tab is open, so a re-render or the next visit
+    opens on it. The equality guard swallows the firing that happens when
+    navigation mounts the tabs with the value they were seeded with."""
+    if not active_tab or active_tab == current:
+        raise PreventUpdate
+    return active_tab
+
+
+@callback(
     Output("home-symbol-list", "children"),
     Output("home-cohort-table", "children"),
     Output("home-board-title", "children"),
     Output("home-meta-wrap", "children"),
+    Output("home-session-runs", "children"),
     Input("home-symbol-filter", "data"),
     Input("home-symbol-search", "value", allow_optional=True),
-    # The rail shows watchlist membership, so it re-renders when the
-    # watchlist changes (add/remove/clear/restore); the board follows the
-    # cutoff override. Guarded to Home below, the stores fire everywhere
-    # but the Outputs exist on one route.
+    # The rail shows watchlist membership and the Scheduled board is the
+    # watchlist's rows, so both re-render when the watchlist changes
+    # (add/remove/clear/restore); the board follows the cutoff override.
+    # Guarded to Home below, the stores fire everywhere but the Outputs
+    # exist on one route.
     Input("selected-symbols", "data"),
     Input("home-cutoff-date", "data"),
-    # A completed run must land here without a manual reload: predictions
-    # arrive via the store status, report-only runs via the analysis store
-    # (their research reports feed the right-hand reader).
-    Input("prediction-store-status", "data"),
-    Input("ai-analysis-store", "data"),
+    # A completed run must land here without a manual reload. The archive
+    # store is bumped by every writer (predictions, reports, synthesis and
+    # the evaluation), so one Input covers a run landing on This session
+    # and the evening scoring filling in the Actual column.
+    Input("report-history-store", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
 def render_home_panes(active_symbol, search, watchlist, cutoff,
-                      _pred_status, _ai_analysis, pathname):
-    """Re-render the symbol rail, the board, and its date header together.
+                      _history, pathname):
+    """Re-render the symbol rail, both tabs' boards and the date header.
 
-    One callback for all four so the row highlight, the board, and the
+    One callback for all five so the row highlight, the board, and the
     "predicting X, data through Y" line can never disagree about which
     symbol or cutoff is active. The pathname guard PreventUpdates off Home,
     where these Outputs are not mounted (see render_archive_body).
@@ -1143,30 +1258,36 @@ def render_home_panes(active_symbol, search, watchlist, cutoff,
     if path != "/":
         raise PreventUpdate
     from services import dashboard_service as ds
-    cohort = ds.get_cohort(cutoff)
-    if (not cohort or not cohort.get("prediction_date")) and not watchlist:
-        raise PreventUpdate
+    watchlist = watchlist or []
+    cohort = _home_cohort(cutoff, watchlist)
+    session_runs = _home_session_runs()
     rail = home_page.symbol_list(cohort, _home_reports_by_symbol(),
                                  active_symbol, search or "",
-                                 watchlist=watchlist or [])
-    # Typing in the filter box only narrows the rail. The board (and the
-    # per-symbol chart/news fetch behind it) rebuilds only when the
-    # selection, the watchlist or the cutoff actually changed.
+                                 watchlist=watchlist,
+                                 session_runs=session_runs)
+    # Typing in the filter box only narrows the rail. The boards (and the
+    # per-symbol chart/news fetch behind the Scheduled one) rebuild only
+    # when the selection, the watchlist, the cutoff or the archive changed.
     if ctx.triggered_id == "home-symbol-search":
-        return rail, dash.no_update, dash.no_update, dash.no_update
+        return (rail, dash.no_update, dash.no_update, dash.no_update,
+                dash.no_update)
+    session = home_page.session_tab(session_runs)
     if not cohort or not cohort.get("prediction_date"):
-        return rail, dash.no_update, dash.no_update, dash.no_update
-    cutoffs = ds.get_available_cutoffs()
+        # No scheduled cutoff yet: the empty state stays in place.
+        return rail, dash.no_update, dash.no_update, dash.no_update, session
+    cutoffs = ds.get_available_cutoffs(kind="scheduled")
     return (
         rail,
         home_page.cohort_table(cohort, active_symbol,
                                symbol_reports=_home_symbol_reports(active_symbol),
-                               symbol_detail=_home_symbol_detail(active_symbol)),
+                               symbol_detail=_home_symbol_detail(active_symbol),
+                               watchlist=watchlist),
         home_page.board_title(cutoffs, cutoff or (cutoffs[0] if cutoffs else None)),
         # Run-time/error metadata belongs to the latest run only; a
         # historical cutoff shows its cohort's own dates and outcomes.
         home_page.last_run_header(cohort, ds.get_last_run() if not cutoff
                                   else None),
+        session,
     )
 
 

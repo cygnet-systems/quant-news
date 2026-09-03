@@ -15,6 +15,7 @@ import re
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
+import dash
 import diskcache
 import pytest
 from dash.exceptions import PreventUpdate
@@ -281,11 +282,28 @@ class TestRunView:
         done = seed(db, status="done")
         failed = seed(db, status="failed", error="boom")
 
+        cancelled = seed(db, status="cancelled")
+
         ds.get_run_view(live)
+        assert calls == []
+        # Cancelling closes the row, but the research stage cannot be
+        # killed mid-call: a report written after the cancel would be
+        # invisible behind a memo taken at cancel time.
+        ds.get_run_view(cancelled)
         assert calls == []
         ds.get_run_view(done)
         ds.get_run_view(failed)
         assert calls == [f"run:{done}", f"run:{failed}"]
+        assert ds.MEMOIZED_RUN_STATUSES == ("done", "failed")
+
+    def test_a_cancelled_runs_late_report_still_shows(self, db):
+        """The un-killable research stage can land after the cancel."""
+        run_id = seed(db, status="cancelled", with_report=False)
+        assert ds.get_run_view(run_id)["symbols"][0]["report"] is None
+        with rs.get_session() as session:
+            session.add(_report(run_id, "NVDA"))
+        view = ds.get_run_view(run_id)
+        assert view["symbols"][0]["report"]["decision"] == "BUY"
 
     def test_terminal_read_is_served_from_the_memo(self, db, monkeypatch):
         run_id = seed(db, status="done")
@@ -383,6 +401,22 @@ class TestLayout:
         adds = _buttons(page, "add-symbol")
         assert [b.id["symbol"] for b in adds] == ["AMD", "TSLA"]
         assert "on watchlist" in _text(rows[0])
+
+    def test_a_symbol_with_no_predictions_reads_as_no_call(self, db):
+        """TSLA was configured but nothing was ever stored for it. The
+        outcome cell must say so rather than score an empty row as a
+        flat, held $0.00, which is what a run cancelled before its models
+        would have shown on every name."""
+        run_id = seed(db, status="cancelled")
+        page = run_page.layout(ds.get_run_view(run_id), [])
+        tsla = _find(page, className="history-data-table").children[1].children[2]
+        cell = _find(tsla, className="home-resolution")
+        assert _text(cell) == "no call"
+        assert "held" not in _text(cell)
+        assert "$" not in _text(cell)
+        # A symbol that does have calls is untouched.
+        nvda = _find(page, className="history-data-table").children[1].children[0]
+        assert "2/3 right" in _text(_find(nvda, className="home-resolution"))
 
     def test_open_first_marks_the_row_the_reader_opened(self, db):
         run_id = seed(db)
@@ -489,14 +523,34 @@ class TestRouter:
         page, _ = _render(f"/runs/{run_id}", [])
         assert _find_all(page, className="run-row-opened") == []
 
-    def test_run_route_matches_uuids_only(self):
+    def test_run_route_takes_any_single_segment(self):
+        """A malformed id is still a run link: it must reach the run page
+        and be told the run is unknown, not silently land on Home."""
         rid = "12345678-1234-1234-1234-123456789abc"
         assert app_module._run_route(f"/runs/{rid}") == rid
         assert app_module._run_route(f"/runs/{rid}/") == rid
-        assert app_module._run_route("/runs/nope") is None
+        assert app_module._run_route("/runs/nope") == "nope"
+        assert app_module._run_route("/runs/nope/") == "nope"
+        assert app_module._run_route("/runs") is None
+        assert app_module._run_route("/runs/") is None
+        assert app_module._run_route("/runs/a/b") is None
         assert app_module._run_route("/schedule") is None
         assert app_module._run_route(None) is None
         assert "/runs" not in app_module._ROUTES
+
+    def test_malformed_id_renders_not_found(self, db):
+        page, title = _render("/runs/nope")
+        assert title == "Run"
+        assert "Run not found" in _text(page)
+
+    def test_malformed_id_is_a_no_op_for_the_page_callbacks(self, db):
+        """Every other reader of the route must survive a non-uuid id."""
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_run_watchlist_cells(["NVDA"], "/runs/nope")
+        with pytest.raises(PreventUpdate):
+            app_module.open_first_report("?open=first", "/runs/nope")
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_live_run(1, "/runs/nope", ["NVDA"], None)
 
     def test_wants_first_report(self):
         assert app_module._wants_first_report("?open=first") is True
@@ -514,6 +568,96 @@ class TestRouter:
             app_module.refresh_run_watchlist_cells(["NVDA"], "/")
         with pytest.raises(PreventUpdate):
             app_module.refresh_run_watchlist_cells(["NVDA"], "/runs/" + "0" * 36)
+
+
+# --- live refresh ---------------------------------------------------------
+
+class TestLivePoll:
+    """The run page is built once per visit; the progress poll is what
+    fills a live run's rows in without a reload."""
+
+    def test_rows_land_between_ticks(self, db):
+        run_id = rs.create_run("manual", ["NVDA", "AMD"], "u1",
+                               preset="standard", prediction_date="2026-09-02",
+                               target_date="2026-09-03")
+        rs.update_progress(run_id, "models", state="running", done=0, total=2)
+        first = app_module.refresh_live_run(1, f"/runs/{run_id}", ["NVDA"], None)
+        table, pill_text, pill_cls, fp = first
+        assert "No predictions yet" in _text(table)
+        assert pill_text == "Running"
+        assert "run-status-running" in pill_cls
+        assert fp["status"] == "running"
+
+        with rs.get_session() as session:
+            session.add(_pred(run_id, "NVDA", "kronos_mini", "BUY"))
+        rs.update_progress(run_id, "models", done=1, total=2)
+        table, _, _, fp2 = app_module.refresh_live_run(
+            2, f"/runs/{run_id}", ["NVDA"], fp)
+        assert "No predictions yet" not in _text(table)
+        assert _find(table, className="home-chip-positive") is not None
+        assert fp2 != fp
+
+    def test_an_unchanged_tick_writes_nothing(self, db):
+        run_id = seed(db, status="running")
+        _, _, _, fp = app_module.refresh_live_run(1, f"/runs/{run_id}", [], None)
+        again = app_module.refresh_live_run(2, f"/runs/{run_id}", [], fp)
+        assert all(part is dash.no_update for part in again)
+
+    def test_the_finishing_tick_is_the_last_one(self, db):
+        run_id = seed(db, status="running")
+        _, _, _, fp = app_module.refresh_live_run(1, f"/runs/{run_id}", [], None)
+        rs.set_status(run_id, "done")
+        table, pill_text, pill_cls, fp2 = app_module.refresh_live_run(
+            2, f"/runs/{run_id}", [], fp)
+        assert pill_text == "Complete"
+        assert "run-status-done" in pill_cls
+        assert table is not dash.no_update
+        assert fp2["status"] == "done"
+        # And from there the poll costs nothing at all.
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_live_run(3, f"/runs/{run_id}", [], fp2)
+
+    def test_a_terminal_run_is_not_queried_again(self, db, monkeypatch):
+        monkeypatch.setattr(ds, "get_run_view",
+                            lambda run_id: pytest.fail("read a settled run"))
+        for status in ("done", "failed", "cancelled"):
+            with pytest.raises(PreventUpdate):
+                app_module.refresh_live_run(1, "/runs/x", [], {"status": status})
+
+    def test_off_a_run_route_it_does_nothing(self, db):
+        for path in ("/", "/reports", "/schedule", None):
+            with pytest.raises(PreventUpdate):
+                app_module.refresh_live_run(1, path, ["NVDA"], None)
+
+    def test_a_db_failure_leaves_the_page_alone(self, db, monkeypatch):
+        run_id = seed(db, status="running")
+
+        def boom(_run_id):
+            raise RuntimeError("connection reset")
+
+        monkeypatch.setattr(ds, "get_run_view", boom)
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_live_run(1, f"/runs/{run_id}", [], None)
+
+    def test_the_page_seeds_the_fingerprint_it_polls_against(self, db):
+        run_id = seed(db, status="running")
+        view = ds.get_run_view(run_id)
+        page = run_page.layout(view, [])
+        store = _find(page, id="run-live-fp")
+        assert store.data == run_page.live_fingerprint(view["run"])
+        assert _find(page, id="run-status-pill") is not None
+        # Seeded from the render, so the first tick after a load that
+        # missed nothing writes nothing.
+        assert all(part is dash.no_update for part in
+                   app_module.refresh_live_run(1, f"/runs/{run_id}", [],
+                                               store.data))
+
+    def test_the_watchlist_cells_survive_a_refresh(self, db):
+        run_id = seed(db, status="running")
+        table, _, _, _ = app_module.refresh_live_run(
+            1, f"/runs/{run_id}", ["NVDA"], None)
+        assert [b.id["symbol"] for b in _buttons(table, "add-symbol")] == \
+            ["AMD", "TSLA"]
 
 
 # --- ?open=first ----------------------------------------------------------
@@ -645,7 +789,23 @@ class TestWiring:
         assert any("open=first" in s for s in _inline_scripts())
 
     def test_watchlist_refresh_targets_the_run_table(self):
-        cb = _callbacks_writing("run-symbol-table.children")
-        assert len(cb) == 1
-        assert [i["id"] for i in cb[0]["inputs"]] == ["selected-symbols"]
-        assert cb[0]["prevent_initial_call"] is True
+        cbs = _callbacks_writing("run-symbol-table.children")
+        plain = [c for c in cbs if "@" not in c["output"]]
+        dup = [c for c in cbs if "@" in c["output"]]
+        assert len(plain) == 1 and len(dup) == 1
+        assert [i["id"] for i in plain[0]["inputs"]] == ["selected-symbols"]
+        assert plain[0]["prevent_initial_call"] is True
+
+    def test_the_poll_is_the_second_writer_of_the_run_table(self):
+        """The live refresh shares the Output, so it must be a duplicate
+        writer, and it must ride the existing progress poll."""
+        cb = next(c for c in _callbacks_writing("run-symbol-table.children")
+                  if "@" in c["output"])
+        assert [(i["id"], i["property"]) for i in cb["inputs"]] == \
+            [("progress-interval", "n_intervals")]
+        assert [(st["id"], st["property"]) for st in cb["state"]] == \
+            [("url", "pathname"), ("selected-symbols", "data"),
+             ("run-live-fp", "data")]
+        assert cb["prevent_initial_call"] is True
+        assert "run-status-pill.children" in cb["output"]
+        assert "run-live-fp.data" in cb["output"]

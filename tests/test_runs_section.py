@@ -1,4 +1,4 @@
-"""The Runs section on the Reports page.
+"""The Runs section on the Reports page, and the research cards below it.
 
 One row per analysis run, newest first, above the symbol-grouped archive.
 The page's filter bar applies to it the way it applies to recommendations:
@@ -230,3 +230,41 @@ class TestReportsPage:
         assert "any symbols" in text
         assert "past run or report" in text
         assert "for the watchlist" not in text
+
+
+class TestResearchCards:
+    """A report row whose token columns are NULL used to raise TypeError
+    inside the card and take the whole Reports page down with it."""
+
+    def _report(self, **over):
+        report = {"id": "r1", "symbol": "NVDA", "decision": "BUY",
+                  "confidence": 0.62, "trade_date": "2026-09-02",
+                  "report_text": "# Report\n\nBuy it."}
+        report.update(over)
+        return report
+
+    def test_null_token_columns_render(self):
+        section = hs.build_ta_reports_section(
+            [self._report(input_tokens=None, output_tokens=None)])
+        assert section is not None
+        assert "NVDA" in _text(section)
+
+    def test_missing_token_columns_render(self):
+        section = hs.build_ta_reports_section([self._report()])
+        assert "tokens" not in _text(section)
+
+    def test_no_counts_means_no_token_line(self):
+        for over in ({"input_tokens": None, "output_tokens": None},
+                     {"input_tokens": 0, "output_tokens": 0},
+                     {"input_tokens": None, "output_tokens": 0}):
+            card = hs._ta_report_card(self._report(**over))
+            assert "tokens" not in _text(card)
+            assert "2026-09-02" in _text(card)
+
+    def test_counts_are_summed_and_shown(self):
+        card = hs._ta_report_card(
+            self._report(input_tokens=1200, output_tokens=None))
+        assert "1,200 tokens" in _text(card)
+        card = hs._ta_report_card(
+            self._report(input_tokens=1200, output_tokens=800))
+        assert "2,000 tokens" in _text(card)

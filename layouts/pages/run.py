@@ -12,7 +12,7 @@ returns; the reader modal is opened by app.py on ``?open=first``.
 
 from datetime import datetime, timezone
 
-from dash import html
+from dash import dcc, html
 
 from layouts.pages.home import DECISION_CLASS, board_headers, symbol_row
 from services.progress_service import format_stamp
@@ -121,9 +121,35 @@ def _meta(label: str, value, cls: str = "") -> html.Span:
     )
 
 
+def status_pill(run: dict) -> html.Span:
+    """The header's status word. Carries an id because the poll rewrites
+    it in place while the run is live (app.refresh_live_run)."""
+    status = run.get("status") or "queued"
+    return html.Span(STATUS_LABEL.get(status, status), id="run-status-pill",
+                     className=f"run-status run-status-{status}")
+
+
+def live_fingerprint(run: dict) -> dict:
+    """Everything a poll tick must notice on a live run page.
+
+    The status drives the pill and the empty-state wording; the stage
+    entries (their state, their done/total and their per-symbol glyphs)
+    and the counters move whenever a stage lands or another symbol is
+    stored, which is exactly when there are new rows to draw. Nothing on
+    this page changes without one of the three moving, so an unchanged
+    fingerprint means an unchanged board and the tick can write nothing.
+    The status is kept at the top level because the poll reads it back to
+    decide whether the run is worth another query at all.
+    """
+    return {
+        "status": run.get("status"),
+        "stages": run.get("stages") or {},
+        "counters": run.get("counters") or {},
+    }
+
+
 def header(view: dict) -> html.Div:
     run = view["run"]
-    status = run.get("status") or "queued"
     kind = run.get("kind") or "manual"
     preset = run.get("preset")
     symbols = run.get("symbols") or []
@@ -136,8 +162,7 @@ def header(view: dict) -> html.Div:
         html.Span(_PRESET_LABEL.get(preset, preset) if preset else "",
                   className="run-preset") if preset else "",
         html.Span(", ".join(symbols), className="run-symbols"),
-        html.Span(STATUS_LABEL.get(status, status),
-                  className=f"run-status run-status-{status}"),
+        status_pill(run),
     ]
     facts = [
         _meta("Owner", run.get("owner_uid") or "anonymous"),
@@ -379,6 +404,9 @@ def layout(view: dict, watchlist=None, open_first: bool = False) -> html.Div:
             html.Div(symbol_table(view, watchlist, open_first),
                      id="run-symbol-table"),
             synthesis_card(view.get("recommendation"), run),
+            # Seeded from the render so the first poll tick after a load
+            # only redraws when something actually moved since.
+            dcc.Store(id="run-live-fp", data=live_fingerprint(run)),
         ],
         className="page page-run",
         id="run-page",

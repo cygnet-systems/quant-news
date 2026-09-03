@@ -4457,6 +4457,181 @@ body {
     white-space: nowrap;
 }
 
+/* --- Home board tabs: Scheduled | This session ------------------------ */
+/* The tab strip is the right pane's head; the active pane inherits the
+   column's flex chain so the board still scrolls inside the viewport.
+   dbc.Tabs has no element of its own — .home-board-tabs is the nav <ul>
+   and the pane container is its SIBLING — so the flex chain hangs off the
+   wrapper div around it. Put a layout rule on .home-board-tabs itself and
+   the strip collapses to a 1px line the board is painted over. */
+
+.home-board-tabs-wrap {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.home-board-tabs-wrap > .nav-tabs {
+    border-bottom: 1px solid var(--border-subtle);
+    flex: 0 0 auto;
+}
+
+.home-board-tabs .nav-link {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 6px 14px;
+}
+
+.home-board-tabs .nav-link.active {
+    color: var(--accent-primary);
+    background: none;
+    border-bottom: 2px solid var(--accent-primary);
+    font-weight: 600;
+}
+
+.home-board-tabs-wrap > .tab-content {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+/* dbc wraps a tab's children in an unclassed div of its own, so the height
+   has to be handed down through it too: leave it block and the board sizes
+   to its rows and the page scrolls instead of the board. */
+.home-board-tabs-wrap > .tab-content > .tab-pane.active,
+.home-board-tabs-wrap > .tab-content > .tab-pane.active > div,
+.home-tab-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    gap: var(--space-3);
+}
+
+.home-tab-body { padding-top: var(--space-3); }
+
+/* Scheduled rows: call, actual, result, P&L; the model chips fold away. */
+
+.home-call .home-chip { font-size: var(--text-sm); }
+
+.home-actual-cell {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    white-space: nowrap;
+}
+
+.home-move { font-size: var(--text-xs); }
+
+.home-result-pill {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.home-result-hit  { color: var(--positive); background: rgba(0, 200, 5, 0.10); }
+
+.home-result-miss { color: var(--negative); background: rgba(255, 80, 0, 0.10); }
+
+.home-result-held { color: var(--text-secondary); background: var(--bg-tertiary); }
+
+.home-result-pending { color: var(--text-muted); font-size: var(--text-xs); }
+
+.home-pnl { white-space: nowrap; }
+
+.home-not-run { color: var(--text-muted); font-size: var(--text-xs); }
+
+.home-row-not-run td { color: var(--text-muted); }
+
+.home-models-cell { width: 1%; }
+
+.home-models-details { position: relative; }
+
+.home-models-summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    list-style: none;
+    user-select: none;
+}
+
+.home-models-summary::before {
+    content: "\25B8";
+    display: inline-block;
+    margin-right: 4px;
+    transition: transform 120ms ease;
+}
+
+.home-models-summary::-webkit-details-marker { display: none; }
+
+.home-models-details[open] > .home-models-summary::before { transform: rotate(90deg); }
+
+.home-models-details[open] > .home-models-summary { color: var(--text-secondary); }
+
+.home-models-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-2) 0 var(--space-1);
+    min-width: 260px;
+}
+
+.home-model-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.home-model-name { color: var(--text-muted); font-size: var(--text-2xs); }
+
+/* This session: one block per ad-hoc run, newest first. */
+
+.home-session-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    overflow-y: auto;
+    min-height: 0;
+}
+
+.home-session-run {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: var(--space-2) var(--space-3) var(--space-3);
+}
+
+.home-session-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding-bottom: var(--space-2);
+    font-size: var(--text-sm);
+}
+
+.home-session-started { color: var(--text-secondary); }
+
+.home-session-owner { color: var(--text-muted); font-size: var(--text-xs); }
+
+.home-session-head .run-status { margin-left: auto; }
+
+.home-session-open { white-space: nowrap; }
+
+.home-session-note { padding: 0 0 var(--space-2); }
+
+.home-session-empty { padding: var(--space-4) 0; }
+
 /* Narrow screens: fall back to a normally scrolling single column. */
 @media (max-width: 1100px) {
     .home-split { grid-template-columns: 1fr; height: auto; }
