@@ -1351,14 +1351,21 @@ def _create_scheduled_run_row(symbols: list[str], cutoff_date: date_cls,
     and the run page lose this run. The JobRun link, the owner and the
     visibility travel by env from scheduler_service.run_job (a CLI run has
     none of them); the row is stamped with the same visibility its
-    predictions and reports get, so a private job's run is private too."""
+    predictions and reports get, so a private job's run is private too.
+
+    The estimate is what past scheduled runs of this size actually took;
+    there is no dialog here to price a run from its parts, so before enough
+    of them have finished the pill simply shows no time remaining."""
     try:
         from services import run_service
         from services.auth_service import run_is_public
         job_run_id = os.environ.get("QUANTNEWS_JOB_RUN_ID")
+        estimate_s = run_service.median_duration_s(
+            None, len(symbols), kind="scheduled")
         return run_service.create_run(
             "scheduled", symbols, os.environ.get("QUANTNEWS_RUN_OWNER") or None,
             config=config, prediction_date=cutoff_date, target_date=target_date,
+            estimate_s=int(round(estimate_s)) if estimate_s else None,
             job_run_id=int(job_run_id) if job_run_id else None,
             is_public=run_is_public())
     except Exception as e:

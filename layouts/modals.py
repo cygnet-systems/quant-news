@@ -50,6 +50,35 @@ def create_data_modal() -> dbc.Modal:
     )
 
 
+def run_field_defaults() -> dict:
+    """What every run-configuring control shows when nothing seeds it.
+
+    One dict rather than a default per widget, because a run can now be
+    started WITHOUT the dialog (the watchlist strip's Analyze shortcut),
+    and that path has to record the same settings the dialog would have
+    recorded. Two lists of defaults would drift the first time one moved.
+    """
+    from config import MODEL
+    from services.investigation_service import WEB_RESEARCH_TOOL
+
+    return {
+        "lookback": MODEL.NEWS_LOOKBACK_DAYS,
+        "max_articles": MODEL.NEWS_MAX_ARTICLES,
+        "report_model": "gpt-5.6-luna",
+        "depth": "thesis",
+        "recs": "auto",
+        "recs_model": "claude-sonnet-5",
+        "evidence": list(MODEL.DEFAULT_EVIDENCE),
+        "tools": [WEB_RESEARCH_TOOL],
+        "models": [mid for mid, _, _ in RUN_MODELS],
+        "ensemble": True,
+        "ensemble_members": list(MODEL.ENSEMBLE_DEFAULT_ENABLED),
+        "ensemble_weights": dict(MODEL.ENSEMBLE_DEFAULT_WEIGHTS),
+        "ensemble_method": MODEL.ENSEMBLE_DEFAULT_METHOD,
+        "ensemble_min_agree": MODEL.ENSEMBLE_MIN_AGREE,
+    }
+
+
 def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
     """Parameter controls for the Run dialog (prefix "run").
 
@@ -57,8 +86,8 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
 : the sentiment and research models as well as the report, which is
     why they render in their own always-visible section, not under Report.
     """
-    from config import MODEL
     v = values or {}
+    d = run_field_defaults()
 
     return {
         "lookback": dbc.Select(
@@ -74,7 +103,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
                 {"label": "1 year (365 days)", "value": "365"},
                 {"label": "Overnight (close → open)", "value": "overnight"},
             ],
-            value=str(v.get("lookback") or MODEL.NEWS_LOOKBACK_DAYS),
+            value=str(v.get("lookback") or d["lookback"]),
             size="sm",
         ),
         # Per-symbol cap on the window: keep the newest N, 0 = all. Applied
@@ -86,7 +115,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
             min=0,
             step=1,
             value=(v["max_articles"] if v.get("max_articles") is not None
-                   else MODEL.NEWS_MAX_ARTICLES),
+                   else d["max_articles"]),
             size="sm",
         ),
         "model": dbc.Select(
@@ -97,7 +126,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
                 {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
                 {"label": "Claude Haiku 4.5 (fast)", "value": "claude-haiku-4-5"},
             ],
-            value=v.get("report_model") or "gpt-5.6-luna",
+            value=v.get("report_model") or d["report_model"],
             size="sm",
         ),
         "type": dbc.Select(
@@ -106,7 +135,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
                 {"label": "Deep (company thesis)", "value": "thesis"},
                 {"label": "Standard (faster)", "value": "standard"},
             ],
-            value=v.get("depth") or "thesis",
+            value=v.get("depth") or d["depth"],
             size="sm",
         ),
         "recs": dbc.Select(
@@ -116,7 +145,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
                 {"label": "From predictions only (no text)", "value": "signals"},
                 {"label": "Off", "value": "off"},
             ],
-            value=v.get("recs") or "auto",
+            value=v.get("recs") or d["recs"],
             size="sm",
         ),
         "recs-model": dbc.Select(
@@ -126,7 +155,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
                 {"label": "GPT-5.6 Luna (reasoning)", "value": "gpt-5.6-luna"},
                 {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
             ],
-            value=v.get("recs_model") or "claude-sonnet-5",
+            value=v.get("recs_model") or d["recs_model"],
             size="sm",
         ),
     }
@@ -282,6 +311,46 @@ def preset_run_tools(name: str | None, target_date) -> list[str]:
     return list(fixed) if fixed is not None else by_date
 
 
+def _date_str(value) -> str | None:
+    return str(value)[:10] if value else None
+
+
+def preset_run_config(name: str | None, *, target_date=None,
+                      prediction_date=None, picked_date=None) -> dict:
+    """The config an untouched ``name`` preset would be confirmed with.
+
+    The Run dialog builds this dict out of its controls; a run started
+    without the dialog (the watchlist strip's Analyze shortcut) has no
+    controls to read, so it builds the same dict here from the preset and
+    the shared field defaults. Same keys, same meanings: the stages read
+    the run row and cannot tell which surface wrote it.
+
+    ``customized`` is False by construction, so a run started this way is
+    recorded under its preset's own name and counts towards that preset's
+    measured duration.
+    """
+    key = name if name in RUN_PRESETS else DEFAULT_RUN_PRESET
+    defaults = run_field_defaults()
+    fields = preset_fields(key)
+    config = {k: v for k, v in defaults.items()
+              if k not in ("evidence", "tools", "models")}
+    config.update({
+        "scope": fields.get("scope", "full"),
+        "preset": key,
+        "customized": [],
+        "target_date": _date_str(target_date),
+        "prediction_date": _date_str(prediction_date),
+        "picked_date": _date_str(picked_date),
+        "models": list(fields.get("models") or defaults["models"]),
+        "evidence": sorted(fields.get("evidence") or defaults["evidence"]),
+        # preset_run_tools, not the preset's raw list: the no-web-research-
+        # for-a-backtest rule outranks a preset that asks for it.
+        "tools": sorted(preset_run_tools(key, target_date)),
+        "recs": fields.get("recs", defaults["recs"]),
+    })
+    return config
+
+
 def split_symbol_input(text: str | None) -> list[str]:
     """Tokens of a typed or pasted symbol string, separators stripped."""
     return [t for t in _PASTE_SPLIT.split((text or "").strip()) if t]
@@ -389,6 +458,12 @@ def estimate_run_seconds(scope: str, n_symbols: int, models: list,
     ``tools`` matters because web research is the slowest thing a run does
     and the estimate used to ignore it entirely: Deep quoted the same
     duration as Standard while spending minutes per symbol on the open web.
+
+    This prices a run from its parts. Once enough comparable runs have
+    finished, run_service.median_duration_s is the better answer and the
+    dispatcher prefers it; this stays the pre-flight preview (no run row
+    exists yet, and it must be free on every control change) and the
+    fallback for a preset with no history.
     """
     from config import MODEL
 
@@ -876,17 +951,18 @@ def run_model_controls(prefix: str, with_info: bool = False,
 
 def run_evidence_tools(prefix: str, values: dict | None = None):
     """The Evidence-blocks and Tools checklists for any run-configuring dialog."""
-    from config import MODEL
     v = values or {}
+    d = run_field_defaults()
     evidence = dbc.Checklist(
         id=f"{prefix}-evidence", options=EVIDENCE_OPTIONS,
         value=(list(v["evidence"]) if v.get("evidence") is not None
-               else list(MODEL.DEFAULT_EVIDENCE)),
+               else list(d["evidence"])),
         inline=True, className="run-evidence-checklist",
     )
     tools = dbc.Checklist(
         id=f"{prefix}-tools", options=TOOL_OPTIONS,
-        value=(list(v["tools"]) if v.get("tools") is not None else ["web_research"]),
+        value=(list(v["tools"]) if v.get("tools") is not None
+               else list(d["tools"])),
         inline=True, className="run-evidence-checklist",
     )
     return evidence, tools

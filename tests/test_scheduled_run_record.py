@@ -163,6 +163,33 @@ def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatc
     assert summary["predictions_stored"] == 2
 
 
+def test_scheduled_estimate_comes_from_past_scheduled_runs(db, feed, stages,
+                                                           monkeypatch):
+    # No dialog priced this run, so the pill's countdown has only the
+    # record to go on: without one it shows no time, with one it shows the
+    # median of past jobs of this size.
+    from datetime import timedelta
+
+    from db.models import AnalysisRun
+
+    # One symbol: its own band, so this run is not in the sample below.
+    ar.run_full_analysis(["NVDA"], lookback_days=7, max_articles=50,
+                         recs_mode="auto")
+    assert _only_run()["estimate_s"] is None
+
+    for secs in (200, 220, 240, 260, 280):
+        past = rs.create_run("scheduled", ["NVDA", "AMD"], None)
+        rs.set_status(past, "done")
+        with rs.get_session() as session:
+            row = session.get(AnalysisRun, past)
+            row.finished_at = row.started_at + timedelta(seconds=secs)
+
+    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=7, max_articles=50,
+                         recs_mode="auto")
+    newest = rs.list_runs()[0]
+    assert newest["estimate_s"] == 240
+
+
 def test_cli_run_without_a_job_has_no_link(db, feed, stages, monkeypatch):
     monkeypatch.delenv("QUANTNEWS_JOB_RUN_ID", raising=False)
     monkeypatch.delenv("QUANTNEWS_RUN_OWNER", raising=False)

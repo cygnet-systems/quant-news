@@ -1,4 +1,4 @@
-"""Cross-process rate limiting for third-party APIs.
+"""Cross-process rate limiting and concurrency bounds for third-party APIs.
 
 Alpha Vantage answers a throttled request with HTTP 200 and an explanatory
 body, so exceeding the quota does not look like an error at the transport
@@ -15,6 +15,13 @@ JSON file under an ``flock`` gives every process on the box one shared view.
 The state file holds the timestamps of recent calls. Acquiring prunes anything
 older than the window, and either records a new call or sleeps until the
 oldest one ages out.
+
+``FileSemaphore`` below answers the other shape of the same problem: not "how
+often" but "how many at once", for a provider billed per call with no quota
+document to pace against. It has the same reason to live in a file rather than
+in a module global — the UI process, each background-callback subprocess and
+the scheduler are different processes and a per-process counter bounds none of
+them against the others.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import fcntl
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -118,6 +126,104 @@ class TokenBucket:
         """Drop recorded calls. For tests and manual recovery."""
         if self._path.exists():
             self._path.unlink()
+
+
+class FileSemaphore:
+    """At most ``slots`` holders at once, across every process on the box.
+
+    One lock file per slot, taken with a non-blocking ``flock`` over them in
+    turn. The kernel drops a holder's lock when its descriptor closes, so a
+    worker killed mid-call cannot strand a slot the way a stored pid or a
+    heartbeat can; nothing is written to the files and nothing has to be
+    reaped. Waiting is unbounded on purpose: the callers are long web calls
+    inside a run that a watchdog already bounds, and failing one because the
+    box is busy would print in a report as a question nobody could answer.
+    Waiters poll rather than queue, so a slot does not go to the longest
+    waiter; the calls it guards run for minutes, which is what makes an
+    unfair hand-off cheaper than a shared queue between processes.
+
+    The interface is ``threading.BoundedSemaphore``'s, which is what it
+    replaced: acquire/release keep a per-thread stack of the descriptors this
+    thread holds, so nested holds and a plain semaphore substituted in a test
+    both behave. Not reentrant across a wait — a thread that holds a slot must
+    not block on a lock some other thread can only release by taking one.
+
+    A state directory that cannot be created or opened disables the bound
+    rather than failing the call: an unbounded search is a cost problem, a
+    crashed run is a correctness one.
+
+    Args:
+        name: Identifies the resource. Callers sharing it must share a name.
+        slots: Concurrent holders permitted. Below 1 disables the bound.
+        state_dir: Where to keep the lock files.
+        poll_s: How long to wait before re-trying every slot.
+    """
+
+    def __init__(self, name: str, slots: int, state_dir: Path | None = None,
+                 poll_s: float = 0.2):
+        self.name = name
+        self.slots = int(slots)
+        self.poll_s = float(poll_s)
+        self._dir = Path(state_dir) if state_dir else _STATE_DIR
+        self._held = threading.local()
+        self._disabled = self.slots < 1
+        # The directory is made on first use, not here: these live as module
+        # globals and importing one must not touch the filesystem.
+        self._ready = False
+
+    def _stack(self) -> list:
+        stack = getattr(self._held, "fds", None)
+        if stack is None:
+            stack = self._held.fds = []
+        return stack
+
+    def _try_slot(self, index: int):
+        """An open handle holding slot ``index``, or None if it is taken."""
+        try:
+            if not self._ready:
+                self._dir.mkdir(parents=True, exist_ok=True)
+                self._ready = True
+            fh = open(self._dir / f"{self.name}.{index}.slot", "a+")
+        except OSError as e:
+            logger.warning("semaphore %s: slot file unusable, not bounding: %s",
+                           self.name, e)
+            self._disabled = True
+            return None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        return fh
+
+    def acquire(self) -> bool:
+        """Block until a slot is free. Always returns True."""
+        stack = self._stack()
+        if self._disabled:
+            stack.append(None)
+            return True
+        while True:
+            for i in range(self.slots):
+                fh = self._try_slot(i)
+                if fh is not None:
+                    stack.append(fh)
+                    return True
+                if self._disabled:      # the directory went away mid-wait
+                    stack.append(None)
+                    return True
+            time.sleep(self.poll_s)
+
+    def release(self) -> None:
+        stack = self._stack()
+        if not stack:
+            raise RuntimeError(f"{self.name}: this thread holds no slot")
+        fh = stack.pop()
+        if fh is None:
+            return
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 _buckets: dict[str, TokenBucket] = {}

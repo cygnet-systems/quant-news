@@ -22,6 +22,7 @@ import asyncio
 import os
 import subprocess
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 
 import dash
@@ -32,8 +33,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from db.models import AnalysisRun, Base, JobRun, Ticker
+from layouts.modals import RUN_MODELS
 from services import progress_service as prog
 from services import run_service as rs
 
@@ -55,7 +58,10 @@ def _jsonb_as_json(type_, compiler, **kw):
 def db(monkeypatch):
     import db.session as dbs
 
-    eng = create_engine("sqlite://")
+    # One shared connection: the shortcut validates its symbol in a worker
+    # thread, and a per-thread in-memory SQLite would be empty there.
+    eng = create_engine("sqlite://", poolclass=StaticPool,
+                        connect_args={"check_same_thread": False})
     Base.metadata.create_all(eng, tables=[AnalysisRun.__table__, JobRun.__table__,
                                           Ticker.__table__])
     monkeypatch.setattr(dbs, "_engine", eng)
@@ -748,6 +754,247 @@ class TestRetry:
         assert "record is gone" in msg
         assert rs.list_runs() == []
         assert all(v is dash.no_update for v in out[4:])
+
+
+class TestAnalyzeNow:
+    """The watchlist strip's shortcut: a Standard run on one typed ticker,
+    without the dialog. It is a confirm with a config nobody edited, so it
+    shares the lock, the row, the feed and the acknowledgement; what it must
+    NOT share is the Enter key's meaning, which is still "add to watchlist"."""
+
+    @pytest.fixture
+    def owner(self, db, feed, monkeypatch):
+        monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
+        return "u1"
+
+    @pytest.fixture
+    def priced(self, db, monkeypatch):
+        """The price lookup behind the symbol gate, with its calls recorded.
+        Nothing here reaches a vendor; a name the cache already knows must
+        not even get this far."""
+        from services import ticker_service as ts
+
+        calls = []
+
+        def _info(sym):
+            calls.append(sym)
+            if sym in ("NVDA", "AMD"):
+                return SimpleNamespace(name="NVIDIA Corp")
+            raise ValueError("no data")
+
+        monkeypatch.setattr(ts, "_fetch_info", _info)
+        return calls
+
+    def _analyze(self, *args):
+        return asyncio.run(app_module.analyze_typed_symbol(*args))
+
+    def test_offer_appears_only_for_one_recognisable_ticker(self):
+        children, style, title = app_module.offer_analyze_now("nvda")
+        assert children[-1] == "Analyze NVDA"
+        assert style["display"] == "inline-flex"
+        assert "Standard" in title and "NVDA" in title
+
+        for typed in (None, "", "  ", "NVDA AMD", "NVDA, AMD",
+                      "advanced micro devices"):
+            _, style, title = app_module.offer_analyze_now(typed)
+            assert style == {"display": "none"}, typed
+            assert title == ""
+
+    def test_runs_the_typed_symbol_on_the_default_preset(self, owner, feed,
+                                                        priced):
+        out = self._analyze(1, " nvda ", {"closed": True})
+        store, dispatch, cleared, modal, msg = out[:5]
+        panel, toast_open, toast_msg, interval = out[5:]
+
+        assert store == dispatch
+        assert store["symbols"] == ["NVDA"]
+        assert store["kind"] == "manual" and store["owner_uid"] == "u1"
+        assert store["preset"] == "standard" and store["scope"] == "full"
+        # The box empties (which hides the button); the dialog stays shut.
+        assert cleared == "" and modal is dash.no_update and msg == ""
+
+        row = rs.get_run(store["run_id"])
+        assert row["status"] == "queued" and row["symbols"] == ["NVDA"]
+        assert row["preset"] == "standard"
+        config = row["config"]
+        assert config["preset"] == "standard" and config["customized"] == []
+        assert config["scope"] == "full" and config["recs"] == "auto"
+        assert config["models"] == [m for m, _, _ in RUN_MODELS]
+        # Standard buys the report and the synthesis, never the open web.
+        assert config["tools"] == []
+        assert config["target_date"] and config["prediction_date"]
+        assert config["prediction_date"] < config["target_date"]
+
+        # Acknowledged exactly like a confirm.
+        assert store["run_id"] in feed._active_runs()
+        assert panel["closed"] is False
+        assert toast_open is True and toast_msg.startswith("NVDA · ")
+        assert interval == app_module._PROGRESS_POLL_ACTIVE_MS
+
+    def test_the_shortcut_does_not_touch_the_watchlist(self):
+        # Enter is the action that adds a symbol; this one only runs it, so
+        # the watchlist store must not be among the shortcut's outputs.
+        from dash._callback import GLOBAL_CALLBACK_MAP
+        key = next(k for k, v in GLOBAL_CALLBACK_MAP.items()
+                   if any(i["id"] == "wl-analyze-now"
+                          for i in v.get("inputs", [])))
+        assert "selected-symbols" not in key
+        # It writes both run stores and the whole acknowledgement, which is
+        # what makes it the same run as a confirm.
+        for wanted in ("run-store.data", "run-dispatch.data",
+                       "progress-panel-state.data", "run-started-toast.is_open",
+                       "progress-interval.interval"):
+            assert wanted in key, wanted
+
+    def test_refused_while_this_owner_has_a_run(self, owner, feed, priced):
+        first = rs.create_run("manual", ["AAPL"], "u1")
+
+        out = self._analyze(1, "NVDA", None)
+        store, dispatch, cleared, modal, msg = out[:5]
+
+        assert store is dash.no_update and dispatch is dash.no_update
+        # The typed text survives and the dialog opens carrying the reason,
+        # which is the only surface with the Cancel button on it.
+        assert cleared is dash.no_update and modal is True
+        assert "run in progress" in msg[0]
+        assert msg[1].id == "run-cancel-active-btn"
+        assert [r["run_id"] for r in rs.list_runs()] == [first]
+        assert all(v is dash.no_update for v in out[5:])
+
+    def test_nothing_runs_without_a_click_or_a_symbol(self, owner, feed,
+                                                     priced):
+        with pytest.raises(PreventUpdate):
+            self._analyze(None, "NVDA", None)
+        with pytest.raises(PreventUpdate):
+            self._analyze(1, "", None)
+        with pytest.raises(PreventUpdate):
+            self._analyze(1, "NVDA AMD", None)
+        assert rs.list_runs() == []
+
+    def test_a_typo_never_runs_and_never_joins_the_cache(self, owner, feed,
+                                                        priced):
+        """normalize_symbol says only that the text COULD be a ticker. Without
+        the price lookup the dialog makes, NVDAA started a full Standard run
+        that failed late AND left NVDAA in the typeahead cache for good, since
+        _start_manual_run caches every symbol a run uses."""
+        from services import ticker_service as ts
+
+        out = self._analyze(1, "NVDAA", {"closed": True})
+        store, dispatch, cleared, modal, msg = out[:5]
+
+        assert store is dash.no_update and dispatch is dash.no_update
+        assert modal is True and msg == "No price data for NVDAA"
+        assert cleared is dash.no_update          # the text stays, to be fixed
+        assert rs.list_runs() == []
+        assert ts.get("NVDAA") is None
+        assert priced == ["NVDAA"]
+        assert all(v is dash.no_update for v in out[5:])
+
+    def test_a_symbol_the_cache_knows_costs_no_lookup(self, owner, feed,
+                                                      priced):
+        from services import ticker_service as ts
+
+        ts.upsert([{"symbol": "NVDA", "name": "NVIDIA Corp"}], "index")
+        out = self._analyze(1, "nvda", {"closed": True})
+
+        assert out[0]["symbols"] == ["NVDA"]
+        assert priced == []
+        # An unknown name that does price joins the cache as validated, and
+        # the run row records the normalised symbol.
+        out = self._analyze(1, "amd", {"closed": True})
+        assert out[3] is True and "run in progress" in out[4][0]
+        assert priced == ["AMD"]
+        assert ts.get("AMD")["source"] == "validated"
+
+    def test_the_shortcuts_config_is_the_dialogs_config(self, confirm, db):
+        # The one real risk in starting a run without the dialog: two lists
+        # of defaults that drift. An untouched Standard confirm and the
+        # shortcut must record the same run.
+        from layouts.modals import preset_run_config, run_field_defaults
+
+        d = run_field_defaults()
+        out = confirm(["NVDA"], scope="full", run_date="2026-09-03",
+                      lookback=d["lookback"], max_articles=d["max_articles"],
+                      report_model=d["report_model"], depth=d["depth"],
+                      recs=d["recs"], recs_model=d["recs_model"],
+                      run_evidence=list(d["evidence"]), run_tools=[],
+                      model_checks=[True] * 5, run_ensemble=d["ensemble"],
+                      ens_method=d["ensemble_method"],
+                      ens_min_agree=d["ensemble_min_agree"],
+                      ens_members=[True] * 5,
+                      ens_weights=[d["ensemble_weights"][m]
+                                   for m, _, _ in RUN_MODELS])
+        row = rs.get_run(out[RUN_STORE]["run_id"])
+        assert row["preset"] == "standard"
+        dialog = row["config"]
+        shortcut = preset_run_config(
+            "standard", target_date=dialog["target_date"],
+            prediction_date=dialog["prediction_date"],
+            picked_date=dialog["picked_date"])
+        assert set(shortcut) == set(dialog)
+        assert shortcut == dialog
+
+    def test_the_button_is_mounted_and_starts_hidden(self):
+        from layouts.nav import create_watchlist_strip
+
+        def find(node, wanted):
+            if getattr(node, "id", None) == wanted:
+                return node
+            ch = getattr(node, "children", None)
+            for c in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                if c is not None and hasattr(c, "id"):
+                    hit = find(c, wanted)
+                    if hit is not None:
+                        return hit
+            return None
+
+        button = find(create_watchlist_strip(), "wl-analyze-now")
+        assert button is not None
+        assert button.style == {"display": "none"}
+
+
+class TestMeasuredEstimate:
+    """The row's estimate_s is what the pill counts down from. Past runs of
+    the same shape beat the static estimator once there are enough of them,
+    and the lookup happens once, here, never on the poll."""
+
+    def _finish(self, run_id, seconds):
+        with rs.get_session() as session:
+            row = session.get(AnalysisRun, run_id)
+            row.status = "done"
+            row.finished_at = row.started_at + timedelta(seconds=seconds)
+
+    def test_confirm_quotes_the_median_of_comparable_runs(self, confirm, db):
+        for secs in (600, 610, 620, 630, 640):
+            run_id = rs.create_run("manual", ["NVDA", "AMD"], "u1",
+                                   preset="standard", config={})
+            self._finish(run_id, secs)
+
+        out = confirm(["NVDA", "AMD"], scope="full",
+                      model_checks=[True] * 5, recs="auto")
+
+        row = rs.get_run(out[RUN_STORE]["run_id"])
+        assert row["preset"] == "standard"
+        assert row["estimate_s"] == 620
+
+    def test_a_preset_with_no_history_keeps_the_static_estimate(self, confirm,
+                                                                db):
+        from layouts.modals import estimate_run_seconds
+        out = confirm(["NVDA", "AMD"], scope="full",
+                      model_checks=[True] * 5, recs="auto")
+        row = rs.get_run(out[RUN_STORE]["run_id"])
+        static = estimate_run_seconds("full", 2, [m for m, _, _ in RUN_MODELS],
+                                      True, [])
+        assert row["estimate_s"] == int(round(static))
+
+    def test_a_broken_lookup_never_stops_a_run(self, confirm, db, monkeypatch):
+        def boom(*a, **kw):
+            raise RuntimeError("no database")
+
+        monkeypatch.setattr(rs, "median_duration_s", boom)
+        out = confirm(["NVDA"], scope="models")
+        assert out[RUN_STORE] is not dash.no_update
+        assert rs.get_run(out[RUN_STORE]["run_id"])["estimate_s"] > 0
 
 
 class TestRunConfigAuthority:

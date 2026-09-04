@@ -133,10 +133,6 @@ def pin_holds(run, active_ids, now=None, run_store=None) -> bool:
                     started_at=run.get("started_at"))
 
 
-def stage_state(stages, stage) -> str:
-    return ((stages or {}).get(stage) or {}).get("state") or "pending"
-
-
 def symbol_state(stages, stage, symbol) -> str:
     """One symbol's state in one stage.
 

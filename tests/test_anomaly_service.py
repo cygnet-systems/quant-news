@@ -9,7 +9,12 @@ about claiming a story exists:
 * a missing block is not a neutral block. Nothing here may invent an anomaly
   from an argument that was never passed;
 * a zero-priced Form 4 row (grant, gift, option exercise) carries no dollar
-  value, so no dollar floor may ever be cleared by one;
+  value, so no dollar floor may ever be cleared by one, a set of them filed on
+  one day is an annual grant rather than a cluster, and one landing this week
+  does not re-date a priced sale from four months ago;
+* insider activity is judged against the symbol's own recent rate over a
+  cluster-length window, not by a flat count over the store's whole read
+  window, or every large cap trips the detector every day;
 * ranking is what the cap acts on, and the cross-source reading
   (positioning_vs_price) has to outrank the single-source ones or the section
   that says something about the future gets dropped for one that recites the
@@ -232,6 +237,93 @@ class TestInsiderCluster:
             "insider_cluster")
         assert from_summary is not None
         assert from_summary["severity"] == from_rows["severity"]
+        # Including the per-side dates the cluster window is read from: the
+        # summary aggregates the whole window, so without them the summary
+        # shape would silently stop firing where the row shape fires.
+        spread = [insider_row(f"Exec {i}", "D", shares=500, days_ago=d)
+                  for i, d in enumerate((60, 100, 150))]
+        assert anom.detect("NVDA", AS_OF, insiders=spread) == []
+        assert anom.detect("NVDA", AS_OF,
+                           insiders=summary(spread, monkeypatch)) == []
+
+    def test_a_cluster_spread_over_the_whole_window_is_a_calendar(self):
+        """Three people who each filed once, months apart, are not acting
+        together. Counting them over the store's 180-day read window fired
+        on 88 of 104 symbol-days in the local store, so no symbol was ever
+        quiet and every one claimed a research question."""
+        rows = [insider_row(f"Exec {i}", "D", shares=500, days_ago=d)
+                for i, d in enumerate((60, 100, 150))]
+        assert anom.detect("NVDA", AS_OF, insiders=rows) == []
+
+    def test_an_unpriced_cluster_is_a_grant_day_not_a_decision(self):
+        """The most common shape in the store: three directors taking the
+        same annual award on the same day. The vendor prices those at 0 and
+        av_store stores no value, which is what says they are paperwork."""
+        rows = [insider_row(f"Director {i}", "A", shares=1000, price=0.0,
+                            days_ago=5, title="Director") for i in range(3)]
+        assert all(r["value_usd"] is None for r in rows)
+        assert anom.detect("NVDA", AS_OF, insiders=rows) == []
+        # The same three, paid for, are an open-market purchase and do fire.
+        bought = [insider_row(f"Director {i}", "A", shares=1000, price=90.0,
+                              days_ago=5, title="Director") for i in range(3)]
+        a = only(anom.detect("NVDA", AS_OF, insiders=bought), "insider_cluster")
+        assert a is not None and "priced acquisitions" in a["facts"][0]
+
+    def test_a_grant_last_week_does_not_date_a_sale_from_may(self, monkeypatch):
+        """The window test and the price test have to be asked of the SAME
+        filing. Three executives whose only priced disposal is months old,
+        each with an unpriced row inside the window, have sold nothing in the
+        last 30 days; reading the recency off all rows and the money off the
+        priced ones reported the May sales as a cluster today, and the $9M
+        row would have cleared the single-disposal floor the same way."""
+        rows = []
+        for i in range(3):
+            rows.append(insider_row(f"Exec {i}", "D", shares=50_000,
+                                    price=180.0, days_ago=100))
+            rows.append(insider_row(f"Exec {i}", "D", shares=1000, price=0.0,
+                                    days_ago=5, title="EVP"))
+        assert anom.detect("NVDA", AS_OF, insiders=rows) == []
+        assert anom.detect("NVDA", AS_OF,
+                           insiders=summary(rows, monkeypatch)) == []
+
+    def test_the_filings_line_counts_only_the_priced_rows(self, monkeypatch):
+        """The count sits beside a dollar total that excludes unpriced rows;
+        counting them here made the two halves of one sentence disagree."""
+        rows = []
+        for i in range(3):
+            rows.append(insider_row(f"Exec {i}", "D", shares=500, price=100.0,
+                                    days_ago=5))
+            rows.append(insider_row(f"Exec {i}", "D", shares=900, price=0.0,
+                                    days_ago=6))
+        for shape in (rows, summary(rows, monkeypatch)):
+            a = only(anom.detect("NVDA", AS_OF, insiders=shape),
+                     "insider_cluster")
+            assert a is not None
+            assert "3 priced filings from them" in a["facts"][3]
+            assert "$150K" in a["facts"][3]
+
+    def test_a_cluster_must_beat_the_symbols_own_rate(self):
+        """Three officers selling in a month is not news at a symbol where
+        eight sold over the preceding five. The comparison is to the symbol's
+        own trailing rate, never to a flat count."""
+        recent = [insider_row(f"Now {i}", "D", shares=500, days_ago=5)
+                  for i in range(3)]
+        busy = [insider_row(f"Then {i}", "D", shares=500, days_ago=60 + i)
+                for i in range(8)]
+        assert anom.detect("NVDA", AS_OF, insiders=recent + busy) == []
+        # The same three against a quieter history clear it.
+        quiet = busy[:4]
+        a = only(anom.detect("NVDA", AS_OF, insiders=recent + quiet),
+                 "insider_cluster")
+        assert a is not None
+        assert any("its own recent rate" in f for f in a["facts"])
+
+    def test_a_large_disposal_months_ago_is_not_todays_story(self):
+        """It stays in the 180-day window for six months; reading the largest
+        row anywhere in that window kept the section alive the whole time."""
+        rows = [insider_row("Jensen Huang", "D", shares=100_000, price=180.0,
+                            days_ago=150, title="CEO")]
+        assert anom.detect("NVDA", AS_OF, insiders=rows) == []
 
     def test_one_disposal_over_the_floor_is_its_own_anomaly(self):
         rows = [insider_row("Jensen Huang", "D", shares=100_000, price=180.0,

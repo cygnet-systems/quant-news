@@ -228,8 +228,8 @@ class TradingAgentsModel(BaseModel):
         # SPY regime, and the selected evidence blocks. Computed here: not
         # asserted by the LLM, and all lookahead-safe.
         tools = sorted(set(kwargs.get("tools") or []))
-        (extra_blocks, investigation, anomalies,
-         screened) = self._build_extra_context(
+        (extra_blocks, investigation, anomalies, screened,
+         scan_failed) = self._build_extra_context(
             symbol, ohlcv_df, as_of, evidence=evidence, ledger=ledger,
             news=news, target=kwargs.get("target_date"), tools=tools)
 
@@ -279,6 +279,7 @@ class TradingAgentsModel(BaseModel):
             situation=(investigation.situation if investigation else None),
             anomalies=anomalies,
             screened=screened,
+            scan_failed=scan_failed,
         )
 
         decision = (result.get("decision") or "HOLD").upper()
@@ -455,13 +456,14 @@ class TradingAgentsModel(BaseModel):
         switches from the same dialog, "web_research" lets the
         investigation search the open web; absent means off.
 
-        Returns (blocks, investigation, anomalies, screened), where
-        ``screened`` names the anomaly categories this run could actually
-        rule out: an empty anomaly list says nothing about a category whose
-        block was never fetched, and the report has to be able to tell the
-        two apart. Every block records itself on the ledger as present or as
-        a gap with the reason; required blocks raise through
-        ``ledger.missing``.
+        Returns (blocks, investigation, anomalies, screened, scan_failed),
+        where ``screened`` names the anomaly categories this run could
+        actually rule out: an empty anomaly list says nothing about a
+        category whose block was never fetched, and the report has to be
+        able to tell the two apart. ``scan_failed`` separates a scan that
+        raised from a scan that found nothing. Every block records itself on
+        the ledger as present or as a gap with the reason; required blocks
+        raise through ``ledger.missing``.
         """
         evidence = set(evidence) if evidence is not None else set(MODEL.DEFAULT_EVIDENCE)
         ledger = ledger or EvidenceLedger(symbol)
@@ -650,7 +652,12 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 blocks, problems = [], [str(e)[:120]]
             extra_blocks.extend(blocks)
-            if blocks and not problems:
+            # Same rule as the insider and dossier blocks below: a block that
+            # was written is evidence the model can read, so it is recorded as
+            # present even when the other half of the fetch failed. The caveat
+            # rides in the block text (political_blocks appends it), not as an
+            # absence of a block that is sitting in the prompt.
+            if blocks:
                 ledger.have("political")
             elif problems:
                 ledger.missing("political", "; ".join(problems))
@@ -749,7 +756,7 @@ class TradingAgentsModel(BaseModel):
                 investigation = None
                 ledger.missing("investigation", f"investigation stage failed: {str(e)[:100]}")
 
-        anomalies, screened = self._scan_and_research(
+        anomalies, screened, scan_failed = self._scan_and_research(
             symbol, as_of, evidence=evidence, ledger=ledger, news=news,
             ohlcv_df=ohlcv_df, target=target, web=web, options=metrics_pc,
             by_expiry=by_expiry, quality=quality_result)
@@ -762,20 +769,32 @@ class TradingAgentsModel(BaseModel):
                 extra_blocks.insert(0, format_anomaly_block(
                     symbol, anomaly, anomaly.get("answer")))
 
-        return extra_blocks, investigation, anomalies, screened
+        return extra_blocks, investigation, anomalies, screened, scan_failed
 
     def _scan_and_research(
         self, symbol: str, as_of: str, *, evidence: set, ledger,
         news: list | None, ohlcv_df, target: str | None, web: bool,
         options, by_expiry, quality,
-    ) -> tuple[list[dict], list[str]]:
+    ) -> tuple[list[dict], list[str], bool]:
         """What stands out for this symbol, each item researched on the web.
 
-        Returns (anomalies, screened). ``screened`` names the categories the
-        scan could actually rule out. An empty anomaly list means "nothing
-        stood out in THOSE categories" and means nothing at all about the
-        ones this run never fetched, so the caller needs both to write the
-        quiet-symbol note without asserting an absence it did not check.
+        Returns (anomalies, screened, scan_failed). ``screened`` names the
+        categories the scan could actually rule out. An empty anomaly list
+        means "nothing stood out in THOSE categories" and means nothing at
+        all about the ones this run never fetched, so the caller needs both
+        to write the quiet-symbol note without asserting an absence it did
+        not check.
+
+        ``scan_failed`` is the third state and exists because the first two
+        do not cover it: a scan that raised AFTER the run gathered its
+        evidence knows neither that the symbol is quiet nor that there was
+        nothing to screen, and reusing the nothing-was-gathered wording for
+        it would tell the report a falsehood about its own run.
+
+        What counts as screened is read off the run's evidence set and the
+        ledger, never off whether rows came back. A dossier that rendered
+        "no member of Congress disclosed a trade" screened congressional
+        filings; an empty list of rows is its finding, not its absence.
 
         Detection (services.anomaly_service) is arithmetic over blocks the
         run already computed, so it costs nothing and never raises the
@@ -790,25 +809,51 @@ class TradingAgentsModel(BaseModel):
         four happened; a block that inferred it from a missing answer would
         put a false statement about the run's own provenance in the report.
         """
+        from services import anomaly_service
+        # Gathered, not non-empty. A block is on the ledger when it RENDERED,
+        # which is the only honest answer to "did this run look": the
+        # congressional dossier renders a block saying nobody filed, and the
+        # options and quality blocks are on the ledger only when their fetch
+        # produced one. Computed before the scan so the failure path below
+        # can still say what the run had in hand when it broke.
+        present = set(ledger.present)
+        looked = {
+            "options": "options" in evidence and "options" in present,
+            "by_expiry": "options" in evidence and "options" in present,
+            "insiders": "insiders" in evidence and "insiders" in present,
+            # Either block puts the congressional rows in the prompt: the
+            # dossier when it is selected, and the political block's own
+            # congressional half when it is not (political_blocks is called
+            # with include_congress=False whenever the dossier is on). The
+            # scan reads them from the same store either way, so the report
+            # never says the filings were not looked at over a block that
+            # lists them.
+            "congress": (("politicians" in evidence and "politicians" in present)
+                         or ("political" in evidence
+                             and "politicians" not in evidence
+                             and "political" in present)),
+            "quality": "quality" in evidence and "quality" in present,
+            # news_source is REQUIRED evidence, so reaching here with it on
+            # the ledger means the window was read; an empty list from a
+            # responding source is a quiet week, which IS a screen.
+            "news": news is not None and "news_source" in present,
+        }
+        screened = anomaly_service.screened(looked, ohlcv=ohlcv_df)
         try:
-            from services import anomaly_service
             insider_summary = congress_rows = None
-            if "insiders" in evidence and "insiders" in set(ledger.present):
+            if looked["insiders"]:
                 from services.insider_service import summarize_insiders
                 insider_summary = summarize_insiders(symbol, as_of)
-            if "politicians" in evidence and "politicians" in set(ledger.present):
+            if looked["congress"]:
                 from services import av_store
                 congress_rows = av_store.congress_trades_for(symbol, as_of)
-            # One dict for both calls: detect() says what stands out and
-            # screened() says over what, and they must never disagree.
-            inputs = dict(options=options, by_expiry=by_expiry,
-                          insiders=insider_summary, congress=congress_rows,
-                          quality=quality, news=news, ohlcv=ohlcv_df)
-            anomalies = anomaly_service.detect(symbol, as_of, **inputs)
-            screened = anomaly_service.screened(**inputs)
+            anomalies = anomaly_service.detect(
+                symbol, as_of, options=options, by_expiry=by_expiry,
+                insiders=insider_summary, congress=congress_rows,
+                quality=quality, news=news, ohlcv=ohlcv_df)
         except Exception as e:
             logger.warning(f"{symbol}: anomaly scan failed: {e}")
-            return [], []
+            return [], screened, True
 
         for anomaly in anomalies:
             anomaly["answer"] = None
@@ -820,7 +865,7 @@ class TradingAgentsModel(BaseModel):
             looked_at = ", ".join(screened) or "any evidence this run gathered"
             _emit("ta", f"Research {symbol}: nothing stands out in "
                         f"{looked_at}, the report stays short")
-            return anomalies, screened
+            return anomalies, screened, False
 
         _emit("ta", f"Research {symbol}: {len(anomalies)} anomaly/anomalies to "
                     f"write about ("
@@ -828,7 +873,7 @@ class TradingAgentsModel(BaseModel):
               payload={"event": "anomalies", "symbol": symbol,
                        "keys": [a["key"] for a in anomalies]})
         if not web:
-            return anomalies, screened
+            return anomalies, screened, False
 
         try:
             from services.investigation_service import research_questions
@@ -853,7 +898,7 @@ class TradingAgentsModel(BaseModel):
             logger.warning(f"{symbol}: anomaly research failed: {e}")
             for anomaly in anomalies:
                 anomaly["unresearched"] = "stage_failed"
-            return anomalies, screened
+            return anomalies, screened, False
 
         by_question = {a["question"]: a for a in answers}
         for anomaly in anomalies:
@@ -873,4 +918,4 @@ class TradingAgentsModel(BaseModel):
         researched = sum(1 for a in anomalies if a["researched"])
         _emit("ta", f"Research {symbol}: researched {researched} of "
                     f"{len(anomalies)} anomaly question(s) on the web")
-        return anomalies, screened
+        return anomalies, screened, False

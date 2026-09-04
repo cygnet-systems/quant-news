@@ -1519,6 +1519,131 @@ def manage_symbols(input_submit, clear_click, add_clicks,
     raise PreventUpdate
 
 
+def _typed_shortcut_symbol(text):
+    """The one ticker a strip shortcut would run, or None.
+
+    Deliberately one: the shortcut exists to skip the dialog for a single
+    name, and a half-typed list is exactly the case where a user wants the
+    dialog's chips instead. normalize_symbol is the same test the
+    typeahead's paste option applies, so the button never offers to run a
+    company name. It is a shape test only: whether the symbol exists is a
+    price lookup, and that is paid once, on the click.
+    """
+    from layouts.modals import split_symbol_input
+    from services.ticker_service import normalize_symbol
+
+    tokens = split_symbol_input(text)
+    if len(tokens) != 1:
+        return None
+    return normalize_symbol(tokens[0])
+
+
+@callback(
+    Output("wl-analyze-now", "children"),
+    Output("wl-analyze-now", "style"),
+    Output("wl-analyze-now", "title"),
+    Input("symbol-input", "value"),
+)
+def offer_analyze_now(typed):
+    """Offer the second action on what is being typed into the strip.
+
+    Enter adds the symbol to the watchlist; this button runs it. The
+    control is mounted always and only shown when there is one recognisable
+    ticker to name, so no id appears or disappears under the callbacks.
+    Pure string work on every keystroke: the input is un-debounced.
+    """
+    symbol = _typed_shortcut_symbol(typed)
+    if symbol is None:
+        return dash.no_update, {"display": "none"}, ""
+    from layouts.modals import DEFAULT_RUN_PRESET, RUN_PRESETS
+    preset = RUN_PRESETS[DEFAULT_RUN_PRESET]["label"]
+    return (
+        [html.I(className="bi bi-play-fill me-1"), f"Analyze {symbol}"],
+        {"display": "inline-flex", "alignItems": "center"},
+        f"Run a {preset} analysis of {symbol} now, without the dialog",
+    )
+
+
+@callback(
+    Output("run-store", "data", allow_duplicate=True),
+    Output("run-dispatch", "data", allow_duplicate=True),
+    # Clearing the box hides the button again; manage_symbols owns this
+    # value on the Enter path, hence the duplicate.
+    Output("symbol-input", "value", allow_duplicate=True),
+    # A refusal has nowhere else to be read: the dialog is where the run
+    # lock explains itself (and carries the Cancel button), so a refused
+    # shortcut opens it on that message, exactly as a refused retry does.
+    Output("run-modal", "is_open", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("progress-panel-state", "data", allow_duplicate=True),
+    Output("run-started-toast", "is_open", allow_duplicate=True),
+    Output("run-started-toast", "children", allow_duplicate=True),
+    Output("progress-interval", "interval", allow_duplicate=True),
+    Input("wl-analyze-now", "n_clicks"),
+    State("symbol-input", "value"),
+    State("progress-panel-state", "data"),
+    prevent_initial_call=True,
+)
+async def analyze_typed_symbol(n_clicks, typed, panel_state):
+    """Run the typed ticker on the default preset, without the dialog.
+
+    The shortcut is a confirm with a config nobody edited: the preset's
+    own fields over the shared control defaults (preset_run_config), the
+    next trading session as the target, and one symbol. It goes through
+    _start_manual_run like every other manual run, so it takes the same
+    per-owner lock, writes the same row, and is reported on by the same
+    pill and panel. Nothing is added to the watchlist: Enter is the action
+    that does that.
+
+    The symbol clears the same gate the dialog's chips clear before any of
+    that: _typed_shortcut_symbol only says the text COULD be a ticker, and
+    a run started on a typo would fail late at the price fetch and leave
+    the typo in the lookup cache behind it (_start_manual_run caches every
+    symbol a run uses). One cached read, or one price lookup for a name
+    nothing has seen, decides it here instead.
+    """
+    if not n_clicks:
+        raise PreventUpdate
+    symbol = _typed_shortcut_symbol(typed)
+    if symbol is None:
+        raise PreventUpdate
+
+    from layouts.modals import (DEFAULT_RUN_PRESET, estimate_run_seconds,
+                                preset_run_config)
+    from utils.trading_calendar import resolve_target_and_cutoff
+
+    no_feedback = (dash.no_update,) * 4
+
+    def refuse(message):
+        return (dash.no_update, dash.no_update, dash.no_update, True,
+                message) + no_feedback
+
+    accepted, rejected = await asyncio.to_thread(
+        _resolve_run_symbols, [symbol], [])
+    if rejected or not accepted:
+        # The dialog's wording, because it is the dialog this opens on.
+        return refuse(f"No price data for {', '.join(rejected or [symbol])}")
+    symbol = accepted[0]
+
+    try:
+        target_d, cutoff_d = resolve_target_and_cutoff(None)
+    except Exception as e:
+        logger.warning("Analyze now: target date unresolved: %s", e)
+        target_d = cutoff_d = None
+    config = preset_run_config(DEFAULT_RUN_PRESET, target_date=target_d,
+                               prediction_date=cutoff_d)
+    static_estimate_s = estimate_run_seconds(
+        config["scope"], 1, config["models"], config["recs"] != "off",
+        config["tools"])
+    estimate_s = _run_estimate_s(DEFAULT_RUN_PRESET, 1, static_estimate_s)
+    run_data, ack = _start_manual_run([symbol], config, config["scope"],
+                                      DEFAULT_RUN_PRESET, estimate_s,
+                                      cutoff_d, target_d, panel_state)
+    if run_data is None:
+        return refuse(ack)
+    return (run_data, run_data, "", dash.no_update, "") + ack
+
+
 @callback(
     Output("watchlist-strip-chips", "children"),
     Input("selected-symbols", "data"),
@@ -1526,7 +1651,9 @@ def manage_symbols(input_submit, clear_click, add_clicks,
 def render_watchlist_strip(symbols):
     """The always-visible watchlist chips under the toolbar."""
     if not symbols:
-        return html.Span("empty: type a symbol and press Enter",
+        # Two actions on one typed ticker: Enter keeps it, the button that
+        # appears beside the box runs it once.
+        return html.Span("empty: type a symbol; Enter adds it, Analyze runs it",
                          className="wl-strip-empty")
     return [
         html.Span(
@@ -2240,6 +2367,90 @@ def _active_run_refusal():
                    size="sm", outline=True, color="danger",
                    className="ms-2"),
     ]
+
+
+def _run_estimate_s(preset, n_symbols, static_estimate_s):
+    """How long to tell the user this run will take, in seconds.
+
+    estimate_run_seconds prices a run from its parts using constants
+    measured once; this box, these models and these providers have all
+    moved since. Past runs of the same preset and roughly the same symbol
+    count are the better witness, so their median wins whenever enough of
+    them exist (run_service.MIN_DURATION_SAMPLES). One indexed read, taken
+    once, here, as the run row is written: the pill afterwards reads
+    estimate_s off the row, so this can never land on the poll path.
+    """
+    try:
+        from services import run_service
+        measured = run_service.median_duration_s(preset, n_symbols)
+    except Exception as e:
+        logger.warning("Run estimate: past-duration lookup failed: %s", e)
+        measured = None
+    return measured or static_estimate_s
+
+
+def _start_manual_run(symbols, config, scope, preset, estimate_s,
+                      prediction_date, target_date, panel_state, extra=None):
+    """Take the per-owner run lock, record the run, and arm the stages.
+
+    The one path a manual run starts by, whichever surface asked for it:
+    the dialog's confirm, the Analyze-now shortcut in the watchlist strip,
+    and a retry all come through here, so they share the lock, the row,
+    the pending feed and the acknowledgement rather than three near-copies
+    that drift.
+
+    Returns ``(run_data, acknowledgement)``, the dict for run-store and
+    run-dispatch plus the tuple _run_acknowledgement builds; or
+    ``(None, refusal)``, where refusal is the validation line to show, when
+    the run may not start. ``extra`` merges into run_data (a retry marks
+    itself so the report stage skips its persistent cache).
+    """
+    from services import progress_service as prog
+    from services import run_service
+
+    owner_uid = _run_owner_uid()
+    try:
+        refusal = _active_run_refusal()
+    except Exception as e:
+        logger.warning("Run start: could not check for an active run: %s", e)
+        return None, f"Could not check for a run in progress: {str(e)[:120]}"
+    if refusal is not None:
+        return None, refusal
+    try:
+        run_id = run_service.create_run(
+            kind="manual", symbols=symbols, owner_uid=owner_uid,
+            preset=preset, config=config, prediction_date=prediction_date,
+            target_date=target_date,
+            estimate_s=int(round(estimate_s)) if estimate_s else None)
+    except Exception as e:
+        # No row, no run: the stages key everything on the id.
+        logger.error("Run start: run row not created: %s", e)
+        return None, f"Could not record the run: {str(e)[:120]}"
+    # Mark the feed active NOW: the stage that calls start_run is a
+    # separate callback, and the fast tick below must not see an idle
+    # feed and drop straight back to the slow rate.
+    prog.mark_run_pending(run_id)
+    # Every symbol that runs joins the lookup cache, so the typeahead
+    # knows it next time. Never worth failing a run over.
+    try:
+        from services import ticker_service
+        ticker_service.ensure_symbols(symbols)
+    except Exception as e:
+        logger.warning("Run start: symbol cache not updated: %s", e)
+
+    run_data = {
+        "run_id": run_id,
+        "started": datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "preset": preset,
+        "symbols": list(symbols),
+        "owner_uid": owner_uid,
+        "kind": "manual",
+    }
+    if extra:
+        run_data.update(extra)
+    return run_data, _run_acknowledgement(panel_state, symbols, estimate_s,
+                                          scope)
 
 
 def _close_run(run_id, message: str, status: str = "done", error=None) -> None:
@@ -6082,16 +6293,14 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
     the preset alone, so the dialog opens diverging from it with Customize
     unfolded, which is an honest picture of what will run.
 
-    Confirm is the run dispatcher: one run per owner at a time (a second
-    confirm is refused with a Cancel button while one is in flight), then
-    the analysis_runs row is created, with the dialog's every value as its
-    config (the stages read the row, never the dialog, so what ran is what
-    the row says), and its id written to run-store and run-dispatch, which
-    is what starts the stages. The immediate acknowledgement (panel open,
-    toast, fast poll) is _run_acknowledgement, shared with retry. An empty
-    symbol set keeps the dialog open with an inline message instead of
-    silently no-opping, every downstream stage guards on the list being
-    non-empty.
+    Confirm turns the dialog's every value into the run's config (the
+    stages read the row, never the dialog, so what ran is what the row
+    says) and hands it to _start_manual_run, which is the dispatcher
+    proper: the per-owner lock, the analysis_runs row, the armed feed and
+    the acknowledgement, shared with retry and with the watchlist strip's
+    Analyze shortcut. An empty symbol set keeps the dialog open with an
+    inline message instead of silently no-opping, every downstream stage
+    guards on the list being non-empty.
     """
     from layouts.modals import (DEFAULT_RUN_PRESET, RUN_PRESETS,
                                 run_confirm_label)
@@ -6122,17 +6331,6 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         if not symbols:
             return refuse("Add at least one symbol to run.")
         scope = run_scope or "full"
-        from services import progress_service as prog
-        from services import run_service
-
-        owner_uid = _run_owner_uid()
-        try:
-            refusal = _active_run_refusal()
-        except Exception as e:
-            logger.warning("Run dialog: could not check for an active run: %s", e)
-            return refuse(f"Could not check for a run in progress: {str(e)[:120]}")
-        if refusal is not None:
-            return refuse(refusal)
 
         # The dialog's values as the row's config, and the estimate the
         # toast quotes; the same inputs the preflight line reads.
@@ -6141,8 +6339,9 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
         selected_models = [m for m, on in zip(_RUN_MODEL_IDS, model_checks or [])
                            if on]
         recs_on = scope == "full" and (recs or "auto") != "off"
-        estimate_s = estimate_run_seconds(scope, len(symbols), selected_models,
-                                          recs_on, run_tools)
+        static_estimate_s = estimate_run_seconds(scope, len(symbols),
+                                                 selected_models, recs_on,
+                                                 run_tools)
         picked = str(run_date)[:10] if run_date else None
         try:
             target_d, cutoff_d = resolve_target_and_cutoff(picked)
@@ -6165,6 +6364,8 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             "tools": run_tools,
         })
         row_preset = preset_name if not customized else "custom"
+        estimate_s = _run_estimate_s(row_preset, len(symbols),
+                                     static_estimate_s)
         if ens_members is not None:
             ensemble_members = [m for m, on in zip(_RUN_MODEL_IDS, ens_members)
                                 if on]
@@ -6209,40 +6410,13 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             "ensemble_method": ens_method or MODEL.ENSEMBLE_DEFAULT_METHOD,
             "ensemble_min_agree": min_agree_val,
         }
-        try:
-            run_id = run_service.create_run(
-                kind="manual", symbols=symbols, owner_uid=owner_uid,
-                preset=row_preset, config=config,
-                prediction_date=cutoff_d, target_date=target_d,
-                estimate_s=int(round(estimate_s)) if estimate_s else None)
-        except Exception as e:
-            # No row, no run: the stages key everything on the id.
-            logger.error("Run dialog: run row not created: %s", e)
-            return refuse(f"Could not record the run: {str(e)[:120]}")
-        # Mark the feed active NOW: the stage that calls start_run is a
-        # separate callback, and the fast tick below must not see an idle
-        # feed and drop straight back to the slow rate.
-        prog.mark_run_pending(run_id)
-        # Every symbol that runs joins the lookup cache, so the typeahead
-        # knows it next time. Never worth failing a run over.
-        try:
-            from services import ticker_service
-            ticker_service.ensure_symbols(symbols)
-        except Exception as e:
-            logger.warning("Run dialog: symbol cache not updated: %s", e)
-
-        run_data = {
-            "run_id": run_id,
-            "started": datetime.now(timezone.utc).isoformat(),
-            "scope": scope,
-            "preset": row_preset,
-            "symbols": list(symbols),
-            "owner_uid": owner_uid,
-            "kind": "manual",
-        }
+        run_data, ack = _start_manual_run(symbols, config, scope, row_preset,
+                                          estimate_s, cutoff_d, target_d,
+                                          panel_state)
+        if run_data is None:
+            return refuse(ack)
         prefs_out = {"preset": preset_name, "symbols": list(symbols)}
-        return (False, dash.no_update, dash.no_update, "") \
-            + _run_acknowledgement(panel_state, symbols, estimate_s, scope) \
+        return (False, dash.no_update, dash.no_update, "") + ack \
             + no_picker + (run_data, run_data) \
             + (dash.no_update, prefs_out, dash.no_update) + button_ready
 
@@ -6385,20 +6559,19 @@ def retry_run(n_clicks, run_store, panel_state=None):
     The old retry re-ran the report stage under the previous run's id,
     which walked past the per-owner lock and reopened a row that had
     already closed. A retry is a confirm with the previous run's config:
-    it is refused while this owner has a run in flight (the dialog opens
-    to show why, with the Cancel button), otherwise a fresh manual row is
-    created from the previous row's config and handed to the same stores
-    the confirm writes, so the normal dispatch path runs, and the same
-    acknowledgement the confirm gives (panel open, started toast, fast
-    poll) follows. The dict is marked retry_of so the report stage skips
-    its persistent cache.
+    it goes through _start_manual_run like any other manual run, so it is
+    refused while this owner has a run in flight (the dialog opens to show
+    why, with the Cancel button) and otherwise gets a fresh row, the same
+    stores and the same acknowledgement. The dict is marked retry_of so
+    the report stage skips its persistent cache. The previous row's own
+    estimate is reused rather than re-measured: a retry runs the same work
+    the first attempt was quoted for.
     """
     if not n_clicks:
         raise PreventUpdate
     prev_id = (run_store or {}).get("run_id")
     if not prev_id:
         raise PreventUpdate
-    from services import progress_service as prog
     from services import run_service
 
     no_feedback = (dash.no_update,) * 4
@@ -6406,13 +6579,6 @@ def retry_run(n_clicks, run_store, panel_state=None):
     def refuse(message):
         return (dash.no_update, dash.no_update, True, message) + no_feedback
 
-    try:
-        refusal = _active_run_refusal()
-    except Exception as e:
-        logger.warning("Retry: could not check for an active run: %s", e)
-        return refuse(f"Could not check for a run in progress: {str(e)[:120]}")
-    if refusal is not None:
-        return refuse(refusal)
     prev = run_service.get_run(prev_id)
     if prev is None:
         logger.warning("Retry: run %s has no row to retry from", prev_id[:8])
@@ -6421,31 +6587,14 @@ def retry_run(n_clicks, run_store, panel_state=None):
         # run-store can point at a scheduled run after a click on its pill;
         # its config is the scheduler's vocabulary, not the dialog's.
         return refuse("That was a scheduled run. Start yours from Run analysis.")
-    owner_uid = _run_owner_uid()
-    try:
-        run_id = run_service.create_run(
-            kind="manual", symbols=prev["symbols"], owner_uid=owner_uid,
-            preset=prev["preset"], config=prev["config"],
-            prediction_date=prev["prediction_date"],
-            target_date=prev["target_date"], estimate_s=prev["estimate_s"])
-    except Exception as e:
-        logger.error("Retry: run row not created: %s", e)
-        return refuse(f"Could not record the run: {str(e)[:120]}")
-    prog.mark_run_pending(run_id)
     scope = _run_scope_of(prev, run_store)
-    run_data = {
-        "run_id": run_id,
-        "started": datetime.now(timezone.utc).isoformat(),
-        "scope": scope,
-        "preset": prev["preset"],
-        "symbols": list(prev["symbols"]),
-        "owner_uid": owner_uid,
-        "kind": "manual",
-        "retry_of": prev_id,
-    }
-    return (run_data, run_data, dash.no_update, "") \
-        + _run_acknowledgement(panel_state, prev["symbols"],
-                               prev["estimate_s"], scope)
+    run_data, ack = _start_manual_run(
+        prev["symbols"], prev["config"], scope, prev["preset"],
+        prev["estimate_s"], prev["prediction_date"], prev["target_date"],
+        panel_state, extra={"retry_of": prev_id})
+    if run_data is None:
+        return refuse(ack)
+    return (run_data, run_data, dash.no_update, "") + ack
 
 
 @callback(

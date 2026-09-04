@@ -137,6 +137,12 @@ def create_watchlist_strip() -> html.Div:
     Chips use the wl-remove pattern, distinct from the rail rows'
     remove-symbol pattern, because both surfaces are mounted at once on Home
     and duplicate component ids are a hard error.
+
+    Typing a ticker offers two things: Enter adds it to the watchlist, and
+    the Analyze button starts a Standard run on that one name without the
+    dialog. The button is always mounted and hidden until there is a symbol
+    to name, rather than rendered on demand: an id that comes and goes is
+    the one shape Dash callbacks cannot see reliably.
     """
     return html.Div(
         [
@@ -149,6 +155,14 @@ def create_watchlist_strip() -> html.Div:
                 debounce=False,
                 autoComplete="off",
                 className="wl-strip-add",
+            ),
+            dbc.Button(
+                id="wl-analyze-now",
+                size="sm",
+                color="success",
+                outline=True,
+                className="wl-strip-analyze",
+                style={"display": "none"},
             ),
         ],
         className="watchlist-strip",

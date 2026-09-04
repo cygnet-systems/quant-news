@@ -195,12 +195,6 @@ def _active_runs() -> list[str]:
     return [r for r in (runs or []) if r]
 
 
-def is_active(run_id: str | None) -> bool:
-    """Whether the feed lists this run as in flight (a live process is
-    reporting on it, or the confirm dispatcher just armed it)."""
-    return bool(run_id) and run_id in _active_runs()
-
-
 def active_run_ids() -> list[str]:
     """The runs the feed lists as in flight, oldest first. A diskcache
     read, not a query: the panel decides which run to pin from it before

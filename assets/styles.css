@@ -5528,6 +5528,13 @@ body {
     border-color: var(--accent-primary);
 }
 
+/* Shown only while the box holds one recognisable ticker. */
+.wl-strip-analyze {
+    font-size: var(--text-2xs);
+    white-space: nowrap;
+    padding: 2px 8px;
+}
+
 /* --- Home cutoff selector --- */
 .home-cutoff-wrap {
     display: flex;

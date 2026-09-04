@@ -9,6 +9,9 @@ anything a chart could not. What is pinned here is the fix:
 * a symbol with nothing standing out produces NO anomaly sections and a prompt
   that says so and asks for a short report, because padding a quiet name out
   is the failure this replaces;
+* what a run SCREENED is read off the evidence it gathered, not off whether
+  rows came back. A category that returned nothing was still looked at, and a
+  scan that raised is a third state that must not borrow either wording;
 * the investigation cache is keyed on what was asked. A changed question is a
   new search and a repeated one is free, or a changed prompt reads back the
   previous run's answer (the trap this phase exists to close);
@@ -190,13 +193,25 @@ class WebLLM:
 
 
 def scan(monkeypatch, llm, *, web=True, options=None, insiders=None,
-         evidence=("options", "insiders")):
+         congress=None, evidence=("options", "insiders"), present=()):
     model = TradingAgentsModel()
     ledger = EvidenceLedger("NVDA")
+    for block in present:
+        ledger.have(block)
+    # The ledger is what says a category was looked at, so the fixture has to
+    # record the blocks the real builder would have recorded before the scan.
+    if options is not None:
+        ledger.have("options")
     if insiders is not None:
         ledger.have("insiders")
         monkeypatch.setattr("services.insider_service.summarize_insiders",
                             lambda *a, **k: insiders)
+    # congress=[] is the ordinary case and is NOT "no dossier": the block
+    # renders, says nobody filed, and hands back zero rows.
+    if congress is not None:
+        ledger.have("politicians" if "politicians" in evidence else "political")
+        monkeypatch.setattr(av_store, "congress_trades_for",
+                            lambda *a, **k: list(congress))
     with patch("services.llm_service.get_llm", return_value=llm):
         return model._scan_and_research(
             "NVDA", AS_OF, evidence=set(evidence), ledger=ledger, news=None,
@@ -205,7 +220,8 @@ def scan(monkeypatch, llm, *, web=True, options=None, insiders=None,
 
 
 def anomalies_from(*args, **kwargs) -> list:
-    """``scan`` returns (anomalies, screened); most tests want the first."""
+    """``scan`` returns (anomalies, screened, scan_failed); most tests want
+    the first."""
     return scan(*args, **kwargs)[0]
 
 
@@ -222,9 +238,13 @@ class TestTwoThingsStandOut:
         # the cluster is three officers on a 180-day window.
         assert [a["key"] for a in found] == ["options_skew", "insider_cluster"]
         # One search per anomaly, each carrying that anomaly's own question.
+        # Which prompt arrives first is a race (the questions fan out over a
+        # thread pool and each takes a web slot on the way in), so what is
+        # pinned is that every question was searched exactly once.
         assert llm.searches == 2
-        for anomaly, prompt in zip(found, llm.prompts):
-            assert anomaly["question"] in prompt
+        for anomaly in found:
+            carrying = [p for p in llm.prompts if anomaly["question"] in p]
+            assert len(carrying) == 1, anomaly["key"]
         assert all(a["researched"] for a in found)
 
         sections = render_output_sections("NVDA", AS_OF, "XLK", found)
@@ -350,6 +370,42 @@ class TestRunLevelResearchBudget:
             second = research_questions("BBB", AS_OF, ["q3", "q4"], web=True)
 
         assert len(first) == 2 and second == []
+        assert llm.searches == 2
+        assert investigation_service.research_budget_left() == 0
+
+    def test_a_cached_answer_does_not_spend_a_slot(self, monkeypatch):
+        """The ceiling counts SEARCHES. Claiming before the cache lookup let
+        an answer that cost nothing burn a slot, and the question refused
+        afterwards was labelled "capped" and rendered as "this run's research
+        budget went to higher-ranked questions", which had not happened."""
+        investigation_service.begin_research_budget(2)
+        llm = WebLLM()
+        with patch("services.llm_service.get_llm", return_value=llm):
+            research_questions("AAA", AS_OF, ["q1"], web=True)
+            assert investigation_service.research_budget_left() == 1
+            # Same symbol, same date, same question: served from the cache.
+            again = research_questions("AAA", AS_OF, ["q1"], web=True)
+            assert len(again) == 1 and llm.searches == 1
+            assert investigation_service.research_budget_left() == 1
+            # And the slot the cache hit did not take is still there to spend.
+            fresh = research_questions("BBB", AS_OF, ["q2"], web=True)
+
+        assert len(fresh) == 1 and llm.searches == 2
+        assert investigation_service.research_budget_left() == 0
+
+    def test_a_cache_hit_beside_a_new_question_leaves_the_ceiling_for_the_new_one(
+            self, monkeypatch):
+        """One warm question and one cold one, with a single slot left: the
+        cold one must get it rather than be refused by the warm one."""
+        llm = WebLLM()
+        with patch("services.llm_service.get_llm", return_value=llm):
+            investigation_service.begin_research_budget(None)
+            research_questions("AAA", AS_OF, ["warm"], web=True)
+            investigation_service.begin_research_budget(1)
+            answers = research_questions("AAA", AS_OF, ["warm", "cold"],
+                                         web=True)
+
+        assert [a["question"] for a in answers] == ["warm", "cold"]
         assert llm.searches == 2
         assert investigation_service.research_budget_left() == 0
 
@@ -493,7 +549,7 @@ class TestNothingStandsOut:
         balanced = options_service._aggregate(
             [{"type": "put", "volume": 40_000, "open_interest": 0},
              {"type": "call", "volume": 52_000, "open_interest": 0}], AS_OF)
-        found, screened = scan(monkeypatch, llm, options=balanced)
+        found, screened, failed = scan(monkeypatch, llm, options=balanced)
 
         assert found == []
         assert llm.searches == 0
@@ -520,9 +576,9 @@ class TestNothingStandsOut:
             self, monkeypatch):
         """detect() returns [] both for a quiet symbol and for a symbol whose
         blocks were never fetched. Only the first is "nothing stands out"."""
-        found, screened = scan(monkeypatch, WebLLM(), options=None,
-                               evidence=())
-        assert found == [] and screened == []
+        found, screened, failed = scan(monkeypatch, WebLLM(), options=None,
+                                       evidence=())
+        assert found == [] and screened == [] and failed is False
 
         sections = render_output_sections("NVDA", AS_OF, "XLK", found, screened)
         flat = " ".join(sections.split())
@@ -536,6 +592,101 @@ class TestNothingStandsOut:
         not told us a single category was ruled out."""
         flat = " ".join(render_output_sections("NVDA", AS_OF, "XLK", []).split())
         assert "gathered none of the evidence the anomaly scan reads" in flat
+
+    def test_a_screened_category_that_returned_nothing_is_still_screened(
+            self, monkeypatch):
+        """The headline case. Congressional disclosure is sparse, so the
+        common outcome is a dossier that rendered, said nobody filed, and
+        returned zero rows. Reading gathered-ness off those rows told the
+        model the filings "were not looked at" on the same prompt as the
+        block saying they were checked, and no report could ever say that no
+        member of Congress traded the name."""
+        found, screened, failed = scan(
+            monkeypatch, WebLLM(), congress=[],
+            evidence=("politicians",))
+
+        assert found == [] and failed is False
+        assert "congressional filings" in screened
+
+        flat = " ".join(render_output_sections(
+            "NVDA", AS_OF, "XLK", found, screened).split())
+        assert "screened: congressional filings" in flat
+        assert "did NOT screen congressional filings" not in flat
+        # And the categories this run really did skip are still named.
+        assert "the options chain" in flat
+
+    def test_the_political_blocks_congress_half_counts_as_a_screen(
+            self, monkeypatch):
+        """With the dossier off, political_blocks renders the congressional
+        half itself, so those rows ARE in the prompt. Tying the screen to the
+        dossier key alone put "this run did NOT screen congressional filings"
+        beside a block listing them."""
+        found, screened, failed = scan(monkeypatch, WebLLM(), congress=[],
+                                       evidence=("political",))
+        assert "congressional filings" in screened and failed is False
+
+    def test_the_dossier_key_wins_when_both_are_selected(self, monkeypatch):
+        """With both keys on, political_blocks is called with
+        include_congress=False, so a political block that rendered carries
+        13F holders only, and a dossier that failed leaves the congressional
+        filings genuinely unscreened."""
+        found, screened, failed = scan(monkeypatch, WebLLM(), congress=None,
+                                       evidence=("political", "politicians"),
+                                       present=("political",))
+        assert "congressional filings" not in screened
+
+    def test_a_category_the_run_never_fetched_is_not_screened(
+            self, monkeypatch):
+        """The other side of the same contract: politicians was not in the
+        run's evidence, so nothing about congressional filings is known."""
+        found, screened, failed = scan(monkeypatch, WebLLM(), congress=None,
+                                       evidence=("politicians",))
+
+        assert screened == [] and failed is False
+        flat = " ".join(render_output_sections(
+            "NVDA", AS_OF, "XLK", found, screened).split())
+        assert "gathered none of the evidence the anomaly scan reads" in flat
+
+    def test_rows_that_came_back_are_screened_and_researched(self, monkeypatch):
+        """Gathered and found: the same category, with rows in it, still
+        reads as screened and raises its question."""
+        llm = WebLLM()
+        trade = {"symbol": "NVDA", "bioguide_id": "P000001",
+                 "politician": "Rep. A", "party": "D", "chamber": "House",
+                 "state": "CA-11", "type": "PURCHASE", "owner": "self",
+                 "asset_name": "NVIDIA Corp", "transaction_date": "2026-08-20",
+                 "filed_date": "2026-08-30", "amount_min": 15001.0,
+                 "amount_max": 50000.0}
+        found, screened, failed = scan(monkeypatch, llm, congress=[trade],
+                                       evidence=("politicians",))
+
+        assert [a["key"] for a in found] == ["congress_activity"]
+        assert "congressional filings" in screened and failed is False
+        assert llm.searches == 1
+
+    def test_a_scan_that_raised_is_neither_quiet_nor_unscreened(
+            self, monkeypatch):
+        """The third state. A crash AFTER the evidence was gathered knows
+        neither that the symbol is quiet nor that there was nothing to
+        screen, and reusing either wording puts a false account of the run
+        in the report."""
+        def boom(*a, **k):
+            raise RuntimeError("detector blew up")
+
+        monkeypatch.setattr(anomaly_service, "detect", boom)
+        found, screened, failed = scan(monkeypatch, WebLLM(), congress=[],
+                                       evidence=("politicians",))
+
+        assert found == [] and failed is True
+        # What the run HAD gathered is still known and still named.
+        assert "congressional filings" in screened
+
+        flat = " ".join(render_output_sections(
+            "NVDA", AS_OF, "XLK", found, screened, failed).split())
+        assert "The anomaly scan for NVDA failed on this run" in flat
+        assert "congressional filings" in flat
+        assert "Nothing stands out" not in flat
+        assert "gathered none of the evidence" not in flat
 
     def test_the_footer_names_what_was_screened(self, monkeypatch):
         from models.single_agent import _join

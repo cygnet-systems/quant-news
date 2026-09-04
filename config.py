@@ -354,6 +354,18 @@ class ModelConfig:
     # Investigations run concurrently ahead of the model loop; each takes
     # minutes, and the scheduled job has a 75-minute ceiling.
     INVESTIGATION_WORKERS: int = int(os.getenv("INVESTIGATION_WORKERS", "4"))
+    # Box-wide ceiling on open-web calls in flight, across ALL runs AND all
+    # processes: a manual run's model stage is a forked background-callback
+    # subprocess, so a per-process counter bounds nothing between users.
+    # INVESTIGATION_WORKERS bounds one run; ten people running at once (the
+    # concurrency the run flow allows) would open ten times that, plus three
+    # question searches per symbol on top, against one API key. Alpha
+    # Vantage is covered by the cross-process token bucket; the search
+    # providers are not, so this is where that stage is bounded
+    # (rate_limiter.FileSemaphore, one flock per slot under
+    # RATE_LIMIT_STATE_DIR). Below 1 disables the bound.
+    WEB_RESEARCH_CONCURRENCY: int = int(
+        os.getenv("WEB_RESEARCH_CONCURRENCY", "6"))
     # Output budget covers thinking + interim text between searches + the
     # JSON; 6000 truncated the first live run before the JSON was written.
     INVESTIGATION_MAX_TOKENS: int = int(os.getenv("INVESTIGATION_MAX_TOKENS", "20000"))

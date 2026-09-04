@@ -2,14 +2,17 @@
 block formatting, and how the research model wires it in."""
 
 import json
+import time
 from unittest.mock import patch
 
 import pytest
 
+from config import MODEL
 from services import investigation_service as inv_svc
 from services.investigation_service import (
     Investigation, _extract_json, format_investigation_block, investigate,
 )
+from services.rate_limiter import FileSemaphore
 
 
 @pytest.fixture(autouse=True)
@@ -266,7 +269,7 @@ def test_research_model_records_gap_when_investigation_fails():
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df), \
          patch("services.stock_data.get_company_profile", return_value="BHF: insurer"):
-        blocks, inv, _, _ = model._build_extra_context(
+        blocks, inv, _, _, _ = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger,
             tools=["web_research"])
     assert inv is None
@@ -298,7 +301,7 @@ def test_the_dossier_supersedes_the_political_blocks_congress_half():
                return_value=("[BHF: congressional dossier]\nnothing", [])), \
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df):
-        blocks, _, _, _ = model._build_extra_context(
+        blocks, _, _, _, _ = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"political", "politicians"},
             ledger=EvidenceLedger("BHF"))
     assert seen["include_congress"] is False
@@ -337,7 +340,7 @@ def test_a_rendered_block_is_present_evidence_even_with_a_stale_source():
                return_value=(stale, ["insider top-up: unavailable"])), \
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df):
-        blocks, _, _, _ = model._build_extra_context(
+        blocks, _, _, _, _ = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"politicians", "insiders"},
             ledger=ledger)
 
@@ -346,3 +349,166 @@ def test_a_rendered_block_is_present_evidence_even_with_a_stale_source():
     assert {"politicians", "insiders"} <= set(ledger.present)
     assert [g.block for g in ledger.gaps
             if g.block in ("politicians", "insiders")] == []
+
+
+def test_the_political_block_follows_the_same_rule_as_its_siblings():
+    """political_blocks' two halves fail independently, so a 13F block can be
+    written while the congressional fetch raised. Requiring an empty problems
+    list put that rendered block in the prompt AND a gap saying the same
+    evidence was unavailable next to it."""
+    from services.evidence_contract import EvidenceLedger
+    from models.trading_agents_model import TradingAgentsModel
+    import pandas as pd
+
+    idx = pd.bdate_range("2025-09-01", "2026-09-01")
+    df = pd.DataFrame({"Open": 50.0, "High": 51.0, "Low": 49.0, "Close": 50.0,
+                       "Volume": 1_000_000}, index=idx)
+    model = TradingAgentsModel()
+    ledger = EvidenceLedger("BHF")
+    holders = "[BHF: institutional (13F) holder flows]\nTwo holders added."
+
+    with patch("services.political_service.political_blocks",
+               return_value=([holders], ["congressional trades: throttled"])), \
+         patch("utils.events.get_upcoming_events", return_value={}), \
+         patch("services.stock_data.fetch_stock_data", return_value=df):
+        blocks, _, _, _, _ = model._build_extra_context(
+            "BHF", df, "2026-09-01", evidence={"political"}, ledger=ledger)
+
+    assert "Two holders added." in "\n".join(blocks)
+    assert "political" in set(ledger.present)
+    assert [g.block for g in ledger.gaps if g.block == "political"] == []
+
+
+def test_the_political_caveat_rides_in_the_block_text():
+    """Where the model reading the rows can see it, which is the only place
+    a caveat about those rows does any work."""
+    from services import political_service
+
+    with patch.object(political_service, "get_congress_trades",
+                      side_effect=RuntimeError("throttled")), \
+         patch.object(political_service, "get_institutional_holdings",
+                      return_value={"symbol": "BHF"}), \
+         patch.object(political_service, "format_institutional_block",
+                      return_value="[BHF: institutional (13F) holder flows]\nrows"):
+        blocks, problems = political_service.political_blocks("BHF", "2026-09-01")
+
+    assert len(blocks) == 1 and problems
+    assert "Not every source behind this section refreshed" in blocks[0]
+    assert "throttled" in blocks[0]
+
+
+class TestWebResearchSlots:
+    """One box, however many runs and processes: the open-web calls are
+    bounded.
+
+    The Alpha Vantage token bucket does not cover this stage (different
+    vendor, and it paces calls per minute rather than counting the ones in
+    flight), so this semaphore is the only thing standing between ten
+    simultaneous runs and ten prefetch pools' worth of provider connections.
+    It has to be the file-backed one: a manual run's model stage is a forked
+    background-callback subprocess, so a threading.Semaphore here bounds one
+    run's own fan-out and nothing between two people. The bound itself is
+    tested in test_rate_limiter; what is tested here is that these three
+    call sites take it and the triage does not.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_answers(self):
+        inv_svc._ANSWER_CACHE.clear()
+        yield
+        inv_svc._ANSWER_CACHE.clear()
+
+    def _bounded(self, monkeypatch, tmp_path, size=1):
+        monkeypatch.setattr(inv_svc, "_WEB_SLOTS", FileSemaphore(
+            "web_research_test", size, state_dir=tmp_path, poll_s=0.01))
+
+    def test_the_shipped_bound_is_the_cross_process_one(self):
+        assert isinstance(inv_svc._WEB_SLOTS, FileSemaphore)
+        assert inv_svc._WEB_SLOTS.slots == MODEL.WEB_RESEARCH_CONCURRENCY
+
+    def test_web_investigations_do_not_exceed_the_slot_count(self, monkeypatch,
+                                                             tmp_path):
+        import threading
+        self._bounded(monkeypatch, tmp_path, size=1)
+        seen, live = [], []
+        gate = threading.Lock()
+
+        class _Counting(_FakeLLM):
+            def generate_with_web_search(self, prompt, system, **kw):
+                with gate:
+                    live.append(1)
+                    seen.append(len(live))
+                # Long enough that unbounded threads WOULD overlap: without
+                # the semaphore this test sees 4.
+                time.sleep(0.05)
+                try:
+                    return super().generate_with_web_search(prompt, system, **kw)
+                finally:
+                    with gate:
+                        live.pop()
+
+        fake = _Counting(_wrapped(BHF_JSON))
+        with patch("services.llm_service.get_llm", return_value=fake):
+            threads = [threading.Thread(
+                target=investigate, args=(sym, "2026-09-01"),
+                kwargs={"web": True, "target": "2026-09-02"})
+                for sym in ("AAA", "BBB", "CCC", "DDD")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        assert fake.web_calls == 4
+        assert max(seen) == 1
+
+    def test_question_research_shares_the_same_slots(self, monkeypatch,
+                                                     tmp_path):
+        # The three questions a symbol raises fan out concurrently; they are
+        # web searches like any other and queue with the investigations.
+        import threading
+        self._bounded(monkeypatch, tmp_path, size=1)
+        seen, live = [], []
+        gate = threading.Lock()
+
+        def _one(symbol, as_of, question, **kw):
+            with gate:
+                live.append(1)
+                seen.append(len(live))
+            time.sleep(0.05)
+            with gate:
+                live.pop()
+            return {"question": question, "finding": "x", "citations": []}
+
+        monkeypatch.setattr(inv_svc, "_research_one", _one)
+        answers = inv_svc.research_questions(
+            "AAA", "2026-09-01", ["q1", "q2", "q3"], web=True)
+
+        assert len(answers) == 3
+        assert max(seen) == 1
+
+    def test_the_web_free_triage_never_takes_a_slot(self, monkeypatch, tmp_path):
+        # Held by someone else for the whole call: a triage that waited on
+        # a slot it does not need would deadlock a run behind a run.
+        self._bounded(monkeypatch, tmp_path, size=1)
+        inv_svc._WEB_SLOTS.acquire()
+        try:
+            fake = _FakeLLM(_wrapped(BHF_JSON))
+            with patch("services.llm_service.get_llm", return_value=fake):
+                inv = investigate("BHF", "2026-09-01", web=False)
+        finally:
+            inv_svc._WEB_SLOTS.release()
+        assert fake.plain_calls == 1 and inv.web is False
+
+    def test_a_failed_search_gives_its_slot_back(self, monkeypatch, tmp_path):
+        self._bounded(monkeypatch, tmp_path, size=1)
+
+        class _Boom(_FakeLLM):
+            def generate_with_web_search(self, prompt, system, **kw):
+                raise RuntimeError("provider down")
+
+        with patch("services.llm_service.get_llm", return_value=_Boom("")):
+            with pytest.raises(RuntimeError):
+                investigate("AAA", "2026-09-01", web=True)
+        fake = _FakeLLM(_wrapped(BHF_JSON))
+        with patch("services.llm_service.get_llm", return_value=fake):
+            assert investigate("BBB", "2026-09-01", web=True).web is True

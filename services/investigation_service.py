@@ -30,11 +30,13 @@ import json
 import logging
 import re
 import threading
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional
 
 from config import MODEL
+from services.rate_limiter import FileSemaphore
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,38 @@ SITUATIONS = (
 # much as a reading cap: three sourced answers is what a report can carry
 # without the sections turning into a list.
 MAX_RESEARCH_QUESTIONS = 3
+
+# Every open-web call on this BOX passes through _web_slot, whatever run or
+# process it belongs to. INVESTIGATION_WORKERS bounds ONE run's prefetch pool;
+# each symbol can add three concurrent question searches on top; and a manual
+# run does its model stage in a background-callback subprocess of its own
+# (dash's DiskcacheManager forks per invocation), so ten people running at
+# once are ten processes and an in-process semaphore bounded none of them
+# against the others. The file-backed one does: flock, one lock file per
+# slot, released by the kernel if a subprocess is killed holding it. Alpha
+# Vantage is bounded by the token bucket in the same module, which is why
+# nothing here throttles the news fetch: the search providers are the ones
+# with no limiter in front of them. Waiting is unbounded on purpose. A run
+# that stalls on a slot is caught by the run watchdog and the scheduler's
+# kill ceiling, whereas failing a search because the box is busy would print
+# in the report as a question nobody could answer.
+_WEB_SLOTS = FileSemaphore("web_research", MODEL.WEB_RESEARCH_CONCURRENCY)
+
+
+@contextmanager
+def _web_slot():
+    """Hold one of the box's open-web slots for the duration of a call.
+
+    Only the paths that actually search take one: the web-free triage makes
+    no search, and blocking it would queue a call that is about to decide it
+    needs no slot at all.
+    """
+    _WEB_SLOTS.acquire()
+    try:
+        yield
+    finally:
+        _WEB_SLOTS.release()
+
 
 _CACHE: dict[tuple, "Investigation"] = {}
 _CACHE_LOCK = threading.Lock()
@@ -119,6 +153,22 @@ def _claim_budget(wanted: int) -> int:
         take = min(wanted, ledger["left"])
         ledger["left"] -= take
         return take
+
+
+def _release_budget(claimed: int) -> None:
+    """Give back a slot that paid for no search.
+
+    A claim is a claim on a WEB SEARCH, so an answer that came back from the
+    cache has to hand its slot back or the run refuses a later question and
+    tells the report that budget went to a higher-ranked one, which is not
+    what happened. Only ever called with slots this run claimed, so the
+    ceiling cannot grow past what was opened.
+    """
+    ledger = _BUDGET.get()
+    if ledger is None or claimed <= 0:
+        return
+    with _BUDGET_LOCK:
+        ledger["left"] += claimed
 
 
 def _evidence_digest(profile: str, headlines: str, filings: str,
@@ -323,10 +373,11 @@ def investigate(
                     raise RuntimeError(inv.error)
                 return inv
         try:
-            inv = _investigate_uncached(
-                key, symbol, as_of, web=web, target=target, profile=profile,
-                headlines=headlines, filings=filings, quality=quality,
-                last_close=last_close, model=model)
+            with _web_slot() if web else nullcontext():
+                inv = _investigate_uncached(
+                    key, symbol, as_of, web=web, target=target, profile=profile,
+                    headlines=headlines, filings=filings, quality=quality,
+                    last_close=last_close, model=model)
         except Exception as e:
             # A failure is cached too: the prefetch thread and the in-loop
             # call would otherwise both pay for the same failing search.
@@ -527,7 +578,10 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
     Fewer answers than questions is normal and is the caller's signal that a
     question went unasked: the per-symbol cap and the run-level ceiling
     (``begin_research_budget``) both trim the list, and an anomaly with no
-    answer must be rendered as unresearched rather than dropped. The asked
+    answer must be rendered as unresearched rather than dropped. The ceiling
+    counts SEARCHES: a question already answered in this process is served
+    from the cache and claims nothing, so it can never be the reason a later
+    question is refused. The asked
     questions run CONCURRENTLY. They sit on the serial per-symbol model loop,
     so three web searches one after another would add their full latency to
     every symbol of a scheduled run; each one is an independent call and the
@@ -552,44 +606,67 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
                      "off for this run", symbol, len(asked))
         return []
 
-    allowed = _claim_budget(len(asked))
-    if allowed < len(asked):
+    use_model = model or MODEL.INVESTIGATION_MODEL
+    contexts = context_by_question or {}
+    # The context is in the key, not just the question. Two runs can raise the
+    # same sentence off different figures (the quality question names the
+    # failure COUNT, the facts name which checks failed), and serving the
+    # first run's answer for the second would cite reporting about numbers
+    # this run never measured.
+    keys = {q: (symbol.upper(), str(as_of)[:10], q, use_model,
+                _context_digest(contexts.get(q, "")))
+            for q in asked}
+
+    # The cache is read BEFORE the ceiling is claimed. A claim is a claim on a
+    # web search, and an answer already in this process pays for none: the
+    # prefetch pool warms most of them, so claiming for cache hits burned the
+    # run's budget on questions that cost nothing and then refused later ones
+    # as "capped", which the report renders as "this run's research budget
+    # went to higher-ranked questions". Nothing had gone anywhere.
+    with _CACHE_LOCK:
+        free = {q for q in asked if keys[q] in _ANSWER_CACHE}
+    searching = [q for q in asked if q not in free]
+    allowed = _claim_budget(len(searching))
+    if allowed < len(searching):
         logger.info("%s: %d of %d question(s) not researched, this run's "
                     "research budget is spent", symbol,
-                    len(asked) - allowed, len(asked))
-        asked = asked[:allowed]
+                    len(searching) - allowed, len(searching))
+        refused = set(searching[allowed:])
+        asked = [q for q in asked if q not in refused]
+    claimed = {q for q in asked if q not in free}
     if not asked:
         return []
 
     # One shared search budget: the run's ceiling divided over the questions
-    # it is spending it on, never per question on top of it.
-    per_question = max(1, MODEL.INVESTIGATION_MAX_SEARCHES // len(asked))
-    use_model = model or MODEL.INVESTIGATION_MODEL
-    contexts = context_by_question or {}
+    # it is spending it on, never per question on top of it. Cache hits are
+    # not spending it, so they do not shrink the others' share.
+    per_question = max(1, MODEL.INVESTIGATION_MAX_SEARCHES // max(len(claimed), 1))
 
     def _one(question: str) -> dict:
-        # The context is in the key, not just the question. Two runs can
-        # raise the same sentence off different figures (the quality
-        # question names the failure COUNT, the facts name which checks
-        # failed), and serving the first run's answer for the second would
-        # cite reporting about numbers this run never measured.
-        key = (symbol.upper(), str(as_of)[:10], question, use_model,
-               _context_digest(contexts.get(question, "")))
+        key = keys[question]
         with _CACHE_LOCK:
             cached = _ANSWER_CACHE.get(key)
             key_lock = _ANSWER_LOCKS.setdefault(key, threading.Lock())
         if cached is not None:
+            # Filled between the pre-check above and here, by the prefetch
+            # pool or a sibling worker. The slot claimed for it bought no
+            # search and goes back to the run.
+            if question in claimed:
+                _release_budget(1)
             return cached
         with key_lock:
             with _CACHE_LOCK:
                 cached = _ANSWER_CACHE.get(key)
             if cached is not None:
+                if question in claimed:
+                    _release_budget(1)
                 return cached
             try:
-                cached = _research_one(
-                    symbol, str(as_of)[:10], question, target=target,
-                    context=contexts.get(question, ""), model=use_model,
-                    max_searches=per_question)
+                with _web_slot():
+                    cached = _research_one(
+                        symbol, str(as_of)[:10], question, target=target,
+                        context=contexts.get(question, ""), model=use_model,
+                        max_searches=per_question)
             except Exception as e:
                 logger.warning("%s: research failed for %r: %s",
                                symbol, question[:60], e)

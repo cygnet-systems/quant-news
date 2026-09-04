@@ -28,7 +28,7 @@ the cap allows.
 
 import logging
 import math
-from datetime import date
+from datetime import date, timedelta
 
 from services.options_service import MIN_LIQUID_VOLUME
 
@@ -52,11 +52,12 @@ UNRESEARCHED_REASONS = {
 # When nothing stamped a reason. Says only what is certainly true.
 UNRESEARCHED_DEFAULT = "this question was not researched on this run"
 
-# The categories detect() can rule out, and the inputs each one needs. A
-# caller that hands us nothing for a category has NOT ruled it out, and a
-# report that says "no insider cluster" over a block that was never fetched
-# is the absence-asserted-from-nothing failure this module exists to stop.
-# screened() below is the honest list of what a run actually looked at.
+# The categories detect() can rule out, and the inputs each one needs. A run
+# that did not fetch an input has NOT ruled its category out, and a report
+# that says "no insider cluster" over a block that was never fetched is the
+# absence-asserted-from-nothing failure this module exists to stop. screened()
+# below is the honest list of what a run actually looked at, and it is told
+# what was fetched rather than guessing it from whether rows came back.
 # (label, "any"/"all", the detect() keywords it needs). One row per detector
 # family, so the list a run reports is the list of detectors that could fire.
 SCREENS = (
@@ -93,9 +94,50 @@ TERM_SPAN = 0.45
 
 # --- insiders ------------------------------------------------------------
 # One executive selling is a calendar entry: vesting, a window opening, a
-# 10b5-1 tranche. Three separate people moving the same way inside one window
-# is the board acting on the same information.
+# 10b5-1 tranche. Several people moving the same way TOGETHER is the board
+# acting on the same information, and "together" is days or weeks, not the six
+# months the store serves. Four gates say so, and each earns its place against
+# the local insider store read the way the pipeline reads it, through
+# summarize_insiders (CRWD, MU, NVDA, HPE, each at 26 weekly as-of dates = 104
+# symbol-days): counting three one-sided executives anywhere in the 180-day
+# window at any price fired on 87 of those 104, so nearly every symbol claimed
+# a research question and no report was ever short. The four together fire on
+# 16 of 104, and what survives are events (four MU officers selling inside one
+# month in July) rather than calendars.
+#
+#   window   only filings inside CLUSTER_WINDOW_DAYS count toward the cluster
+#            (180d -> 30d alone: 87 -> 30 of 104)
+#   priced   an unpriced row is a grant, a gift or an option exercise, which
+#            the vendor sends at share price 0 and av_store stores with a NULL
+#            value. Three directors taking the same annual award on the same
+#            day is the single most common shape in the store (NVDA 2026-06-25,
+#            CRWD 2026-06-18) and it is a calendar entry, not a decision
+#            (30 -> 18 of 104)
+#   base     the count has to beat what THIS symbol does anyway, measured over
+#            the rest of the caller's window. Three MU officers selling in a
+#            month is MU's normal month (18 -> 16 of 104)
+#   same row the window is read off the PRICED span, so the filing that dates
+#            the cluster is the filing that priced it. Reading recency off all
+#            rows and money off the priced ones let a $9M sale from May be
+#            reported as a disposal inside the last 30 days because an unpriced
+#            grant landed in August. No symbol-day in this store has that shape
+#            (16 -> 16 of 104), which is why it survived the retune above and
+#            why the guard is a test rather than a number
+#
+# With the same window applied to the single-large-disposal branch below, the
+# whole detector fires on 23 of those 104 symbol-days (16 cluster, 7 single
+# disposal) instead of 87, and on none of the 4 symbols in the store as of
+# 2026-09-02.
 MIN_CLUSTER_EXECUTIVES = 3
+CLUSTER_WINDOW_DAYS = 30
+# How many times the symbol's own trailing rate the cluster has to be. Two,
+# because the trailing rate is a small number over a short window and anything
+# tighter reads noise as a signal.
+CLUSTER_BASE_RATE_MULTIPLE = 2.0
+# av_store.INSIDER_WINDOW_DAYS, restated rather than imported: this module
+# touches no database and importing the store for one integer would pull the
+# ORM in behind it. Only used when the caller passes rows with no window.
+DEFAULT_INSIDER_WINDOW_DAYS = 180
 CLUSTER_BASE = 0.45
 CLUSTER_SPAN = 0.4
 CLUSTER_SATURATION = 3
@@ -103,7 +145,10 @@ CLUSTER_SATURATION = 3
 # A single Form 4 disposal this large is not tax withholding at any market cap
 # this platform runs. Zero-price rows never reach the test: av_store leaves
 # value_usd NULL for grants, gifts and option exercises, so a fabricated
-# "$0 sale" cannot clear a dollar floor.
+# "$0 sale" cannot clear a dollar floor. CLUSTER_WINDOW_DAYS bounds this
+# branch too: reading the largest row of the whole 180 days meant a symbol
+# kept a section about a sale five months old for as long as the row stayed
+# in the window (21 of the same 104 symbol-days, down to 7 with the gate).
 LARGE_DISPOSAL_USD = 5_000_000
 DISPOSAL_BASE = 0.4
 DISPOSAL_SPAN = 0.4
@@ -270,17 +315,42 @@ def _insider_people(insiders):
             p = people.setdefault(name, {
                 "executive": name, "title": r.get("title"),
                 "acquired": 0, "disposed": 0,
-                "value_acquired": 0.0, "value_disposed": 0.0})
+                "value_acquired": 0.0, "value_disposed": 0.0,
+                "priced_acquired": 0, "priced_disposed": 0,
+                "first_priced_acquired": None, "latest_priced_acquired": None,
+                "first_priced_disposed": None, "latest_priced_disposed": None})
             side = (r.get("side") or "").upper()
             value = _num(r.get("value_usd")) or 0.0
-            if side == ACQUIRED:
-                p["acquired"] += 1
-                p["value_acquired"] += value
-            elif side == DISPOSED:
-                p["disposed"] += 1
-                p["value_disposed"] += value
+            key = ("acquired" if side == ACQUIRED
+                   else "disposed" if side == DISPOSED else None)
+            if not key:
+                continue
+            p[key] += 1
+            p[f"value_{key}"] += value
+            if value > 0:
+                # Same per-side priced span and count summarize_insiders
+                # keeps, built here so the two input shapes read identically.
+                # PRICED rows only: the window test and the value are then
+                # asked of the same filings, and a person whose only recent
+                # row is an unpriced grant cannot be counted as having
+                # sold or bought inside the cluster window.
+                p[f"priced_{key}"] += 1
+                _span(p, f"priced_{key}", r.get("transaction_date"))
         return list(people.values()), rows
     return [], []
+
+
+def _span(person: dict, side: str, when) -> None:
+    """Widen ``person``'s first/latest dates on ``side`` to include ``when``.
+    ISO strings compare as dates, so no parsing is needed to order them."""
+    when = str(when)[:10] if when else None
+    if not when:
+        return
+    first, latest = person.get(f"first_{side}"), person.get(f"latest_{side}")
+    if first is None or when < first:
+        person[f"first_{side}"] = when
+    if latest is None or when > latest:
+        person[f"latest_{side}"] = when
 
 
 def _one_sided(people, side: str) -> list[dict]:
@@ -439,67 +509,116 @@ def _detect_options_term_divergence(symbol, by_expiry, as_of) -> dict | None:
         "options")
 
 
-def _detect_insider_cluster(symbol, insiders, window_days) -> dict | None:
+def _cluster_group(people, side, cutoff):
+    """(acting together now, active earlier) on ``side``.
+
+    Both lists are drawn from the executives who moved ONE way over the
+    caller's whole window, and both the recency test and the base rate read
+    the PRICED span: a person's priced rows and their recent rows are not
+    necessarily the same rows, and asking the two questions of different
+    filings let a $9M sale from May be reported as a disposal inside the last
+    30 days because an unpriced grant landed in August. A person priced on
+    both sides of ``cutoff`` is in both lists, which is what a rate wants.
+    """
+    group = [p for p in _one_sided(people, side)
+             if int(p.get(f"priced_{side}") or 0) > 0]
+    recent = [p for p in group
+              if (p.get(f"latest_priced_{side}") or "") >= cutoff]
+    earlier = [p for p in group
+               if (p.get(f"first_priced_{side}") or "9999") < cutoff]
+    return recent, earlier
+
+
+def _detect_insider_cluster(symbol, insiders, window_days, as_of) -> dict | None:
     people, rows = _insider_people(insiders)
     if not people:
         return None
 
-    window = f"the last {window_days} days" if window_days else "the window"
-    sellers = _one_sided(people, "disposed")
-    buyers = _one_sided(people, "acquired")
-    for group, verb, noun in ((sellers, "disposed", "disposals"),
-                              (buyers, "acquired", "acquisitions")):
-        if len(group) < MIN_CLUSTER_EXECUTIVES:
+    ref = _as_of_date(as_of)
+    if ref is None:
+        # Both branches below are bounded by the cluster window, and an
+        # unreadable as-of gives no window to bound them with. Reading the
+        # whole six months instead is the flat count this was retuned away
+        # from, so the honest answer is that nothing was detected.
+        return None
+    window_days = int(window_days or DEFAULT_INSIDER_WINDOW_DAYS)
+    window = f"the last {window_days} days"
+    cutoff = (ref - timedelta(days=CLUSTER_WINDOW_DAYS)).isoformat()
+    # The rest of the caller's window is the base rate; a caller whose window
+    # is no longer than the cluster window has no earlier period to compare to.
+    base_days = max(window_days - CLUSTER_WINDOW_DAYS, 0)
+    for side, noun in (("disposed", "disposals"), ("acquired", "acquisitions")):
+        cluster, earlier = _cluster_group(people, side, cutoff)
+        if len(cluster) < MIN_CLUSTER_EXECUTIVES:
             continue
-        shown = group[:MIN_CLUSTER_EXECUTIVES + 1]
+        rate = len(earlier) * CLUSTER_WINDOW_DAYS / base_days if base_days else 0.0
+        if len(cluster) < CLUSTER_BASE_RATE_MULTIPLE * rate:
+            continue
+        shown = cluster[:MIN_CLUSTER_EXECUTIVES + 1]
         named = ", ".join(
             f"{p.get('executive')}"
             + (f" ({p['title']})" if p.get("title") else "")
             for p in shown)
-        if len(group) > len(shown):
-            named += f", and {len(group) - len(shown)} more"
-        value = sum(_num(p.get(f"value_{verb}")) or 0.0 for p in group)
+        if len(cluster) > len(shown):
+            named += f", and {len(cluster) - len(shown)} more"
+        value = sum(_num(p.get(f"value_{side}")) or 0.0 for p in cluster)
+        filings = sum(int(p.get(f"priced_{side}") or 0) for p in cluster)
         facts = [
-            f"{len(group)} distinct executives filed only {noun} in {window}, "
-            f"and none of them transacted the other way",
+            f"{len(cluster)} distinct executives filed priced {noun} inside the "
+            f"last {CLUSTER_WINDOW_DAYS} days, and none of them transacted the "
+            f"other way anywhere in {window}",
             f"they are {named}",
-            f"{sum(int(p.get(verb) or 0) for p in group)} filings in total",
+            (f"over the {base_days} days before that, this symbol averaged "
+             f"{rate:.1f} such executives per {CLUSTER_WINDOW_DAYS} days, so "
+             f"this is {len(cluster) / rate:.1f}x its own recent rate"
+             if rate else
+             f"no executive filed one-sided priced {noun} at all over the "
+             f"{base_days} days before that"),
+            f"{filings} priced filings from them across {window}, worth "
+            f"{_usd(value)}; grants, gifts and option exercises are priced at "
+            f"zero by the vendor and are excluded from this count, from the "
+            f"total beside it and from the executives named above",
         ]
-        if value:
-            facts.append(f"{_usd(value)} across the rows carrying a real share "
-                         f"price; grants, gifts and option exercises are priced "
-                         f"at zero by the vendor and are excluded")
-        if verb == "acquired":
-            facts.append("an acquisition is not necessarily an open-market "
-                         "purchase: vesting awards file the same way")
-        ratio = (len(group) - MIN_CLUSTER_EXECUTIVES) / CLUSTER_SATURATION
+        if side == "acquired":
+            facts.append("a priced acquisition is an open-market purchase or "
+                         "an exercise settled in cash, not a vesting award: "
+                         "awards come through unpriced and are not counted")
+        ratio = (len(cluster) - MIN_CLUSTER_EXECUTIVES) / CLUSTER_SATURATION
         return _anomaly(
             "insider_cluster",
-            f"{len(group)} insiders {verb} in the same window",
+            f"{len(cluster)} insiders {side} within {CLUSTER_WINDOW_DAYS} days",
             _severity(CLUSTER_BASE, CLUSTER_SPAN, ratio),
             facts,
-            f"What are the {len(group)} {symbol} executives who all {verb} "
-            f"within {window} acting on, and do their filings give a reason?",
+            f"What are the {len(cluster)} {symbol} executives who all {side} "
+            f"within {CLUSTER_WINDOW_DAYS} days of {str(as_of)[:10]} acting "
+            f"on, and do their filings give a reason?",
             "insiders")
 
     # No cluster: a single disposal can still be the whole story if it is big
-    # enough. Candidates come from the rows when the caller passed them, and
-    # from any executive with exactly one disposal (whose window total IS that
-    # one row) when the caller passed a summary.
+    # enough and RECENT. Candidates come from the rows when the caller passed
+    # them, and from any executive with exactly one disposal (whose window
+    # total IS that one row) when the caller passed a summary. The same
+    # cluster window bounds both: an $8M sale five months ago is a fact about
+    # the window, not something that stands out today, and before this gate it
+    # was the largest such row in the whole 180 days that decided the section.
     candidates = []
     for r in rows:
         if (r.get("side") or "").upper() != DISPOSED:
             continue
+        when = str(r.get("transaction_date") or "")[:10]
         value = _num(r.get("value_usd"))
-        if value:
+        if value and when >= cutoff:
             candidates.append((value, r.get("executive") or "an executive",
-                               r.get("title"), r.get("transaction_date")))
+                               r.get("title"), when))
     for p in people:
-        if int(p.get("disposed") or 0) == 1:
+        # The priced span, for the same reason the cluster reads it: the one
+        # disposal this branch prices has to BE the row inside the window.
+        when = str(p.get("latest_priced_disposed") or "")[:10]
+        if int(p.get("disposed") or 0) == 1 and when >= cutoff:
             value = _num(p.get("value_disposed"))
             if value:
                 candidates.append((value, p.get("executive") or "an executive",
-                                   p.get("title"), None))
+                                   p.get("title"), when or None))
     if not candidates:
         return None
     value, who, title, when = max(candidates, key=lambda c: c[0])
@@ -735,7 +854,7 @@ def detect(symbol, as_of, *, options=None, by_expiry=None, insiders=None,
     found = [a for a in (
         _detect_options_skew(symbol, options),
         _detect_options_term_divergence(symbol, by_expiry, as_of),
-        _detect_insider_cluster(symbol, insiders, window_days),
+        _detect_insider_cluster(symbol, insiders, window_days, as_of),
         _detect_congress_activity(symbol, congress, dossier, trend),
         _detect_quality_failures(symbol, quality),
         _detect_news_spike(symbol, news),
@@ -757,41 +876,38 @@ def detect(symbol, as_of, *, options=None, by_expiry=None, insiders=None,
     return kept
 
 
-def screened(*, options=None, by_expiry=None, insiders=None, congress=None,
-             dossier=None, quality=None, news=None, ohlcv=None) -> list[str]:
-    """The categories ``detect`` could actually rule out from these inputs.
+def screened(gathered: "dict | None" = None, *, ohlcv=None) -> list[str]:
+    """The categories ``detect`` could actually rule out on this run.
 
-    Same keywords as ``detect`` on purpose: the caller builds one dict of
-    inputs and hands it to both, so the two can never disagree about what a
-    run looked at. ``detect`` returning [] means "nothing stood out in THESE
-    categories", and only this list says which they were. Without it the
-    empty list reads as "nothing stands out anywhere", which is a claim about
-    evidence the run may never have fetched.
+    ``gathered`` maps ``detect``'s input keywords ("options", "by_expiry",
+    "insiders", "congress", "quality", "news") to whether the run FETCHED
+    that input. Fetched, not non-empty: the two are different questions and
+    reading the second as the first is how this went wrong. Congressional
+    disclosure is sparse by design — most symbols go a whole window with
+    none — so the common case is a dossier block that rendered, said no
+    member of Congress traded the name, and handed back zero rows. Inferring
+    gathered-ness from the truthiness of those rows put "this run did NOT
+    screen congressional filings, they were not looked at" in the same
+    prompt as the block stating they were checked and none were found, and
+    made the report unable to ever say that nobody in Congress traded it.
 
-    ``dossier`` is accepted and ignored: it decorates congressional names and
-    screens nothing of its own.
+    ``detect`` returning [] means "nothing stood out in THESE categories",
+    and only this list says which they were. Without it the empty list reads
+    as "nothing stands out anywhere", which is a claim about evidence the run
+    may never have fetched.
+
+    "trend" is not a fetch and is not the caller's to declare: a frame with
+    three bars in it was gathered but still cannot carry a trend, so it is
+    derived from ``ohlcv`` here and the cross-source screen counts it absent.
     """
-    # A frame with three bars in it was fetched but cannot carry a trend, so
-    # the cross-source screen counts it as absent rather than as looked-at.
-    have = {"options": options, "by_expiry": by_expiry, "insiders": insiders,
-            "congress": congress, "quality": quality, "news": news,
-            "trend": price_trend(ohlcv)}
+    have = {k: bool(v) for k, v in (gathered or {}).items()}
+    have["trend"] = bool(price_trend(ohlcv))
     out = []
     for label, mode, needs in SCREENS:
-        got = (_present(have.get(k)) for k in needs)
+        got = [have.get(k, False) for k in needs]
         if (all(got) if mode == "all" else any(got)):
             out.append(label)
     return out
-
-
-def _present(value) -> bool:
-    """Whether a block was gathered. Not a DataFrame path: every input this
-    is asked about is a dict or a list, and ``bool(df)`` raises."""
-    if value is None:
-        return False
-    if isinstance(value, (dict, list, tuple, set, str)):
-        return bool(value)
-    return True
 
 
 def format_anomaly_block(symbol: str, anomaly: dict,

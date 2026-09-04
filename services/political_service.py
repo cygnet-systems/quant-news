@@ -266,6 +266,13 @@ def political_blocks(symbol: str, as_of: str,
     ``include_congress`` is False when the run also carries the congressional
     dossier: it reads the same stored rows over the same window and names the
     members, so this block would only repeat it.
+
+    A non-empty ``problems`` alongside a non-empty ``blocks`` means one
+    sub-block failed and the other was written, not that the evidence is
+    missing: the caveat is appended to the rendered text, where the model
+    reading the rows sees it, and the caller records the block as present.
+    Recording it as a gap instead put a rendered block in the prompt and a
+    "this was not available" line about the same block beside it.
     """
     blocks: list[str] = []
     problems: list[str] = []
@@ -282,4 +289,9 @@ def political_blocks(symbol: str, as_of: str,
             blocks.append(block)
     except Exception as e:
         problems.append(f"institutional holdings: {str(e)[:120]}")
-    return [b for b in blocks if b], problems
+    blocks = [b for b in blocks if b]
+    if blocks and problems:
+        blocks[-1] += ("\nNot every source behind this section refreshed on "
+                       f"this run ({'; '.join(problems)}); what is above is "
+                       f"what could be read.")
+    return blocks, problems

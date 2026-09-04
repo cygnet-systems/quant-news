@@ -68,6 +68,24 @@ def _person(name: str, title: str | None) -> str:
     return f"{name} ({title})" if title else name
 
 
+def _span(person: dict, side: str, when) -> None:
+    """Widen ``person``'s first/latest PRICED transaction dates on ``side``.
+    ISO strings order as dates, so nothing is parsed to compare them.
+
+    Priced rows only, because the only reader (the insider-cluster detector)
+    asks "did these people act together" of the same filings it then values.
+    An unpriced grant in August next to a priced sale in May is not a sale in
+    August, and a span over both said it was."""
+    when = str(when)[:10] if when else None
+    if not when:
+        return
+    first, latest = person[f"first_{side}"], person[f"latest_{side}"]
+    if first is None or when < first:
+        person[f"first_{side}"] = when
+    if latest is None or when > latest:
+        person[f"latest_{side}"] = when
+
+
 def summarize_insiders(symbol: str, as_of, days: int = WINDOW_DAYS) -> dict:
     """Aggregate the visible Form 4 lines for ``symbol`` as of ``as_of``.
 
@@ -91,6 +109,13 @@ def summarize_insiders(symbol: str, as_of, days: int = WINDOW_DAYS) -> dict:
             "disposed": 0, "shares_acquired": 0.0, "shares_disposed": 0.0,
             "value_acquired": 0.0, "value_disposed": 0.0, "unpriced": 0,
             "latest": r["transaction_date"],
+            # Per side and priced-only, because a reader of this dict asking
+            # "did these people act together" has to be able to bound the
+            # answer to a few weeks: the aggregate above spans the whole
+            # window and cannot tell a cluster from a calendar.
+            "priced_acquired": 0, "priced_disposed": 0,
+            "first_priced_acquired": None, "latest_priced_acquired": None,
+            "first_priced_disposed": None, "latest_priced_disposed": None,
         })
         if p["title"] is None:
             p["title"] = r["title"]
@@ -105,21 +130,28 @@ def summarize_insiders(symbol: str, as_of, days: int = WINDOW_DAYS) -> dict:
             totals["unpriced"] += 1
         else:
             totals["priced"] += 1
+        # A row the vendor sent at share price 0 buys nothing nameable, so it
+        # counts toward neither the money nor the dates.
+        priced = value is not None and float(value) > 0
         if side == ACQUIRED:
             p["acquired"] += 1
             p["shares_acquired"] += shares
             totals["acquired"] += 1
             totals["shares_acquired"] += shares
-            if value is not None:
+            if priced:
                 p["value_acquired"] += float(value)
+                p["priced_acquired"] += 1
+                _span(p, "priced_acquired", r["transaction_date"])
                 totals["value_acquired"] += float(value)
         elif side == DISPOSED:
             p["disposed"] += 1
             p["shares_disposed"] += shares
             totals["disposed"] += 1
             totals["shares_disposed"] += shares
-            if value is not None:
+            if priced:
                 p["value_disposed"] += float(value)
+                p["priced_disposed"] += 1
+                _span(p, "priced_disposed", r["transaction_date"])
                 totals["value_disposed"] += float(value)
         else:
             totals["other"] += 1

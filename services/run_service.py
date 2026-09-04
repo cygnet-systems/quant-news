@@ -21,7 +21,8 @@ world, never from inside scheduler_service.run_job's finalize block.
 
 import logging
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from statistics import median
 
 from sqlalchemy import func, select, update
 
@@ -329,6 +330,81 @@ def runs_generation(kind: str | None = None) -> str:
             q = q.where(AnalysisRun.kind == kind)
         n, started, finished = session.execute(q).one()
     return f"{n or 0}:{started or '-'}:{finished or '-'}"
+
+
+# What a run's duration is compared against. Bands rather than exact symbol
+# counts: two symbols and three take about the same time, and demanding an
+# exact match would leave every uncommon count on the static estimate for
+# ever. The bands are (low, high) inclusive, high None meaning open-ended.
+DURATION_BANDS = ((1, 1), (2, 3), (4, 10), (11, None))
+# Below this many past runs the median is a rumour, not a measurement, and
+# the caller keeps its static estimate.
+MIN_DURATION_SAMPLES = 5
+# Only recent history: models, providers and the box all change, and a
+# median over a year of runs would quote the slowest thing this app ever was.
+DURATION_HISTORY_DAYS = 60
+DURATION_HISTORY_LIMIT = 200
+
+
+def symbol_band(n_symbols: int) -> tuple[int, int | None]:
+    """The band a symbol count falls in; the last band catches everything
+    above it, so every count has exactly one."""
+    n = max(1, int(n_symbols or 0))
+    for low, high in DURATION_BANDS:
+        if n >= low and (high is None or n <= high):
+            return (low, high)
+    return DURATION_BANDS[-1]
+
+
+def _in_band(csv: str, band: tuple[int, int | None]) -> bool:
+    n = len([s for s in (csv or "").split(",") if s])
+    low, high = band
+    return n >= low and (high is None or n <= high)
+
+
+def median_duration_s(preset: str | None, n_symbols: int,
+                      kind: str = "manual",
+                      min_samples: int = MIN_DURATION_SAMPLES) -> float | None:
+    """Median wall-clock of past DONE runs of this preset and symbol band.
+
+    The honest answer to "how long will this take": what runs like this one
+    actually took, rather than what a table of per-stage constants predicts.
+    None when there is not enough history (fewer than ``min_samples``
+    comparable runs), which the caller reads as "keep the static estimate".
+
+    One query, bounded twice over: the started_at index range-scans the last
+    DURATION_HISTORY_DAYS and the row cap holds the read to a page. Meant to
+    be called once per run, as its row is written, never on a poll.
+    """
+    from db.models import AnalysisRun
+
+    band = symbol_band(n_symbols)
+    since = _now() - timedelta(days=DURATION_HISTORY_DAYS)
+    with get_session() as session:
+        q = (select(AnalysisRun.symbols_csv, AnalysisRun.started_at,
+                    AnalysisRun.finished_at)
+             .where(AnalysisRun.status == "done",
+                    AnalysisRun.kind == kind,
+                    AnalysisRun.finished_at.is_not(None),
+                    AnalysisRun.started_at >= since))
+        q = q.where(AnalysisRun.preset.is_(None) if preset is None
+                    else AnalysisRun.preset == preset)
+        rows = session.execute(
+            q.order_by(AnalysisRun.started_at.desc())
+            .limit(DURATION_HISTORY_LIMIT)).all()
+
+    durations = []
+    for csv, started, finished in rows:
+        if started is None or finished is None or not _in_band(csv, band):
+            continue
+        seconds = (finished - started).total_seconds()
+        # A run whose clock ran backwards (a row edited by hand, a machine
+        # whose time moved) is not evidence of anything.
+        if seconds > 0:
+            durations.append(seconds)
+    if len(durations) < max(1, int(min_samples)):
+        return None
+    return float(median(durations))
 
 
 def cancel_run(run_id: str) -> dict | None:

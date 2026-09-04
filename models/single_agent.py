@@ -424,9 +424,23 @@ out for this symbol, and you must not write that nothing does. Say in section
 and write only what the price and fundamentals blocks actually support."""
 
 
+# The scan raised over evidence the run HAD. Neither of the two notes above
+# is true then: the symbol is not known to be quiet and the run is not known
+# to have screened nothing, and either wording would put a false account of
+# the run in the report.
+SCAN_FAILED_NOTE = """The anomaly scan for {ticker} failed on this run. The
+evidence it reads was gathered ({checked}) and the blocks are below, but the
+scan over it raised before it produced anything, so NOTHING IS KNOWN about
+whether something stands out for this symbol. Do not write that nothing does.
+Say in section 1 that the scan failed and that this report is therefore the
+fixed frame over the blocks below, keep every section to its minimum, and
+write only what those blocks support."""
+
+
 def render_output_sections(ticker: str, date: str, sector_etf: str,
                            anomalies: Optional[list] = None,
-                           screened: Optional[list] = None) -> str:
+                           screened: Optional[list] = None,
+                           scan_failed: bool = False) -> str:
     """The numbered output-format list for one report.
 
     ``anomalies`` is ``services.anomaly_service.detect``'s output for this
@@ -442,6 +456,11 @@ def render_output_sections(ticker: str, date: str, sector_etf: str,
     statement from an empty list over none, and only the caller knows which
     happened. Omitting it (a caller with no scan at all) produces the
     nothing-was-screened wording, never a blanket "nothing stands out".
+
+    ``scan_failed`` is the third of those states: the run gathered evidence
+    and the scan over it raised. That is neither a quiet symbol nor a run
+    with nothing to screen, and it gets its own wording so a crash is never
+    reported to the model as an absence of findings.
     """
     fmt = {"ticker": ticker, "date": date, "sector_etf": sector_etf}
     fixed = [s.format(**fmt) for s in FIXED_SECTIONS]
@@ -458,16 +477,22 @@ def render_output_sections(ticker: str, date: str, sector_etf: str,
     items += fixed[ANOMALY_INSERT_AFTER:]
 
     out = [f"{i}. {body}" for i, body in enumerate(items, 1)]
-    head = "" if found else _quiet_note(ticker, screened) + "\n\n"
+    head = "" if found else _quiet_note(ticker, screened, scan_failed) + "\n\n"
     return head + intro + "\n".join(out)
 
 
-def _quiet_note(ticker: str, screened: Optional[list]) -> str:
+def _quiet_note(ticker: str, screened: Optional[list],
+                scan_failed: bool = False) -> str:
     """The header for a report with no anomaly sections, worded over the
     categories that were really screened and naming the rest as unchecked."""
     from services.anomaly_service import SCREENS
 
     checked = [str(s) for s in (screened or []) if str(s or "").strip()]
+    if scan_failed:
+        return SCAN_FAILED_NOTE.format(
+            ticker=ticker,
+            checked=(_join(checked) if checked else
+                     "none of the categories the scan reads"))
     if not checked:
         return NO_SCREEN_NOTE.format(ticker=ticker)
     missed = [label for label, _, _ in SCREENS if label not in checked]
@@ -1215,6 +1240,7 @@ class SingleAgentResearch:
         situation: Optional[str] = None,
         anomalies: Optional[list] = None,
         screened: Optional[list] = None,
+        scan_failed: bool = False,
     ) -> dict[str, Any]:
         """Run the analysis for `symbol` as of `as_of` (YYYY-MM-DD).
 
@@ -1235,6 +1261,9 @@ class SingleAgentResearch:
         researched by the caller) shapes the output format: one section per
         anomaly, numbered into the fixed frame. An empty list tells the
         report to be short instead of padding the same headings out.
+        `screened` names the categories the scan ruled out and `scan_failed`
+        says the scan raised instead of finishing: the three of them are what
+        keep the no-anomaly wording true to what actually happened.
         """
         from services.stock_data import fetch_stock_data
 
@@ -1402,7 +1431,7 @@ class SingleAgentResearch:
             # anomaly titles that came from data, and format() must not walk
             # into a brace inside one of them.
             output_sections=render_output_sections(
-                symbol, as_of, sector_etf, anomalies, screened),
+                symbol, as_of, sector_etf, anomalies, screened, scan_failed),
         ) + EPILOGUE_INSTRUCTIONS % {
             "thesis": THESIS_EPILOGUE_SCHEMA if include_thesis else "",
         }
@@ -1532,8 +1561,10 @@ class SingleAgentResearch:
             "anomalies_researched": sum(1 for a in (anomalies or [])
                                         if a.get("researched")),
             # What the scan could rule out. Without it a reader cannot tell
-            # a quiet symbol from a run that fetched nothing to screen.
+            # a quiet symbol from a run that fetched nothing to screen, and
+            # without the flag neither of those from a scan that raised.
             "anomalies_screened": list(screened or []),
+            "anomaly_scan_failed": bool(scan_failed),
             "evidence": ledger.to_dict(),
         }
         news_desc = (
@@ -1563,6 +1594,7 @@ class SingleAgentResearch:
             + (f"; {len(anomalies)} anomaly section(s), "
                f"{provenance['anomalies_researched']} web-researched"
                if anomalies else
+               "; the anomaly scan failed on this run" if scan_failed else
                f"; nothing anomalous in {_join(list(screened))}"
                if screened else
                "; no evidence available to screen for anomalies")

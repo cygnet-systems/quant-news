@@ -374,3 +374,72 @@ class TestOrphans:
         run_id = rs.create_run("manual", ["NVDA"], "u1")
         _age(run_id, 601)
         assert rs.reap_orphans(live=[]) and rs.get_run(run_id)["status"] == "failed"
+
+
+def _completed(preset, symbols, seconds, kind="manual", days_ago=0,
+               status="done"):
+    """A finished run of a known duration, for the median estimate."""
+    run_id = rs.create_run(kind, symbols, "u1", preset=preset, config={})
+    rs.set_status(run_id, status)
+    with rs.get_session() as session:
+        row = session.get(AnalysisRun, run_id)
+        row.started_at = rs._now() - timedelta(days=days_ago)
+        row.finished_at = row.started_at + timedelta(seconds=seconds)
+    return run_id
+
+
+class TestMedianDuration:
+    """What a run of this shape actually took, for the pill's ETA. The
+    static estimator prices a run from constants; this reads the record."""
+
+    def test_median_of_comparable_runs(self, db):
+        for secs in (100, 120, 140, 160, 900):
+            _completed("standard", ["NVDA", "AMD"], secs)
+        assert rs.median_duration_s("standard", 2) == 140.0
+        # Same band, not the same count: two and three are one band.
+        assert rs.median_duration_s("standard", 3) == 140.0
+
+    def test_too_few_samples_keeps_the_static_estimate(self, db):
+        for secs in (100, 120, 140, 160):
+            _completed("standard", ["NVDA", "AMD"], secs)
+        assert rs.median_duration_s("standard", 2) is None
+        _completed("standard", ["NVDA", "AMD"], 180)
+        assert rs.median_duration_s("standard", 2) == 140.0
+
+    def test_only_this_preset_this_band_this_kind_and_done(self, db):
+        for secs in (100, 120, 140, 160, 180):
+            _completed("standard", ["NVDA", "AMD"], secs)
+        for secs in (1, 2, 3, 4, 5):
+            _completed("deep", ["NVDA", "AMD"], secs)
+            _completed("standard", ["NVDA"], secs)
+            _completed("standard", list("ABCDEFGHIJKL"), secs)
+            _completed("standard", ["NVDA", "AMD"], secs, kind="scheduled")
+            _completed("standard", ["NVDA", "AMD"], secs, status="failed")
+
+        assert rs.median_duration_s("standard", 2) == 140.0
+        assert rs.median_duration_s("deep", 2) == 3.0
+        assert rs.median_duration_s("standard", 1) == 3.0
+        assert rs.median_duration_s("standard", 12) == 3.0
+        assert rs.median_duration_s("standard", 2, kind="scheduled") == 3.0
+
+    def test_history_older_than_the_window_is_not_evidence(self, db):
+        for secs in (100, 120, 140, 160, 180):
+            _completed("standard", ["NVDA", "AMD"], secs,
+                       days_ago=rs.DURATION_HISTORY_DAYS + 1)
+        assert rs.median_duration_s("standard", 2) is None
+
+    def test_a_row_whose_clock_ran_backwards_is_ignored(self, db):
+        for secs in (100, 120, 140, 160, 180):
+            _completed("standard", ["NVDA", "AMD"], secs)
+        for secs in (-10, -20, 0):
+            _completed("standard", ["NVDA", "AMD"], secs)
+        assert rs.median_duration_s("standard", 2) == 140.0
+
+    def test_every_symbol_count_lands_in_exactly_one_band(self, db):
+        for n in range(1, 40):
+            low, high = rs.symbol_band(n)
+            assert (low, high) in rs.DURATION_BANDS
+            assert n >= low and (high is None or n <= high)
+        # A count of zero is nonsense the caller should never pass; it is
+        # read as one symbol rather than matching nothing.
+        assert rs.symbol_band(0) == rs.DURATION_BANDS[0]

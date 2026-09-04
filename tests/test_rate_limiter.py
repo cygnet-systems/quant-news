@@ -9,14 +9,23 @@ happening.
 The cross-process case is the one worth pinning: the web app and the scheduler
 subprocess are separate processes, so a module-level bucket would let each use
 the full quota and together double it.
+
+FileSemaphore is the same problem counted in concurrent calls rather than
+calls per minute, and it exists for the same reason: a manual run's model
+stage is a forked background-callback subprocess, so a threading.Semaphore in
+the web process bounded one run's own fan-out and nothing at all between two
+people running at once. The tests that matter are therefore the two the file
+buys — a second PROCESS waits, and a holder that dies frees its slot.
 """
 
 import multiprocessing as mp
+import os
+import signal
 import time
 
 import pytest
 
-from services.rate_limiter import RateLimitTimeout, TokenBucket
+from services.rate_limiter import FileSemaphore, RateLimitTimeout, TokenBucket
 
 
 @pytest.fixture
@@ -31,6 +40,77 @@ def _burst(state_dir, n, window, limit, q):
     for _ in range(n):
         b.acquire(timeout=30)
     q.put(time.time() - start)
+
+
+def _hold(state_dir, seconds, q):
+    """Run in a child process: take the one slot and keep it."""
+    sem = FileSemaphore("shared", 1, state_dir=state_dir, poll_s=0.02)
+    sem.acquire()
+    q.put(os.getpid())
+    time.sleep(seconds)
+    sem.release()
+
+
+class TestFileSemaphore:
+    def test_a_second_process_waits_for_the_slot(self, bucket_dir):
+        q = mp.Queue()
+        child = mp.Process(target=_hold, args=(bucket_dir, 1.0, q))
+        child.start()
+        assert q.get(timeout=30)                     # the child holds it now
+
+        sem = FileSemaphore("shared", 1, state_dir=bucket_dir, poll_s=0.02)
+        start = time.time()
+        sem.acquire()
+        waited = time.time() - start
+        sem.release()
+        child.join(timeout=30)
+        assert waited > 0.4, (
+            f"acquired in {waited:.2f}s - the slot is not shared across "
+            f"processes")
+
+    def test_a_killed_holder_frees_its_slot(self, bucket_dir):
+        """The reason this is flock and not a pid file: the scheduler kills a
+        run that overruns, and a slot stranded by that would shrink the
+        ceiling for every later run until the box restarted."""
+        q = mp.Queue()
+        child = mp.Process(target=_hold, args=(bucket_dir, 60.0, q))
+        child.start()
+        pid = q.get(timeout=30)
+        os.kill(pid, signal.SIGKILL)
+        child.join(timeout=30)
+
+        sem = FileSemaphore("shared", 1, state_dir=bucket_dir, poll_s=0.02)
+        start = time.time()
+        sem.acquire()
+        assert time.time() - start < 1.0
+        sem.release()
+
+    def test_holders_up_to_the_count_do_not_wait(self, bucket_dir):
+        sem = FileSemaphore("t", 3, state_dir=bucket_dir, poll_s=0.02)
+        start = time.time()
+        for _ in range(3):
+            sem.acquire()
+        assert time.time() - start < 0.5
+        for _ in range(3):
+            sem.release()
+
+    def test_zero_slots_disables_the_bound(self, bucket_dir):
+        """The escape hatch, and the shape a missing state directory falls
+        back to: unbounded searching is a cost problem, a crashed run is a
+        correctness one."""
+        sem = FileSemaphore("off", 0, state_dir=bucket_dir)
+        start = time.time()
+        for _ in range(50):
+            sem.acquire()
+        assert time.time() - start < 0.5
+        for _ in range(50):
+            sem.release()
+        assert not bucket_dir.exists()
+
+    def test_releasing_what_this_thread_never_took_is_an_error(self, bucket_dir):
+        sem = FileSemaphore("t", 2, state_dir=bucket_dir)
+        with pytest.raises(RuntimeError, match="holds no slot"):
+            sem.release()
 
 
 class TestPacing:
