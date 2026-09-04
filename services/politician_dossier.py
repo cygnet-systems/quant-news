@@ -433,8 +433,10 @@ def format_dossier_block(d: dict | None) -> str:
              f"{d['trades_in_window']} disclosed trade(s) in {symbol} in the "
              f"window; {d['members_named_in_news']} roster member(s) named "
              f"across {d['news_scanned']} article(s) in this run. Showing "
-             f"{len(d['entries'])}, ranked by news mention first, then by "
-             f"most recent trade in {symbol}."]
+             f"{len(d['entries'])}, ordered by members who both traded "
+             f"{symbol} and are named in this run's news, then the remaining "
+             f"traders most recent first, then members named only in the "
+             f"news."]
     for e in d["entries"]:
         lines.append(f"* {e['identity']}. {e['tenure']}.")
         if e["own_total"]:
@@ -500,6 +502,12 @@ def politician_block(symbol: str, as_of, news: list | None = None,
     A vendor failure is a gap only where it leaves nothing to read; with
     stored rows the block is still written rather than the run marked
     degraded for evidence it has.
+
+    A non-empty ``problems`` alongside a non-empty block means one of the
+    two sources went stale, not that the block is missing: the caller has a
+    rendered block in the prompt and must record it as present. The caveat
+    rides in the block text, where the model that is reading the rows can
+    see it.
     """
     symbol = (symbol or "").strip().upper()
     problems: list[str] = []
@@ -524,4 +532,10 @@ def politician_block(symbol: str, as_of, news: list | None = None,
         problems.append(f"roster: {roster_fresh['reason']}")
     if problems and not dossier["entries"]:
         return "", problems
-    return format_dossier_block(dossier), problems
+
+    block = format_dossier_block(dossier)
+    if problems:
+        block += ("\nNot every source behind this block refreshed on this "
+                  f"run ({'; '.join(problems)}); the rows above are as "
+                  f"stored.")
+    return block, problems

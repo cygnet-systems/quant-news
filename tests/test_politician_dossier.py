@@ -16,7 +16,8 @@ The rules pinned here:
   and logged rather than silently disappearing;
 * point-in-time survives the block layer: a filing dated after the as-of is
   not in the dossier, however recent the underlying trade;
-* a vendor throttle produces a recorded gap, not a crash.
+* a vendor throttle produces a recorded gap, not a crash, and a
+  half-failure that still renders a dossier says so inside the block.
 
 In-memory SQLite, HTTP stubbed, no network.
 """
@@ -398,6 +399,24 @@ class TestDossier:
         assert "2 further member(s) over the cap of 3 are not shown" in block
         assert "not shown" in caplog.text and "Mary Miller" in caplog.text
 
+    def test_the_order_sentence_matches_the_order_of_the_entries(
+            self, seeded):
+        """A member named only in the news sorts LAST, behind everyone who
+        traded the symbol. The header sentence claimed the opposite, and the
+        header is what tells the model how to weigh the list."""
+        news = [article("Rep.-elect Elect Newcomer calls for a review of "
+                        "NVIDIA export licences",
+                        "The incoming member wants hearings.")]
+        d = pd_.build_dossier("NVDA", AS_OF, news=news, days=60)
+        block = pd_.format_dossier_block(d)
+
+        assert [e["bioguide_id"] for e in d["entries"]] == [
+            "N000189", "W000802", "E000999"]
+        assert not d["dropped"]
+        assert "ranked by news mention first" not in block
+        assert "then members named only in the news." in block
+        assert block.index("Dan Newhouse") < block.index("Elect Newcomer")
+
     def test_it_shows_the_trade_lines_and_the_bands(self, seeded):
         block = pd_.format_dossier_block(
             pd_.build_dossier("NVDA", AS_OF, news=self.NEWS))
@@ -496,6 +515,25 @@ class TestVendorFailure:
         calls = stub_fetch(monkeypatch)
         pd_.politician_block("NVDA", AS_OF)
         assert calls == []
+
+    def test_a_stale_source_is_stated_in_the_block_it_rendered(
+            self, seeded, monkeypatch):
+        """The roster top-up failing while the trades still answer is a
+        PARTIAL failure: the dossier is written and goes into the prompt, so
+        the caveat has to be in the text the model reads. The caller records
+        a rendered block as present, and nothing else states this."""
+        with seeded.get_session() as session:
+            for row in session.execute(select(AvFetchLog)).scalars():
+                row.last_fetched_at = (datetime.now(timezone.utc)
+                                       - timedelta(days=60))
+        stub_fetch(monkeypatch, error=AlphaVantageUnavailable("throttled"))
+
+        block, problems = pd_.politician_block("NVDA", AS_OF)
+        assert [p for p in problems if p.startswith("roster:")]
+        assert "Dan Newhouse" in block
+        assert "Not every source behind this block refreshed on this run" \
+               in block
+        assert "throttled" in block.rsplit("\n", 1)[-1]
 
     def test_a_transport_error_leaves_the_run_on_the_stored_rows(
             self, seeded, monkeypatch):

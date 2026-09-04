@@ -885,7 +885,11 @@ class InsiderTransaction(Base):
     value_usd is NULL when share_price is 0 or missing. Grants, gifts and
     option exercises come through with a zero price and are a large share of
     the rows; multiplying them out would invent dollar flows that never
-    happened.
+    happened. Where it is written it is quantized to this column's two
+    decimals BEFORE the insert (av_store._money): a fractional share count
+    times a four-decimal price is more precise than the column, and the
+    writer's change detection compares what it computed against what it
+    reads back.
     """
 
     __tablename__ = "insider_transactions"

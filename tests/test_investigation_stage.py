@@ -153,7 +153,10 @@ def test_failed_triage_does_not_block_the_search():
     fake = _FakeLLM(_wrapped(BHF_JSON))
     fake.generate = lambda *a, **k: "garbage"          # triage unparseable
     with patch("services.llm_service.get_llm", return_value=fake):
-        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+        # Same evidence the prefetch assembled: the cache key carries a digest
+        # of it, so this is what the in-loop call actually passes.
+        inv = investigate("BHF", "2026-09-01", web=True, target="2026-09-02",
+                          profile="BHF", last_close=52.99)
     assert fake.web_calls == 1 and inv.web is True
 
 
@@ -166,7 +169,10 @@ def test_prefetch_warms_the_cache_for_the_in_loop_call():
         pool = prefetch_many(["BHF"], "2026-09-01", web=True, target="2026-09-02",
                              news_by_symbol={"BHF": []}, workers=2)
         pool.shutdown(wait=True)
-        inv = investigate("BHF", "2026-09-01", web=True, last_close=52.99)
+        # Same evidence the prefetch assembled: the cache key carries a digest
+        # of it, so this is what the in-loop call actually passes.
+        inv = investigate("BHF", "2026-09-01", web=True, target="2026-09-02",
+                          profile="BHF", last_close=52.99)
     assert fake.web_calls == 1
     assert inv.situation == "PENDING_ACQUISITION"
 
@@ -260,7 +266,7 @@ def test_research_model_records_gap_when_investigation_fails():
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df), \
          patch("services.stock_data.get_company_profile", return_value="BHF: insurer"):
-        blocks, inv = model._build_extra_context(
+        blocks, inv, _, _ = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger,
             tools=["web_research"])
     assert inv is None
@@ -292,7 +298,7 @@ def test_the_dossier_supersedes_the_political_blocks_congress_half():
                return_value=("[BHF: congressional dossier]\nnothing", [])), \
          patch("utils.events.get_upcoming_events", return_value={}), \
          patch("services.stock_data.fetch_stock_data", return_value=df):
-        blocks, _ = model._build_extra_context(
+        blocks, _, _, _ = model._build_extra_context(
             "BHF", df, "2026-09-01", evidence={"political", "politicians"},
             ledger=EvidenceLedger("BHF"))
     assert seen["include_congress"] is False
@@ -305,3 +311,38 @@ def test_the_dossier_supersedes_the_political_blocks_congress_half():
                                    evidence={"political"},
                                    ledger=EvidenceLedger("BHF"))
     assert seen["include_congress"] is True
+
+
+def test_a_rendered_block_is_present_evidence_even_with_a_stale_source():
+    """politician_block returns a dossier AND a problem when one of its two
+    stored sources did not refresh. The dossier is in the prompt, so the
+    ledger has to say the report was built with it; recording a gap against
+    text the model is reading is how a complete report gets labelled
+    degraded."""
+    from services.evidence_contract import EvidenceLedger
+    from models.trading_agents_model import TradingAgentsModel
+    import pandas as pd
+
+    idx = pd.bdate_range("2025-09-01", "2026-09-01")
+    df = pd.DataFrame({"Open": 50.0, "High": 51.0, "Low": 49.0, "Close": 50.0,
+                       "Volume": 1_000_000}, index=idx)
+    model = TradingAgentsModel()
+    ledger = EvidenceLedger("BHF")
+    dossier = "[BHF: congressional dossier]\nDan Newhouse bought."
+    stale = "[BHF: insider transactions (SEC Form 4)]\nJensen Huang sold."
+
+    with patch("services.politician_dossier.politician_block",
+               return_value=(dossier, ["roster: unavailable (throttled)"])), \
+         patch("services.insider_service.insider_block",
+               return_value=(stale, ["insider top-up: unavailable"])), \
+         patch("utils.events.get_upcoming_events", return_value={}), \
+         patch("services.stock_data.fetch_stock_data", return_value=df):
+        blocks, _, _, _ = model._build_extra_context(
+            "BHF", df, "2026-09-01", evidence={"politicians", "insiders"},
+            ledger=ledger)
+
+    assert "Dan Newhouse bought." in "\n".join(blocks)
+    assert "Jensen Huang sold." in "\n".join(blocks)
+    assert {"politicians", "insiders"} <= set(ledger.present)
+    assert [g.block for g in ledger.gaps
+            if g.block in ("politicians", "insiders")] == []

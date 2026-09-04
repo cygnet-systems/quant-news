@@ -375,7 +375,13 @@ def build_model_inputs_xlsx(
         blocks.append((f"{sym} Fundamentals", _fundamentals_block(sym, as_of)))
         try:
             from models.trading_agents_model import TradingAgentsModel
-            for extra in TradingAgentsModel()._build_extra_context(sym, tdf, as_of):
+            # (blocks, investigation, anomalies, screened): iterating the
+            # tuple itself handed the whole list to .split() and every export
+            # silently fell into the except below with "Precomputed blocks:
+            # unavailable".
+            extra_blocks, _, _, _ = TradingAgentsModel()._build_extra_context(
+                sym, tdf, as_of)
+            for extra in extra_blocks:
                 title = extra.split("\n", 1)[0][:60]
                 blocks.append((f"Precomputed: {title}", extra))
         except Exception as e:

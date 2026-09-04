@@ -529,6 +529,53 @@ class TestReportStageProgress:
         assert seen == {"status": "running", "symbols": ["NVDA"]}
         assert rs.get_run(run_id)["stages"]["report"]["state"] == "running"
 
+    def test_the_report_run_opens_its_own_anomaly_research_ceiling(
+            self, db, feed, monkeypatch):
+        """The scheduler and this callback share one uvicorn process. The
+        ceiling used to be opened only by run_predictions, so a report a user
+        asked for after the 07:00 job either inherited that job's spent
+        counter and reported every anomaly question as ranked out, or, in a
+        process where no job had run, searched with no bound at all.
+        """
+        from contextvars import copy_context
+
+        from config import MODEL
+        from services import investigation_service
+
+        run_id = rs.create_run(
+            "manual", ["NVDA"], "u1", preset="report",
+            config={"scope": "report", "target_date": "2026-09-03",
+                    "lookback": 7, "max_articles": 10})
+        feed.mark_run_pending(run_id)
+        monkeypatch.setattr(app_module, "ctx",
+                            SimpleNamespace(triggered_id="run-dispatch"))
+        seen = {}
+
+        class _Stop(Exception):
+            """Ends the stage once the ceiling has been read."""
+
+        def _fill(symbols, stock_data, news_data=None):
+            # Read in the worker: to_thread copies the callback's context,
+            # which is where the ledger lives.
+            seen["left"] = investigation_service.research_budget_left()
+            raise _Stop()
+        monkeypatch.setattr(app_module, "_fill_run_inputs", _fill)
+        store = {"run_id": run_id, "scope": "report", "symbols": ["NVDA"],
+                 "owner_uid": "u1", "kind": "manual"}
+
+        def _case():
+            # Stands in for a scheduled job already part-way through its own
+            # ceiling when the user clicks Run.
+            investigation_service.begin_research_budget(1)
+            with pytest.raises(_Stop):
+                asyncio.run(app_module.generate_ai_analysis(store, {}, None))
+            assert seen["left"] == MODEL.ANOMALY_RESEARCH_BUDGET
+            # The callback opened its own and left the other run's alone.
+            assert investigation_service.research_budget_left() == 1
+
+        # Inside a copy so nothing about this run reaches the next test.
+        copy_context().run(_case)
+
 
 class TestOrphanEscape:
     """A row whose process is provably gone must not lock its owner out."""

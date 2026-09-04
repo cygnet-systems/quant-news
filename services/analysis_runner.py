@@ -74,7 +74,15 @@ ALL_MODELS: tuple[str, ...] = (
 # political/institutional flows and by-expiry put/call, lead with a Situation
 # section, and carry an evidence ledger; the default news window is 14 days.
 # Reports written before this were blind to the situation a symbol was in.
-PIPELINE_EPOCH = "2026-09-03.1"
+# 2026-09-03.2: the report's section list is no longer fixed. An anomaly scan
+# over the blocks the run already computed decides which sections exist, each
+# one gets its own web-researched question, and a symbol with nothing
+# anomalous is told to write a short report. A prediction from before this
+# was made from a prompt with different sections and different research.
+# 2026-09-03.3: the quiet-symbol note and the unresearched-anomaly wording
+# now name only what the run actually screened and why a question went
+# unasked; the prompt a report was written from is different again.
+PIPELINE_EPOCH = "2026-09-03.3"
 
 # Conviction labels map to nominal confidences for display only, backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -427,7 +435,16 @@ def run_predictions(
     # container down three times on 2026-09-02. The pool starts once that
     # symbol is through and covers the rest; symbol one investigates
     # in-loop, one thread wide, as it did before the prefetch existed.
-    from services.investigation_service import WEB_RESEARCH_TOOL
+    from services.investigation_service import (
+        WEB_RESEARCH_TOOL, begin_research_budget)
+    # One ceiling for the whole run's anomaly research. Those questions are
+    # asked inside the serial per-symbol loop, so without a run-level ceiling
+    # a long watchlist could add an hour of web searches to a job that is
+    # killed at 95 minutes. Symbols past it still get their anomaly sections,
+    # written from the figures and labelled unresearched. The ledger belongs
+    # to THIS run's context, so an interactive report opened in the same
+    # process neither drains it nor is drained by it.
+    begin_research_budget(MODEL.ANOMALY_RESEARCH_BUDGET)
     investigation_pool = None
     prefetch_pending = ("investigation" in evidence_set
                         and "trading_agents" in selected)
@@ -443,6 +460,7 @@ def run_predictions(
             investigation_pool = prefetch_many(
                 remaining, str(cutoff_date), web=web,
                 target=str(target_date), news_by_symbol=news_by_symbol,
+                evidence=evidence_set,
                 workers=MODEL.INVESTIGATION_WORKERS)
             prog.emit("ta", f"Investigating the remaining {len(remaining)} "
                             f"symbols in the background "

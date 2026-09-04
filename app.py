@@ -2397,6 +2397,15 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
                     else sorted(MODEL.DEFAULT_EVIDENCE))
     # Tools are opt-in: absent means none (the backend never switches one on).
     tools_sel = sorted(set(config.get("tools") or []))
+    # This run's own ceiling on anomaly research. Opened here and not only
+    # in run_predictions: the scheduler and this callback share one process,
+    # so a report run that never opened a ceiling either inherited nothing
+    # and searched unbounded, or (once the ceiling was a module global) read
+    # the 07:00 job's spent counter and reported every question as ranked
+    # out. The ledger lives in this task's context, which asyncio.to_thread
+    # copies into the per-symbol research workers below.
+    from services.investigation_service import begin_research_budget
+    begin_research_budget(MODEL.ANOMALY_RESEARCH_BUDGET)
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
     # Per-symbol analysis is always the full research agent now, the shallow
     # summarize_news_structured pass produced a thinner second opinion on the
@@ -6133,7 +6142,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                            if on]
         recs_on = scope == "full" and (recs or "auto") != "off"
         estimate_s = estimate_run_seconds(scope, len(symbols), selected_models,
-                                          recs_on)
+                                          recs_on, run_tools)
         picked = str(run_date)[:10] if run_date else None
         try:
             target_d, cutoff_d = resolve_target_and_cutoff(picked)
@@ -6772,6 +6781,7 @@ def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
         report_model or "",
         recs_basis or "auto",
         recs_model or "",
+        run_tools,
     )
     preset_name = preset if preset in RUN_PRESETS else DEFAULT_RUN_PRESET
     customized = preset_divergence(preset_name, {

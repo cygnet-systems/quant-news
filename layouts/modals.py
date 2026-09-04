@@ -359,6 +359,13 @@ RESEARCH_CONCURRENCY = 8      # app.py caps the async fan-out at 8 workers
 SYNTHESIS_SECONDS = 15        # one call for the batch, not per symbol
 NEWS_FETCH_SECONDS = 3        # per symbol, Alpha Vantage is rate-limited
 ML_MODEL_SECONDS = 4          # per symbol per numerical model
+# A web-search turn (the situation investigation, and each anomaly question)
+# is minutes, not seconds. The situation call overlaps the model loop in the
+# background prefetch pool, so it costs the run roughly one call per
+# INVESTIGATION_WORKERS symbols; the anomaly questions run on the serial
+# per-symbol loop and are capped for the whole run by
+# MODEL.ANOMALY_RESEARCH_BUDGET, three at a time per symbol.
+WEB_SEARCH_SECONDS = 60
 
 _LLM_MODELS = {"trading_agents"}
 _NEWS_MODELS = {"deberta_sentiment", "xgboost_shap", "lightgbm"}
@@ -376,13 +383,21 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def estimate_run_seconds(scope: str, n_symbols: int, models: list,
-                         recs_on: bool) -> float:
-    """Rough wall-clock for the selected scope. Deliberately coarse."""
+                         recs_on: bool, tools: list | None = None) -> float:
+    """Rough wall-clock for the selected scope. Deliberately coarse.
+
+    ``tools`` matters because web research is the slowest thing a run does
+    and the estimate used to ignore it entirely: Deep quoted the same
+    duration as Standard while spending minutes per symbol on the open web.
+    """
+    from config import MODEL
+
     n = max(1, int(n_symbols or 0))
     models = list(models or [])
     total = 0.0
     does_report = scope in ("report", "full")
     does_models = scope in ("models", "full")
+    web = "web_research" in set(tools or [])
 
     if does_report or (does_models and any(m in _NEWS_MODELS for m in models)):
         total += n * NEWS_FETCH_SECONDS
@@ -397,6 +412,14 @@ def estimate_run_seconds(scope: str, n_symbols: int, models: list,
             # In the models-only path the research call runs inside the
             # prediction subprocess, one symbol at a time.
             total += n * RESEARCH_SECONDS
+    if web and (does_report or "trading_agents" in models):
+        # Situation investigations run in a pool of INVESTIGATION_WORKERS
+        # alongside the model loop; anomaly questions run inside it, three
+        # concurrent per symbol, until the run's budget is spent.
+        workers = max(1, int(MODEL.INVESTIGATION_WORKERS))
+        total += -(-n // workers) * WEB_SEARCH_SECONDS
+        researched = min(n, max(0, int(MODEL.ANOMALY_RESEARCH_BUDGET)) // 3)
+        total += researched * WEB_SEARCH_SECONDS
     if recs_on and scope == "full":
         total += SYNTHESIS_SECONDS
     return total
@@ -404,7 +427,7 @@ def estimate_run_seconds(scope: str, n_symbols: int, models: list,
 
 def run_preflight_children(scope: str, symbols: list, models: list,
                            report_model: str, recs_basis: str,
-                           recs_model: str) -> list:
+                           recs_model: str, tools: list | None = None) -> list:
     """Warnings about missing keys plus a duration estimate for this run.
 
     A run with no usable API key used to look identical to a healthy one until
@@ -466,7 +489,7 @@ def run_preflight_children(scope: str, symbols: list, models: list,
             className="run-preflight-estimate",
         )
     else:
-        seconds = estimate_run_seconds(scope, n, models, recs_on)
+        seconds = estimate_run_seconds(scope, n, models, recs_on, tools)
         estimate = html.Div(
             [
                 html.I(className="bi bi-clock me-1"),

@@ -66,7 +66,8 @@ def _block_ceiling(lengths: list[int], budget: int) -> int:
 
 
 def _fit_blocks(blocks: list[str], per_block: int = PER_BLOCK_CHARS,
-                budget: int = MAX_EXTRA_CONTEXT_CHARS) -> str:
+                budget: int = MAX_EXTRA_CONTEXT_CHARS,
+                protected: int = 0) -> str:
     """Join the context blocks so that every one of them survives.
 
     The old assembly sliced each block and let the whole string be cut from
@@ -75,21 +76,44 @@ def _fit_blocks(blocks: list[str], per_block: int = PER_BLOCK_CHARS,
     recorded on the ledger as present. Here the budget is shared instead --
     each block is capped, then the longest are trimmed at a line boundary
     until the total fits -- so a block can be shortened but never disappear.
+
+    ``protected`` counts leading blocks that give way LAST. Those are the
+    anomaly sections: they are the reason the report is being written at all,
+    and a water-fill that treats them like the SPY regime block would trim
+    the researched finding out of the one section that says something the
+    reader could not get from a chart. Everything else reaches its floor
+    before they are touched.
     """
-    fitted = [_smart_truncate(b, per_block) for b in blocks if b]
+    head = [_smart_truncate(b, per_block) for b in blocks[:protected] if b]
+    tail = [_smart_truncate(b, per_block) for b in blocks[protected:] if b]
+    fitted = head + tail
     if not fitted:
         return ""
     # "\n\n" between blocks, plus _smart_truncate's marker on each one it
     # cuts, both come out of the same budget.
     room = budget - 2 * (len(fitted) - 1) - 16 * len(fitted)
     if sum(len(b) for b in fitted) > room:
-        ceiling = max(MIN_BLOCK_CHARS,
-                      _block_ceiling([len(b) for b in fitted], room))
-        trimmed = [b for b in fitted if len(b) > ceiling]
-        if trimmed:
-            logger.info("context budget: %d of %d blocks trimmed to %d chars",
-                        len(trimmed), len(fitted), ceiling)
-        fitted = [_smart_truncate(b, ceiling) for b in fitted]
+        head_len = sum(len(b) for b in head)
+        if tail:
+            ceiling = max(MIN_BLOCK_CHARS,
+                          _block_ceiling([len(b) for b in tail],
+                                         room - head_len))
+            trimmed = [b for b in tail if len(b) > ceiling]
+            tail = [_smart_truncate(b, ceiling) for b in tail]
+            if trimmed:
+                logger.info("context budget: %d of %d blocks trimmed to "
+                            "%d chars", len(trimmed), len(fitted), ceiling)
+        tail_len = sum(len(b) for b in tail)
+        if head and head_len + tail_len > room:
+            # Everything unprotected is already at the floor; the anomaly
+            # sections now share what is left rather than overflow the prompt.
+            ceiling = max(MIN_BLOCK_CHARS,
+                          _block_ceiling([len(b) for b in head],
+                                         room - tail_len))
+            logger.info("context budget: %d protected block(s) trimmed to "
+                        "%d chars", len(head), ceiling)
+            head = [_smart_truncate(b, ceiling) for b in head]
+        fitted = head + tail
     return "\n\n".join(fitted)
 
 
@@ -204,7 +228,8 @@ class TradingAgentsModel(BaseModel):
         # SPY regime, and the selected evidence blocks. Computed here: not
         # asserted by the LLM, and all lookahead-safe.
         tools = sorted(set(kwargs.get("tools") or []))
-        extra_blocks, investigation = self._build_extra_context(
+        (extra_blocks, investigation, anomalies,
+         screened) = self._build_extra_context(
             symbol, ohlcv_df, as_of, evidence=evidence, ledger=ledger,
             news=news, target=kwargs.get("target_date"), tools=tools)
 
@@ -242,8 +267,9 @@ class TradingAgentsModel(BaseModel):
             track_record=track_record,
             # Shared budget rather than a slice per block and a cut on the
             # tail: peers vanished that way once, and the disclosure blocks
-            # (appended last, already on the ledger) would vanish next.
-            extra_context=_fit_blocks(extra_blocks),
+            # (appended last, already on the ledger) would vanish next. The
+            # anomaly blocks lead the list and are the last to give way.
+            extra_context=_fit_blocks(extra_blocks, protected=len(anomalies)),
             use_news=use_news,
             include_thesis=kwargs.get("include_thesis", False),
             # The run's own window, frontend-owned: no fallback here, the
@@ -251,6 +277,8 @@ class TradingAgentsModel(BaseModel):
             news_lookback_days=kwargs.get("news_lookback_days"),
             ledger=ledger,
             situation=(investigation.situation if investigation else None),
+            anomalies=anomalies,
+            screened=screened,
         )
 
         decision = (result.get("decision") or "HOLD").upper()
@@ -317,6 +345,19 @@ class TradingAgentsModel(BaseModel):
             "output_tokens": result.get("output_tokens", 0),
             "served_by_model": result.get("served_by_model", ""),
         }
+        details["anomalies"] = [
+            {k: v for k, v in a.items() if k != "answer"} | {
+                "citations": [c.get("url") for c in
+                              (a.get("answer") or {}).get("citations", [])
+                              if c.get("url")],
+                "finding": (a.get("answer") or {}).get("finding", ""),
+            }
+            for a in anomalies
+        ]
+        for a in anomalies:
+            answer = a.get("answer") or {}
+            details["input_tokens"] += answer.get("input_tokens", 0)
+            details["output_tokens"] += answer.get("output_tokens", 0)
         if investigation is not None:
             details["investigation"] = investigation.to_dict()
             details["input_tokens"] += investigation.input_tokens
@@ -404,7 +445,7 @@ class TradingAgentsModel(BaseModel):
         news: list | None = None,
         target: str | None = None,
         tools: "set[str] | list[str] | None" = None,
-    ) -> "tuple[list[str], object | None]":
+    ) -> "tuple[list[str], object | None, list[dict], list[str]]":
         """Assemble validated, lookahead-safe context blocks for the prompt.
 
         ``evidence`` gates the optional blocks per run (Run-Analysis modal
@@ -414,9 +455,13 @@ class TradingAgentsModel(BaseModel):
         switches from the same dialog, "web_research" lets the
         investigation search the open web; absent means off.
 
-        Returns (blocks, investigation). Every block records itself on the
-        ledger as present or as a gap with the reason; required blocks
-        raise through ``ledger.missing``.
+        Returns (blocks, investigation, anomalies, screened), where
+        ``screened`` names the anomaly categories this run could actually
+        rule out: an empty anomaly list says nothing about a category whose
+        block was never fetched, and the report has to be able to tell the
+        two apart. Every block records itself on the ledger as present or as
+        a gap with the reason; required blocks raise through
+        ``ledger.missing``.
         """
         evidence = set(evidence) if evidence is not None else set(MODEL.DEFAULT_EVIDENCE)
         ledger = ledger or EvidenceLedger(symbol)
@@ -550,6 +595,9 @@ class TradingAgentsModel(BaseModel):
             ledger.missing("filings", f"Terminal data unavailable: {str(e)[:80]}")
 
         # --- options positioning (expected when selected) ---
+        # metrics_pc / by_expiry outlive the block: the anomaly scan below
+        # reads the same numbers rather than fetching the chain a second time.
+        metrics_pc = by_expiry = None
         if "options" in evidence:
             try:
                 from services.options_service import (
@@ -571,13 +619,15 @@ class TradingAgentsModel(BaseModel):
 
         # --- quality screen (expected when selected) ---
         quality_text = ""
+        quality_result = None
         if "quality" in evidence:
             try:
                 from services.bad_apples_service import (
                     analyze_symbol as _ba_analyze, format_bad_apples_block,
                 )
-                quality_text = format_bad_apples_block(
-                    symbol, _ba_analyze(symbol, as_of, articles=(news or None)))
+                quality_result = _ba_analyze(symbol, as_of,
+                                             articles=(news or None))
+                quality_text = format_bad_apples_block(symbol, quality_result)
             except Exception as e:
                 logger.warning(f"{symbol}: quality screen failed: {e}")
             if quality_text:
@@ -625,9 +675,12 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 logger.warning(f"{symbol}: insider block failed: {e}")
                 block, problems = "", [str(e)[:120]]
+            # A block that was written is evidence the model can read, so
+            # it is recorded as present even when a problem came back with
+            # it. A partial failure (a top-up that did not run) is stated
+            # inside the block text, not as an absence of the whole block.
             if block:
                 extra_blocks.append(block)
-            if block and not problems:
                 ledger.have("insiders")
             else:
                 ledger.missing("insiders", "; ".join(problems)
@@ -644,19 +697,22 @@ class TradingAgentsModel(BaseModel):
             except Exception as e:
                 logger.warning(f"{symbol}: congressional dossier failed: {e}")
                 block, problems = "", [str(e)[:120]]
+            # Same rule as the insider block: politician_block returns a
+            # rendered dossier together with problems when one of its two
+            # sources went stale, and that dossier is in the prompt.
             if block:
                 extra_blocks.append(block)
-            if block and not problems:
                 ledger.have("politicians")
             else:
                 ledger.missing("politicians", "; ".join(problems)
                                or "no congressional rows stored for this symbol")
 
+        web = WEB_RESEARCH_TOOL in set(tools or [])
+
         # --- situation & investigation (expected when selected) ---
         # Placed FIRST in the prompt's precomputed section: the situation
         # decides how every other block is read.
         if "investigation" in evidence:
-            web = WEB_RESEARCH_TOOL in set(tools or [])
             try:
                 from services.investigation_service import (
                     investigate, format_investigation_block, headlines_for_prompt,
@@ -693,4 +749,128 @@ class TradingAgentsModel(BaseModel):
                 investigation = None
                 ledger.missing("investigation", f"investigation stage failed: {str(e)[:100]}")
 
-        return extra_blocks, investigation
+        anomalies, screened = self._scan_and_research(
+            symbol, as_of, evidence=evidence, ledger=ledger, news=news,
+            ohlcv_df=ohlcv_df, target=target, web=web, options=metrics_pc,
+            by_expiry=by_expiry, quality=quality_result)
+        # Ahead of the situation block, which is itself ahead of everything
+        # else: these are the only blocks in the prompt that say something a
+        # reader could not read off the chart.
+        if anomalies:
+            from services.anomaly_service import format_anomaly_block
+            for anomaly in reversed(anomalies):
+                extra_blocks.insert(0, format_anomaly_block(
+                    symbol, anomaly, anomaly.get("answer")))
+
+        return extra_blocks, investigation, anomalies, screened
+
+    def _scan_and_research(
+        self, symbol: str, as_of: str, *, evidence: set, ledger,
+        news: list | None, ohlcv_df, target: str | None, web: bool,
+        options, by_expiry, quality,
+    ) -> tuple[list[dict], list[str]]:
+        """What stands out for this symbol, each item researched on the web.
+
+        Returns (anomalies, screened). ``screened`` names the categories the
+        scan could actually rule out. An empty anomaly list means "nothing
+        stood out in THOSE categories" and means nothing at all about the
+        ones this run never fetched, so the caller needs both to write the
+        quiet-symbol note without asserting an absence it did not check.
+
+        Detection (services.anomaly_service) is arithmetic over blocks the
+        run already computed, so it costs nothing and never raises the
+        report. The two store reads below re-read rows the insider and
+        dossier blocks already pulled, one indexed query each, rather than
+        widen those functions' return contracts.
+
+        Each surviving anomaly is enriched in place with ``answer`` (its
+        researched finding, or None), ``researched``, and — when it was not —
+        ``unresearched``, one of anomaly_service.UNRESEARCHED_REASONS. That
+        reason is stamped here because only this function knows which of the
+        four happened; a block that inferred it from a missing answer would
+        put a false statement about the run's own provenance in the report.
+        """
+        try:
+            from services import anomaly_service
+            insider_summary = congress_rows = None
+            if "insiders" in evidence and "insiders" in set(ledger.present):
+                from services.insider_service import summarize_insiders
+                insider_summary = summarize_insiders(symbol, as_of)
+            if "politicians" in evidence and "politicians" in set(ledger.present):
+                from services import av_store
+                congress_rows = av_store.congress_trades_for(symbol, as_of)
+            # One dict for both calls: detect() says what stands out and
+            # screened() says over what, and they must never disagree.
+            inputs = dict(options=options, by_expiry=by_expiry,
+                          insiders=insider_summary, congress=congress_rows,
+                          quality=quality, news=news, ohlcv=ohlcv_df)
+            anomalies = anomaly_service.detect(symbol, as_of, **inputs)
+            screened = anomaly_service.screened(**inputs)
+        except Exception as e:
+            logger.warning(f"{symbol}: anomaly scan failed: {e}")
+            return [], []
+
+        for anomaly in anomalies:
+            anomaly["answer"] = None
+            anomaly["researched"] = False
+            anomaly["unresearched"] = "no_web" if not web else "capped"
+        if not anomalies:
+            # Hoisted: nesting the same quote inside an f-string expression
+            # is 3.12+ grammar and the container runs 3.11.
+            looked_at = ", ".join(screened) or "any evidence this run gathered"
+            _emit("ta", f"Research {symbol}: nothing stands out in "
+                        f"{looked_at}, the report stays short")
+            return anomalies, screened
+
+        _emit("ta", f"Research {symbol}: {len(anomalies)} anomaly/anomalies to "
+                    f"write about ("
+                    + ", ".join(a["title"] for a in anomalies) + ")",
+              payload={"event": "anomalies", "symbol": symbol,
+                       "keys": [a["key"] for a in anomalies]})
+        if not web:
+            return anomalies, screened
+
+        try:
+            from services.investigation_service import research_questions
+            from services import usage_service as _usage
+            ctx = _usage.current()
+            with _usage.track("investigation", symbol=symbol,
+                              trade_date=ctx.trade_date or as_of,
+                              section=f"anomaly_research:{symbol}"):
+                # The figures that raised each question travel WITH it.
+                # Without them the researcher was handed a one-line question
+                # and told in writing that no supporting figures were
+                # supplied, so it searched the ticker instead of the
+                # anomaly: the insider names, put/call volumes, expiry dates
+                # and disclosure sizes that make the question answerable are
+                # exactly what these facts carry.
+                answers = research_questions(
+                    symbol, as_of, [a["question"] for a in anomalies],
+                    web=True, target=target,
+                    context_by_question={a["question"]: "\n".join(a["facts"])
+                                         for a in anomalies})
+        except Exception as e:
+            logger.warning(f"{symbol}: anomaly research failed: {e}")
+            for anomaly in anomalies:
+                anomaly["unresearched"] = "stage_failed"
+            return anomalies, screened
+
+        by_question = {a["question"]: a for a in answers}
+        for anomaly in anomalies:
+            answer = by_question.get(anomaly["question"])
+            if answer and answer.get("finding") and not answer.get("error"):
+                anomaly["answer"] = answer
+                anomaly["researched"] = True
+                anomaly.pop("unresearched", None)
+            elif answer:
+                # A failed search still travels: the block prints the reason
+                # instead of reading as though the question was never asked.
+                anomaly["answer"] = answer
+                anomaly["unresearched"] = "failed"
+            # No entry at all means research_questions never asked it: the
+            # per-symbol cap or the run's ceiling took it, which is what
+            # "capped" (stamped above) says.
+        researched = sum(1 for a in anomalies if a["researched"])
+        _emit("ta", f"Research {symbol}: researched {researched} of "
+                    f"{len(anomalies)} anomaly question(s) on the web")
+        return anomalies, screened

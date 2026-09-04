@@ -11,11 +11,14 @@ claiming more than the filing supports:
 * visibility is the SEC filing DEADLINE, a proxy, and the block has to name
   it as one or the model reads the transaction-to-visible gap as timing;
 * a vendor throttle is a recorded gap, never a crash and never a silent
-  "no insider activity".
+  "no insider activity";
+* no date in the block is later than the as-of, the sync stamp included:
+  backtests run as-of a past date and the stamp is wall clock.
 
 In-memory SQLite, HTTP stubbed, no network.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -33,6 +36,8 @@ pytestmark = pytest.mark.filterwarnings(
     r"ignore:.*does \*not\* support Decimal.*")
 
 TABLES = [InsiderTransaction.__table__, AvFetchLog.__table__]
+
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 @compiles(JSONB, "sqlite")
@@ -162,6 +167,35 @@ class TestPointInTime:
         seeded(db, monkeypatch)
         with pytest.raises(ValueError):
             insider_service.summarize_insiders("NVDA", None)
+
+    def test_the_header_carries_no_date_later_than_the_as_of(self, db,
+                                                             monkeypatch):
+        """The sync stamp is wall clock. Backtests are how this platform
+        measures alpha, and they run as-of a past date, so a header reading
+        "store synced <today>" would put a date from after the cutoff into
+        the research prompt."""
+        seeded(db, monkeypatch)
+        stamp = av_store.last_synced_date(av_store.INSIDER_FUNCTION, "NVDA")
+        assert stamp > "2026-08-20", "fixture assumes the sync is 'today'"
+
+        header = insider_service.insider_block("NVDA", "2026-08-20")[0] \
+            .splitlines()[0]
+        assert stamp not in header
+        assert "store synced" not in header
+        # Dated instead by the newest row it is serving, which the reader
+        # bounds by as_of: the Aug 10 sales became visible on Aug 12.
+        assert "newest row visible from 2026-08-12" in header
+        assert all(d <= "2026-08-20" for d in DATE.findall(header))
+
+    def test_an_empty_backtest_window_states_no_date_at_all(self, db,
+                                                            monkeypatch):
+        # Nothing visible means no row to date the block by either, and the
+        # wall-clock stamp is still the wrong answer.
+        seeded(db, monkeypatch)
+        s = insider_service.summarize_insiders("NVDA", "2026-08-20", days=3)
+        header = insider_service.format_insider_block(
+            "NVDA", s, synced="2026-09-30").splitlines()[0]
+        assert header.endswith("transactions in the 3d to 2026-08-20]")
 
 
 class TestVendorFailure:

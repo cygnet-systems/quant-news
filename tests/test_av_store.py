@@ -11,7 +11,8 @@ bug before. The rules pinned here:
   after the transaction, because the payload carries no filing date;
 * re-fetching a symbol writes nothing new (both endpoints return full
   history on every call, so this happens every week);
-* a zero share price yields NULL, not a fabricated dollar value;
+* a zero share price yields NULL, not a fabricated dollar value, and a
+  value that is stored is stored at the scale of its column;
 * a fetch inside its max age spends no call.
 
 Everything runs on in-memory SQLite with the HTTP layer stubbed. No test
@@ -22,6 +23,7 @@ import importlib.util
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -154,6 +156,14 @@ INSIDER_PAYLOAD = {"data": [
      "executive": "Colette Kress", "executive_title": "CFO",
      "security_type": "Restricted Stock Units",
      "acquisition_or_disposal": "A", "shares": "25000", "share_price": "0.0"},
+    # A 10b5-1 sale of a fractional lot: shares x price runs to six decimals,
+    # which is more than the value column holds. The two rows above are both
+    # exact at two decimals and cannot catch a writer that stores the
+    # unrounded product.
+    {"transaction_date": "2026-08-31", "ticker": "NVDA",
+     "executive": "Debora Shoquist", "executive_title": "EVP Operations",
+     "security_type": "Common Stock", "acquisition_or_disposal": "D",
+     "shares": "1350.7315", "share_price": "182.4433"},
 ]}
 
 ROSTER_PAYLOAD = {"politicians": [
@@ -246,7 +256,8 @@ class TestInsiderPointInTime:
         assert av_store.insider_transactions_for("NVDA", "2026-09-01") == []
         served = av_store.insider_transactions_for("NVDA", "2026-09-02")
         assert {r["executive"] for r in served} == {"Jensen Huang",
-                                                    "Colette Kress"}
+                                                    "Colette Kress",
+                                                    "Debora Shoquist"}
 
     def test_the_deadline_is_two_trading_days_not_two_calendar_days(self):
         # Friday 2026-09-04 -> Monday 09-07 is Labor Day -> Tue 08, Wed 09.
@@ -260,6 +271,26 @@ class TestInsiderPointInTime:
         assert served["Colette Kress"]["share_price"] == 0.0
         assert served["Colette Kress"]["value_usd"] is None
         assert served["Jensen Huang"]["value_usd"] == 100000 * 180.50
+
+    def test_a_dollar_value_is_stored_at_the_scale_of_its_column(
+            self, db, monkeypatch):
+        """1350.7315 x 182.4433 = 246,431.91227395, which Numeric(24, 2)
+        cannot hold. Rounding has to happen where the row is built, or the
+        value read back never equals the value computed."""
+        stub_fetch(monkeypatch, {av_store.INSIDER_FUNCTION: INSIDER_PAYLOAD})
+        av_store.sync_insider_transactions("NVDA")
+        served = {r["executive"]: r
+                  for r in av_store.insider_transactions_for("NVDA", "2026-09-02")}
+        assert served["Debora Shoquist"]["value_usd"] == pytest.approx(
+            round(1350.7315 * 182.4433, 2))
+
+        # Asserted on the row the writer builds, not on the row read back:
+        # every database rounds on the way in, so a value read back is
+        # always at the column's scale and cannot show what was sent.
+        built = av_store._insider_rows("NVDA", INSIDER_PAYLOAD["data"])
+        values = [v["value_usd"] for v in built.values()
+                  if v["executive"] == "Debora Shoquist"]
+        assert values == [Decimal("246431.91")]
 
     def test_a_row_without_a_transaction_date_is_dropped(self, db, monkeypatch):
         stub_fetch(monkeypatch, {av_store.INSIDER_FUNCTION: {"data": [
@@ -280,10 +311,13 @@ class TestUpsertIdempotence:
 
     def test_resyncing_the_same_insider_payload_writes_nothing(
             self, db, monkeypatch):
+        """Both endpoints return full history on every call, so this runs
+        weekly per symbol. A value the writer computes at more precision
+        than the column holds is rewritten on every one of those syncs."""
         stub_fetch(monkeypatch, {av_store.INSIDER_FUNCTION: INSIDER_PAYLOAD})
-        assert av_store.sync_insider_transactions("NVDA") == 2
+        assert av_store.sync_insider_transactions("NVDA") == 3
         assert av_store.sync_insider_transactions("NVDA") == 0
-        assert count(db, InsiderTransaction) == 2
+        assert count(db, InsiderTransaction) == 3
 
     def test_a_late_filing_date_updates_the_row_in_place(self, db, monkeypatch):
         """The vendor fills filed_date in later on some Senate rows; that is
@@ -513,7 +547,7 @@ class TestRefreshAll:
         monkeypatch.setattr(av_store, "fetch", _fetch)
         summary = av_store.refresh_all(["NVDA", "BAD"])
         assert summary["politicians"] == 4 and summary["symbols"] == 2
-        assert summary["congress_rows"] == 4 and summary["insider_rows"] == 2
+        assert summary["congress_rows"] == 4 and summary["insider_rows"] == 3
         assert summary["failed"] == 2 and len(summary["problems"]) == 2
 
     def test_a_second_refresh_spends_no_calls(self, db, monkeypatch):

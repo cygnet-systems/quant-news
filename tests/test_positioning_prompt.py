@@ -32,7 +32,9 @@ from db.models import (
     Politician,
     PoliticianAlias,
 )
-from models.single_agent import SINGLE_AGENT_PROMPT
+from models.single_agent import (
+    SINGLE_AGENT_PROMPT, render_output_sections,
+)
 from services import av_store, insider_service
 from services import politician_dossier as pd_
 from services.alpha_vantage import AlphaVantageUnavailable
@@ -136,6 +138,9 @@ def build_prompt(extra_context: str) -> str:
         business_block="chips", spy_block="spy", sector_block="sector",
         price_block="price", tech_block="tech", fundamentals_block="fund",
         news_block="news",
+        # The section list is rendered, not literal: with no anomaly it is
+        # the fixed twelve, numbered as they always were.
+        output_sections=render_output_sections("NVDA", AS_OF, "XLK", []),
         extra_context=(
             "\n== PRECOMPUTED METRICS & EVENTS (validated. Prefer these numbers) ==\n"
             + extra_context + "\n") if extra_context else "")
@@ -171,7 +176,8 @@ class TestPromptRules:
         assert "give it the weight thin evidence deserves" in step
 
     def test_section_five_demands_the_names_the_sizes_and_the_lag(self):
-        section = SINGLE_AGENT_PROMPT.split("5. Positioning & Flows")[1] \
+        sections = render_output_sections("NVDA", AS_OF, "XLK", [])
+        section = sections.split("5. Positioning & Flows")[1] \
             .split("6. Peer Comparison")[0]
         assert "NAME the executives and their titles" in section
         assert "NAME the members with their" in section

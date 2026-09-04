@@ -67,6 +67,13 @@ Every number you cite must be traceable to the data below:
   support/resistance bounces or exact percentage moves unless a data block states
   them with concrete dates and prices.
 - Do not prefix price LEVELS with +/- signs; signs belong on returns/changes only.
+- PRICE AND INDICATOR MOVEMENT DESCRIBE WHAT ALREADY HAPPENED. A moving average,
+  an RSI reading, a MACD cross or a five-day return is an observation, never a
+  forecast on its own. A directional call has to rest on something that has NOT
+  played out yet: a dated event, a position someone has taken and would have to
+  unwind, a researched cause. Where the blocks hold nothing of that kind, say
+  the evidence does not support a directional call rather than reading one off
+  the chart.
 - A claim about a group (peers, sectors, models) must hold for EVERY member you
   name. If it doesn't, name only the members it holds for, or quantify exactly
   ("3 of 4 peers"), never stretch "all" or "much" over a member the numbers
@@ -278,7 +285,19 @@ Then the analysis, as sections in this order. Formatting rules:
   Rounding for readability is not estimating; the underlying digits must come
   from the data.
 
-1. Situation & Key Figures: what kind of situation {ticker} is in and the one
+{output_sections}
+"""
+
+
+# The report's fixed frame: the sections every report carries, in order,
+# stored without their numbers. The Verdict block above them and the JSON
+# epilogue below them are what the rest of the app parses; these are the
+# reading frame. Numbers are applied at render time because the anomaly
+# sections are numbered INTO this list, and a report whose sections are the
+# same twelve headings whatever the evidence holds is the thing this design
+# is trying to stop.
+FIXED_SECTIONS = (
+    """Situation & Key Figures: what kind of situation {ticker} is in and the one
    question that decides the next 1-5 sessions. From the SITUATION &
    INVESTIGATION block: the deal or proceeding and its terms (offer price,
    spread, consideration, approvals and their status), the dated milestones,
@@ -286,16 +305,16 @@ Then the analysis, as sections in this order. Formatting rules:
    every fact with its src and date. If the block says a finding is an
    inference, say so. If no situation block was gathered, say exactly that in
    one sentence and classify the situation yourself from the news block. For
-   MOMENTUM_ONLY, one short paragraph saying nothing situational is in play.
-2. Technicals ({ticker}): cover price vs ALL THREE SMAs (20/50/200, the
+   MOMENTUM_ONLY, one short paragraph saying nothing situational is in play.""",
+    """Technicals ({ticker}): cover price vs ALL THREE SMAs (20/50/200, the
    200SMA anchors the long-term trend and must not be skipped), RSI, MACD,
    volume, and volatility. In a PENDING_ACQUISITION, state every level relative
-   to the offer price as well.
-3. News & Catalysts: company-specific first, then sector, then macro. Every
-   claim carries its outlet and date inline; is anything actually new?
-4. Fundamentals: valuation and quality, only as they bear on the 1-5 day window
-   (in a PENDING_ACQUISITION, only as they bear on completion or break value)
-5. Positioning & Flows: who is positioned which way, covering each of these
+   to the offer price as well.""",
+    """News & Catalysts: company-specific first, then sector, then macro. Every
+   claim carries its outlet and date inline; is anything actually new?""",
+    """Fundamentals: valuation and quality, only as they bear on the 1-5 day window
+   (in a PENDING_ACQUISITION, only as they bear on completion or break value)""",
+    """Positioning & Flows: who is positioned which way, covering each of these
    for which a block was provided:
    - Options: put/call, by expiry when given.
    - Insiders (Form 4): NAME the executives and their titles, and for each one
@@ -325,34 +344,143 @@ Then the analysis, as sections in this order. Formatting rules:
    scenario below each one is exposed to. Where a block is thin or holds
    nothing, say that in one sentence and weight it accordingly rather than
    constructing a read it cannot carry. If a block was not gathered at all, say
-   so in one line rather than skipping it.
-6. Peer Comparison: {ticker} vs the peer set in the data; company-specific move
-   or sector-wide repricing? (omit this section only if no peer block was provided)
-7. Business Context: what the company actually does, and which of tomorrow's
-   drivers (sector beta, own catalysts, liquidity) dominate for a name this size
-8. Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
+   so in one line rather than skipping it.""",
+    """Peer Comparison: {ticker} vs the peer set in the data; company-specific move
+   or sector-wide repricing? (omit this section only if no peer block was provided)""",
+    """Business Context: what the company actually does, and which of tomorrow's
+   drivers (sector beta, own catalysts, liquidity) dominate for a name this size""",
+    """Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
    three sentences. This context is identical for every symbol analysed today, so
    it earns no more space than that; spend the words on what it changes for
-   {ticker} specifically
-9. Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
+   {ticker} specifically""",
+    """Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
    strongest arguments FOR upside, each anchored to a specific number or article
    in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
    same standard. Argue each side at full strength. Do not soften the side you
    disagree with. The Read line states which side wins over 1-5 sessions and on
-   what evidence the loser's case would take over.
-10. Scenarios: what is more and less likely over the next 1-5 sessions. One
+   what evidence the loser's case would take over.""",
+    """Scenarios: what is more and less likely over the next 1-5 sessions. One
    short paragraph per scenario, in descending probability, each opening with
    "**<name> (p≈X%):**" and covering what happens, the early confirmation in the
    data, and the price implication against the levels in the blocks. Say once
    that the probabilities are this report's judgement. The Read line names the
-   most likely path and what would make the least likely one take over.
-11. Risk: systematic / sector / idiosyncratic; name the single biggest risk to
+   most likely path and what would make the least likely one take over.""",
+    """Risk: systematic / sector / idiosyncratic; name the single biggest risk to
    THIS call and the falsification conditions that would flip it. Name any
-   evidence this run could not gather and what it would have changed.
-12. Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
+   evidence this run could not gather and what it would have changed.""",
+    """Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
    described above and stamped "as of {date}"; invalidation (which close, level
-   or event kills the thesis); what to watch next session
-"""
+   or event kills the thesis); what to watch next session""",
+)
+
+# The anomaly sections go straight after Situation & Key Figures: they are
+# the specific version of the same question ("what is actually going on with
+# this name"), and everything below them is context for reading them.
+ANOMALY_INSERT_AFTER = 1
+
+ANOMALY_GROUP_INTRO = """Sections {first} to {last} below are the reason this
+report exists. Each covers something that measurably stands out for {ticker}
+today and has its own ANOMALY block in the precomputed section carrying its
+figures and, where this run researched it, a sourced finding. Write them at
+full strength and do not merge them into one another."""
+
+ANOMALY_SECTION = """{title}: write this section from the ANOMALY block headed
+   "{key}" and from nothing else. Three parts, visibly separated. (a) What the
+   evidence shows: quote that block's figures exactly, and only those. (b) What
+   the research found: the finding with the outlet and date of the source it
+   came from; where the block says the question was NOT researched, say that in
+   one sentence and stop, never supply a cause of your own. (c) What it implies
+   for the next 1-5 sessions and what would show the implication is wrong.
+   (a) and (b) are what is observed and sourced, (c) is your reading of it, and
+   the reader must be able to tell which is which without guessing."""
+
+# Worded over what the run ACTUALLY screened. The earlier version listed
+# every category the scanner knows about, so a run with the options block
+# throttled, or with evidence boxes unchecked in the Run dialog, told the
+# model there was no lopsided chain and no insider cluster on the strength
+# of blocks that were never fetched. That is the absence-asserted-from-
+# nothing failure the whole stage exists to stop, restated in the prompt.
+NO_ANOMALY_NOTE = """Nothing stands out for {ticker} in what this run
+screened: {checked}. Nothing unusual turned up there.{unchecked} That absence
+is itself the finding, so THIS REPORT IS SHORT. Say in section 1 that nothing
+stands out, name what was screened and what was not, keep every section below
+to its minimum, and cut anything you are writing only because a heading
+exists. Padding a quiet symbol out with technical recitation is a failure of
+this report, not thoroughness: length here is a cost to the reader, not a
+service."""
+
+UNSCREENED_NOTE = """ This run did NOT screen {unchecked}, so say nothing
+about those either way: they were not looked at, which is not the same as
+finding nothing in them."""
+
+# Nothing was screened at all: the run gathered none of the evidence the
+# scan reads. Saying "nothing stands out" here would be a claim about
+# evidence that does not exist.
+NO_SCREEN_NOTE = """This run gathered none of the evidence the anomaly scan
+reads for {ticker}: no options chain, no insider or congressional filings, no
+quality screen and no news. So NOTHING IS KNOWN about whether anything stands
+out for this symbol, and you must not write that nothing does. Say in section
+1 that the scan had nothing to read, keep every section below to its minimum,
+and write only what the price and fundamentals blocks actually support."""
+
+
+def render_output_sections(ticker: str, date: str, sector_etf: str,
+                           anomalies: Optional[list] = None,
+                           screened: Optional[list] = None) -> str:
+    """The numbered output-format list for one report.
+
+    ``anomalies`` is ``services.anomaly_service.detect``'s output for this
+    symbol. Each one becomes its own numbered section between Situation and
+    Technicals, and the fixed sections after them renumber around it, so the
+    document a reader gets is shaped by what the run actually found. An empty
+    list is the normal outcome for a quiet name and produces the fixed frame
+    plus the instruction that the report is to be short.
+
+    ``screened`` is ``anomaly_service.screened``'s labels for the categories
+    this run could rule out. It is what makes the quiet-symbol note honest:
+    an empty anomaly list over two screened categories is a different
+    statement from an empty list over none, and only the caller knows which
+    happened. Omitting it (a caller with no scan at all) produces the
+    nothing-was-screened wording, never a blanket "nothing stands out".
+    """
+    fmt = {"ticker": ticker, "date": date, "sector_etf": sector_etf}
+    fixed = [s.format(**fmt) for s in FIXED_SECTIONS]
+    items = fixed[:ANOMALY_INSERT_AFTER]
+    intro = ""
+    found = list(anomalies or [])
+    if found:
+        first = ANOMALY_INSERT_AFTER + 1
+        intro = ANOMALY_GROUP_INTRO.format(
+            ticker=ticker, first=first, last=first + len(found) - 1) + "\n\n"
+        items += [ANOMALY_SECTION.format(title=a.get("title") or "Anomaly",
+                                         key=a.get("key") or "anomaly")
+                  for a in found]
+    items += fixed[ANOMALY_INSERT_AFTER:]
+
+    out = [f"{i}. {body}" for i, body in enumerate(items, 1)]
+    head = "" if found else _quiet_note(ticker, screened) + "\n\n"
+    return head + intro + "\n".join(out)
+
+
+def _quiet_note(ticker: str, screened: Optional[list]) -> str:
+    """The header for a report with no anomaly sections, worded over the
+    categories that were really screened and naming the rest as unchecked."""
+    from services.anomaly_service import SCREENS
+
+    checked = [str(s) for s in (screened or []) if str(s or "").strip()]
+    if not checked:
+        return NO_SCREEN_NOTE.format(ticker=ticker)
+    missed = [label for label, _, _ in SCREENS if label not in checked]
+    unchecked = UNSCREENED_NOTE.format(unchecked=_join(missed)) if missed else ""
+    return NO_ANOMALY_NOTE.format(ticker=ticker, checked=_join(checked),
+                                  unchecked=unchecked)
+
+
+def _join(labels: list) -> str:
+    """"a", "a and b", "a, b and c"."""
+    if len(labels) <= 1:
+        return labels[0] if labels else ""
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
 
 
 # Appended to the prompt (not part of the format template, the JSON braces
@@ -376,7 +504,8 @@ The stance MUST be consistent with your Verdict: BUY maps to BULLISH
 (CAUTIOUS_BULLISH if CONVICTION < 0.6), SELL to BEARISH (CAUTIOUS_BEARISH if
 CONVICTION < 0.6), HOLD to NEUTRAL. watch_items must reuse levels/dates already
 cited in your report. Do not introduce new numbers here. scenarios must match
-section 10: same names, same probabilities (as decimals summing to about 1.0).
+the Scenarios section: same names, same probabilities (as decimals summing to
+about 1.0).
 Text inside the JSON follows the same voice rules as the report: no em dashes,
 no "not just X, it's Y", no filler.
 """
@@ -1084,6 +1213,8 @@ class SingleAgentResearch:
         use_continuity: bool = True,
         ledger: "Optional[EvidenceLedger]" = None,
         situation: Optional[str] = None,
+        anomalies: Optional[list] = None,
+        screened: Optional[list] = None,
     ) -> dict[str, Any]:
         """Run the analysis for `symbol` as of `as_of` (YYYY-MM-DD).
 
@@ -1099,6 +1230,11 @@ class SingleAgentResearch:
         quote a hit rate measured on sessions it has not reached; when omitted
         the report states that no rate can be given. `use_continuity=False`
         suppresses the prior-stance lookup for the same reason.
+
+        `anomalies` (services.anomaly_service.detect's output, already
+        researched by the caller) shapes the output format: one section per
+        anomaly, numbered into the fixed frame. An empty list tells the
+        report to be short instead of padding the same headings out.
         """
         from services.stock_data import fetch_stock_data
 
@@ -1262,6 +1398,11 @@ class SingleAgentResearch:
             fundamentals_block=_smart_truncate(fundamentals_block, 2000),
             news_block=news_block_text,
             extra_context=extra_block,
+            # Rendered separately and passed in: the section bodies carry
+            # anomaly titles that came from data, and format() must not walk
+            # into a brace inside one of them.
+            output_sections=render_output_sections(
+                symbol, as_of, sector_etf, anomalies, screened),
         ) + EPILOGUE_INSTRUCTIONS % {
             "thesis": THESIS_EPILOGUE_SCHEMA if include_thesis else "",
         }
@@ -1387,6 +1528,12 @@ class SingleAgentResearch:
             # itself never sees the prior stance.
             "since_last_source": since_source,
             "situation": situation,
+            "anomalies": [a.get("key") for a in (anomalies or [])],
+            "anomalies_researched": sum(1 for a in (anomalies or [])
+                                        if a.get("researched")),
+            # What the scan could rule out. Without it a reader cannot tell
+            # a quiet symbol from a run that fetched nothing to screen.
+            "anomalies_screened": list(screened or []),
             "evidence": ledger.to_dict(),
         }
         news_desc = (
@@ -1413,6 +1560,12 @@ class SingleAgentResearch:
             + (f"; prior stance from the {prior_report['trade_date']} report"
                if prior_report else "; no prior report on record")
             + (f"; situation {situation}" if situation else "")
+            + (f"; {len(anomalies)} anomaly section(s), "
+               f"{provenance['anomalies_researched']} web-researched"
+               if anomalies else
+               f"; nothing anomalous in {_join(list(screened))}"
+               if screened else
+               "; no evidence available to screen for anomalies")
             + "."
             + (f" **Written without expected evidence: {ledger.summary()}.**"
                if ledger.degraded else "")

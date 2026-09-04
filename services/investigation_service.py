@@ -25,10 +25,12 @@ told the decision moment (before the target session's open) and to date
 every source.
 """
 
+import hashlib
 import json
 import logging
 import re
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -48,11 +50,100 @@ SITUATIONS = (
     "OTHER",
 )
 
+# Each researched question is its own web search, so this is a spend cap as
+# much as a reading cap: three sourced answers is what a report can carry
+# without the sections turning into a list.
+MAX_RESEARCH_QUESTIONS = 3
+
 _CACHE: dict[tuple, "Investigation"] = {}
 _CACHE_LOCK = threading.Lock()
 # One lock per cache key: a prefetch thread and the in-loop call for the
 # same symbol must never both pay for the search, the second waits.
 _KEY_LOCKS: dict[tuple, threading.Lock] = {}
+
+# Answers to specific questions live in their own cache: a different value
+# shape, and a key that carries the question itself.
+_ANSWER_CACHE: dict[tuple, dict] = {}
+_ANSWER_LOCKS: dict[tuple, threading.Lock] = {}
+
+# A run-level ceiling on question research, claimed here and opened by
+# whoever starts a run. The per-symbol cap alone does not bound a run:
+# three questions on each of a 20-symbol watchlist is 60 more web-search
+# turns on the serial model loop of a job that already takes ~40 minutes and
+# is killed at 95. Questions past the ceiling come back unanswered and their
+# sections say so, which is the same contract as a failed search.
+#
+# The ceiling is held in a ContextVar rather than a module global because
+# the scheduled job and an interactive report run in the SAME process: one
+# global counter meant the 07:00 watchlist job drained the ceiling to zero
+# and every report a user asked for afterwards was told its questions had
+# been ranked out, while a run nobody had opened a ceiling for searched
+# without any bound at all. A ContextVar gives each run its own ledger for
+# free: the runner and the callback each open one, and the copy_context()
+# hand-offs the model loop and the research fan-out already use carry the
+# same ledger OBJECT into their workers, so a run's symbols still share one
+# counter. Unset (a caller outside any run, e.g. an export) means unlimited.
+_BUDGET: "ContextVar[dict | None]" = ContextVar("research_budget", default=None)
+_BUDGET_LOCK = threading.Lock()
+
+
+def begin_research_budget(questions: "int | None") -> None:
+    """Open a ceiling of ``questions`` for the run starting in this context.
+
+    Called once per run, before its symbols are dispatched. ``None`` lifts
+    the ceiling. Context state rather than a threaded parameter because the
+    questions are raised deep inside one symbol's model call and the ceiling
+    is a property of the run around it.
+    """
+    _BUDGET.set(None if questions is None
+                else {"left": max(0, int(questions))})
+    logger.debug("research budget for this run: %s question(s)",
+                 "unlimited" if questions is None else questions)
+
+
+def research_budget_left() -> "int | None":
+    """What is left of this run's ceiling. For tests and progress lines."""
+    ledger = _BUDGET.get()
+    if ledger is None:
+        return None
+    with _BUDGET_LOCK:
+        return ledger["left"]
+
+
+def _claim_budget(wanted: int) -> int:
+    """Claim up to ``wanted`` questions from this run's ceiling."""
+    ledger = _BUDGET.get()
+    if ledger is None:
+        return wanted
+    with _BUDGET_LOCK:
+        take = min(wanted, ledger["left"])
+        ledger["left"] -= take
+        return take
+
+
+def _evidence_digest(profile: str, headlines: str, filings: str,
+                     quality: str) -> str:
+    """Fingerprint of the evidence one call was handed.
+
+    The cache keyed on (symbol, date, web, model) alone, so a run that fed
+    the investigator different headlines, new filings or a changed prompt
+    read back the previous run's answer. ``last_close`` is deliberately
+    outside the digest: it moves the spread arithmetic, not the question
+    being researched, and the background prefetch does not have it, so
+    folding it in would make every in-loop call miss the warm entry and pay
+    for the same search a second time.
+    """
+    h = hashlib.sha256()
+    for part in (profile, headlines, filings, quality):
+        h.update((part or "").encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def _context_digest(context: str) -> str:
+    """Fingerprint of the figures one researched question was raised by."""
+    return hashlib.sha256(
+        (context or "").encode("utf-8", "replace")).hexdigest()[:16]
 
 
 @dataclass
@@ -192,7 +283,9 @@ def investigate(
     """Run the stage. ``web`` is the frontend's tool switch (default off).
     Raises on provider failure, the caller classes the block (expected
     evidence) and records the gap."""
-    key = (symbol.upper(), str(as_of)[:10], web, model or MODEL.INVESTIGATION_MODEL)
+    key = (symbol.upper(), str(as_of)[:10], web,
+           model or MODEL.INVESTIGATION_MODEL,
+           _evidence_digest(profile, headlines, filings, quality))
     with _CACHE_LOCK:
         if key in _CACHE:
             if _CACHE[key].error:
@@ -306,8 +399,221 @@ def _investigate_uncached(key, symbol, as_of, *, web, target, profile, headlines
     return inv
 
 
+RESEARCH_SYSTEM_PROMPT = """You are an investigative equity research analyst. You are given ONE specific question about a company, raised by something measurable that stands out in today's data, and you answer that question and nothing else.
+
+Discipline:
+- Answer the question that was asked. Do not write a general note on the company, do not summarise its chart, do not offer a trading view.
+- Every claim carries a source: outlet or document, publication date, URL. What you cannot source does not go in "finding"; it goes in "unresolved".
+- Separate fact from inference. Label a reading of the facts "inference:" inside the sentence that makes it.
+- Never invent a number, a date or a name. Quote figures exactly as the source states them.
+- If the web says nothing about this question, say so plainly in "finding" and leave "citations" empty. An honest "no reporting found" is a useful answer; a plausible-sounding cause you cannot source is not.
+- Write plain sentences: no em dashes or en dashes as punctuation, no "not just X, it's Y", no "delve", "dive", "landscape", "unlock", no filler.
+- Output ONLY the JSON object described in the user message, inside one ```json fence, nothing after the fence."""
+
+
+def _research_prompt(symbol: str, as_of: str, target: Optional[str],
+                     question: str, context: str) -> str:
+    when = (f"The decision this feeds is made before the open of {target}; "
+            f"information published up to that moment is usable."
+            if target else
+            f"The decision this feeds is made at the close of {as_of}; use "
+            f"information published on or before that date.")
+    return f"""Company: {symbol}
+As-of (data cutoff): {as_of}
+{when}
+
+== THE QUESTION ==
+{question}
+
+== WHAT RAISED IT (measured from this run's own data) ==
+{context or 'no supporting figures supplied'}
+
+== TASK ==
+Search the open web for what explains or bears on that question, then return ONLY this JSON:
+
+```json
+{{
+  "finding": "<2-5 sentences answering the question, every claim attributable to one of the citations below; say 'no reporting found' if that is the truth>",
+  "citations": [
+    {{"source": "<outlet or document>", "date": "YYYY-MM-DD", "url": "<url>"}}
+  ],
+  "unresolved": "<what the search could not establish and would change the answer, or an empty string>"
+}}
+```"""
+
+
+def _answer(question: str, **fields) -> dict:
+    """The shape every caller reads: the question it was asked, the finding,
+    and the citations behind it. Everything else is bookkeeping."""
+    out = {"question": question, "finding": "", "citations": [],
+           "unresolved": "", "searches": 0, "model": "", "web": True,
+           "input_tokens": 0, "output_tokens": 0, "parse_ok": True,
+           "error": None}
+    out.update(fields)
+    return out
+
+
+def _research_one(symbol: str, as_of: str, question: str, *,
+                  target: Optional[str], context: str, model: Optional[str],
+                  max_searches: int) -> dict:
+    from services.llm_service import get_llm
+
+    llm = get_llm()
+    usage: dict = {}
+    out = llm.generate_with_web_search(
+        _research_prompt(symbol, as_of, target, question, context),
+        RESEARCH_SYSTEM_PROMPT,
+        model=model or MODEL.INVESTIGATION_MODEL,
+        max_tokens=MODEL.INVESTIGATION_MAX_TOKENS,
+        max_searches=max_searches, usage_out=usage)
+
+    ans = _answer(question, searches=int(out.get("searches") or 0),
+                  model=out.get("model") or "",
+                  input_tokens=int(usage.get("input_tokens") or 0),
+                  output_tokens=int(usage.get("output_tokens") or 0))
+    data = _extract_json(out.get("text") or "")
+    if data:
+        ans["finding"] = str(data.get("finding") or "").strip()
+        ans["unresolved"] = str(data.get("unresolved") or "").strip()
+        ans["citations"] = [c for c in (data.get("citations") or [])
+                            if isinstance(c, dict)][:6]
+    else:
+        # A prose answer with the provider's own sources still carries the
+        # research; only the structure was lost. Recording it as an error
+        # would throw away a search that was already paid for.
+        ans["parse_ok"] = False
+        ans["finding"] = (out.get("text") or "").strip()[:1200]
+    if not ans["citations"]:
+        ans["citations"] = [{"source": s.get("title") or "web", "date": "",
+                             "url": s.get("url") or ""}
+                            for s in (out.get("sources") or [])[:6]
+                            if isinstance(s, dict)]
+    if not ans["finding"]:
+        raise RuntimeError("question research returned no text")
+    return ans
+
+
+def research_questions(symbol: str, as_of: str, questions: list[str], *,
+                       web: bool = False, target: Optional[str] = None,
+                       model: Optional[str] = None,
+                       context_by_question: Optional[dict] = None,
+                       max_questions: Optional[int] = None
+                       ) -> list[dict]:
+    """Research specific questions about ``symbol``, one web search each.
+
+    ``investigate`` above asks what KIND of situation a symbol is in, and it
+    triages first so a plain momentum name never pays for a search. This is
+    the other half: the questions handed here were raised by something
+    measurable that stands out (a chain positioned against the tape, three
+    executives selling in a fortnight), which is exactly the case that
+    should search, so nothing here triages them away.
+
+    ``context_by_question`` carries the measured figures each question was
+    raised by; the prompt puts them under "what raised it" so the search is
+    aimed at the anomaly rather than the ticker.
+
+    Each answer is {question, finding, citations} plus its own bookkeeping,
+    cached under a key that carries the question AND a digest of its
+    context, so a changed question or changed figures is a new search and a
+    repeated one is free. A question whose search fails
+    comes back with an empty finding and ``error`` set rather than raising:
+    the caller still has the figures that raised it and must render them as
+    unresearched.
+
+    Returns [] when ``web`` is off. There is no web-free answer to "why is
+    this happening" that is worth putting in a report, and a caller that got
+    one back would print it as research.
+
+    Fewer answers than questions is normal and is the caller's signal that a
+    question went unasked: the per-symbol cap and the run-level ceiling
+    (``begin_research_budget``) both trim the list, and an anomaly with no
+    answer must be rendered as unresearched rather than dropped. The asked
+    questions run CONCURRENTLY. They sit on the serial per-symbol model loop,
+    so three web searches one after another would add their full latency to
+    every symbol of a scheduled run; each one is an independent call and the
+    caches below are already shared safely with the prefetch pool.
+    """
+    import concurrent.futures
+    from contextvars import copy_context
+
+    asked: list[str] = []
+    for q in (questions or []):
+        q = str(q or "").strip()
+        if q and q not in asked:
+            asked.append(q)
+    # Read at call time, not bound as a default: the cap is a spend knob and
+    # a test or a caller that lowers it must actually lower it.
+    cap = MAX_RESEARCH_QUESTIONS if max_questions is None else max_questions
+    asked = asked[:max(0, int(cap))]
+    if not asked:
+        return []
+    if not web:
+        logger.debug("%s: %d question(s) left unresearched, web research is "
+                     "off for this run", symbol, len(asked))
+        return []
+
+    allowed = _claim_budget(len(asked))
+    if allowed < len(asked):
+        logger.info("%s: %d of %d question(s) not researched, this run's "
+                    "research budget is spent", symbol,
+                    len(asked) - allowed, len(asked))
+        asked = asked[:allowed]
+    if not asked:
+        return []
+
+    # One shared search budget: the run's ceiling divided over the questions
+    # it is spending it on, never per question on top of it.
+    per_question = max(1, MODEL.INVESTIGATION_MAX_SEARCHES // len(asked))
+    use_model = model or MODEL.INVESTIGATION_MODEL
+    contexts = context_by_question or {}
+
+    def _one(question: str) -> dict:
+        # The context is in the key, not just the question. Two runs can
+        # raise the same sentence off different figures (the quality
+        # question names the failure COUNT, the facts name which checks
+        # failed), and serving the first run's answer for the second would
+        # cite reporting about numbers this run never measured.
+        key = (symbol.upper(), str(as_of)[:10], question, use_model,
+               _context_digest(contexts.get(question, "")))
+        with _CACHE_LOCK:
+            cached = _ANSWER_CACHE.get(key)
+            key_lock = _ANSWER_LOCKS.setdefault(key, threading.Lock())
+        if cached is not None:
+            return cached
+        with key_lock:
+            with _CACHE_LOCK:
+                cached = _ANSWER_CACHE.get(key)
+            if cached is not None:
+                return cached
+            try:
+                cached = _research_one(
+                    symbol, str(as_of)[:10], question, target=target,
+                    context=contexts.get(question, ""), model=use_model,
+                    max_searches=per_question)
+            except Exception as e:
+                logger.warning("%s: research failed for %r: %s",
+                               symbol, question[:60], e)
+                # Cached like a successful answer: two workers on the same
+                # symbol must not both pay for a failing search.
+                cached = _answer(question, error=str(e)[:200], parse_ok=False)
+            with _CACHE_LOCK:
+                _ANSWER_CACHE[key] = cached
+            return cached
+
+    if len(asked) == 1:
+        return [_one(asked[0])]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(asked), thread_name_prefix="research") as pool:
+        # A fresh context copy per worker: usage attribution is a ContextVar
+        # and a plain thread would start outside the caller's track() scope,
+        # billing these searches to no stage at all.
+        futures = [pool.submit(copy_context().run, _one, q) for q in asked]
+        return [f.result() for f in futures]
+
+
 def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
                   target: Optional[str], news_by_symbol: dict,
+                  evidence: "set | list | tuple | None" = None,
                   workers: int = 4) -> "concurrent.futures.ThreadPoolExecutor":
     """Start the investigations for a run's symbols in the background.
 
@@ -319,9 +625,17 @@ def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
     finishes). Failures are swallowed here, the in-loop call re-raises
     them into the ledger where they belong. The executor is returned so the
     caller can release it (``shutdown(wait=False)``) when the run ends.
+
+    ``evidence`` is the run's selected evidence set. It exists so this
+    thread assembles the SAME evidence the in-loop call will: the cache key
+    carries a digest of it, so a prefetch that computed a quality screen the
+    run did not select would miss the warm entry and pay for the search
+    twice, which is the cost this function exists to avoid.
     """
     import concurrent.futures
     from services import usage_service as _usage
+
+    evidence = set(evidence if evidence is not None else MODEL.DEFAULT_EVIDENCE)
 
     def _one(symbol: str) -> None:
         try:
@@ -332,10 +646,11 @@ def prefetch_many(symbols: list[str], as_of: str, *, web: bool,
                 from services.bad_apples_service import analyze_symbol, format_bad_apples_block
                 # The run's own capped window; an empty list means "quiet or
                 # source down", which the scan must fetch to tell apart.
-                quality = format_bad_apples_block(
-                    symbol, analyze_symbol(
-                        symbol, as_of,
-                        articles=(news_by_symbol.get(symbol) or None)))
+                if "quality" in evidence:
+                    quality = format_bad_apples_block(
+                        symbol, analyze_symbol(
+                            symbol, as_of,
+                            articles=(news_by_symbol.get(symbol) or None)))
             except Exception:
                 pass
             try:

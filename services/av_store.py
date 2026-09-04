@@ -35,7 +35,7 @@ import logging
 import re
 import threading
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -68,6 +68,8 @@ INSIDER_WINDOW_DAYS = 180
 # Honorifics the vendor mixes into name variants ("Hon. Dan Newhouse").
 _HONORIFIC = re.compile(r"^(hon|mr|mrs|ms|dr|sen|rep|the honorable)\.?\s+")
 _MISSING = "~"
+# Every dollar column in these tables holds two decimals.
+_CENTS = Decimal("0.01")
 # Fetch stamps are shown next to report dates, which are market dates. A UTC
 # stamp reads as tomorrow from mid-evening on.
 _DISPLAY_TZ = ZoneInfo("US/Eastern")
@@ -125,6 +127,12 @@ def _amount_part(value: Optional[Decimal]) -> Optional[str]:
 
 def _share_part(value: Optional[Decimal]) -> Optional[str]:
     return None if value is None else f"{value:.4f}"
+
+
+def _money(value: Decimal) -> Decimal:
+    """A dollar amount at the scale of the columns that hold one, rounded
+    the way Postgres rounds on the way in (half away from zero)."""
+    return value.quantize(_CENTS, rounding=ROUND_HALF_UP)
 
 
 def alias_key(name: Optional[str]) -> Optional[str]:
@@ -439,7 +447,13 @@ def _insider_rows(symbol: str, rows: Iterable[dict]) -> dict[str, dict]:
         # A grant, gift or option exercise comes through at price 0. Any
         # dollar figure derived from those rows is invented, so there is not
         # one: value_usd stays NULL and the reader says so.
-        value = (shares * price
+        #
+        # Quantized to the scale of the column it lands in. A fractional
+        # share count times a four-decimal price carries more precision than
+        # Numeric(24, 2) can hold, and the unrounded product would never
+        # equal the rounded value read back, so _upsert would see every one
+        # of those rows as changed on every weekly re-sync.
+        value = (_money(shares * price)
                  if shares is not None and price is not None and price > 0
                  else None)
         out[key] = {

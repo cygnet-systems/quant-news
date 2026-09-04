@@ -357,6 +357,15 @@ class ModelConfig:
     # Output budget covers thinking + interim text between searches + the
     # JSON; 6000 truncated the first live run before the JSON was written.
     INVESTIGATION_MAX_TOKENS: int = int(os.getenv("INVESTIGATION_MAX_TOKENS", "20000"))
+    # Ceiling on anomaly-research questions for a WHOLE run, not per symbol.
+    # Anomaly questions are researched inside the serial per-symbol model
+    # loop, so the per-symbol cap of three would let a 20-symbol watchlist
+    # add 60 web-search turns to a job that already runs ~40 minutes against
+    # a 95-minute kill. 18 is six symbols' worth: enough that the names a run
+    # actually flags get researched, bounded enough that the job still lands.
+    # 0 turns anomaly research off; a run may lift it by passing None.
+    ANOMALY_RESEARCH_BUDGET: int = int(
+        os.getenv("ANOMALY_RESEARCH_BUDGET", "18"))
 
     # Swappable research backend: "single_agent" (in-tree default) or
     # "tradingagents" (adapter over a pinned external release; see

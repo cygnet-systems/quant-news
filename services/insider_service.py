@@ -76,6 +76,10 @@ def summarize_insiders(symbol: str, as_of, days: int = WINDOW_DAYS) -> dict:
     """
     rows = av_store.insider_transactions_for(symbol, as_of, days=days)
     people: dict[str, dict] = {}
+    # Bounded by as_of by construction: the reader serves nothing whose
+    # visibility date is later. It is what the header dates the block with
+    # when the wall-clock sync stamp would sit after the run's own cutoff.
+    latest_visible = max((r["visible_from"] for r in rows), default=None)
     totals = {"acquired": 0, "disposed": 0, "other": 0, "priced": 0,
               "unpriced": 0, "value_acquired": 0.0, "value_disposed": 0.0,
               "shares_acquired": 0.0, "shares_disposed": 0.0}
@@ -131,6 +135,7 @@ def summarize_insiders(symbol: str, as_of, days: int = WINDOW_DAYS) -> dict:
         "window_days": days,
         "n": len(rows),
         "executives": len(people),
+        "latest_visible": latest_visible,
         "by_executive": ranked,
         "recent": rows[:MAX_LINES],
         **totals,
@@ -145,9 +150,20 @@ def format_insider_block(symbol: str, s: dict | None,
     if not s:
         return ""
     symbol = (symbol or s.get("symbol") or "").upper()
+    # The sync stamp is wall clock, and every other date in this block is
+    # bounded by as_of. On a backtest it would put a date AFTER the run's
+    # cutoff into the research prompt, on the path this platform measures
+    # alpha with, so past that point the block dates itself by the newest
+    # row it is actually serving.
+    stamp = str(synced)[:10] if synced else ""
+    if stamp and stamp <= s["as_of"]:
+        dated = f", store synced {stamp}"
+    elif s.get("latest_visible"):
+        dated = f", newest row visible from {s['latest_visible']}"
+    else:
+        dated = ""
     head = (f"[{symbol}: insider transactions (SEC Form 4), transactions in "
-            f"the {s['window_days']}d to {s['as_of']}"
-            + (f", store synced {synced}" if synced else "") + "]")
+            f"the {s['window_days']}d to {s['as_of']}{dated}]")
     lag = ("Visibility is a PROXY: a row enters this block on the second "
            "trading day after the transaction, the SEC Form 4 filing "
            "deadline. Most filings land sooner, so these dates are the "
@@ -238,8 +254,8 @@ def insider_block(symbol: str, as_of, days: int = WINDOW_DAYS
 
     ``ensure_fresh`` decides whether this run spends a call at all; a vendor
     failure is only a gap when it leaves nothing to read. With stored rows
-    from a previous week the block is still written, dated by the sync, and
-    the run is not marked degraded for evidence it does have.
+    from a previous week the block is still written and the run is not
+    marked degraded for evidence it does have.
 
     The top-up is inside the try with everything else. It reports vendor
     failures rather than raising them, but a database error underneath it
@@ -250,9 +266,10 @@ def insider_block(symbol: str, as_of, days: int = WINDOW_DAYS
     try:
         freshness = av_store.ensure_fresh(av_store.INSIDER_FUNCTION, symbol)
         summary = summarize_insiders(symbol, as_of, days=days)
-        # Dated by the last SUCCESSFUL sync, not the last attempt: the top-up
-        # that just failed writes a fetch stamp of its own, and a header
-        # reading that would say "synced today" above rows from last week.
+        # The last SUCCESSFUL sync, not the last attempt: the top-up that
+        # just failed writes a fetch stamp of its own, and a header reading
+        # that would say "synced today" above rows from last week. The
+        # formatter drops it when it falls after as_of.
         stamp = av_store.last_synced_date(av_store.INSIDER_FUNCTION, symbol)
     except Exception as e:
         logger.warning("%s: insider block failed: %s", symbol, e)
