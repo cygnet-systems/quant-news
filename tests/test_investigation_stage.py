@@ -267,3 +267,41 @@ def test_research_model_records_gap_when_investigation_fails():
     gap = next(g for g in ledger.expected_gaps() if g.block == "investigation")
     assert "provider down" in gap.reason
     assert any(b.startswith("[SPY regime") for b in blocks)
+
+
+def test_the_dossier_supersedes_the_political_blocks_congress_half():
+    """Both keys are default-on, and both cover congressional trades over the
+    same window from the same store. Building both would put two counts of
+    the same disclosures in one prompt."""
+    from services.evidence_contract import EvidenceLedger
+    from models.trading_agents_model import TradingAgentsModel
+    import pandas as pd
+
+    idx = pd.bdate_range("2025-09-01", "2026-09-01")
+    df = pd.DataFrame({"Open": 50.0, "High": 51.0, "Low": 49.0, "Close": 50.0,
+                       "Volume": 1_000_000}, index=idx)
+    seen = {}
+
+    def political(symbol, as_of, include_congress=True):
+        seen["include_congress"] = include_congress
+        return (["[BHF: institutional (13F) holder flows]\nnothing"], [])
+
+    model = TradingAgentsModel()
+    with patch("services.political_service.political_blocks", political), \
+         patch("services.politician_dossier.politician_block",
+               return_value=("[BHF: congressional dossier]\nnothing", [])), \
+         patch("utils.events.get_upcoming_events", return_value={}), \
+         patch("services.stock_data.fetch_stock_data", return_value=df):
+        blocks, _ = model._build_extra_context(
+            "BHF", df, "2026-09-01", evidence={"political", "politicians"},
+            ledger=EvidenceLedger("BHF"))
+    assert seen["include_congress"] is False
+    assert sum("congressional" in b for b in blocks) == 1
+
+    with patch("services.political_service.political_blocks", political), \
+         patch("utils.events.get_upcoming_events", return_value={}), \
+         patch("services.stock_data.fetch_stock_data", return_value=df):
+        model._build_extra_context("BHF", df, "2026-09-01",
+                                   evidence={"political"},
+                                   ledger=EvidenceLedger("BHF"))
+    assert seen["include_congress"] is True

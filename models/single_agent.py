@@ -151,13 +151,42 @@ divergence; negative revision/guidance cut; deteriorating margins or rising debt
 Neutral: RSI 45-55 with flat MACD; no material catalyst; tight range (<1% moves).
 
 **Step 2b: Positioning and flows (who is already positioned, and which way)**
-Read the options, congressional-trade, institutional (13F) and short-interest
-blocks as a group. Quantify before you characterise: "6 Democratic sells vs 4
-Democratic buys" is balanced, not a party stance, and a filing lags its trade by
-weeks. A put skew concentrated in the front month is event hedging; a skew spread
-across expiries is a stance. Large 13F cuts by a named holder are a fact about
-last quarter, not about tomorrow. Positioning tells you who would be squeezed or
-relieved by each outcome; it does not tell you the direction on its own.
+Read the options, congressional-trade, congressional-dossier, insider (Form 4),
+institutional (13F) and short-interest blocks as a group. Quantify before you
+characterise: "6 Democratic sells vs 4 Democratic buys" is balanced, not a party
+stance. A put skew concentrated in the front month is event hedging; a skew
+spread across expiries is a stance. Large 13F cuts by a named holder are a fact
+about last quarter, not about tomorrow. Then apply these, which is where this
+kind of evidence is usually over-read:
+- EVERY congressional and insider line is DISCLOSURE-LAGGED, so none of them is
+  a timing signal for the next session. A congressional filing can trail its
+  trade by weeks and its amount is a band, never an exact figure. A Form 4 line
+  becomes visible on the second trading day after the transaction, which is the
+  filing deadline and a proxy: most filings land sooner, so that date is the
+  latest a reader could have seen the trade, not the moment the tape learned it.
+  Never write that a member or an executive "just" bought or sold, and never
+  read the gap between a transaction date and its visibility date as
+  information.
+- One trade by one member of Congress is noise. Say so and move on. What can
+  carry weight is repetition: the same member trading this name again and
+  again, or several distinct members landing on the same side inside the window.
+- On the insider side, the only pattern worth weighting is a CLUSTER OF DISTINCT
+  EXECUTIVES on the same side, above all several named officers selling within
+  the same few weeks. One officer selling once is noise, and routine scheduled
+  selling by an officer who sells every quarter is noise as well.
+- A SHARE PRICE OF 0.00 IS NOT A PURCHASE. Those rows are grants, awards, gifts
+  or option exercises: shares move and no money does. Never call one a buy,
+  never derive a dollar figure from one, and never fold one into an "insiders
+  are buying" read. Only rows carrying a real share price can be read as
+  open-market activity, and the block states how many rows those are.
+- A committee seat, a hearing or a bill that touches this company explains why a
+  member is paying attention to it. That is context, not causation, and it is
+  never evidence of foreknowledge. Name the seat; do not build a thesis on it.
+- Where this evidence is thin, one filing, two executives, a single member, say
+  it is thin and give it the weight thin evidence deserves. A thin window is a
+  real finding. Inventing a read from it is not.
+Positioning tells you who would be squeezed or relieved by each outcome; it does
+not tell you the direction on its own.
 
 **Step 3: Combine Systematic + Idiosyncratic**
 - BULL + bullish ticker = strong BUY; BULL + bearish = HOLD (support limits downside)
@@ -266,12 +295,37 @@ Then the analysis, as sections in this order. Formatting rules:
    claim carries its outlet and date inline; is anything actually new?
 4. Fundamentals: valuation and quality, only as they bear on the 1-5 day window
    (in a PENDING_ACQUISITION, only as they bear on completion or break value)
-5. Positioning & Flows: who is positioned which way. Options (put/call, by
-   expiry when given), congressional trades (counts, party split, sizes, filing
-   lag), institutional 13F adds and cuts, short interest. Quote the counts and
-   the named holders or members from the blocks; say what each group would need
-   to see to change position, and which scenario below each one is exposed to.
-   If a block was not gathered, say so in one line rather than skipping it.
+5. Positioning & Flows: who is positioned which way, covering each of these
+   for which a block was provided:
+   - Options: put/call, by expiry when given.
+   - Insiders (Form 4): NAME the executives and their titles, and for each one
+     quote the share count and, where the block states one, the dollar value,
+     exactly as the block prints them (the block states dollars only over the
+     rows carrying a real share price, and says how many that is). Give the
+     transaction dates and the visible-from dates, and state the filing lag.
+     Say plainly which pattern the window holds: a cluster of distinct sellers,
+     one filer acting alone, or nothing. Rows priced at 0.00 are grants or
+     exercises and must be described as such, never as purchases and never with
+     a dollar figure attached.
+   - Congress: the window's trade count and, where a block states one, the
+     party split; the amount bands quoted as the block writes
+     them (the blocks print a range with a dash, your prose writes it "X to Y"),
+     and the filing lag. From the dossier, NAME the members with their
+     party, chamber and seat, say whether they were sitting on {date}, give what
+     each traded in {ticker} with the dates those disclosures became public, and
+     say what else they have been trading. Where the dossier says a member was
+     named in the news with no title next to the name, the identification rests
+     on their own filing: report it that way and claim nothing more.
+     That last list only covers the
+     symbols this system syncs, so read it as a floor on their activity: where
+     the block reports nothing else, write that nothing else was in coverage,
+     never that the member traded nothing else.
+   - Institutional 13F adds and cuts, and short interest.
+   Then say what each group would need to see to change position, and which
+   scenario below each one is exposed to. Where a block is thin or holds
+   nothing, say that in one sentence and weight it accordingly rather than
+   constructing a read it cannot carry. If a block was not gathered at all, say
+   so in one line rather than skipping it.
 6. Peer Comparison: {ticker} vs the peer set in the data; company-specific move
    or sector-wide repricing? (omit this section only if no peer block was provided)
 7. Business Context: what the company actually does, and which of tomorrow's
@@ -361,6 +415,15 @@ def _cached_frame(symbol: str, period: str = "2y") -> "pd.DataFrame":
         from services.stock_data import fetch_stock_data
         _FRAME_CACHE[key] = fetch_stock_data(symbol, period=period)
     return _FRAME_CACHE[key]
+
+
+# The whole precomputed section, all blocks together. Raised from 12,000
+# when the insider and congressional-disclosure blocks were added: at 12,000
+# the two of them (roughly 2.5 KB each) were pushed past the end by the
+# blocks assembled before them, and the caller had already recorded them as
+# present. The caller fits the blocks to this same number, so this is the
+# backstop and not the working limit.
+MAX_EXTRA_CONTEXT_CHARS = 16000
 
 
 def _smart_truncate(data: str, max_chars: int) -> str:
@@ -1159,15 +1222,15 @@ class SingleAgentResearch:
             ledger.missing("fundamentals", "no filings on or before the as-of date")
 
         extra_block = ""
-        # 12000: the assembled blocks now open with the situation &
-        # investigation block and can carry political flows too; callers
-        # truncate per block, this is the whole-string backstop. The gaps
-        # block is appended LAST and never truncated away.
+        # The callers fit their blocks to MAX_EXTRA_CONTEXT_CHARS before
+        # they get here, trimming the longest so none of them vanishes; this
+        # is the backstop for a caller that did not. The gaps block is
+        # appended LAST and never truncated away.
         gaps_block = ledger.prompt_block()
         if extra_context or gaps_block:
             extra_block = (
                 "\n== PRECOMPUTED METRICS & EVENTS (validated. Prefer these numbers) ==\n"
-                + _smart_truncate(extra_context, 12000)
+                + _smart_truncate(extra_context, MAX_EXTRA_CONTEXT_CHARS)
                 + (("\n\n" + gaps_block) if gaps_block else "")
                 + "\n"
             )

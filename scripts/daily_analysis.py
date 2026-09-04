@@ -54,7 +54,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
                         choices=["analyze", "evaluate", "replay", "alpha-lab",
-                                 "ticker-refresh", "cost", "notify-test"])
+                                 "ticker-refresh", "av-refresh",
+                                 "cost", "notify-test"])
     parser.add_argument("--event-move", type=float, default=5.0,
                         help="alpha-lab: one-day move (%%) that defines an "
                              "event (default 5)")
@@ -136,6 +137,28 @@ def main() -> int:
               else f"Ticker cache: {summary['indexes']} index symbol(s), "
                    f"{summary['history']} from run history")
         return 2 if summary["indexes"] == 0 else 0
+
+    if args.command == "av-refresh":
+        from services import av_store
+        symbols = ([x.strip().upper() for x in args.symbols.split(",") if x.strip()]
+                   if args.symbols
+                   else av_store.watchlist_symbols() or DEFAULT_SYMBOLS)
+        summary = av_store.refresh_all(symbols)
+        summary["at"] = datetime.now().isoformat()
+        # A symbol the vendor would not serve leaves last week's stored rows
+        # answering, so this is partial (exit 2, mailed as such), not a
+        # failure: the reports still have filings, a week older than they
+        # should be for that name.
+        if summary["problems"]:
+            summary["degraded"] = summary["problems"][:5]
+        print(json.dumps(summary) if args.json
+              else f"AV filings: {summary['calls']} call(s), "
+                   f"{summary['congress_rows']} congressional and "
+                   f"{summary['insider_rows']} insider row(s) written across "
+                   f"{summary['symbols']} symbol(s); "
+                   f"{summary['skipped']} already fresh, "
+                   f"{summary['failed']} unavailable")
+        return 2 if summary["failed"] else 0
 
     from services.analysis_runner import evaluate_pending, run_full_analysis
     from utils.trading_calendar import is_trading_day

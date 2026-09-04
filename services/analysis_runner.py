@@ -74,7 +74,7 @@ ALL_MODELS: tuple[str, ...] = (
 # political/institutional flows and by-expiry put/call, lead with a Situation
 # section, and carry an evidence ledger; the default news window is 14 days.
 # Reports written before this were blind to the situation a symbol was in.
-PIPELINE_EPOCH = "2026-09-02.1"
+PIPELINE_EPOCH = "2026-09-03.1"
 
 # Conviction labels map to nominal confidences for display only, backtests
 # showed they carry no calibration signal, so the label stays in details.

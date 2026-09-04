@@ -15,10 +15,8 @@ import logging
 import threading
 from datetime import date, timedelta
 
-import requests
-
 from config import API
-from services.rate_limiter import alpha_vantage_bucket
+from services.alpha_vantage import AlphaVantageUnavailable, fetch
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +66,16 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
 
     result = None
     try:
-        # Shares the quota with the news fetches; pace against the same bucket.
-        alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
-        response = requests.get(
-            API.ALPHA_VANTAGE_BASE_URL,
-            params={
-                "function": "HISTORICAL_OPTIONS",
-                "symbol": symbol.upper(),
-                "date": chain_date,
-                "apikey": API.ALPHA_VANTAGE_API_KEY,
-            },
-            timeout=API.DEFAULT_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        # AV signals throttling/bad requests with HTTP 200 and a message body.
-        for k in ("Note", "Information", "Error Message"):
-            if k in data:
-                logger.warning(f"{symbol}: HISTORICAL_OPTIONS {k}: "
-                               f"{str(data[k])[:150]}")
-                return None  # transient: do not cache
+        # Shares the quota with the news fetches; the client paces both.
+        data = fetch("HISTORICAL_OPTIONS", symbol=symbol.upper(),
+                     date=chain_date)
         contracts = data.get("data") or []
         if contracts:
             result = _aggregate(contracts, chain_date)
+    except AlphaVantageUnavailable as e:
+        # A throttle is transient and must not be cached as "no chain".
+        logger.warning(f"{symbol}: {e}")
+        return None
     except Exception as e:
         logger.warning(f"{symbol}: options chain fetch failed: {e}")
         return None
@@ -180,21 +165,8 @@ def get_put_call_by_expiry(symbol: str, as_of: str) -> dict | None:
         return None
     result = None
     try:
-        alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
-        response = requests.get(
-            API.ALPHA_VANTAGE_BASE_URL,
-            params={"function": "HISTORICAL_PUT_CALL_RATIO",
-                    "symbol": symbol.upper(), "date": chain_date,
-                    "apikey": API.ALPHA_VANTAGE_API_KEY},
-            timeout=API.DEFAULT_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        for k in ("Note", "Information", "Error Message"):
-            if k in data:
-                logger.warning(f"{symbol}: HISTORICAL_PUT_CALL_RATIO {k}: "
-                               f"{str(data[k])[:150]}")
-                return None
+        data = fetch("HISTORICAL_PUT_CALL_RATIO", symbol=symbol.upper(),
+                     date=chain_date)
         rows = []
         for r in data.get("put_call_ratio_by_expiration") or []:
             try:
@@ -210,6 +182,9 @@ def get_put_call_by_expiry(symbol: str, as_of: str) -> dict | None:
         if rows or full is not None:
             result = {"as_of": str(data.get("date") or chain_date)[:10],
                       "full_chain": full, "by_expiry": rows[:6]}
+    except AlphaVantageUnavailable as e:
+        logger.warning(f"{symbol}: {e}")
+        return None
     except Exception as e:
         logger.warning(f"{symbol}: put/call by expiry fetch failed: {e}")
         return None

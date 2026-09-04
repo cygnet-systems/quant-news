@@ -75,7 +75,7 @@ def test_congress_block_states_the_skew_as_a_number():
     from services.political_service import format_congress_block
     c = {"as_of": "2026-09-02", "window_days": 180, "n": 22, "buys": 9, "sells": 13,
          "by_party": {"D": {"buys": 4, "sells": 6}, "R": {"buys": 5, "sells": 6}},
-         "trades": [], "total_disclosed_all_time": 405}
+         "trades": [], "total_disclosed_visible": 405}
     block = format_congress_block("NVDA", c)
     assert "Skew: balanced overall; by party: D balanced, R balanced" in block
     c2 = {**c, "buys": 2, "sells": 20, "by_party": {"D": {"buys": 0, "sells": 12}}}

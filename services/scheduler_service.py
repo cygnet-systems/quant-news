@@ -51,6 +51,7 @@ CLI = str(PROJECT_ROOT / "scripts" / "daily_analysis.py")
 ANALYSIS_JOB = "daily_analysis"
 EVALUATION_JOB = "daily_evaluation"
 TICKER_REFRESH_JOB = "ticker_refresh"
+AV_REFRESH_JOB = "av_refresh"
 
 # Wall-clock ceiling per run, env-tunable. Sized from the measured scheduled
 # runs of 2026-08-14..09-01: 41-55 min typical, 68.6 min worst (a day with
@@ -169,6 +170,19 @@ JOB_TYPES: dict[str, JobType] = {
         default_hour=6,
         default_minute=0,
     ),
+    "av_refresh": JobType(
+        kind="av_refresh",
+        label="Filings refresh",
+        description="Top up congressional trades, insider Form 4 filings and "
+                    "the Congress roster for the watchlist. Weekly is "
+                    "enough: both disclosures lag their trade by weeks, and "
+                    "the endpoints return full history, so a run reads the "
+                    "stored rows instead of spending a call",
+        verb="av-refresh",
+        needs_symbols=False,
+        default_hour=5,
+        default_minute=30,
+    ),
 }
 
 
@@ -248,6 +262,20 @@ DEFAULT_JOBS = (
         # Sunday, well clear of the weekday analysis window.
         "hour": 6,
         "minute": 0,
+        "days_of_week": "sun",
+        "symbols_csv": None,
+        "params_json": {},
+    },
+    {
+        "id": AV_REFRESH_JOB,
+        "kind": "av_refresh",
+        "description": "Refresh congressional trades, insider filings and the "
+                       "Congress roster for the watchlist",
+        # Ahead of the ticker refresh, still on the quiet Sunday slot: it
+        # spends up to two Alpha Vantage calls per watchlist symbol and must
+        # not compete with a weekday run for the shared quota.
+        "hour": 5,
+        "minute": 30,
         "days_of_week": "sun",
         "symbols_csv": None,
         "params_json": {},

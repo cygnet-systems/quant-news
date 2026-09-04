@@ -33,9 +33,64 @@ from models.base import BaseModel, PredictionResult
 from services.evidence_contract import (
     OPTIONAL, EvidenceLedger, MissingRequiredEvidence,
 )
+from models.single_agent import MAX_EXTRA_CONTEXT_CHARS, _smart_truncate
 from services.investigation_service import WEB_RESEARCH_TOOL
 
 logger = logging.getLogger(__name__)
+
+
+# Per-block ceiling. A single oversized block (usually news-heavy metrics)
+# must not crowd the later ones out, but the ceiling has to clear the
+# largest block written on purpose: the insider block runs to ~2.7 KB on a
+# board that files often, the congressional dossier to ~2.8 KB.
+PER_BLOCK_CHARS = 3400
+# No block is cut below this, however tight the whole-section budget gets:
+# a header, its caveat and a couple of lines still carry evidence.
+MIN_BLOCK_CHARS = 600
+
+
+def _block_ceiling(lengths: list[int], budget: int) -> int:
+    """The largest per-block ceiling whose total fits ``budget``.
+
+    Water-filling: raise one ceiling across every block until the sum hits
+    the budget, so the excess comes off the longest blocks and the short
+    ones are left whole.
+    """
+    ordered = sorted(lengths)
+    for i, length in enumerate(ordered):
+        remaining = len(ordered) - i
+        kept = sum(ordered[:i])
+        if kept + length * remaining > budget:
+            return max(0, (budget - kept) // remaining)
+    return ordered[-1]
+
+
+def _fit_blocks(blocks: list[str], per_block: int = PER_BLOCK_CHARS,
+                budget: int = MAX_EXTRA_CONTEXT_CHARS) -> str:
+    """Join the context blocks so that every one of them survives.
+
+    The old assembly sliced each block and let the whole string be cut from
+    the end, which silently dropped the LAST blocks: the insider and
+    congressional disclosures, appended after the technical ones and already
+    recorded on the ledger as present. Here the budget is shared instead --
+    each block is capped, then the longest are trimmed at a line boundary
+    until the total fits -- so a block can be shortened but never disappear.
+    """
+    fitted = [_smart_truncate(b, per_block) for b in blocks if b]
+    if not fitted:
+        return ""
+    # "\n\n" between blocks, plus _smart_truncate's marker on each one it
+    # cuts, both come out of the same budget.
+    room = budget - 2 * (len(fitted) - 1) - 16 * len(fitted)
+    if sum(len(b) for b in fitted) > room:
+        ceiling = max(MIN_BLOCK_CHARS,
+                      _block_ceiling([len(b) for b in fitted], room))
+        trimmed = [b for b in fitted if len(b) > ceiling]
+        if trimmed:
+            logger.info("context budget: %d of %d blocks trimmed to %d chars",
+                        len(trimmed), len(fitted), ceiling)
+        fitted = [_smart_truncate(b, ceiling) for b in fitted]
+    return "\n\n".join(fitted)
 
 
 def _emit(stage: str, message: str, payload: dict | None = None) -> None:
@@ -185,10 +240,10 @@ class TradingAgentsModel(BaseModel):
             ohlcv_df=ohlcv_df,
             news=news,
             track_record=track_record,
-            # Per-block cap: one oversized block (usually news-heavy metrics)
-            # must not push the later blocks (peers, SPY regime) past the
-            # whole-string budget, that's how peers silently vanished.
-            extra_context="\n\n".join(b[:2600] for b in extra_blocks),
+            # Shared budget rather than a slice per block and a cut on the
+            # tail: peers vanished that way once, and the disclosure blocks
+            # (appended last, already on the ledger) would vanish next.
+            extra_context=_fit_blocks(extra_blocks),
             use_news=use_news,
             include_thesis=kwargs.get("include_thesis", False),
             # The run's own window, frontend-owned: no fallback here, the
@@ -353,7 +408,8 @@ class TradingAgentsModel(BaseModel):
         """Assemble validated, lookahead-safe context blocks for the prompt.
 
         ``evidence`` gates the optional blocks per run (Run-Analysis modal
-        checklist): "options", "quality", "investigation", "political".
+        checklist): "options", "quality", "investigation", "political",
+        "insiders", "politicians".
         None means the configured default set. ``tools`` is the run's tool
         switches from the same dialog, "web_research" lets the
         investigation search the open web; absent means off.
@@ -532,9 +588,15 @@ class TradingAgentsModel(BaseModel):
 
         # --- political & institutional flows (optional: sparse by nature) ---
         if "political" in evidence:
+            # The dossier reads the same stored congressional rows over the
+            # same window and names the members who filed them, so with both
+            # selected this block contributes the 13F half only. Two
+            # renderings of one dataset is how a report quotes two counts.
+            congress = "politicians" not in evidence
             try:
                 from services.political_service import political_blocks
-                blocks, problems = political_blocks(symbol, as_of)
+                blocks, problems = political_blocks(symbol, as_of,
+                                                    include_congress=congress)
             except Exception as e:
                 blocks, problems = [], [str(e)[:120]]
             extra_blocks.extend(blocks)
@@ -542,6 +604,53 @@ class TradingAgentsModel(BaseModel):
                 ledger.have("political")
             elif problems:
                 ledger.missing("political", "; ".join(problems))
+            else:
+                # Nothing fetched and nothing broken: 13F rows can simply be
+                # absent, and with the congressional half in the dossier
+                # there is no other line for this key to write.
+                ledger.missing("political",
+                               "no 13F holder rows visible on or before "
+                               "the as-of date"
+                               + ("" if congress else
+                                  "; congressional trades are in the "
+                                  "dossier block"))
+
+        # --- insider Form 4 flow (optional: many windows hold none) ---
+        # Read from the local store, so this costs a vendor call at most
+        # once a week per symbol however many runs ask for it.
+        if "insiders" in evidence:
+            try:
+                from services.insider_service import insider_block
+                block, problems = insider_block(symbol, as_of)
+            except Exception as e:
+                logger.warning(f"{symbol}: insider block failed: {e}")
+                block, problems = "", [str(e)[:120]]
+            if block:
+                extra_blocks.append(block)
+            if block and not problems:
+                ledger.have("insiders")
+            else:
+                ledger.missing("insiders", "; ".join(problems)
+                               or "no Form 4 rows stored for this symbol")
+
+        # --- congressional dossier (optional) ---
+        # Passed the run's OWN news: the dossier names members the articles
+        # mention, and re-fetching that news here would be a second window
+        # with a different cutoff.
+        if "politicians" in evidence:
+            try:
+                from services.politician_dossier import politician_block
+                block, problems = politician_block(symbol, as_of, news=news)
+            except Exception as e:
+                logger.warning(f"{symbol}: congressional dossier failed: {e}")
+                block, problems = "", [str(e)[:120]]
+            if block:
+                extra_blocks.append(block)
+            if block and not problems:
+                ledger.have("politicians")
+            else:
+                ledger.missing("politicians", "; ".join(problems)
+                               or "no congressional rows stored for this symbol")
 
         # --- situation & investigation (expected when selected) ---
         # Placed FIRST in the prompt's precomputed section: the situation

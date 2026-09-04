@@ -320,9 +320,15 @@ class ModelConfig:
     #   quality: Bad Apples screen + news red flags
     #   investigation: situation classifier + web-researched context
     #                   (deal terms, regulators, key figures), live runs only
-    #   political: congressional trades + 13F holder flows (Alpha Vantage)
+    #   political: congressional trades + 13F holder flows (Alpha Vantage);
+    #              with `politicians` also on, the congressional half is
+    #              left to the dossier and this contributes 13F only
+    #   insiders: named executives' Form 4 buys and sells, from the store
+    #   politicians: the congressional dossier — who traded this name, who
+    #                this run's news names, and what else they are trading
     DEFAULT_EVIDENCE: tuple[str, ...] = ("options", "quality",
-                                         "investigation", "political")
+                                         "investigation", "political",
+                                         "insiders", "politicians")
 
     # Investigation stage (services/investigation_service.py): one
     # tool-using LLM call per symbol that classifies the situation

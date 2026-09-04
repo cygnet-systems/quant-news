@@ -2,30 +2,36 @@
 
 Two point-in-time-aware evidence blocks for the research prompt:
 
-* Congressional trades (``CONGRESS_TRADES``). STOCK Act disclosures by
-  House and Senate members, with party, chamber, owner (self/spouse/child)
-  and the amount band. Point-in-time on ``filed_date``: a trade is visible
+* Congressional trades. STOCK Act disclosures by House and Senate members,
+  with party, chamber, owner (self/spouse/child) and the amount band, read
+  out of ``services.av_store``: the endpoint returns the symbol's entire
+  history on every call, so it is synced weekly and filtered locally rather
+  than fetched per run. Point-in-time on ``filed_date``: a trade is visible
   only from the day it was filed, which is what a reader on ``as_of`` could
   have known. Disclosure lags the trade by up to 45 days, so this is
-  positioning context, never a timing signal.
+  positioning context, never a timing signal. When a run also carries the
+  congressional dossier (``services.politician_dossier``) this half is left
+  out: same rows, same window, and two renderings of one dataset in one
+  prompt is how a report ends up quoting two different counts.
 * Institutional holdings (``INSTITUTIONAL_HOLDINGS``). 13F holders adding
   vs cutting, with the largest movers. Holder rows carry the quarter-end
   they were reported for and are filtered to ``last_reported <= as_of``;
   the vendor's aggregate counts are a current snapshot and are labelled as
   such rather than presented as point-in-time.
 
-Both endpoints were verified against the project key on 2026-09-01. Each
-is one Alpha Vantage call per symbol per run and shares the news bucket.
+Both endpoints were verified against the project key on 2026-09-01. The 13F
+half is one Alpha Vantage call per symbol per run and shares the news
+bucket; the congressional half spends one at most weekly, through the store.
 """
 
 import logging
 import threading
-from datetime import date, timedelta
+from datetime import date
 
-import requests
-
-from config import API
-from services.rate_limiter import alpha_vantage_bucket
+from services import av_store
+# AlphaVantageUnavailable is re-exported: the two blocks here raise it and
+# political_blocks' callers catch it by this module's name.
+from services.alpha_vantage import AlphaVantageUnavailable, fetch  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -36,26 +42,15 @@ CONGRESS_WINDOW_DAYS = 180
 INSTITUTIONAL_TOP_N = 4
 
 
-class AlphaVantageUnavailable(RuntimeError):
-    """The vendor answered with a throttle/limit message, not data."""
-
-
 def _av_get(params: dict) -> dict:
-    if not API.ALPHA_VANTAGE_API_KEY:
-        raise AlphaVantageUnavailable("no ALPHA_VANTAGE_API_KEY")
-    alpha_vantage_bucket().acquire(timeout=API.DEFAULT_TIMEOUT * 4)
-    response = requests.get(
-        API.ALPHA_VANTAGE_BASE_URL,
-        params={**params, "apikey": API.ALPHA_VANTAGE_API_KEY},
-        timeout=API.DEFAULT_TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
-    for k in ("Note", "Information", "Error Message"):
-        if k in data:
-            raise AlphaVantageUnavailable(f"{params.get('function')} {k}: "
-                                          f"{str(data[k])[:150]}")
-    return data
+    """The shared client, behind the name the callers below already use.
+
+    Both blocks let AlphaVantageUnavailable out: political evidence is
+    OPTIONAL, and ``political_blocks`` turns the failure into a named gap
+    rather than into a silent "no trades disclosed".
+    """
+    params = dict(params)
+    return fetch(params.pop("function"), **params)
 
 
 def _iso(d: str | None) -> date | None:
@@ -65,7 +60,9 @@ def _iso(d: str | None) -> date | None:
         return None
 
 
-def _band(lo, hi) -> str:
+def amount_band(lo, hi) -> str:
+    """The STOCK Act amount band as text. Public because the congressional
+    dossier renders the same bands and the two must read identically."""
     try:
         lo_f, hi_f = float(lo), float(hi)
     except (TypeError, ValueError):
@@ -83,40 +80,27 @@ def _band(lo, hi) -> str:
 def get_congress_trades(symbol: str, as_of: str,
                         days: int = CONGRESS_WINDOW_DAYS) -> dict:
     """Trades in ``symbol`` filed on or before ``as_of`` whose transaction
-    date falls in the last ``days``. Raises AlphaVantageUnavailable on a
-    vendor throttle so the caller can record a gap instead of "no trades".
+    date falls in the last ``days``.
+
+    Read from the store, which the top-up refreshes at most weekly: the
+    endpoint hands back the symbol's whole history whatever dates are asked
+    for, so a per-run fetch bought nothing and spent a call. Raises
+    AlphaVantageUnavailable only when the top-up failed AND nothing is
+    stored, so the caller records a gap rather than reporting "none
+    disclosed" about a symbol nobody has ever fetched.
     """
+    symbol = symbol.upper()
     as_of_d = date.fromisoformat(str(as_of)[:10])
-    key = ("congress", symbol.upper(), as_of_d.isoformat(), days)
+    key = ("congress", symbol, as_of_d.isoformat(), days)
     with _CACHE_LOCK:
         if key in _CACHE:
             return _CACHE[key]
 
-    data = _av_get({"function": "CONGRESS_TRADES", "symbol": symbol.upper()})
-    floor = as_of_d - timedelta(days=days)
-    trades = []
-    for t in data.get("trades") or []:
-        # Visibility is the filing date; fall back to the notification date
-        # (Senate rows carry no filed_date on some records). A row with
-        # neither cannot be placed in time and is dropped.
-        visible = _iso(t.get("filed_date")) or _iso(t.get("notification_date"))
-        tx = _iso(t.get("transaction_date"))
-        if visible is None or tx is None:
-            continue
-        if visible > as_of_d or tx < floor:
-            continue
-        trades.append({
-            "politician": t.get("politician_canonical") or t.get("politician"),
-            "party": t.get("party"),
-            "chamber": t.get("chamber"),
-            "state": t.get("state_district") or t.get("state"),
-            "type": (t.get("transaction_type") or "").upper(),
-            "owner": t.get("owner_code"),
-            "transaction_date": tx.isoformat(),
-            "filed_date": visible.isoformat(),
-            "amount_min": t.get("amount_min"),
-            "amount_max": t.get("amount_max"),
-        })
+    freshness = av_store.ensure_fresh(av_store.CONGRESS_FUNCTION, symbol)
+    trades = av_store.congress_trades_for(symbol, as_of_d, days=days)
+    on_record = av_store.congress_trades_count(symbol, as_of_d)
+    if not on_record and freshness["reason"].startswith("unavailable"):
+        raise AlphaVantageUnavailable(freshness["reason"])
     trades.sort(key=lambda r: r["transaction_date"], reverse=True)
     buys = [t for t in trades if t["type"].startswith("BUY") or t["type"] == "PURCHASE"]
     sells = [t for t in trades if t["type"].startswith("SELL") or t["type"] == "SALE"]
@@ -129,7 +113,7 @@ def get_congress_trades(symbol: str, as_of: str,
             for p in sorted({t["party"] for t in trades if t.get("party")})
         },
         "trades": trades[:12],
-        "total_disclosed_all_time": len(data.get("trades") or []),
+        "total_disclosed_visible": on_record,
     }
     with _CACHE_LOCK:
         _CACHE[key] = result
@@ -143,7 +127,8 @@ def format_congress_block(symbol: str, c: dict | None) -> str:
             f"through {c['as_of']}, transactions in last {c['window_days']}d)]")
     if not c["n"]:
         return (head + f"\nNone disclosed in the window "
-                f"({c['total_disclosed_all_time']} on record all-time). "
+                f"({c['total_disclosed_visible']} on record and public by "
+                f"{c['as_of']}). "
                 f"Absence is uninformative for a small/mid cap.")
     party = ", ".join(f"{p}: {v['buys']} buy / {v['sells']} sell"
                       for p, v in c["by_party"].items())
@@ -171,7 +156,7 @@ def format_congress_block(symbol: str, c: dict | None) -> str:
         who = f"{t['politician']} ({t['party'] or '?'}-{t['state'] or '?'}, {t['chamber']})"
         owner = f", {t['owner'].lower()}" if t.get("owner") and t["owner"] != "SELF" else ""
         lines.append(f"- {t['transaction_date']} {t['type']} "
-                     f"{_band(t['amount_min'], t['amount_max'])}: {who}{owner}; "
+                     f"{amount_band(t['amount_min'], t['amount_max'])}: {who}{owner}; "
                      f"filed {t['filed_date']}")
     lines.append("Disclosures lag the trade by up to 45 days and amounts are "
                  "bands; read as positioning by informed-but-slow actors, "
@@ -272,16 +257,24 @@ def format_institutional_block(symbol: str, h: dict | None) -> str:
 # Composite
 # ---------------------------------------------------------------------------
 
-def political_blocks(symbol: str, as_of: str) -> tuple[list[str], list[str]]:
+def political_blocks(symbol: str, as_of: str,
+                     include_congress: bool = True
+                     ) -> tuple[list[str], list[str]]:
     """(blocks, problems). Each sub-block fails independently; a problem
-    string names what could not be fetched so the caller can log a gap."""
+    string names what could not be fetched so the caller can log a gap.
+
+    ``include_congress`` is False when the run also carries the congressional
+    dossier: it reads the same stored rows over the same window and names the
+    members, so this block would only repeat it.
+    """
     blocks: list[str] = []
     problems: list[str] = []
-    try:
-        blocks.append(format_congress_block(
-            symbol, get_congress_trades(symbol, as_of)))
-    except Exception as e:
-        problems.append(f"congressional trades: {str(e)[:120]}")
+    if include_congress:
+        try:
+            blocks.append(format_congress_block(
+                symbol, get_congress_trades(symbol, as_of)))
+        except Exception as e:
+            problems.append(f"congressional trades: {str(e)[:120]}")
     try:
         block = format_institutional_block(
             symbol, get_institutional_holdings(symbol, as_of))

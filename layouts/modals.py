@@ -160,6 +160,9 @@ EVIDENCE_OPTIONS = [
     {"label": "Situation & investigation (web research, live runs)",
      "value": "investigation"},
     {"label": "Political & institutional flows", "value": "political"},
+    {"label": "Insider transactions (Form 4)", "value": "insiders"},
+    {"label": "Congressional dossier (who is trading it, who is named)",
+     "value": "politicians"},
 ]
 
 TOOL_OPTIONS = [

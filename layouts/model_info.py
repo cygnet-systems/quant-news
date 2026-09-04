@@ -185,7 +185,25 @@ _EVIDENCE_BLOCK_ROWS = [
      "Congressional trades disclosed under the STOCK Act (filed on or "
      "before the as-of date, with party, chamber and amount band) and 13F "
      "holder flows (holders adding vs cutting, largest movers). Disclosure "
-     "lags weeks; positioning context, not a timing signal."),
+     "lags weeks; positioning context, not a timing signal. With the "
+     "congressional dossier also selected this contributes the 13F half "
+     "only, because the dossier reads the same trades and names who filed "
+     "them."),
+    ("insiders", "Insider transactions (Form 4)", None,
+     "Named executives with their titles, what they acquired or disposed, "
+     "the share counts, and dollar value only for rows carrying a real "
+     "share price: grants, gifts and option exercises come through priced "
+     "at zero and are counted separately rather than shown as free "
+     "purchases. Rows become visible on the second trading day after the "
+     "transaction, the SEC filing deadline, which is a proxy for the real "
+     "filing date and is stated as one."),
+    ("politicians", "Congressional dossier", None,
+     "Up to three members of Congress: who they are (chamber, party, seat "
+     "and tenure as of the report date), what they traded in this symbol, "
+     "and what else they have been buying and selling recently. Includes "
+     "members named in this run's own news, matched against the roster's "
+     "aliases, whether or not they have traded the name; an alias shared "
+     "by two members is never matched."),
 ]
 
 

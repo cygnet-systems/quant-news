@@ -17,6 +17,12 @@ Tables:
         per-stage progress and counters
     tickers: local symbol lookup cache (index constituents, symbols ever run,
         names accepted after one price lookup)
+    politicians / politician_aliases: the Congress roster and its name
+        variants, so news matching is one indexed lookup
+    congress_trades / insider_transactions: stored STOCK Act and Form 4
+        disclosures, each row carrying the date it became public
+    av_fetch_log: what has already been pulled from Alpha Vantage, so a run
+        spends a call only on data it does not have
 """
 
 from datetime import date, datetime
@@ -30,6 +36,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -760,3 +767,177 @@ class WatchlistHistory(Base):
     __table_args__ = (
         Index("ix_watchlist_history_recent", "owner_uid", "last_used_at"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Alpha Vantage intelligence: who is buying and selling, stored once
+# ---------------------------------------------------------------------------
+#
+# CONGRESS_TRADES and INSIDER_TRANSACTIONS both return the symbol's FULL
+# history on every call (NVDA: 408 congressional trades back to 2016, 6,920
+# Form 4 lines back to 2003) and ignore date parameters. Fetching them per
+# run would spend the shared 70/min quota to re-download the same decade, so
+# they are stored once and filtered locally on every later run.
+#
+# Every row carries visible_from: the date the disclosure became public. All
+# reads filter visible_from <= as_of, which is what keeps a backtest from
+# reading a filing that had not happened yet.
+
+
+class Politician(Base):
+    """A member of Congress from POLITICIAN_METADATA.
+
+    The endpoint ignores its name/bioguide parameters and always returns the
+    whole roster (1,144 rows, ~2 MB), so it is synced whole, weekly, and read
+    locally. aliases holds the vendor's lowercased name variants; the
+    denormalised copy in politician_aliases is what news matching queries.
+    """
+
+    __tablename__ = "politicians"
+
+    bioguide_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    chamber: Mapped[str | None] = mapped_column(String(8))
+    state: Mapped[str | None] = mapped_column(String(4))
+    district: Mapped[str | None] = mapped_column(String(8))
+    party: Mapped[str | None] = mapped_column(String(4))
+    aliases: Mapped[list | None] = mapped_column(JSONB)
+    terms: Mapped[list | None] = mapped_column(JSONB)
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_politicians_display_name", "display_name"),
+    )
+
+
+class PoliticianAlias(Base):
+    """One (alias, member) pair, so matching a name found in an article is a
+    single indexed equality lookup rather than a JSONB scan over the roster.
+    """
+
+    __tablename__ = "politician_aliases"
+
+    alias: Mapped[str] = mapped_column(String(128), primary_key=True)
+    bioguide_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+
+    __table_args__ = (
+        Index("ix_politician_aliases_alias", "alias"),
+    )
+
+
+class CongressTrade(Base):
+    """One STOCK Act disclosure line.
+
+    visible_from is the filing date, falling back to the notification date.
+    A row with neither cannot be placed in time: it is stored with
+    visible_from NULL and is never served, because `NULL <= as_of` is not
+    true and every read filters on that comparison.
+
+    natural_key is a digest of (bioguide_id, symbol, transaction_date,
+    transaction_type, amount_min, amount_max, owner_code, filed_date) with a
+    sentinel for each missing component. A composite UNIQUE over those
+    columns would not work: Postgres treats NULLs as distinct, so the same
+    row re-fetched with a null bioguide_id would insert again every week.
+    """
+
+    __tablename__ = "congress_trades"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True)
+    natural_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    bioguide_id: Mapped[str | None] = mapped_column(String(16))
+    politician_canonical: Mapped[str | None] = mapped_column(Text)
+    chamber: Mapped[str | None] = mapped_column(String(16))
+    party: Mapped[str | None] = mapped_column(String(8))
+    state: Mapped[str | None] = mapped_column(String(8))
+    state_district: Mapped[str | None] = mapped_column(String(16))
+    asset_name: Mapped[str | None] = mapped_column(Text)
+    asset_type_code: Mapped[str | None] = mapped_column(String(8))
+    transaction_type: Mapped[str | None] = mapped_column(String(8))
+    transaction_date: Mapped[date | None] = mapped_column(Date)
+    notification_date: Mapped[date | None] = mapped_column(Date)
+    filed_date: Mapped[date | None] = mapped_column(Date)
+    amount_min: Mapped[float | None] = mapped_column(Numeric(18, 2))
+    amount_max: Mapped[float | None] = mapped_column(Numeric(18, 2))
+    owner_code: Mapped[str | None] = mapped_column(String(16))
+    filing_status: Mapped[str | None] = mapped_column(String(16))
+    visible_from: Mapped[date | None] = mapped_column(Date)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("natural_key", name="uq_congress_trades_natural_key"),
+        Index("ix_congress_trades_symbol", "symbol", "visible_from"),
+        Index("ix_congress_trades_member", "bioguide_id", "visible_from"),
+    )
+
+
+class InsiderTransaction(Base):
+    """One Form 4 line for a company officer or director.
+
+    The payload carries no filing date, so visible_from is a PROXY: the
+    second trading day strictly after the transaction, which is the SEC
+    deadline for filing a Form 4. A real filing can land earlier; treating
+    the deadline as the visibility date is the conservative direction (it
+    can hide a row a reader could have seen, never reveal one they could not).
+
+    value_usd is NULL when share_price is 0 or missing. Grants, gifts and
+    option exercises come through with a zero price and are a large share of
+    the rows; multiplying them out would invent dollar flows that never
+    happened.
+    """
+
+    __tablename__ = "insider_transactions"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True)
+    natural_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    executive: Mapped[str | None] = mapped_column(Text)
+    executive_title: Mapped[str | None] = mapped_column(Text)
+    security_type: Mapped[str | None] = mapped_column(Text)
+    acquisition_or_disposal: Mapped[str | None] = mapped_column(String(2))
+    transaction_date: Mapped[date | None] = mapped_column(Date)
+    shares: Mapped[float | None] = mapped_column(Numeric(20, 4))
+    share_price: Mapped[float | None] = mapped_column(Numeric(20, 4))
+    value_usd: Mapped[float | None] = mapped_column(Numeric(24, 2))
+    visible_from: Mapped[date] = mapped_column(Date, nullable=False)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("natural_key",
+                         name="uq_insider_transactions_natural_key"),
+        Index("ix_insider_transactions_symbol", "symbol", "visible_from"),
+    )
+
+
+class AvFetchLog(Base):
+    """What has already been pulled, per (function, subject).
+
+    subject is a symbol, or 'ALL' for the roster endpoints that take none.
+    ok=False rows are kept: a throttled attempt is not freshness, and
+    av_store.ensure_fresh only skips a call when the last attempt succeeded
+    and is inside the caller's max age.
+
+    Two timestamps because they answer different questions. last_fetched_at
+    is when a call was last ATTEMPTED and decides whether to spend another
+    one; last_success_at is when data last actually arrived and is what a
+    block prints when it dates the rows it is serving. Reading the attempt
+    stamp for that would have a failed top-up claim the store was synced
+    today.
+    """
+
+    __tablename__ = "av_fetch_log"
+
+    function: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(32), primary_key=True)
+    last_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
+    rows_seen: Mapped[int | None] = mapped_column(Integer)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False,
+                                     server_default=text("true"))
+    detail: Mapped[str | None] = mapped_column(Text)

@@ -60,3 +60,52 @@ def test_explicit_severity_override():
     ledger = EvidenceLedger("BHF")
     ledger.missing("options", "not selected this run", severity=OPTIONAL)
     assert not ledger.degraded
+
+
+class TestContextBudget:
+    """A block the ledger recorded as present has to reach the prompt.
+
+    The old assembly sliced each block to a fixed width and then cut the
+    joined string from the end, so the blocks appended last -- the insider
+    and congressional disclosures -- were the first to disappear while the
+    ledger still reported them present.
+    """
+
+    def _fit(self, blocks, **kw):
+        from models.trading_agents_model import _fit_blocks
+
+        return _fit_blocks(blocks, **kw)
+
+    def test_no_block_is_dropped_when_the_total_overflows(self):
+        blocks = [f"[block {i} header]\n" + "line of evidence\n" * 400
+                  for i in range(12)]
+        fitted = self._fit(blocks)
+        for i in range(12):
+            assert f"[block {i} header]" in fitted
+
+    def test_the_longest_blocks_pay_for_the_overflow(self):
+        short = "[short]\n" + "x\n" * 20
+        long = "[long]\n" + "y\n" * 8000
+        fitted = self._fit([short, long, short], budget=2000)
+        assert fitted.count(short.strip()) == 2   # both short blocks whole
+        assert "[long]" in fitted and "[truncated]" in fitted
+
+    def test_a_disclosure_sized_block_is_not_cut_at_all(self):
+        from models.trading_agents_model import PER_BLOCK_CHARS
+
+        # The insider block runs to ~2.7 KB and the dossier to ~2.8 KB on a
+        # busy name; both must arrive whole alongside the technical blocks.
+        disclosure = "[NVDA: insider transactions]\n" + "filing line\n" * 200
+        assert len(disclosure) < PER_BLOCK_CHARS
+        fitted = self._fit([disclosure, "[metrics]\nrsi 51\n"])
+        assert disclosure in fitted
+
+    def test_the_result_fits_the_prompt_budget(self):
+        from models.single_agent import MAX_EXTRA_CONTEXT_CHARS
+
+        blocks = [f"[b{i}]\n" + "z\n" * 3000 for i in range(14)]
+        assert len(self._fit(blocks)) <= MAX_EXTRA_CONTEXT_CHARS
+
+    def test_empty_blocks_are_dropped_not_joined_as_blank_gaps(self):
+        assert self._fit(["", "[a]\nrow", ""]) == "[a]\nrow"
+        assert self._fit([]) == ""
