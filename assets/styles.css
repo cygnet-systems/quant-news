@@ -4622,6 +4622,8 @@ body {
 
 .home-session-started { color: var(--text-secondary); }
 
+.home-session-cutoff { color: var(--text-muted); font-size: var(--text-xs); }
+
 .home-session-owner { color: var(--text-muted); font-size: var(--text-xs); }
 
 .home-session-head .run-status { margin-left: auto; }
@@ -5126,6 +5128,41 @@ body {
 
 .history-model-dropdown {
     width: 240px;
+}
+
+/* Run scope: what the whole scorecard is counting. It sits above the eval
+   bar because reading a hit rate without knowing whose calls it covers is
+   how an ad-hoc rerun got read as the track record. */
+.perf-scope-bar {
+    margin-bottom: var(--space-2, 8px);
+}
+
+.perf-scope-choice {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+}
+
+.perf-scope-group .btn {
+    font-size: 0.78rem;
+    padding: 3px 14px;
+    color: var(--text-secondary, #A0A0A0);
+    border-color: var(--border-subtle, #2A2A2A);
+}
+
+.perf-scope-group .btn.active,
+.perf-scope-group .btn-check:checked + .btn {
+    color: var(--text-primary, #FFFFFF);
+    background-color: var(--bg-tertiary, #1b1b1b);
+    border-color: var(--border-strong, var(--border-subtle, #2A2A2A));
+    font-weight: 600;
+}
+
+.perf-scope-note {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    margin-top: 4px;
 }
 
 /* The outcome chips change the log far below them, so they have to stay in

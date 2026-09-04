@@ -157,6 +157,17 @@ def _by_run_kind(q, kind: str | None):
              .where(func.coalesce(AnalysisRun.kind, "scheduled") == kind))
 
 
+# The text-SQL twin of _by_run_kind, for the readers that hand-write SQL
+# (calibration is on the ORM path; the evening mail and the Alpha Lab are
+# not). Both must keep agreeing that a prediction with no run row is the
+# daily job's. It is a correlated subquery rather than a join so it drops
+# into an existing WHERE without touching the caller's FROM.
+SCHEDULED_ONLY_SQL = (
+    "coalesce((select r.kind from analysis_runs r "
+    "where r.run_id = model_predictions.run_id), 'scheduled') = 'scheduled'"
+)
+
+
 def _run_kind(session, run_id: str | None) -> str:
     """The kind of the run a write belongs to.
 
@@ -1450,18 +1461,25 @@ class CacheService:
         return inserted
 
     def get_unevaluated_predictions_for_strategy(self, strategy_name: str) -> list[dict]:
+        """Scored predictions this strategy has not been run over yet.
+
+        Scheduled rows only, like every other track record on this platform:
+        an ad-hoc rerun of a call the daily job already made stores its own
+        row, and each extra row would become another strategy_evaluations
+        trade, inflating the per-symbol win rate and Sharpe on Analyze.
+        """
         from db.models import ModelPrediction, StrategyEvaluation
         with get_session() as session:
             subq = select(StrategyEvaluation.prediction_id).where(
                 StrategyEvaluation.strategy_name == strategy_name
             ).scalar_subquery()
 
-            rows = session.execute(
+            rows = session.execute(_by_run_kind(
                 select(ModelPrediction)
                 .where(
                     ModelPrediction.actual_close.isnot(None),
                     ModelPrediction.id.notin_(subq),
-                )
+                ), "scheduled")
             ).scalars().all()
 
             return [
@@ -1935,6 +1953,7 @@ class CacheService:
         end: "date | None" = None,
         model: str | None = None,
         outcome: str | None = None,
+        kind: str | None = None,
     ) -> list[dict]:
         """Every visible prediction matching the History filters, no row cap.
 
@@ -1942,6 +1961,11 @@ class CacheService:
         page sees the whole matching set and paginates it, instead of the
         old newest-1000 slice that rendered any older date as an empty day.
         ``outcome``: pending (no verdict and no P&L), right, wrong.
+
+        ``kind`` restricts to rows written by scheduled or manual runs (see
+        _by_run_kind). The Performance page asks for "scheduled": an ad-hoc
+        rerun writes its own row for a call the daily job already made, and
+        counting both reports one call as two trades.
         """
         from db.models import ModelPrediction
         with get_session() as session:
@@ -1964,7 +1988,8 @@ class CacheService:
                 q = q.where(ModelPrediction.was_correct.is_(True))
             elif outcome == "wrong":
                 q = q.where(ModelPrediction.was_correct.is_(False))
-            return [_pred_to_dict(r) for r in session.execute(q).scalars().all()]
+            return [_pred_to_dict(r) for r in
+                    session.execute(_by_run_kind(q, kind)).scalars().all()]
 
     def get_open_predictions(self, limit: int = 200) -> list[dict]:
         """Calls that have been made but cannot be scored yet.

@@ -177,14 +177,19 @@ TOOL_OPTIONS = [
 # with it Quick would be slower than Standard and still pay one LLM call per
 # symbol. Deep is the only preset that turns the open web on, and the date
 # rule (no web research for a backtest) still wins over it.
+# Standard is the default, so it has to produce both primary outputs, the
+# research report and the recommendation synthesis: it shipped with recs
+# "off", which silently disabled synthesis for every default run and for
+# every schedule saved through the dialog. What Standard buys over Deep is
+# only the open web and the extra evidence blocks.
 RUN_PRESET_ORDER = ["quick", "standard", "deep"]
 DEFAULT_RUN_PRESET = "standard"
 PRESET_FIELDS = ("scope", "models", "recs", "evidence", "tools")
 RUN_PRESETS = {
     "quick": {
         "label": "Quick",
-        "hint": "Models only: the four numerical models, no LLM research, "
-                "no report, no recommendations.",
+        "hint": "The four numerical models and nothing else: no research "
+                "report and no recommendation synthesis.",
         "fields": {
             "scope": "models",
             "models": [mid for mid, _, _ in RUN_MODELS
@@ -194,19 +199,19 @@ RUN_PRESETS = {
     },
     "standard": {
         "label": "Standard",
-        "hint": "Research report and every model. No web research, no "
-                "recommendation synthesis.",
+        "hint": "Research report, every model, and the recommendation "
+                "synthesis. No open-web research.",
         "fields": {
             "scope": "full",
             "models": [mid for mid, _, _ in RUN_MODELS],
-            "recs": "off",
+            "recs": "auto",
             "tools": [],
         },
     },
     "deep": {
         "label": "Deep",
-        "hint": "Standard plus web research on every evidence block and "
-                "the recommendation synthesis. Slowest, most spend.",
+        "hint": "Standard plus every evidence block and open-web research "
+                "in the situation investigation. Slowest, most spend.",
         "fields": {
             "scope": "full",
             "models": [mid for mid, _, _ in RUN_MODELS],
@@ -944,9 +949,15 @@ def create_run_modal() -> dbc.Modal:
 
     # The selects seed from the default preset so a dialog opened by a
     # report shortcut (which leaves the preset untouched) does not start
-    # out diverging from it.
-    sel = _report_param_selects(
-        "run", {"recs": preset_fields(DEFAULT_RUN_PRESET)["recs"]})
+    # out diverging from it. The evidence and tools checklists seed from it
+    # for the same reason: apply_run_preset only fires on a change, so a
+    # checklist rendered on a value the preset does not hold would read as
+    # "customized" on the first open and the run would carry it.
+    preset_defaults = preset_fields(DEFAULT_RUN_PRESET)
+    sel = _report_param_selects("run", {"recs": preset_defaults["recs"]})
+    evidence_check, tools_check = run_evidence_tools(
+        "run", {k: preset_defaults[k]
+                for k in ("evidence", "tools") if k in preset_defaults})
 
     model_checks, ensemble_section = run_model_controls("run", with_info=True)
 
@@ -1147,7 +1158,7 @@ def create_run_modal() -> dbc.Modal:
                             [
                                 html.Div("Evidence blocks",
                                          className="run-field-label"),
-                                run_evidence_tools("run")[0],
+                                evidence_check,
                             ],
                             className="mt-2",
                         ),
@@ -1157,14 +1168,15 @@ def create_run_modal() -> dbc.Modal:
 
                 # --- Tools ---
                 # Run tools are opt-in switches the backend never flips on
-                # its own. Web research defaults ON here for a next-day run
-                # and is switched off by the date callback for a backtest
-                # date (the open web cannot be bounded to a past as-of).
+                # its own. The default preset decides what they start as
+                # (Standard leaves the open web off, Deep turns it on), and
+                # the date callback forces them off for a backtest date (the
+                # open web cannot be bounded to a past as-of).
                 html.Div(
                     [
                         html.Hr(),
                         html.H6("Tools", className="mb-2"),
-                        run_evidence_tools("run")[1],
+                        tools_check,
                     ],
                     id="run-tools-section",
                 ),

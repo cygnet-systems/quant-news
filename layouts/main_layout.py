@@ -122,6 +122,12 @@ def create_layout() -> html.Div:
             # Model slice of the scoreboard: "all" or one model_name.
             # Session-scoped for the same reason as the outcome slice.
             dcc.Store(id="history-filter-model", data="all"),
+            # Which runs the Performance scoreboard counts: "scheduled"
+            # (the track record, the default) or "all". Memory-scoped on
+            # purpose: widening it is a deliberate look at experiments, and
+            # a reload must return to the honest number rather than leave a
+            # browser quietly reading ad-hoc runs as the record forever.
+            dcc.Store(id="history-run-kind", data="scheduled"),
             # Page offsets per archive bucket ({"predictions": 200, ...}).
             # Session-scoped; filter changes reset it.
             dcc.Store(id="history-page", data={}),

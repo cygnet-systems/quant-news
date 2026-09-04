@@ -121,7 +121,7 @@ class TestPresetFields:
                          "recs": "off"}
         standard = modals.preset_fields("standard")
         assert standard == {"scope": "full", "models": ALL_MODELS,
-                            "recs": "off", "tools": []}
+                            "recs": "auto", "tools": []}
         deep = modals.preset_fields("deep")
         assert deep["scope"] == "full" and deep["recs"] == "auto"
         assert deep["evidence"] == [o["value"] for o in modals.EVIDENCE_OPTIONS]
@@ -138,6 +138,31 @@ class TestPresetFields:
         for n in (1, 3, 8):
             assert est("quick", n) < est("standard", n) <= est("deep", n)
         assert "trading_agents" not in modals.preset_fields("quick")["models"]
+
+    def test_the_default_preset_produces_both_primary_outputs(self):
+        # The regression this pins: Standard shipped with recs "off", so
+        # every default run — and every schedule saved through the dialog,
+        # which carries the dialog's values into params_json — produced a
+        # research report and no synthesis. The default preset may never
+        # switch either of the product's two outputs off.
+        f = modals.preset_fields(modals.DEFAULT_RUN_PRESET)
+        assert modals.DEFAULT_RUN_PRESET == "standard"
+        assert f["scope"] == "full"
+        assert "trading_agents" in f["models"]
+        assert f["recs"] == "auto"
+
+    def test_quick_is_the_only_preset_that_drops_them(self):
+        quick = modals.preset_fields("quick")
+        assert quick["scope"] == "models" and quick["recs"] == "off"
+        assert "trading_agents" not in quick["models"]
+        assert quick != modals.preset_fields(modals.DEFAULT_RUN_PRESET)
+        # An explicit choice has to say what it costs.
+        hint = modals.RUN_PRESETS["quick"]["hint"]
+        assert "no research report" in hint
+        assert "no recommendation synthesis" in hint
+        for name in ("standard", "deep"):
+            f = modals.preset_fields(name)
+            assert f["recs"] == "auto" and "trading_agents" in f["models"]
 
     def test_unknown_or_stale_name_is_the_default(self):
         assert modals.preset_fields(None) == modals.preset_fields("standard")
@@ -167,8 +192,27 @@ class TestPresetFields:
         assert find(modal, "run-scope").value == std["scope"]
         assert find(modal, "run-preset").value == "standard"
         assert find(modal, "run-customize-collapse").is_open is False
+        # Standard's tools are what makes it cheaper than Deep; the
+        # checklist has to open on them, not on the checklist's own
+        # default (apply_run_preset never fires for an untouched preset).
+        assert find(modal, "run-tools").value == std["tools"]
         search = find(modal, "run-symbol-search")
         assert search.multi is False and search.searchable is True
+
+        # Every model box, TradingAgents included, is ticked on open.
+        boxes = {}
+
+        def walk(node):
+            nid = getattr(node, "id", None)
+            if isinstance(nid, dict) and nid.get("type") == "run-model-check":
+                boxes[nid["model"]] = node.value
+            ch = getattr(node, "children", None)
+            for c in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                if hasattr(c, "to_plotly_json"):
+                    walk(c)
+
+        walk(modal)
+        assert boxes == {m: True for m in std["models"]}
 
     def test_apply_writes_only_what_the_preset_names(self, monkeypatch):
         _trigger(monkeypatch, "run-preset")
@@ -207,7 +251,7 @@ class TestDivergence:
     def test_matching_controls_do_not_diverge(self):
         assert modals.preset_divergence("standard", {
             "scope": "full", "models": list(reversed(ALL_MODELS)),
-            "recs": "off", "tools": [], "evidence": ["options"]}) == []
+            "recs": "auto", "tools": [], "evidence": ["options"]}) == []
 
     def test_each_named_field_is_reported(self):
         got = modals.preset_divergence("deep", {
@@ -246,7 +290,7 @@ class TestDivergence:
 
     def test_customize_unfolds_only_on_divergence(self, monkeypatch):
         preflight, hint, collapse, auto = self._preflight(
-            monkeypatch, "standard", "full", [True] * 5, "off",
+            monkeypatch, "standard", "full", [True] * 5, "auto",
             ["options"], [])
         assert collapse is dash.no_update
         assert auto == {"diverged": []}
@@ -254,7 +298,7 @@ class TestDivergence:
         assert preflight and "1 symbol" in str(preflight[-1].to_plotly_json())
 
         preflight, hint, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto",
+            monkeypatch, "standard", "report", [True] * 5, "off",
             None, [])
         assert collapse is True
         assert auto == {"diverged": ["scope", "recs"]}
@@ -263,36 +307,36 @@ class TestDivergence:
     def test_customize_unfolds_once_per_divergence_set(self, monkeypatch):
         # A report shortcut: the scope diverges from the moment it opens.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "off", None, [])
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, [])
         assert collapse is True and auto == {"diverged": ["scope"]}
         # The user folds Customize and keeps editing: the same divergence
         # is not a reason to unfold it again, and nothing is re-recorded.
         *_, collapse, again = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "off", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
             opened=False, customize_open=False, auto=auto)
         assert collapse is dash.no_update and again is dash.no_update
         # A new difference is: it unfolds once more and remembers the set.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "off", None, [],
             opened=False, customize_open=False, auto=auto)
         assert collapse is True and auto == {"diverged": ["scope", "recs"]}
         # Folded again, the difference removed: the set moved but nothing
         # new is on screen to show, so it stays folded; the set is kept
         # current so the same field diverging again is news.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "off", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
             opened=False, customize_open=False, auto=auto)
         assert collapse is dash.no_update and auto == {"diverged": ["scope"]}
         # While it is open a new difference needs no unfold, only the record.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 4 + [False], "off",
+            monkeypatch, "standard", "report", [True] * 4 + [False], "auto",
             None, [], opened=False, customize_open=True, auto=auto)
         assert collapse is dash.no_update
         assert auto == {"diverged": ["scope", "models"]}
         # Reopening the dialog starts over: the shortcut's divergence is
         # shown again even though it is the set recorded last time.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "off", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
             opened=True, customize_open=False, auto={"diverged": ["scope"]})
         assert collapse is True and auto == {"diverged": ["scope"]}
 
@@ -307,7 +351,7 @@ class TestDivergence:
 
     def test_closed_dialog_changes_nothing(self, monkeypatch):
         out = self._preflight(monkeypatch, "standard", "full", [True] * 5,
-                              "off", None, [], is_open=False)
+                              "auto", None, [], is_open=False)
         assert out == (dash.no_update,) * 4
 
     def test_customize_button_toggles(self):
@@ -543,3 +587,52 @@ class TestRetryScope:
         assert app_module._run_scope_of({"preset": "quick", "config": {}},
                                         {"scope": "models"}) == "models"
         assert app_module._run_scope_of({}, None) == "full"
+
+
+class TestScheduleModalDefaults:
+    """The Schedule modal renders the Run dialog's field builders under the
+    "sj" prefix, so a preset change can leak into a saved job. A job created
+    from the modal's own defaults must run every model and the synthesis."""
+
+    def _control_values(self):
+        """What open_schedule_modal writes into the controls for a new job."""
+        return app_module._sj_values_from_params(
+            "analysis", {}, ALL_MODELS, ALL_MODELS, [])
+
+    def test_new_job_form_opens_on_every_model_and_recs_auto(self):
+        vals = self._control_values()
+        assert vals["models"] == [True] * len(ALL_MODELS)
+        assert vals["sj-recs"] == "auto"
+
+    def test_saving_the_defaults_writes_them_into_params_json(self, monkeypatch):
+        from services import scheduler_service
+
+        vals = self._control_values()
+        scalars = {
+            "sj-kind": "analysis", "sj-name": "Morning", "sj-hour": 7,
+            "sj-minute": 0, "sj-days": "mon-fri", "sj-tz": "US/Eastern",
+            "sj-visibility": "private", "sj-enabled": True,
+            "sj-symbols": "nvda, amd",
+        }
+        scalars.update({k: v for k, v in vals.items() if k.startswith("sj-")})
+        created = {}
+
+        def _create(**kw):
+            created.update(kw)
+            return "job-1"
+        monkeypatch.setattr(scheduler_service, "create_job", _create)
+
+        member_ids = [{"type": "sj-ens-member", "model": m} for m in ALL_MODELS]
+        out = app_module.save_schedule_job(
+            1, None,
+            *[scalars[cid] for cid, _ in app_module._SJ_SCALARS],
+            vals["models"],
+            [{"type": "sj-model-check", "model": m} for m in ALL_MODELS],
+            vals["members"], vals["weights"], member_ids, [], [])
+
+        assert out[1] is False and out[2] is None
+        params = created["params"]
+        assert "trading_agents" in params["models"]
+        assert params["models"] == ALL_MODELS
+        assert params["recs"] == "auto"
+        assert created["symbols_csv"] == "NVDA,AMD"

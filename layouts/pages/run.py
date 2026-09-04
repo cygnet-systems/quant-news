@@ -129,22 +129,32 @@ def status_pill(run: dict) -> html.Span:
                      className=f"run-status run-status-{status}")
 
 
-def live_fingerprint(run: dict) -> dict:
+def live_fingerprint(view: dict) -> dict:
     """Everything a poll tick must notice on a live run page.
 
     The status drives the pill and the empty-state wording; the stage
     entries (their state, their done/total and their per-symbol glyphs)
     and the counters move whenever a stage lands or another symbol is
-    stored, which is exactly when there are new rows to draw. Nothing on
-    this page changes without one of the three moving, so an unchanged
-    fingerprint means an unchanged board and the tick can write nothing.
-    The status is kept at the top level because the poll reads it back to
-    decide whether the run is worth another query at all.
+    stored, which is exactly when there are new rows to draw. The
+    artifacts line is what a stage that reports no progress still changes:
+    a research stage the user cancelled mid-flight is not killable and
+    lands its report minutes later, with no stage or counter write behind
+    it (app.refresh_live_run keeps reading a cancelled run for exactly
+    that). The status is kept at the top level because the poll reads it
+    back to decide whether the run is worth another query at all.
     """
+    run = view.get("run") or {}
+    rows = view.get("symbols") or []
     return {
         "status": run.get("status"),
         "stages": run.get("stages") or {},
         "counters": run.get("counters") or {},
+        "artifacts": {
+            "rows": [[r.get("symbol"), len(r.get("models") or {}),
+                      bool(r.get("synthesis")),
+                      (r.get("report") or {}).get("id")] for r in rows],
+            "recommendation": bool(view.get("recommendation")),
+        },
     }
 
 
@@ -406,7 +416,7 @@ def layout(view: dict, watchlist=None, open_first: bool = False) -> html.Div:
             synthesis_card(view.get("recommendation"), run),
             # Seeded from the render so the first poll tick after a load
             # only redraws when something actually moved since.
-            dcc.Store(id="run-live-fp", data=live_fingerprint(run)),
+            dcc.Store(id="run-live-fp", data=live_fingerprint(view)),
         ],
         className="page page-run",
         id="run-page",

@@ -50,13 +50,18 @@ def _load_frames():
     from db.session import get_session
     from sqlalchemy import text
 
+    # Scheduled rows only. The lab measures the daily job's track record, and
+    # an ad-hoc rerun of one of its calls stores a second row for that call:
+    # counting both would inflate every n here (see cache_service).
+    from services.cache_service import SCHEDULED_ONLY_SQL
     with get_session() as s:
-        preds = pd.read_sql(text("""
+        preds = pd.read_sql(text(f"""
             SELECT prediction_date::text, symbol, model_name, decision,
                    confidence, up_probability, previous_close, actual_close,
                    was_correct, pnl_dollars
             FROM model_predictions
             WHERE actual_close IS NOT NULL AND previous_close IS NOT NULL
+              AND {SCHEDULED_ONLY_SQL}
         """), s.get_bind())
         prices = pd.read_sql(text("""
             SELECT symbol, date, close FROM stock_prices

@@ -160,6 +160,10 @@ def db(monkeypatch, tmp_path):
     # Never the repo's cache/dashboard dir.
     monkeypatch.setattr(ds, "_cache_handle",
                         lambda: diskcache.Cache(str(tmp_path / "memo")))
+    # "This session" is the CURRENT trading cutoff (get_session_runs), so
+    # the seeded TODAY has to be it or every run below reads as history --
+    # and the wall clock would decide the outcome at the close.
+    monkeypatch.setattr(ds, "current_session_date", lambda: TODAY.isoformat())
     return dbs
 
 
@@ -418,7 +422,7 @@ class TestSessionRuns:
         assert runs[1]["pnl"] == 20.0
         assert runs[1]["target_date"] == "2026-09-03"
 
-    def test_session_is_the_newest_manual_cutoff(self, db):
+    def test_session_is_the_current_cutoff(self, db):
         old = _run("manual", ["NVDA"], cutoff=TODAY - timedelta(days=1))
         new = _run("manual", ["AMD"], cutoff=TODAY)
         _run("scheduled", ["NVDA"], cutoff=TODAY + timedelta(days=1))
@@ -426,6 +430,18 @@ class TestSessionRuns:
         assert [r["run"]["run_id"] for r in runs] == [new]
         assert [r["run"]["run_id"] for r in ds.get_session_runs("2026-09-01")] == [old]
         assert ds.get_session_runs("2026-08-01") == []
+
+    def test_a_run_from_a_past_cutoff_is_not_this_session(self, db):
+        """The tab says "This session" and its empty state says "today", so
+        the newest manual run whatever its age is the wrong answer: once the
+        session moves on, an old run is history, not this session."""
+        _run("manual", ["NVDA"], cutoff=TODAY - timedelta(days=7))
+        assert ds.get_session_runs() == []
+
+    def test_the_current_session_is_the_cutoff_a_new_run_would_carry(self):
+        from utils.trading_calendar import resolve_target_and_cutoff
+        assert ds.current_session_date() == \
+            resolve_target_and_cutoff(None)[1].isoformat()
 
     def test_no_manual_runs_is_an_empty_session(self, db):
         _run("scheduled", ["NVDA"])

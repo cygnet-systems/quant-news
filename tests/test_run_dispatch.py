@@ -114,7 +114,7 @@ BTN_DISABLED, BTN_LABEL = 16, 17
 
 class TestConfirmDispatch:
     def test_creates_row_arms_feed_and_writes_run_store(self, confirm, feed):
-        out = confirm(["nvda", "AMD"], scope="full")
+        out = confirm(["nvda", "AMD"], scope="full", recs="off")
 
         assert out[IS_OPEN] is False
         assert out[VALIDATION] == ""
@@ -131,8 +131,9 @@ class TestConfirmDispatch:
         assert row["status"] == "queued"
         assert row["kind"] == "manual"
         assert row["owner_uid"] == "u1"
-        # Two models and recommendations on is not the Standard preset the
-        # dialog defaulted to: the row says so, and names the fields.
+        # Two models and the synthesis switched off is not the Standard
+        # preset the dialog defaulted to: the row says so, and names the
+        # fields.
         assert row["preset"] == "custom"
         assert run_data["preset"] == "custom"
         assert row["config"]["preset"] == "standard"

@@ -16,7 +16,8 @@ from layouts.history_sections import (
     empty_history_message,
     filter_history_data,
 )
-from services.dashboard_service import aggregate_predictions
+from services.dashboard_service import (aggregate_predictions,
+                                        collapse_rerun_duplicates)
 
 # Column definitions, surfaced as header tooltips. Several of these (Trades vs
 # held, hit rate excluding HOLDs, the $1,000 notional behind P&L) are not
@@ -256,12 +257,66 @@ def scoreboard_table(groups: list[dict], group_key: str, first_label: str,
     )
 
 
-def scorecard(preds: list[dict]) -> html.Div:
+RUN_SCOPE_OPTIONS = [{"label": "Scheduled only", "value": "scheduled"},
+                     {"label": "All runs", "value": "all"}]
+
+
+def run_scope_bar(run_kind: str = "scheduled", collapsed: int = 0) -> html.Div:
+    """Which runs the numbers below count, said out loud.
+
+    The track record is the daily scheduled job. An ad-hoc run of a name the
+    job already called stores its own row for that call, so counting every
+    row reported three reruns of one TSLA call as three trades and three
+    times its P&L, on the page this project uses to decide whether the
+    models have any alpha. Scheduled only is therefore the default; ad-hoc
+    results stay one click away, never silently folded in.
+    """
+    scheduled = (run_kind or "scheduled") != "all"
+    if scheduled:
+        note = ("Counting calls from the daily scheduled job only. Ad-hoc "
+                "runs you start by hand are experiments and stay out of the "
+                "track record.")
+    elif collapsed:
+        note = (f"Counting every run, scheduled and ad-hoc. {collapsed} rerun"
+                f"{'' if collapsed == 1 else 's'} of a call already in scope "
+                f"{'was' if collapsed == 1 else 'were'} collapsed into one "
+                f"(the newest row that has an outcome wins), so no call is "
+                f"counted twice.")
+    else:
+        note = ("Counting every run, scheduled and ad-hoc. Each symbol, model "
+                "and session is counted once; nothing needed collapsing here.")
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Span("Counting:", className="history-date-label"),
+                    dbc.RadioItems(
+                        id="perf-run-scope",
+                        options=RUN_SCOPE_OPTIONS,
+                        value="scheduled" if scheduled else "all",
+                        class_name="btn-group perf-scope-group",
+                        input_class_name="btn-check",
+                        label_class_name="btn btn-outline-secondary btn-sm",
+                        label_checked_class_name="active",
+                    ),
+                ],
+                className="perf-scope-choice",
+            ),
+            html.Div(note, className="perf-scope-note"),
+        ],
+        className="perf-scope-bar",
+    )
+
+
+def scorecard(preds: list[dict], run_kind: str = "scheduled") -> html.Div:
     """Aggregates by model and by symbol, over whatever is in scope.
 
     "Evaluated" is not `was_correct is not None`: the evaluator leaves that
     None for a HOLD while still writing pnl_dollars, so keying on it alone
     would report scored HOLDs as pending forever.
+
+    ``run_kind`` is carried only so the summary line names the scope it is
+    describing; the rows themselves were already narrowed to it in SQL.
     """
     evaluated = [p for p in preds
                  if p.get("was_correct") is not None or p.get("pnl_dollars") is not None]
@@ -319,7 +374,8 @@ def scorecard(preds: list[dict]) -> html.Div:
     summary = html.Div(
         f"{len(evaluated)} scored predictions · "
         f"{len({p.get('symbol') for p in evaluated})} symbols · "
-        f"sessions {dates[0]} to {dates[-1]}",
+        f"sessions {dates[0]} to {dates[-1]} · "
+        f"{'scheduled runs only' if (run_kind or 'scheduled') != 'all' else 'all runs'}",
         className="scoreboard-summary",
     )
     hint = html.Div(
@@ -382,7 +438,8 @@ def model_filter_row(history_data, model="all") -> html.Div:
 
 
 def layout(history_data=None, filter_symbols=None, filter_date_range="all",
-           specific_date=None, outcome="all", model="all") -> html.Div:
+           specific_date=None, outcome="all", model="all",
+           run_kind="scheduled") -> html.Div:
     """Scorecard on top, the per-call log beneath it.
 
     One surface on purpose. The aggregate used to be a modal and the log a
@@ -404,7 +461,7 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
             model_filter_row(history_data, model),
             html.Div(
                 body(history_data, filter_symbols, filter_date_range,
-                     specific_date, outcome, model),
+                     specific_date, outcome, model, run_kind=run_kind),
                 id="archive-body",
             ),
         ],
@@ -413,11 +470,18 @@ def layout(history_data=None, filter_symbols=None, filter_date_range="all",
 
 
 def body(history_data=None, filter_symbols=None, filter_date_range="all",
-         specific_date=None, outcome="all", model="all", page=None) -> list:
+         specific_date=None, outcome="all", model="all", page=None,
+         run_kind="scheduled") -> list:
     history_data = history_data or {}
     buckets = filter_history_data(history_data, filter_symbols,
                                   filter_date_range, specific_date)
     preds = _by_model(buckets["predictions"], model)
+
+    # One row per call before anything counts them, so the log and the
+    # scorecard agree on what a call is. Under the scheduled default there is
+    # nothing to collapse (those ids are shared, so a rerun upserts); in "All
+    # runs" the ad-hoc copies of a call collapse into one.
+    preds, collapsed = collapse_rerun_duplicates(preds)
 
     # The scorecard always describes the full scope; only the log narrows.
     # Filtering the aggregates too would make "wrong" show a 0% hit rate,
@@ -432,7 +496,8 @@ def body(history_data=None, filter_symbols=None, filter_date_range="all",
         subtitle = f"Prediction log · {label} only ({len(log_preds)})"
 
     return [
-        scorecard(preds),
+        run_scope_bar(run_kind, collapsed),
+        scorecard(preds, run_kind),
         alpha_lab_section(),
         html.Div(subtitle, className="scoreboard-subtitle") if log else None,
         log,

@@ -261,13 +261,18 @@ def notify_evaluation(trade_date: str | None = None) -> bool:
     from sqlalchemy import text
 
     target = trade_date or date.today().isoformat()
+    # Scheduled rows only: an ad-hoc rerun of a name the job already called
+    # stores its own row, and the mail would list that symbol twice and
+    # double its P&L in the per-model totals.
+    from services.cache_service import SCHEDULED_ONLY_SQL
     try:
         with get_session() as session:
-            scored = session.execute(text("""
+            scored = session.execute(text(f"""
                 select symbol, model_name, decision, was_correct,
                        round(pnl_dollars::numeric, 2) as pnl
                 from model_predictions
                 where target_date = :d and was_correct is not null
+                  and {SCHEDULED_ONLY_SQL}
                 order by symbol, model_name
             """), {"d": target}).mappings().all()
     except Exception as e:

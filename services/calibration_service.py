@@ -14,12 +14,19 @@ honest answer.
 
 Fits are cached in-process for CALIBRATION_TTL_S and refit lazily; the data
 changes at most once per evaluation run, so staleness is bounded and cheap.
+
+Every read here is scheduled-only. An ad-hoc rerun of a call the daily job
+already made stores its own prediction row (cache_service._prediction_id),
+so counting all rows would weight a re-run name once per rerun and, worse,
+would quote an inflated sample back into a report through
+:func:`track_record_sentence`. The track record is the daily job.
 """
 
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +47,45 @@ class _ModelFit:
 _lock = threading.Lock()
 _fits: dict[str, _ModelFit] = {}
 _fitted_at: float = 0.0
+
+
+def _scheduled_calls(*columns):
+    """Select over the scheduled daily job's scored ACTIVE calls.
+
+    Core rather than text() so the LEFT JOIN and the "no run row means
+    scheduled" COALESCE (cache_service._by_run_kind is the same rule) are
+    written once, and so the date bounds bind as dates on any dialect.
+    """
+    from db.models import AnalysisRun, ModelPrediction
+    from sqlalchemy import func, select
+
+    return (select(*columns)
+            .select_from(ModelPrediction)
+            .outerjoin(AnalysisRun,
+                       AnalysisRun.run_id == ModelPrediction.run_id)
+            .where(func.coalesce(AnalysisRun.kind, "scheduled") == "scheduled",
+                   ModelPrediction.was_correct.isnot(None),
+                   ModelPrediction.decision != "HOLD"))
+
+
+def _hit_avg():
+    """Share of scored calls that were directionally right, as SQL."""
+    from db.models import ModelPrediction
+    from sqlalchemy import case, func
+
+    return func.avg(case((ModelPrediction.was_correct.is_(True), 1.0),
+                         else_=0.0))
+
+
+def _as_of_date(as_of: Optional[str]) -> "date":
+    """Upper bound of a window: the as_of session, else today.
+
+    The process clock rather than the database's CURRENT_DATE, which is what
+    every other window in the codebase already uses (dashboard_service's
+    rolling window, get_open_predictions); app and database run in the same
+    timezone, and binding a real date keeps the query dialect-neutral.
+    """
+    return date.fromisoformat(str(as_of)[:10]) if as_of else date.today()
 
 
 def _pav(pairs: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -65,20 +111,17 @@ def _fit_all(as_of: Optional[str] = None) -> dict[str, _ModelFit]:
     """Isotonic fits per model. ``as_of`` bounds the outcomes used (by
     target_date, the session whose close resolved the call) so a backtest
     does not calibrate on sessions it has not reached."""
+    from db.models import ModelPrediction
     from db.session import get_session
-    from sqlalchemy import text
 
-    upper = "AND target_date <= CAST(:upper AS date)" if as_of else ""
+    q = _scheduled_calls(ModelPrediction.model_name, ModelPrediction.confidence,
+                         ModelPrediction.was_correct).where(
+                             ModelPrediction.confidence.isnot(None))
+    if as_of:
+        q = q.where(ModelPrediction.target_date <= _as_of_date(as_of))
     fits: dict[str, _ModelFit] = {}
     with get_session() as session:
-        rows = session.execute(text(f"""
-            SELECT model_name, confidence, was_correct
-            FROM model_predictions
-            WHERE was_correct IS NOT NULL
-              AND decision != 'HOLD'
-              AND confidence IS NOT NULL
-              {upper}
-        """), {"upper": as_of} if as_of else {}).fetchall()
+        rows = session.execute(q).all()
 
     by_model: dict[str, list[tuple[float, float]]] = {}
     for model, conf, correct in rows:
@@ -168,8 +211,9 @@ def rolling_hit_rate(model_name: str, days: int = 30,
     but still refuses single-digit sample sizes. TTL-cached: a 20-symbol
     batch would otherwise repeat the same query per member per symbol.
     """
+    from db.models import ModelPrediction
     from db.session import get_session
-    from sqlalchemy import text
+    from sqlalchemy import func
 
     key = (model_name, days, str(as_of)[:10] if as_of else None)
     cached = _hit_cache.get(key)
@@ -178,21 +222,13 @@ def rolling_hit_rate(model_name: str, days: int = 30,
 
     # Window ends at as_of (outcomes resolved by then) instead of today, so
     # a backtest's ensemble weights cannot see the future.
-    anchor = "CAST(:upper AS date)" if as_of else "CURRENT_DATE"
-    params = {"model": model_name, "days": days}
-    if as_of:
-        params["upper"] = str(as_of)[:10]
+    anchor = _as_of_date(as_of)
+    q = (_scheduled_calls(func.count(), _hit_avg())
+         .where(ModelPrediction.model_name == model_name,
+                ModelPrediction.target_date <= anchor,
+                ModelPrediction.prediction_date >= anchor - timedelta(days=days)))
     with get_session() as session:
-        row = session.execute(text(f"""
-            SELECT count(*),
-                   avg(CASE WHEN was_correct THEN 1.0 ELSE 0.0 END)
-            FROM model_predictions
-            WHERE model_name = :model
-              AND was_correct IS NOT NULL
-              AND decision != 'HOLD'
-              AND target_date <= {anchor}
-              AND prediction_date >= ({anchor} - make_interval(days => :days))
-        """), params).fetchone()
+        row = session.execute(q).one()
     n, rate = (row[0] or 0), row[1]
     result = (None if n < max(10, MIN_SAMPLES // 3) or rate is None
               else round(float(rate), 3))
@@ -222,35 +258,23 @@ def evaluated_hit_rate(
     None whenever ``n`` is below :data:`MIN_STATEABLE_SAMPLES`, callers must
     then say so rather than print an unearned number.
     """
+    from db.models import ModelPrediction
     from db.session import get_session
-    from sqlalchemy import text
+    from sqlalchemy import func
 
     # The upper bound is on target_date, not prediction_date: an outcome is not
     # knowable until the session it predicted has closed, so a run dated `as_of`
     # may only count calls that had already resolved by then.
-    # CAST(...) rather than the ::date shorthand: SQLAlchemy's text() bind
-    # scanner refuses to bind ":upper" when another colon follows it, so
-    # ":upper::date" reaches Postgres as a literal and fails to parse.
-    upper = "CAST(:upper AS date)" if as_of is not None else "CURRENT_DATE"
-    sql = f"""
-        SELECT count(*),
-               avg(CASE WHEN was_correct THEN 1.0 ELSE 0.0 END),
-               max(target_date)
-        FROM model_predictions
-        WHERE was_correct IS NOT NULL
-          AND decision != 'HOLD'
-          AND prediction_date >= ({upper} - make_interval(days => :days))
-          AND target_date <= {upper}
-    """
-    params: dict = {"days": days}
-    if as_of is not None:
-        params["upper"] = as_of
+    upper = _as_of_date(as_of)
+    q = (_scheduled_calls(func.count(), _hit_avg(),
+                          func.max(ModelPrediction.target_date))
+         .where(ModelPrediction.prediction_date >= upper - timedelta(days=days),
+                ModelPrediction.target_date <= upper))
     if model_name:
-        sql += " AND model_name = :model"
-        params["model"] = model_name
+        q = q.where(ModelPrediction.model_name == model_name)
 
     with get_session() as session:
-        n, rate, through = session.execute(text(sql), params).fetchone()
+        n, rate, through = session.execute(q).one()
 
     n = int(n or 0)
     return {

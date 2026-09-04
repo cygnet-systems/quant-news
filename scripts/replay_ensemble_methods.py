@@ -49,14 +49,21 @@ SYNTHETIC = {"ensemble", "recommendation_synthesis"}
 
 
 def load_cohorts(since: str | None) -> dict:
-    """Member rows plus outcome, grouped by (symbol, prediction_date)."""
-    sql = """
+    """Member rows plus outcome, grouped by (symbol, prediction_date).
+
+    Scheduled rows only, like every other scoreboard: an ad-hoc rerun writes
+    its own row for a call the daily job already made, and here the later
+    row would silently replace that member's decision in the cohort.
+    """
+    from services.cache_service import SCHEDULED_ONLY_SQL
+    sql = f"""
         SELECT symbol, prediction_date, target_date, model_name, decision,
                confidence, up_probability, previous_close, actual_close
           FROM model_predictions
          WHERE model_name NOT IN ('ensemble', 'recommendation_synthesis')
            AND actual_close IS NOT NULL
            AND previous_close IS NOT NULL
+           AND {SCHEDULED_ONLY_SQL}
     """
     if since:
         sql += " AND prediction_date >= :since"

@@ -536,7 +536,7 @@ def _build_route(path, history_data, filter_symbols, filter_range,
                  filter_specific, activity_scope, activity_since,
                  outcome="all", model="all", home_symbol=None,
                  watchlist=None, period=None, home_cutoff=None,
-                 home_tab=None):
+                 home_tab=None, run_kind="scheduled"):
     """Build one section. Each page reads only the state it renders."""
     if path == "/analyze":
         return analyze_page.layout(period or "1y")
@@ -548,8 +548,10 @@ def _build_route(path, history_data, filter_symbols, filter_range,
                 fetch_report_history(
                     only={"predictions"},
                     filters=history_filters(filter_symbols, filter_range,
-                                            filter_specific, model)),
-                filter_symbols, filter_range, filter_specific, outcome, model)
+                                            filter_specific, model,
+                                            run_kind=run_kind)),
+                filter_symbols, filter_range, filter_specific, outcome, model,
+                run_kind=run_kind)
         return reports_page.layout(
             fetch_report_history(
                 only={"reports", "recommendations", "trading_agent_reports",
@@ -612,7 +614,7 @@ def _home_cohort(cutoff, watchlist) -> dict:
     """
     from services import dashboard_service as ds
     return ds.get_cohort(cutoff, kind="scheduled",
-                         symbols=[s.upper() for s in watchlist] or None)
+                         symbols=[s.upper() for s in watchlist or []] or None)
 
 
 def _home_session_runs() -> list[dict]:
@@ -828,11 +830,12 @@ def _build_run_page(run_id: str, watchlist, open_first: bool):
     State("home-cutoff-date", "data"),
     State("url", "search"),
     State("home-tab-store", "data"),
+    State("history-run-kind", "data"),
 )
 def render_page(pathname, history_data, filter_symbols, filter_range,
                 filter_specific, activity_scope, activity_since, outcome,
                 model, home_symbol, watchlist, period, home_cutoff,
-                search=None, home_tab=None):
+                search=None, home_tab=None, run_kind="scheduled"):
     """Mount the section for this URL.
 
     The URL is the only Input on purpose. When the archive stores were Inputs
@@ -873,7 +876,8 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
                             filter_specific, activity_scope, activity_since,
                             outcome, model, home_symbol=home_symbol,
                             watchlist=watchlist, period=period,
-                            home_cutoff=home_cutoff, home_tab=home_tab)
+                            home_cutoff=home_cutoff, home_tab=home_tab,
+                            run_kind=run_kind or "scheduled")
         return page, SECTION_TITLES.get(path, "QuantNews")
     except Exception as e:
         logger.exception("Failed to render %s", path)
@@ -916,6 +920,31 @@ def refresh_run_watchlist_cells(watchlist, pathname):
     return run_page.symbol_table(view, watchlist or [])
 
 
+# How long a cancelled run keeps being read after its last change. Cancelling
+# closes the row but cannot kill the in-process research stage, so its report
+# can still land minutes later (the same reason get_run_view refuses to
+# memoize cancelled). The window restarts on every change, so a run that is
+# still writing is followed until it goes quiet.
+CANCELLED_TAIL_S = 300
+
+
+def _fp_content(fp) -> dict:
+    """A fingerprint without its bookkeeping: what the page actually draws."""
+    return {k: v for k, v in (fp or {}).items() if k != "tail_until"}
+
+
+def _cancelled_tail_open(fp, now=None) -> bool:
+    """True while a cancelled run is still worth another read.
+
+    A fingerprint with no deadline is one the page just rendered, so the
+    window opens then and is bounded from the first tick onwards.
+    """
+    if not isinstance(fp, dict) or fp.get("status") != "cancelled":
+        return False
+    until = fp.get("tail_until")
+    return until is None or (now if now is not None else time.time()) < until
+
+
 @callback(
     Output("run-symbol-table", "children", allow_duplicate=True),
     Output("run-status-pill", "children"),
@@ -938,6 +967,10 @@ def refresh_live_run(_n, pathname, watchlist, last_fp=None):
     the status, so a finished run costs a dict lookup per tick and no
     query. While the run is live it is one get_run_view (the run row plus
     one indexed select per artifact table) and nothing else.
+
+    Cancelled is the exception: the row is closed but a stage already in
+    flight can still write, so the read continues for CANCELLED_TAIL_S
+    after the last change and the late report appears without a reload.
     """
     run_id = _run_route(pathname)
     if not run_id:
@@ -945,7 +978,8 @@ def refresh_live_run(_n, pathname, watchlist, last_fp=None):
     from services import run_service
 
     if (isinstance(last_fp, dict)
-            and last_fp.get("status") in run_service.TERMINAL_STATUSES):
+            and last_fp.get("status") in run_service.TERMINAL_STATUSES
+            and not _cancelled_tail_open(last_fp)):
         raise PreventUpdate
 
     from layouts.pages import run as run_page
@@ -960,9 +994,17 @@ def refresh_live_run(_n, pathname, watchlist, last_fp=None):
     if view is None:
         raise PreventUpdate
     run = view["run"]
-    fp = run_page.live_fingerprint(run)
+    fp = run_page.live_fingerprint(view)
+    moved = _fp_content(fp) != _fp_content(last_fp)
+    if run["status"] == "cancelled":
+        prior = last_fp.get("tail_until") if isinstance(last_fp, dict) else None
+        fp["tail_until"] = (time.time() + CANCELLED_TAIL_S
+                            if moved or prior is None else prior)
     if fp == last_fp:
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    if not moved:
+        # Only the tail deadline moved: nothing on the page to redraw.
+        return dash.no_update, dash.no_update, dash.no_update, fp
     pill = run_page.status_pill(run)
     return (run_page.symbol_table(view, watchlist or []),
             pill.children, pill.className, fp)
@@ -977,10 +1019,11 @@ def refresh_live_run(_n, pathname, watchlist, last_fp=None):
     State("history-filter-model", "data"),
     State("history-filter-outcome", "data"),
     State("history-page", "data"),
+    State("history-run-kind", "data"),
     prevent_initial_call=True,
 )
 def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specific,
-                          model, outcome, page):
+                          model, outcome, page, run_kind="scheduled"):
     """Build the prediction log the first time its section is opened.
 
     Applies the SAME outcome slice the section header announces, the body
@@ -990,8 +1033,13 @@ def render_prediction_log(n_clicks, filter_symbols, filter_range, filter_specifi
     data = fetch_report_history(
         only={"predictions"},
         filters=history_filters(filter_symbols, filter_range, filter_specific,
-                                model, outcome))
-    section = build_predictions_section(data["predictions"], page=page)
+                                model, outcome, run_kind=run_kind or "scheduled"))
+    # The log shows one row per call, the same collapse the scorecard above
+    # it applies (dashboard_service.collapse_rerun_duplicates); a section
+    # that listed every ad-hoc rerun would disagree with its own totals.
+    from services.dashboard_service import collapse_rerun_duplicates
+    preds, _ = collapse_rerun_duplicates(data["predictions"])
+    section = build_predictions_section(preds, page=page)
     if section is None:
         return html.Div("No predictions match this filter.",
                         className="history-empty-msg")
@@ -1026,11 +1074,13 @@ def render_filter_chips(filter_symbols, filter_range, filter_specific):
     Input("history-filter-outcome", "data"),
     Input("history-filter-model", "data"),
     Input("history-page", "data"),
+    Input("history-run-kind", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
 def render_archive_body(history_data, filter_symbols, filter_range,
-                        filter_specific, outcome, model, page, pathname):
+                        filter_specific, outcome, model, page, run_kind,
+                        pathname):
     """Rebuild the filterable part of Performance or Reports.
 
     #archive-body exists only on those two routes, and only their own controls
@@ -1042,12 +1092,15 @@ def render_archive_body(history_data, filter_symbols, filter_range,
     # A filter change starts from page one; only a pager click keeps offsets.
     page = page if ctx.triggered_id == "history-page" else {}
     if path == "/performance":
+        run_kind = run_kind or "scheduled"
         data = fetch_report_history(
             only={"predictions"},
             filters=history_filters(filter_symbols, filter_range,
-                                    filter_specific, model))
+                                    filter_specific, model,
+                                    run_kind=run_kind))
         return performance_page.body(data, filter_symbols, filter_range,
-                                     filter_specific, outcome, model, page=page)
+                                     filter_specific, outcome, model, page=page,
+                                     run_kind=run_kind)
     data = fetch_report_history(
         only={"reports", "recommendations", "trading_agent_reports", "runs"})
     return reports_page.body(data, filter_symbols, filter_range, filter_specific,
@@ -1074,18 +1127,21 @@ def turn_history_page(clicks, page):
 
 
 def _performance_rows(f_symbols, f_range, f_specific, f_outcome,
-                      f_model="all") -> list[dict]:
+                      f_model="all", run_kind="scheduled") -> list[dict]:
     """The prediction rows the Performance page is currently rendering.
 
     Re-derived from the same helpers the page uses rather than scraped from
     the DOM, so View Data and Export can never disagree with the table above
-    them.
+    them, run scope and duplicate collapse included.
     """
+    from services.dashboard_service import collapse_rerun_duplicates
     preds = fetch_report_history(
         only={"predictions"},
         filters=history_filters(f_symbols, f_range or "all", f_specific,
-                                f_model or "all", f_outcome or "all"),
+                                f_model or "all", f_outcome or "all",
+                                run_kind=run_kind or "scheduled"),
     )["predictions"]
+    preds, _ = collapse_rerun_duplicates(preds)
 
     keep = ("symbol", "model_name", "prediction_date", "target_date", "decision",
             "confidence", "up_probability", "previous_close", "predicted_close",
@@ -1129,6 +1185,28 @@ def set_outcome_filter(clicks):
     if not clicks or not any(c for c in clicks if c):
         raise PreventUpdate
     return ctx.triggered_id["outcome"]
+
+
+@callback(
+    Output("history-run-kind", "data"),
+    # The segmented control lives inside #archive-body on Performance only,
+    # so it is remounted by every body rebuild: allow_optional for the other
+    # five routes, and the equality guard below for the remount, which
+    # re-fires this Input with the value the body was just built from.
+    Input("perf-run-scope", "value", allow_optional=True),
+    State("history-run-kind", "data"),
+    prevent_initial_call=True,
+)
+def set_run_scope(value, current):
+    """Widen the scoreboard from the scheduled track record to every run.
+
+    Scheduled is the default and the honest reading: ad-hoc runs are
+    experiments, and one of them re-running a call the daily job already
+    made used to add a whole extra trade to the record.
+    """
+    if value is None or value == (current or "scheduled"):
+        raise PreventUpdate
+    return value
 
 
 @callback(
@@ -1230,23 +1308,25 @@ def track_home_tab(active_tab, current):
     Output("home-session-runs", "children"),
     Input("home-symbol-filter", "data"),
     Input("home-symbol-search", "value", allow_optional=True),
-    # The rail shows watchlist membership and the Scheduled board is the
-    # watchlist's rows, so both re-render when the watchlist changes
-    # (add/remove/clear/restore); the board follows the cutoff override.
-    # Guarded to Home below, the stores fire everywhere but the Outputs
-    # exist on one route.
-    Input("selected-symbols", "data"),
     Input("home-cutoff-date", "data"),
     # A completed run must land here without a manual reload. The archive
     # store is bumped by every writer (predictions, reports, synthesis and
     # the evaluation), so one Input covers a run landing on This session
     # and the evening scoring filling in the Actual column.
+    #
+    # It also covers the watchlist: load_report_history takes
+    # selected-symbols as an Input and always writes a fresh timestamp, so
+    # an edit reaches this callback through the bump. Watching the
+    # watchlist here as well would rebuild Home twice per edit (one cohort
+    # query, one list_runs and one predictions query per manual run each
+    # time), so the membership the rail draws is read as State.
     Input("report-history-store", "data"),
+    State("selected-symbols", "data"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
-def render_home_panes(active_symbol, search, watchlist, cutoff,
-                      _history, pathname):
+def render_home_panes(active_symbol, search, cutoff, _history,
+                      watchlist, pathname):
     """Re-render the symbol rail, both tabs' boards and the date header.
 
     One callback for all five so the row highlight, the board, and the
@@ -3059,10 +3139,12 @@ def update_llm_status(news_data):
     State("history-filter-date-specific", "data"),
     State("history-filter-outcome", "data"),
     State("history-filter-model", "data"),
+    State("history-run-kind", "data"),
     prevent_initial_call=True,
 )
 def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
-                      f_symbols, f_range, f_specific, f_outcome, f_model):
+                      f_symbols, f_range, f_specific, f_outcome, f_model,
+                      f_kind="scheduled"):
     """Show the rows behind whatever the current page is rendering.
 
     The button used to read the Analyze page's stores wherever you clicked
@@ -3084,7 +3166,7 @@ def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
 
     if triggered == "view-data-btn" and path == "/performance":
         rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome,
-                                 f_model)
+                                 f_model, f_kind)
         if not rows:
             return True, html.Div("No predictions in the current filter",
                                   className="text-muted")
@@ -3142,11 +3224,13 @@ def toggle_data_modal(view_click, close_click, symbols, is_open, pathname,
     State("history-filter-date-specific", "data"),
     State("history-filter-outcome", "data"),
     State("history-filter-model", "data"),
+    State("history-run-kind", "data"),
     prevent_initial_call=True,
 )
 def export_data(export_click, modal_export_click, symbols, stock_data,
                 indicators, model_signals, ai_analysis, recommendations,
-                pathname, f_symbols, f_range, f_specific, f_outcome, f_model):
+                pathname, f_symbols, f_range, f_specific, f_outcome, f_model,
+                f_kind="scheduled"):
     """Export everything on screen as a multi-sheet .xlsx.
 
     Replaces the old single-symbol Parquet dump. Sheets are dynamic: prices
@@ -3162,7 +3246,7 @@ def export_data(export_click, modal_export_click, symbols, stock_data,
         # Export what the page is showing, filters and all, the scoreboard is
         # the thing worth taking away from this page, not the Analyze stores.
         rows = _performance_rows(f_symbols, f_range, f_specific, f_outcome,
-                                 f_model)
+                                 f_model, f_kind)
         if not rows:
             raise PreventUpdate
         import pandas as _pd
@@ -3783,9 +3867,15 @@ _history_memo: dict = {}
 
 
 def history_filters(filter_symbols=None, filter_range="all", specific_date=None,
-                    model="all", outcome="all") -> dict:
+                    model="all", outcome="all", run_kind="scheduled") -> dict:
     """The History filter stores as a SQL-ready dict (dates on target_date).
-    Same semantics as layouts.history_sections.filter_items."""
+    Same semantics as layouts.history_sections.filter_items.
+
+    ``run_kind`` defaults to scheduled, not to everything: the track record
+    is the daily job, and an ad-hoc rerun of a call it already made stores a
+    second row that would otherwise be counted as a second trade. "all" is
+    the Performance page's explicit widening.
+    """
     from datetime import date as _date, timedelta as _td
     from layouts.history_sections import current_session
     start = end = None
@@ -3800,7 +3890,8 @@ def history_filters(filter_symbols=None, filter_range="all", specific_date=None,
     return {"symbols": sorted(filter_symbols) if filter_symbols else None,
             "start": start, "end": end,
             "model": model if model and model != "all" else None,
-            "outcome": outcome if outcome and outcome != "all" else None}
+            "outcome": outcome if outcome and outcome != "all" else None,
+            "kind": None if run_kind == "all" else (run_kind or "scheduled")}
 
 
 def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
@@ -3862,7 +3953,7 @@ def fetch_report_history(symbols=None, only=None, filters=None) -> dict:
             result["predictions"] = cache.query_predictions(
                 symbols=filters.get("symbols"), start=filters.get("start"),
                 end=filters.get("end"), model=filters.get("model"),
-                outcome=filters.get("outcome"))
+                outcome=filters.get("outcome"), kind=filters.get("kind"))
         if wanted("recommendations"):
             result["recommendations"] = cache.list_recommendation_runs(limit=None)
         if wanted("runs"):

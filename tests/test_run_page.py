@@ -12,6 +12,7 @@ path uses. Everything runs on in-memory SQLite; no model, no LLM.
 
 import os
 import re
+import time
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
@@ -617,12 +618,54 @@ class TestLivePoll:
         with pytest.raises(PreventUpdate):
             app_module.refresh_live_run(3, f"/runs/{run_id}", [], fp2)
 
-    def test_a_terminal_run_is_not_queried_again(self, db, monkeypatch):
+    def test_a_settled_run_is_not_queried_again(self, db, monkeypatch):
         monkeypatch.setattr(ds, "get_run_view",
                             lambda run_id: pytest.fail("read a settled run"))
-        for status in ("done", "failed", "cancelled"):
+        for status in ("done", "failed"):
             with pytest.raises(PreventUpdate):
                 app_module.refresh_live_run(1, "/runs/x", [], {"status": status})
+        # Cancelled too, but only once its tail window has run out.
+        expired = {"status": "cancelled", "tail_until": time.time() - 1}
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_live_run(1, "/runs/x", [], expired)
+
+    def test_a_cancelled_run_keeps_polling_until_it_goes_quiet(self, db):
+        """Cancelling closes the row but cannot kill the research stage, so
+        the report it was already writing lands afterwards. The page has to
+        show it without a reload."""
+        run_id = seed(db, symbols=("NVDA",), status="running",
+                      with_report=False, with_rec=False)
+        rs.set_status(run_id, "cancelled")
+        _, _, _, fp = app_module.refresh_live_run(1, f"/runs/{run_id}", [], None)
+        assert fp["status"] == "cancelled"
+        assert fp["tail_until"] > time.time()
+        # A quiet tick costs a read and writes nothing back to the page.
+        quiet = app_module.refresh_live_run(2, f"/runs/{run_id}", [], fp)
+        assert all(part is dash.no_update for part in quiet)
+        quiet_table = run_page.symbol_table(ds.get_run_view(run_id), [])
+
+        with rs.get_session() as session:
+            session.add(_report(run_id, "NVDA"))
+        ds.invalidate_memo()
+        table, _, _, fp2 = app_module.refresh_live_run(
+            3, f"/runs/{run_id}", [], fp)
+        assert table is not dash.no_update
+        # The row that had "no report" a tick ago now opens one.
+        assert len(_buttons(table, "ta-view-btn")) == 1
+        assert _buttons(quiet_table, "ta-view-btn") == []
+        # The late write restarts the window rather than ending it.
+        assert fp2["tail_until"] > fp["tail_until"]
+
+    def test_the_cancelled_tail_is_bounded(self, db):
+        run_id = seed(db, symbols=("NVDA",), status="cancelled",
+                      with_report=False, with_rec=False)
+        _, _, _, fp = app_module.refresh_live_run(1, f"/runs/{run_id}", [], None)
+        stale = {**fp, "tail_until": time.time() - 1}
+        with pytest.raises(PreventUpdate):
+            app_module.refresh_live_run(2, f"/runs/{run_id}", [], stale)
+        assert app_module._cancelled_tail_open({"status": "done"}) is False
+        assert app_module._cancelled_tail_open(None) is False
+        assert app_module._cancelled_tail_open({"status": "cancelled"}) is True
 
     def test_off_a_run_route_it_does_nothing(self, db):
         for path in ("/", "/reports", "/schedule", None):
@@ -644,7 +687,7 @@ class TestLivePoll:
         view = ds.get_run_view(run_id)
         page = run_page.layout(view, [])
         store = _find(page, id="run-live-fp")
-        assert store.data == run_page.live_fingerprint(view["run"])
+        assert store.data == run_page.live_fingerprint(view)
         assert _find(page, id="run-status-pill") is not None
         # Seeded from the render, so the first tick after a load that
         # missed nothing writes nothing.

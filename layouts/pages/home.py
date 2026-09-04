@@ -847,6 +847,32 @@ def session_only_rows(session_runs: list[dict] | None,
     return list(out.values())
 
 
+def rail_groups(cohort: dict | None, watchlist: list[str] | None = None,
+                session_runs: list[dict] | None = None,
+                match=None) -> tuple[list, list, list]:
+    """The rail's three groups of rows, in the order it draws them.
+
+    ``(watchlist, scheduled, session)``. The scheduled group is empty
+    except when the watchlist is: the board falls back to every name the
+    scheduled run wrote (app._home_cohort), and a rail that said "No
+    symbols yet" next to a full board left those rows with no way to be
+    opened. ``match`` filters by symbol (the rail's search box).
+    """
+    watchlist = [s.upper() for s in (watchlist or [])]
+    match = match or (lambda _sym: True)
+    cohort_rows = {r["symbol"]: r
+                   for r in (cohort or {}).get("symbols") or []}
+
+    wl_rows = [cohort_rows.get(s) or {"symbol": s, "models": {}}
+               for s in watchlist if match(s)]
+    sched_rows = ([r for r in cohort_rows.values() if match(r["symbol"])]
+                  if not watchlist else [])
+    shown = {r["symbol"] for r in sched_rows}
+    extra_rows = [r for r in session_only_rows(session_runs, watchlist)
+                  if match(r["symbol"]) and r["symbol"] not in shown]
+    return wl_rows, sched_rows, extra_rows
+
+
 def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
                 active_symbol: str | None = None,
                 search: str = "",
@@ -858,24 +884,19 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
     scheduled run, and the Scheduled tab's rows) and then the names only an
     ad-hoc run touched today, each one click from joining the watchlist.
     Watchlist names with no calls yet still get a row, so a freshly added
-    symbol is immediately researchable.
+    symbol is immediately researchable. With no watchlist at all the
+    scheduled board's own names take that first group (see rail_groups).
     """
     reports_by_symbol = reports_by_symbol or {}
-    watchlist = [s.upper() for s in (watchlist or [])]
     needle = (search or "").strip().upper()
-
-    cohort_rows = {r["symbol"]: r
-                   for r in (cohort or {}).get("symbols") or []}
 
     def _match(sym):
         return not needle or needle in sym
 
-    wl_rows = [cohort_rows.get(s) or {"symbol": s, "models": {}}
-               for s in watchlist if _match(s)]
-    extra_rows = [r for r in session_only_rows(session_runs, watchlist)
-                  if _match(r["symbol"])]
+    wl_rows, sched_rows, extra_rows = rail_groups(cohort, watchlist,
+                                                  session_runs, _match)
 
-    if not wl_rows and not extra_rows:
+    if not wl_rows and not sched_rows and not extra_rows:
         return [html.Div(f'No symbol matching "{needle}"'
                          if needle else "No symbols yet. Add one above.",
                          className="home-empty-note")]
@@ -897,6 +918,16 @@ def symbol_list(cohort: dict | None, reports_by_symbol: dict | None,
                         active=(r["symbol"] == active_symbol),
                         in_watchlist=True)
             for r in wl_rows
+        )
+    if sched_rows:
+        out.append(_group("Scheduled run", len(sched_rows),
+                          "What the daily job called, shown because your "
+                          "watchlist is empty: click ＋ on a row to add it"))
+        out.extend(
+            _symbol_row(r, reports_by_symbol.get(r["symbol"]),
+                        active=(r["symbol"] == active_symbol),
+                        in_watchlist=False)
+            for r in sched_rows
         )
     if extra_rows:
         out.append(_group("This session", len(extra_rows),
@@ -1049,10 +1080,18 @@ def _session_block(entry: dict) -> html.Div:
     models = entry.get("model_names") or []
     rows = entry.get("symbols") or []
     preset = run.get("preset")
+    cutoff = run.get("prediction_date")
     head = html.Div(
         [
             html.Span(format_stamp(run.get("started_at")) or "not started",
                       className="num home-session-started"),
+            # The tab is one cutoff's worth of runs, but nothing else on the
+            # block says which one, so a block read out of context (or a run
+            # made for a back-dated session) is unambiguous.
+            html.Span(f"{cutoff} cutoff", className="num home-session-cutoff",
+                      title="The session this run predicted from: it saw "
+                            "data through this date's close")
+            if cutoff else "",
             html.Span(preset.capitalize(), className="run-preset")
             if preset else "",
             html.Span(run.get("owner_uid") or "anonymous",
@@ -1115,8 +1154,9 @@ def layout(cohort, open_preds, rolling, last_run, jobs, rolling_days=30,
     """
     watchlist = watchlist or []
     has_cohort = bool(cohort and cohort.get("prediction_date"))
-    n_rail = len(set(s.upper() for s in watchlist)
-                 | {r["symbol"] for r in session_only_rows(session_runs, watchlist)})
+    n_rail = len({r["symbol"] for group in rail_groups(cohort, watchlist,
+                                                       session_runs)
+                  for r in group})
 
     left = html.Div(
         [

@@ -149,6 +149,43 @@ def _cost_bps(prev_close) -> float:
     return 8.0
 
 
+def collapse_rerun_duplicates(preds: list[dict]) -> tuple[list[dict], int]:
+    """One row per (symbol, model, cutoff): the newest scored write wins.
+
+    An ad-hoc run of a name the daily job already called writes a SECOND row
+    for that call: manual predictions live in their own id space so the
+    rerun cannot destroy the scheduled row or its evaluation (see
+    cache_service._prediction_id). Each of those rows is then evaluated on
+    its own, so aggregating them all reports three reruns of one TSLA call
+    as three trades and three times its P&L. The scoreboard is what this
+    project judges its models by, so it counts the call once.
+
+    Returns the kept rows in their original order plus how many were
+    dropped, because a silent collapse is its own kind of lie: the page
+    says how many rows it folded.
+    """
+    def rank(p):
+        # A scored row outranks an unscored one before recency does: a rerun
+        # started this morning is not yet evaluated, and letting it win would
+        # delete a resolved outcome from the scoreboard rather than
+        # deduplicate it. Then newest, by created_at (an ISO timestamp, so
+        # string order is time order), with the id breaking a same-tick tie.
+        scored = (p.get("was_correct") is not None
+                  or p.get("pnl_dollars") is not None)
+        return (scored, p.get("created_at") or "", p.get("id") or "")
+
+    def call_key(p):
+        return (p.get("symbol"), p.get("model_name"), p.get("prediction_date"))
+
+    newest: dict[tuple, dict] = {}
+    for p in preds:
+        held = newest.get(call_key(p))
+        if held is None or rank(p) >= rank(held):
+            newest[call_key(p)] = p
+    kept = [p for p in preds if newest[call_key(p)] is p]
+    return kept, len(preds) - len(kept)
+
+
 def aggregate_predictions(preds: list[dict], group_key: str) -> list[dict]:
     """Group evaluated predictions by model or symbol into summary stats.
 
@@ -469,15 +506,29 @@ def get_run_view(run_id: str) -> dict | None:
     return {"run": run, **artifacts}
 
 
+def current_session_date() -> str:
+    """The prediction cutoff a run started right now would carry.
+
+    The same resolution the Run dialog does (resolve_target_and_cutoff with
+    no pick), so "this session" means the session the next ad-hoc run would
+    predict from, not whatever the newest manual run happens to be. It
+    rolls forward at the close, with the session it names.
+    """
+    from utils.trading_calendar import resolve_target_and_cutoff
+
+    return resolve_target_and_cutoff(None)[1].isoformat()
+
+
 def get_session_runs(prediction_date: str | None = None,
                      limit: int = 20) -> list[dict]:
     """This session's ad-hoc runs, newest first, each with its own rows.
 
-    A "session" is one prediction cutoff: the newest one any manual run
-    has, or ``prediction_date``. Every manual run at that cutoff is listed,
-    queued and cancelled ones included, so the tab is the answer to "what
-    did I run today" rather than "what finished". Each entry is
-    ``{run, symbols, model_names, counts, pnl, target_date}`` with the rows
+    A "session" is one prediction cutoff: the current one (see
+    current_session_date) or ``prediction_date``. Every manual run at that
+    cutoff is listed, queued and cancelled ones included, so the tab is the
+    answer to "what did I run today" rather than "what finished", and a day
+    with no ad-hoc run is empty rather than showing last month's. Each entry
+    is ``{run, symbols, model_names, counts, pnl, target_date}`` with the rows
     shaped exactly like a cohort's (see shape_symbol_rows), in the run's
     symbol order. Memoized like the cohorts, except that a list holding a
     run still in flight is read live so its rows fill in.
@@ -490,26 +541,20 @@ def get_session_runs(prediction_date: str | None = None,
     """
     from services import run_service
 
-    key = (f"session_runs:{prediction_date or 'latest'}|{limit}"
+    session_date = str(prediction_date or current_session_date())[:10]
+    key = (f"session_runs:{session_date}|{limit}"
            f"|{run_service.runs_generation('manual')}")
-    return _memoized(key, lambda: _session_runs_uncached(prediction_date, limit),
+    return _memoized(key, lambda: _session_runs_uncached(session_date, limit),
                      cacheable=lambda runs: not any(r["run"]["active"]
                                                     for r in runs))
 
 
-def _session_runs_uncached(prediction_date, limit) -> list[dict]:
+def _session_runs_uncached(session_date, limit) -> list[dict]:
     from services import run_service
 
     # Newest first by start; the row limit is generous because one day's
     # ad-hoc runs are a handful and the cutoff filter below does the rest.
     runs = run_service.list_runs(limit=max(limit * 10, 100), kind="manual")
-    session_date = prediction_date or max(
-        (r["prediction_date"] for r in runs if r.get("prediction_date")),
-        default=None)
-    if session_date is None:
-        return []
-    session_date = str(session_date)[:10]
-
     cache = get_cache()
     out = []
     for run in runs:

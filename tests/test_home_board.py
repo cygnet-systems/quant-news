@@ -491,6 +491,51 @@ class TestSymbolList:
         page = _layout(watchlist=["AAPL", "NVDA"], session_runs=runs)
         assert _text(_find(page, className="home-count-badge")) == "3"
 
+    def test_an_empty_watchlist_lists_the_names_the_board_is_showing(self):
+        """With no watchlist the Scheduled board falls back to every name
+        the daily job wrote (app._home_cohort). The rail has to list those
+        names, or the board's rows cannot be opened from it."""
+        cohort = dict(TestScheduledRows.COHORT)
+        rail = home.symbol_list(cohort, {}, watchlist=[], session_runs=[])
+        labels = [_text(n) for n in _find_all(rail, className="home-group-label")]
+        assert [lbl.rsplit(" ", 1)[0] for lbl in labels] == ["Scheduled run"]
+        names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
+        assert names == [r["symbol"] for r in cohort["symbols"]]
+        adds = [n for n in _find_all(rail)
+                if isinstance(getattr(n, "id", None), dict)
+                and n.id.get("type") == "add-symbol"]
+        assert [b.id["symbol"] for b in adds] == names
+        assert "No symbols yet" not in _text(rail)
+        page = _layout(cohort, watchlist=[], session_runs=[])
+        assert _text(_find(page, className="home-count-badge")) == str(len(names))
+
+    def test_the_fallback_names_are_not_repeated_by_a_session_run(self):
+        cohort = dict(TestScheduledRows.COHORT)
+        runs = [_entry(_run_dict(symbols=("AAPL", "TSLA")),
+                       [row("AAPL", prev=None), row("TSLA", prev=None)])]
+        rail = home.symbol_list(cohort, {}, watchlist=[], session_runs=runs)
+        names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
+        assert names == ["AAPL", "BE", "NVDA", "TSLA"]
+        assert names.count("AAPL") == 1
+
+    def test_a_watchlist_replaces_the_fallback(self):
+        cohort = dict(TestScheduledRows.COHORT)
+        rail = home.symbol_list(cohort, {}, watchlist=["AAPL"], session_runs=[])
+        labels = [_text(n) for n in _find_all(rail, className="home-group-label")]
+        assert [lbl.rsplit(" ", 1)[0] for lbl in labels] == ["Watchlist"]
+        names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
+        assert names == ["AAPL"]
+
+    def test_search_narrows_the_fallback_too(self):
+        cohort = dict(TestScheduledRows.COHORT)
+        rail = home.symbol_list(cohort, {}, search="nv", watchlist=[],
+                                session_runs=[])
+        names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
+        assert names == ["NVDA"]
+        empty = home.symbol_list(cohort, {}, search="zz", watchlist=[],
+                                 session_runs=[])
+        assert 'No symbol matching "ZZ"' in _text(empty)
+
 
 # --- scheduled vs session at one cutoff (SQLite) ----------------------------
 
@@ -512,6 +557,10 @@ def db(monkeypatch, tmp_path):
         dbs, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
     monkeypatch.setattr(ds, "_cache_handle",
                         lambda: diskcache.Cache(str(tmp_path / "memo")))
+    # This session is now the CURRENT cutoff, not the newest manual run's
+    # (get_session_runs), so the seeded date has to be the current one or
+    # every run below reads as history.
+    monkeypatch.setattr(ds, "current_session_date", lambda: TODAY.isoformat())
     return dbs
 
 
@@ -586,7 +635,7 @@ class TestScheduledVersusSession:
                             SimpleNamespace(triggered_id="report-history-store"))
         monkeypatch.setattr(app_module, "_home_reports_by_symbol", lambda: {})
         rail, table, title, meta, session = app_module.render_home_panes(
-            None, "", ["NVDA", "TSLA"], None, {"refreshed_at": "x"}, "/")
+            None, "", None, {"refreshed_at": "x"}, ["NVDA", "TSLA"], "/")
         names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
         assert names == ["NVDA", "TSLA"]
         trs = [n for n in _find_all(table) if type(n).__name__ == "Tr"][1:]
@@ -601,9 +650,9 @@ class TestScheduledVersusSession:
         monkeypatch.setattr(app_module, "ctx",
                             SimpleNamespace(triggered_id="home-symbol-search"))
         with pytest.raises(PreventUpdate):
-            app_module.render_home_panes(None, "", ["NVDA"], None, {}, "/reports")
-        out = app_module.render_home_panes(None, "ts", ["NVDA", "TSLA"], None,
-                                           {}, "/")
+            app_module.render_home_panes(None, "", None, {}, ["NVDA"], "/reports")
+        out = app_module.render_home_panes(None, "ts", None, {},
+                                           ["NVDA", "TSLA"], "/")
         names = [_text(n) for n in _find_all(out[0], className="home-sym-name")]
         assert names == ["TSLA"]
         assert all(o is app_module.dash.no_update for o in out[1:])
@@ -617,12 +666,68 @@ class TestScheduledVersusSession:
         monkeypatch.setattr(app_module, "_home_reports_by_symbol", lambda: {})
         monkeypatch.setattr(app_module, "ctx",
                             SimpleNamespace(triggered_id="report-history-store"))
-        out = app_module.render_home_panes(None, "", [], None, {}, "/")
+        out = app_module.render_home_panes(None, "", None, {}, [], "/")
         assert out[1] is app_module.dash.no_update
         assert _find(out[4], href=f"/runs/{manual}") is not None
         # The rail lists the session-only name with a way in.
         names = [_text(n) for n in _find_all(out[0], className="home-sym-name")]
         assert names == ["TSLA"]
+
+
+class TestSessionCutoff:
+    """This session is the CURRENT cutoff's ad-hoc runs, not the newest
+    ones whatever their age: the tab is labelled today and its empty state
+    says "No ad-hoc runs today"."""
+
+    def test_current_session_date_is_what_a_new_run_would_carry(self):
+        from utils.trading_calendar import resolve_target_and_cutoff
+        assert ds.current_session_date() == \
+            resolve_target_and_cutoff(None)[1].isoformat()
+
+    def test_a_run_from_an_older_cutoff_is_not_this_session(self, db):
+        old_day = TODAY - timedelta(days=30)
+        run_id = rs.create_run("manual", ["TSLA"], "u1", preset="quick",
+                               prediction_date=old_day,
+                               target_date=old_day + timedelta(days=1))
+        with db.get_session() as session:
+            session.add(_pred_row("TSLA", "xgboost_shap", run_id))
+        assert ds.get_session_runs() == []
+        assert _text(home.session_tab(ds.get_session_runs())) == \
+            home.SESSION_EMPTY_TEXT
+        # It is still readable as that day's session, on demand.
+        listed = ds.get_session_runs(prediction_date=old_day.isoformat())
+        assert [e["run"]["run_id"] for e in listed] == [run_id]
+
+    def test_todays_runs_are_this_session(self, db, same_cutoff):
+        assert [e["run"]["run_id"] for e in ds.get_session_runs()] == \
+            [same_cutoff["manual"]]
+
+    def test_each_block_names_the_cutoff_it_ran_from(self, db, same_cutoff):
+        tab = home.session_tab(ds.get_session_runs())
+        head = _find(tab, className="home-session-head")
+        assert _text(_find(head, className="home-session-cutoff")) == \
+            f"{TODAY.isoformat()} cutoff"
+
+
+class TestNullWatchlist:
+    """selected-symbols is None until the browser has ever written it."""
+
+    def test_the_cohort_reads_with_no_watchlist_at_all(self, db, same_cutoff):
+        cohort = app_module._home_cohort(None, None)
+        assert [r["symbol"] for r in cohort["symbols"]] == ["AMD", "NVDA"]
+
+    def test_the_panes_callback_renders_with_no_watchlist_at_all(
+            self, db, same_cutoff, monkeypatch):
+        monkeypatch.setattr(app_module, "_home_reports_by_symbol", lambda: {})
+        monkeypatch.setattr(app_module, "ctx",
+                            SimpleNamespace(triggered_id="report-history-store"))
+        rail, table, _, _, _ = app_module.render_home_panes(
+            None, "", None, {"refreshed_at": "x"}, None, "/")
+        names = [_text(n) for n in _find_all(rail, className="home-sym-name")]
+        # The board's own names, since there is no watchlist to draw.
+        assert names == ["AMD", "NVDA", "TSLA"]
+        trs = [n for n in _find_all(table) if type(n).__name__ == "Tr"][1:]
+        assert [_cells(t)[0] for t in trs] == ["AMD", "NVDA"]
 
 
 # --- wiring -----------------------------------------------------------------
@@ -639,9 +744,35 @@ class TestWiring:
         cb = cbs[0]
         assert "home-cohort-table.children" in cb["output"]
         inputs = [(i["id"], i["property"]) for i in cb["inputs"]]
+        states = [(st["id"], st["property"]) for st in cb["state"]]
         assert ("report-history-store", "data") in inputs
-        assert ("selected-symbols", "data") in inputs
         assert ("prediction-store-status", "data") not in inputs
+        # The watchlist is read, never watched: load_report_history already
+        # fires on it, so an Input here would render Home twice per edit.
+        assert ("selected-symbols", "data") not in inputs
+        assert ("selected-symbols", "data") in states
+
+    def test_one_watchlist_edit_renders_home_once(self):
+        """Walk the callback graph from a watchlist write and count the
+        edges that reach the panes callback. Two of them means Home (a
+        cohort query, list_runs and a predictions query per manual run)
+        is built twice for one click."""
+        from dash._callback import GLOBAL_CALLBACK_LIST
+
+        changed = {("selected-symbols", "data")}
+        # Everything a watchlist write eventually changes, callbacks fired
+        # by that set included (load_report_history is one hop away).
+        for _ in range(4):
+            for cb in GLOBAL_CALLBACK_LIST:
+                if any((i["id"], i["property"]) in changed
+                       for i in cb["inputs"]):
+                    changed |= {tuple(o.split("."))
+                                for o in cb["output"].strip(".").split("...")
+                                if "." in o and "{" not in o}
+        panes = _callbacks_writing("home-session-runs.children")[0]
+        edges = [(i["id"], i["property"]) for i in panes["inputs"]
+                 if (i["id"], i["property"]) in changed]
+        assert edges == [("report-history-store", "data")]
 
     def test_tab_store_is_written_from_the_tabs_and_read_by_the_router(self):
         cbs = _callbacks_writing("home-tab-store.data")
@@ -653,7 +784,10 @@ class TestWiring:
                       if k.startswith("..page-content.children"))
         states = [(s["id"], s["property"])
                   for s in GLOBAL_CALLBACK_MAP[router]["state"]]
-        assert states[-1] == ("home-tab-store", "data")
+        # Membership, not position: the router keeps gaining States (the
+        # Performance run-scope store was appended after this one), and
+        # what matters here is that it reads the tab.
+        assert ("home-tab-store", "data") in states
 
     def test_tab_store_is_mounted(self):
         from layouts.main_layout import create_layout
