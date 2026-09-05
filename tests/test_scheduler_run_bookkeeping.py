@@ -24,7 +24,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-from db.models import Base, JobRun, ScheduledJob
+from db.models import AnalysisRun, Base, JobRun, ScheduledJob
 from services import scheduler_service as ss
 
 
@@ -61,8 +61,12 @@ def db(monkeypatch):
     import db.session as dbs
 
     eng = create_engine("sqlite://")
+    # analysis_runs too: run_job's tail closes the rows linked to the job run
+    # it just finalized. Without the table that call logged a warning and the
+    # tests still passed, which is exactly the blind spot they exist to cover.
     Base.metadata.create_all(
-        eng, tables=[ScheduledJob.__table__, JobRun.__table__])
+        eng, tables=[ScheduledJob.__table__, JobRun.__table__,
+                     AnalysisRun.__table__])
     monkeypatch.setattr(dbs, "_engine", eng)
     monkeypatch.setattr(
         dbs, "_SessionLocal", sessionmaker(bind=eng, expire_on_commit=False))
@@ -75,12 +79,25 @@ def quiet_run(monkeypatch):
     import services.progress_service as prog
 
     class _Proc:
+        """Stands in for the Popen run_job drives.
+
+        run_job used to call subprocess.run; since the process-group timeout
+        fix it builds a Popen and communicates with it. Stubbing `run` alone
+        left these tests spawning the REAL analysis CLI, which is why they
+        hung the moment the command started building again.
+        """
+
         returncode = 0
-        stdout = "{}\n"
-        stderr = ""
+        pid = 424242
+
+        def communicate(self, timeout=None):
+            return "{}\n", ""
+
+        def kill(self):
+            pass
 
     monkeypatch.setattr(ss, "_AdvisoryLock", _NoLock)
-    monkeypatch.setattr(ss.subprocess, "run", lambda *a, **kw: _Proc())
+    monkeypatch.setattr(ss.subprocess, "Popen", lambda *a, **kw: _Proc())
     monkeypatch.setattr(ss, "_notify", lambda *a, **kw: None)
     monkeypatch.setattr(prog, "emit", lambda *a, **kw: None)
     monkeypatch.setattr(ss, "datetime", _FrozenDatetime)
@@ -93,6 +110,12 @@ def _seed_job(db, timezone_name):
             hour=7, minute=0, days_of_week="mon-fri",
             timezone=timezone_name, symbols_csv="AAPL",
             is_public=True,
+            # An analysis job without these does not reach the finalize block
+            # at all: _build_command refuses it up front ("job params missing
+            # lookback, max_articles"). These two tests spent that whole
+            # period asserting 'error' != 'success' instead of guarding the
+            # finalize they were written for.
+            params_json={"lookback": 7, "max_articles": 20},
         ))
 
 

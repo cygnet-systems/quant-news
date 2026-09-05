@@ -1104,6 +1104,17 @@ def _catch_up() -> None:
 # was down long enough that a person should decide what to rerun.
 BACKFILL_MAX_SESSIONS = 5
 
+# Dates this process has already spent a backfill run on, whatever the ledger
+# said afterwards. The 2026-09-02..04 incident was a sweep that ran the same
+# session 109 times, ~190s and a full LLM bill each: the run wrote its rows,
+# the ledger below still counted zero, and nothing in the loop could tell
+# "not analysed yet" from "analysed, and the ledger cannot see it". One
+# attempt per date per process is the structural answer -- a real gap is
+# filled on the first sweep, and a ledger that disagrees with the writer
+# costs one run and a loud log line instead of an unbounded bill. Cleared
+# only by a restart, which is also when a fixed ledger takes effect.
+_BACKFILL_ATTEMPTED: set = set()
+
 
 def _backfill_missed_sessions() -> None:
     """Re-run analysis for recent trading sessions that have no predictions.
@@ -1116,7 +1127,7 @@ def _backfill_missed_sessions() -> None:
     rows targeting it was never analysed, so run it with an explicit
     ``--target``. Idempotent by construction.
     """
-    from sqlalchemy import func, select
+    from sqlalchemy import func, or_ as sa_or, select
 
     from db.models import ModelPrediction
     from db.session import get_session
@@ -1150,13 +1161,35 @@ def _backfill_missed_sessions() -> None:
                 if syms:
                     q = q.where(ModelPrediction.symbol.in_(syms))
                 if job.get("owner_uid"):
-                    q = q.where(ModelPrediction.owner_uid == job["owner_uid"])
+                    # A NULL owner counts as this job's, the same legacy rule
+                    # cache_service._visible and _by_run_kind read. Without
+                    # it this ledger can never be satisfied for a session
+                    # whose rows predate the job having an owner: those rows
+                    # keep their NULL for ever, because store_prediction
+                    # deliberately preserves an existing row's owner across a
+                    # rerun (a rerun must not change who owns a call). The
+                    # sweep then re-ran one session every 30 minutes from
+                    # 2026-09-02 to 09-04 -- 109 runs of a day that was
+                    # already on disk.
+                    q = q.where(sa_or(
+                        ModelPrediction.owner_uid == job["owner_uid"],
+                        ModelPrediction.owner_uid.is_(None)))
                 if not session.execute(q).scalar():
                     missing_by_job.setdefault(job["id"], []).append(d)
 
     for job in analysis_jobs:
         missing = missing_by_job.get(job["id"], [])
         for d in sorted(missing):
+            attempt = (job["id"], d.isoformat())
+            if attempt in _BACKFILL_ATTEMPTED:
+                logger.warning(
+                    "Backfill: %s still reads as missing %s after a run in "
+                    "this process. Not re-running: either the run stored "
+                    "nothing, or the ledger above disagrees with what the "
+                    "writer stamped. Investigate rather than retry.",
+                    job["id"], d)
+                continue
+            _BACKFILL_ATTEMPTED.add(attempt)
             logger.warning(f"Backfill: no predictions target {d}: running "
                            f"{job['id']} with --target {d}")
             result = run_job(
