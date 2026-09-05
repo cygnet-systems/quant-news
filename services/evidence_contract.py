@@ -171,7 +171,21 @@ class EvidenceLedger:
 
 
 def gaps_from_details(details: dict | None) -> list[dict]:
-    """Expected-severity gaps stored on a prediction's details, if any."""
-    ledger = (details or {}).get("evidence") or {}
+    """Expected-severity gaps stored on a prediction's details, if any.
+
+    ``details["evidence"]`` carries TWO shapes and always has. This module's
+    ledger writes the dict (``EvidenceLedger.to_dict``: present / gaps /
+    degraded); ``analysis_runner`` writes the plain LIST of evidence block
+    names the run was configured with, over the same key. A reader that
+    assumes the dict crashes on the list, which is what took down every
+    scheduled run on 2026-09-04 (AttributeError in ``_assess_completeness``,
+    at the very end of a 19-minute run, so the whole day's work was lost
+    after it had been paid for). c4c72f0 fixed the identical access in
+    ``llm_service`` and missed this one. A list carries no gap information,
+    so it reads as no gaps -- which is the truth about what it records.
+    """
+    ledger = (details or {}).get("evidence")
+    if not isinstance(ledger, dict):
+        return []
     return [g for g in (ledger.get("gaps") or [])
-            if g.get("severity") == EXPECTED]
+            if isinstance(g, dict) and g.get("severity") == EXPECTED]

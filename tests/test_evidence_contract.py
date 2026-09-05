@@ -109,3 +109,40 @@ class TestContextBudget:
     def test_empty_blocks_are_dropped_not_joined_as_blank_gaps(self):
         assert self._fit(["", "[a]\nrow", ""]) == "[a]\nrow"
         assert self._fit([]) == ""
+
+
+class TestBothEvidenceShapes:
+    """``details["evidence"]`` has two writers and both are legitimate.
+
+    The evidence contract writes the ledger dict (present / gaps / degraded);
+    ``analysis_runner`` writes the plain list of evidence block names the run
+    was configured with, over the same key. A reader that assumes the dict
+    dies on the list -- which is exactly what killed every scheduled run on
+    2026-09-04, in ``_assess_completeness`` at the END of a 19-minute run, so
+    the work was lost after it had been paid for. c4c72f0 fixed the same
+    access in llm_service and missed this one.
+    """
+
+    def test_the_ledger_dict_yields_its_expected_gaps(self):
+        details = {"evidence": {"present": ["options"], "gaps": [
+            {"key": "insiders", "label": "Insider filings",
+             "reason": "vendor throttled", "severity": "expected"},
+            {"key": "news_source", "label": "News", "reason": "x",
+             "severity": "optional"},
+        ]}}
+        gaps = gaps_from_details(details)
+        assert [g["key"] for g in gaps] == ["insiders"]
+
+    def test_the_list_shape_reads_as_no_gaps_instead_of_crashing(self):
+        details = {"evidence": ["options", "quality", "insiders"]}
+        assert gaps_from_details(details) == []
+
+    def test_missing_and_empty_are_no_gaps(self):
+        assert gaps_from_details(None) == []
+        assert gaps_from_details({}) == []
+        assert gaps_from_details({"evidence": None}) == []
+
+    def test_a_non_dict_gap_entry_is_skipped_not_raised(self):
+        details = {"evidence": {"gaps": ["insiders", {"severity": "expected",
+                                                      "key": "quality"}]}}
+        assert [g["key"] for g in gaps_from_details(details)] == ["quality"]
