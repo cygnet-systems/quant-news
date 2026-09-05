@@ -213,10 +213,14 @@ def scan(monkeypatch, llm, *, web=True, options=None, insiders=None,
         monkeypatch.setattr(av_store, "congress_trades_for",
                             lambda *a, **k: list(congress))
     with patch("services.llm_service.get_llm", return_value=llm):
-        return model._scan_and_research(
+        # Detection and research are two steps now: the caller detects first
+        # so the investigation gate can read the result before spending.
+        detected = model._detect_anomalies(
             "NVDA", AS_OF, evidence=set(evidence), ledger=ledger, news=None,
-            ohlcv_df=None, target="2026-09-03", web=web, options=options,
-            by_expiry=None, quality=None)
+            ohlcv_df=None, options=options, by_expiry=None, quality=None)
+        return model._scan_and_research(
+            "NVDA", AS_OF, detected=detected, ledger=ledger,
+            target="2026-09-03", web=web)
 
 
 def anomalies_from(*args, **kwargs) -> list:

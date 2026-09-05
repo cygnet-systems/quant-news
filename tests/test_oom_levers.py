@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from config import MODEL
 from services import bad_apples_service as ba
 
 AS_OF = "2026-09-01"
@@ -115,6 +116,27 @@ def _run(symbols, events, reused=None):
 
 
 class TestPrefetchStartsAfterTheLoadSpike:
+    """The pool only exists when investigation is NOT gated on anomalies.
+
+    With the gate on (the default since 2026-09-05) there is no pool at all:
+    the gate cannot know which symbols are quiet until each one's evidence
+    blocks are built inside the loop, so investigation moved in-loop and only
+    flagged names pay for it. These tests pin the pool's ordering for the
+    ungated configuration, which is still what runs when a deployment turns
+    the gate off.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ungated(self, monkeypatch):
+        # MODEL is a frozen dataclass; swap the module's reference for a copy
+        # with the gate off, the same way test_news_availability does.
+        import dataclasses
+
+        from services import analysis_runner as ar
+
+        monkeypatch.setattr(ar, "MODEL", dataclasses.replace(
+            MODEL, INVESTIGATE_ONLY_ANOMALIES=False))
+
     def test_pool_starts_after_the_first_symbol_and_covers_the_rest(self):
         events = []
         _run(["A", "B", "C"], events)

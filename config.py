@@ -354,6 +354,18 @@ class ModelConfig:
     # Investigations run concurrently ahead of the model loop; each takes
     # minutes, and the scheduled job has a 75-minute ceiling.
     INVESTIGATION_WORKERS: int = int(os.getenv("INVESTIGATION_WORKERS", "4"))
+    # Investigate only the symbols anomaly_service flagged. Detection is free
+    # arithmetic over blocks the run already built, so it can say which names
+    # are worth paying to investigate before a cent is spent on them. On a
+    # 20-symbol watchlist 14 to 16 names were buying a web search to establish
+    # that nothing was happening: investigation was 79% of the bill and the
+    # detector fires on a minority of symbol-days. A quiet symbol now gets a
+    # shorter report that SAYS it is quiet, which is what anomaly_service was
+    # built to allow. Off restores the old behaviour of investigating
+    # everything.
+    INVESTIGATE_ONLY_ANOMALIES: bool = os.getenv(
+        "INVESTIGATE_ONLY_ANOMALIES", "1").strip().lower() not in (
+            "0", "false", "no", "off")
     # Box-wide ceiling on open-web calls in flight, across ALL runs AND all
     # processes: a manual run's model stage is a forked background-callback
     # subprocess, so a per-process counter bounds nothing between users.

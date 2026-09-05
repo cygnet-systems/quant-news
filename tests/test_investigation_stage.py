@@ -249,12 +249,24 @@ def test_block_carries_deal_terms_spread_figures_and_sources():
     assert "4 web searches, 1 sources consulted" in block
 
 
-def test_research_model_records_gap_when_investigation_fails():
+def test_research_model_records_gap_when_investigation_fails(monkeypatch):
     """A failed investigation is an EXPECTED gap: the report is written,
-    but the ledger, the emitted event and the details all say so."""
+    but the ledger, the emitted event and the details all say so.
+
+    Gate off: this is about the FAILURE path, and a gated run never calls
+    the investigator at all. The distinction is the point of
+    test_a_gated_off_investigation_is_a_skip_not_a_gap below.
+    """
+    import dataclasses
+
+    from config import MODEL
     from services.evidence_contract import EvidenceLedger
+    from models import trading_agents_model as tam
     from models.trading_agents_model import TradingAgentsModel
     import pandas as pd
+
+    monkeypatch.setattr(tam, "MODEL", dataclasses.replace(
+        MODEL, INVESTIGATE_ONLY_ANOMALIES=False))
 
     idx = pd.bdate_range("2025-09-01", "2026-09-01")
     df = pd.DataFrame({"Open": 50.0, "High": 51.0, "Low": 49.0, "Close": 50.0,
@@ -276,6 +288,55 @@ def test_research_model_records_gap_when_investigation_fails():
     gap = next(g for g in ledger.expected_gaps() if g.block == "investigation")
     assert "provider down" in gap.reason
     assert any(b.startswith("[SPY regime") for b in blocks)
+
+
+def test_a_gated_off_investigation_is_a_skip_not_a_gap():
+    """A symbol nothing stood out for was not investigated BY DECISION.
+
+    That must not read as an evidence gap. A gap means the run wanted the
+    block and could not get it, marks the report degraded, and tells the
+    model to say the evidence was unavailable. Calling a deliberate saving a
+    failure would mark every quiet symbol degraded and put a false statement
+    about the run's own provenance in the report -- the exact class of thing
+    the evidence contract exists to prevent.
+    """
+    from services.evidence_contract import EvidenceLedger
+    from models.trading_agents_model import TradingAgentsModel
+    import pandas as pd
+
+    idx = pd.bdate_range("2025-09-01", "2026-09-01")
+    df = pd.DataFrame({"Open": 50.0, "High": 51.0, "Low": 49.0, "Close": 50.0,
+                       "Volume": 1_000_000}, index=idx)
+    ledger = EvidenceLedger("BHF")
+    called = []
+
+    def _investigate(*a, **k):
+        called.append(a)
+        raise AssertionError("a quiet symbol must not buy an investigation")
+
+    model = TradingAgentsModel()
+    with patch("services.investigation_service.investigate", _investigate), \
+         patch("utils.events.get_upcoming_events", return_value={}), \
+         patch("services.stock_data.fetch_stock_data", return_value=df), \
+         patch("services.stock_data.get_company_profile", return_value="BHF: insurer"):
+        _, inv, anomalies, _, _ = model._build_extra_context(
+            "BHF", df, "2026-09-01", evidence={"investigation"}, ledger=ledger,
+            tools=["web_research"])
+
+    assert not anomalies, "fixture is meant to be a quiet symbol"
+    assert not called, "the gate let a paid investigation through"
+    assert inv is None
+    assert not [g for g in ledger.expected_gaps() if g.block == "investigation"], (
+        "a deliberate skip was recorded as a gap; every quiet symbol would "
+        "mark its run degraded")
+    # Not `ledger.degraded is False`: this fixture mocks the events calendar
+    # away, which is its own unrelated gap. The claim under test is narrower
+    # and exact -- the skip contributes nothing to degradation.
+    assert "investigation" not in [g.block for g in ledger.gaps]
+    skip = next(g for g in ledger.skipped if g.block == "investigation")
+    assert "nothing stood out" in skip.reason
+    assert skip.severity == "optional", (
+        "a skip must never carry a severity that can degrade a run")
 
 
 def test_the_dossier_supersedes_the_political_blocks_congress_half():
@@ -517,6 +578,11 @@ class TestWebResearchSlots:
 class TestTheBacktestRuleIsEnforcedOnThePath:
     """The open web is off for a backtest wherever the run came from.
 
+    Run with the anomaly gate OFF, because the witness these tests read is
+    the prefetch pool's ``web`` argument and the gate removes the pool. The
+    rule under test is about the tools list run_predictions builds, which is
+    the same either way.
+
     The rule had two witnesses and neither was on the wire: the dialog's
     ``preset_run_tools`` drops web research for a past target and
     ``apply_run_preset`` rewrites the control when the picker moves, but a
@@ -528,6 +594,16 @@ class TestTheBacktestRuleIsEnforcedOnThePath:
     prefetch pool and trading_agents_model, which takes the same list
     through run_report_for_symbol -- see the stripped set.
     """
+
+    @pytest.fixture(autouse=True)
+    def _ungated(self, monkeypatch):
+        import dataclasses
+
+        from config import MODEL
+        from services import analysis_runner as ar
+
+        monkeypatch.setattr(ar, "MODEL", dataclasses.replace(
+            MODEL, INVESTIGATE_ONLY_ANOMALIES=False))
 
     def _run(self, target, cutoff, tools):
         """run_predictions with the models stubbed; returns the web flag the

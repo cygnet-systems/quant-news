@@ -31,8 +31,9 @@ import pandas as pd
 from config import MODEL
 from models.base import BaseModel, PredictionResult
 from services.evidence_contract import (
-    OPTIONAL, EvidenceLedger, MissingRequiredEvidence,
+    EXPECTED, OPTIONAL, EvidenceLedger, MissingRequiredEvidence,
 )
+from services.usage_service import SpendCeilingReached
 from models.single_agent import MAX_EXTRA_CONTEXT_CHARS, _smart_truncate
 from services.investigation_service import WEB_RESEARCH_TOOL
 
@@ -719,7 +720,30 @@ class TradingAgentsModel(BaseModel):
         # --- situation & investigation (expected when selected) ---
         # Placed FIRST in the prompt's precomputed section: the situation
         # decides how every other block is read.
-        if "investigation" in evidence:
+        # Detect FIRST. Detection is free arithmetic over the blocks built
+        # above, and it is the only thing that can tell a symbol worth paying
+        # to investigate from a quiet one before the money is spent. On a
+        # 20-symbol watchlist, 14 to 16 names were buying a web search to
+        # establish that nothing was happening.
+        detected = self._detect_anomalies(
+            symbol, as_of, evidence=evidence, ledger=ledger, news=news,
+            ohlcv_df=ohlcv_df, options=metrics_pc, by_expiry=by_expiry,
+            quality=quality_result)
+        _anomalies_found = bool(detected[0])
+        # A scan that FAILED knows nothing about whether this symbol is quiet,
+        # so it must not be read as "nothing to investigate": the gate opens.
+        _gate_open = (_anomalies_found or detected[2]
+                      or not MODEL.INVESTIGATE_ONLY_ANOMALIES)
+
+        if "investigation" in evidence and not _gate_open:
+            ledger.skip(
+                "investigation",
+                "nothing stood out for this symbol in "
+                + (", ".join(detected[1]) or "the evidence this run gathered")
+                + ", so no situation research was bought")
+            _emit("ta", f"Research {symbol}: quiet symbol, skipping the paid "
+                        f"investigation")
+        elif "investigation" in evidence:
             try:
                 from services.investigation_service import (
                     investigate, format_investigation_block, headlines_for_prompt,
@@ -751,15 +775,27 @@ class TradingAgentsModel(BaseModel):
                                "sources": len(investigation.sources),
                                "findings": len(investigation.findings),
                                "spread_pct": investigation.spread_pct})
+            except SpendCeilingReached as e:
+                # Not a failure of the investigator: the run refused to buy
+                # the call. Saying "stage failed" here would send a vendor
+                # alert for a budget decision, and the report would tell a
+                # reader the evidence was unavailable when it was unbought.
+                logger.warning(f"{symbol}: investigation not bought: {e}")
+                investigation = None
+                ledger.missing("investigation",
+                               f"not researched: {e}", severity=EXPECTED)
+                _emit("ta", f"Research {symbol}: spend ceiling reached, "
+                            f"no investigation bought",
+                      payload={"event": "spend_ceiling", "symbol": symbol,
+                               "stage": "investigation"})
             except Exception as e:
                 logger.warning(f"{symbol}: investigation failed: {e}")
                 investigation = None
                 ledger.missing("investigation", f"investigation stage failed: {str(e)[:100]}")
 
         anomalies, screened, scan_failed = self._scan_and_research(
-            symbol, as_of, evidence=evidence, ledger=ledger, news=news,
-            ohlcv_df=ohlcv_df, target=target, web=web, options=metrics_pc,
-            by_expiry=by_expiry, quality=quality_result)
+            symbol, as_of, detected=detected, ledger=ledger,
+            target=target, web=web)
         # Ahead of the situation block, which is itself ahead of everything
         # else: these are the only blocks in the prompt that say something a
         # reader could not read off the chart.
@@ -771,43 +807,18 @@ class TradingAgentsModel(BaseModel):
 
         return extra_blocks, investigation, anomalies, screened, scan_failed
 
-    def _scan_and_research(
+    def _detect_anomalies(
         self, symbol: str, as_of: str, *, evidence: set, ledger,
-        news: list | None, ohlcv_df, target: str | None, web: bool,
-        options, by_expiry, quality,
+        news: list | None, ohlcv_df, options, by_expiry, quality,
     ) -> tuple[list[dict], list[str], bool]:
-        """What stands out for this symbol, each item researched on the web.
+        """(anomalies, screened, scan_failed) with nothing researched yet.
 
-        Returns (anomalies, screened, scan_failed). ``screened`` names the
-        categories the scan could actually rule out. An empty anomaly list
-        means "nothing stood out in THOSE categories" and means nothing at
-        all about the ones this run never fetched, so the caller needs both
-        to write the quiet-symbol note without asserting an absence it did
-        not check.
-
-        ``scan_failed`` is the third state and exists because the first two
-        do not cover it: a scan that raised AFTER the run gathered its
-        evidence knows neither that the symbol is quiet nor that there was
-        nothing to screen, and reusing the nothing-was-gathered wording for
-        it would tell the report a falsehood about its own run.
-
-        What counts as screened is read off the run's evidence set and the
-        ledger, never off whether rows came back. A dossier that rendered
-        "no member of Congress disclosed a trade" screened congressional
-        filings; an empty list of rows is its finding, not its absence.
-
-        Detection (services.anomaly_service) is arithmetic over blocks the
-        run already computed, so it costs nothing and never raises the
-        report. The two store reads below re-read rows the insider and
-        dossier blocks already pulled, one indexed query each, rather than
-        widen those functions' return contracts.
-
-        Each surviving anomaly is enriched in place with ``answer`` (its
-        researched finding, or None), ``researched``, and — when it was not —
-        ``unresearched``, one of anomaly_service.UNRESEARCHED_REASONS. That
-        reason is stamped here because only this function knows which of the
-        four happened; a block that inferred it from a missing answer would
-        put a false statement about the run's own provenance in the report.
+        Split from _scan_and_research so it can run BEFORE the
+        investigation stage decides whether this symbol is worth paying
+        to investigate. Detection is arithmetic over blocks the run has
+        already built: no fetch, no model call, no database write, so
+        asking it first costs nothing and is the only thing that can
+        tell a quiet symbol from a live one before the money is spent.
         """
         from services import anomaly_service
         # Gathered, not non-empty. A block is on the ledger when it RENDERED,
@@ -854,11 +865,46 @@ class TradingAgentsModel(BaseModel):
         except Exception as e:
             logger.warning(f"{symbol}: anomaly scan failed: {e}")
             return [], screened, True
+        return anomalies, screened, False
 
-        for anomaly in anomalies:
-            anomaly["answer"] = None
-            anomaly["researched"] = False
-            anomaly["unresearched"] = "no_web" if not web else "capped"
+    def _scan_and_research(
+        self, symbol: str, as_of: str, *, detected: tuple, ledger,
+        target: str | None, web: bool,
+    ) -> tuple[list[dict], list[str], bool]:
+        """What stands out for this symbol, each item researched on the web.
+
+        Returns (anomalies, screened, scan_failed). ``screened`` names the
+        categories the scan could actually rule out. An empty anomaly list
+        means "nothing stood out in THOSE categories" and means nothing at
+        all about the ones this run never fetched, so the caller needs both
+        to write the quiet-symbol note without asserting an absence it did
+        not check.
+
+        ``scan_failed`` is the third state and exists because the first two
+        do not cover it: a scan that raised AFTER the run gathered its
+        evidence knows neither that the symbol is quiet nor that there was
+        nothing to screen, and reusing the nothing-was-gathered wording for
+        it would tell the report a falsehood about its own run.
+
+        What counts as screened is read off the run's evidence set and the
+        ledger, never off whether rows came back. A dossier that rendered
+        "no member of Congress disclosed a trade" screened congressional
+        filings; an empty list of rows is its finding, not its absence.
+
+        ``detected`` is _detect_anomalies' result, computed by the caller
+        BEFORE the investigation stage so the gate there can read it. This
+        function only researches what detection already found.
+
+        Each surviving anomaly is enriched in place with ``answer`` (its
+        researched finding, or None), ``researched``, and — when it was not —
+        ``unresearched``, one of anomaly_service.UNRESEARCHED_REASONS. That
+        reason is stamped here because only this function knows which of the
+        four happened; a block that inferred it from a missing answer would
+        put a false statement about the run's own provenance in the report.
+        """
+        anomalies, screened, scan_failed = detected
+        if scan_failed:
+            return anomalies, screened, scan_failed
         if not anomalies:
             # Hoisted: nesting the same quote inside an f-string expression
             # is 3.12+ grammar and the container runs 3.11.
@@ -866,6 +912,11 @@ class TradingAgentsModel(BaseModel):
             _emit("ta", f"Research {symbol}: nothing stands out in "
                         f"{looked_at}, the report stays short")
             return anomalies, screened, False
+
+        for anomaly in anomalies:
+            anomaly["answer"] = None
+            anomaly["researched"] = False
+            anomaly["unresearched"] = "no_web" if not web else "capped"
 
         _emit("ta", f"Research {symbol}: {len(anomalies)} anomaly/anomalies to "
                     f"write about ("

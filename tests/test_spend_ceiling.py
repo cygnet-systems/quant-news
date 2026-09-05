@@ -99,3 +99,64 @@ class TestItIsARunBudgetNotADayBudget:
         us._accrue("run-1", 1.00)
         monkeypatch.setattr(prog, "current_run_id", lambda: "run-2")
         us.check_spend_ceiling()          # run-2 is not run-1's spend
+
+
+class TestItIsReportedAsABudgetStopNotAnOutage:
+    """A ceiling stop and a vendor outage need different responses, so they
+    must not look alike anywhere a person reads them."""
+
+    def _sent(self, monkeypatch):
+        from services import notify_service as ns
+
+        out = {}
+        monkeypatch.setattr(ns, "_send",
+                            lambda subject, html: out.update(
+                                subject=subject, html=html) or True)
+        monkeypatch.setattr(ns, "enabled", lambda: True)
+        return out, ns
+
+    def test_the_partial_mail_says_nothing_is_broken(self, monkeypatch):
+        out, ns = self._sent(monkeypatch)
+        ns.notify_partial(
+            "daily_analysis",
+            ["spend ceiling reached: $1.02 of $1.00, so later stages bought "
+             "nothing"],
+            {"target_date": "2026-09-05", "model_coverage": {}})
+        assert "spend ceiling" in out["subject"]
+        assert "Nothing is broken" in out["html"]
+        assert "RUN_SPEND_CEILING_USD" in out["html"], (
+            "the mail must name the knob that changes the outcome")
+        assert "stop again at the same point" in out["html"], (
+            "a reader told only to 're-run once the cause is fixed' will "
+            "re-run something guaranteed to stop identically")
+
+    def test_an_ordinary_partial_is_unchanged(self, monkeypatch):
+        out, ns = self._sent(monkeypatch)
+        ns.notify_partial("daily_analysis", ["scored nothing: trading_agents"],
+                          {"target_date": "2026-09-05", "model_coverage": {}})
+        assert "spend ceiling" not in out["subject"]
+        assert "Nothing is broken" not in out["html"]
+
+    def test_the_calls_mail_banners_it_too(self, monkeypatch):
+        out, ns = self._sent(monkeypatch)
+        ns.notify_analysis({
+            "target_date": "2026-09-05", "as_of": "2026-09-04",
+            "actions": {"AAPL": "BUY"}, "predictions_stored": 1,
+            "degraded": ["spend ceiling reached: $1.02 of $1.00"],
+        })
+        assert "[spend ceiling]" in out["subject"]
+        assert "hit its spend ceiling" in out["html"]
+
+    def test_a_ceiling_stop_is_an_expected_gap_not_a_stage_failure(self):
+        """The report must say the evidence was not BOUGHT, not that the
+        investigator broke: one is a budget, the other pages someone."""
+        from services.evidence_contract import EXPECTED, EvidenceLedger
+
+        ledger = EvidenceLedger("BHF")
+        ledger.missing("investigation",
+                       "not researched: run spend $1.02 reached the $1.00 "
+                       "ceiling", severity=EXPECTED)
+        gap = next(g for g in ledger.expected_gaps()
+                   if g.block == "investigation")
+        assert "not researched" in gap.reason and "ceiling" in gap.reason
+        assert "failed" not in gap.reason

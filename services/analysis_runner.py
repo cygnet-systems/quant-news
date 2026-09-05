@@ -463,8 +463,17 @@ def run_predictions(
     # process neither drains it nor is drained by it.
     begin_research_budget(MODEL.ANOMALY_RESEARCH_BUDGET)
     investigation_pool = None
+    # The prefetch investigates every symbol ahead of the loop, which is
+    # exactly what the anomaly gate exists to stop: it cannot know which
+    # names are quiet until each symbol's evidence blocks are built, and
+    # those are built inside the loop. With the gate on, investigation
+    # happens in-loop for flagged symbols only. That trades the pool's
+    # parallelism for spending nothing on the majority of names -- a run goes
+    # from ~20 investigations to a handful, so the serial cost is smaller
+    # than the pool it replaces.
     prefetch_pending = ("investigation" in evidence_set
-                        and "trading_agents" in selected)
+                        and "trading_agents" in selected
+                        and not MODEL.INVESTIGATE_ONLY_ANOMALIES)
     web = WEB_RESEARCH_TOOL in tools_set
 
     def _start_prefetch(remaining: list[str]) -> None:
@@ -1722,6 +1731,19 @@ def _run_stages(
 
     coverage, degraded = _assess_completeness(
         signals, priced, models, recommendations)
+    # A run that stopped buying is not a run that failed, and it must not be
+    # reported as one: the mail and the job status both need to name the
+    # budget explicitly, or the next person debugging it goes looking for a
+    # vendor outage that never happened.
+    from config import RUN_SPEND_CEILING_USD
+    from services import usage_service as _usage
+
+    ceiling = float(RUN_SPEND_CEILING_USD or 0)
+    spent = _usage.spent_on_run(prog.current_run_id())
+    if ceiling > 0 and spent >= ceiling:
+        degraded.append(
+            f"spend ceiling reached: ${spent:.2f} of ${ceiling:.2f}, so "
+            f"later stages bought nothing")
     if not archived:
         degraded.append(f"report not archived ({(archive_error or '')[:80]})")
     if news_unavailable:

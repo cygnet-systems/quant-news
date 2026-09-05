@@ -123,10 +123,24 @@ class EvidenceLedger:
     symbol: str
     present: list[str] = field(default_factory=list)
     gaps: list[EvidenceGap] = field(default_factory=list)
+    # Blocks the run decided not to build. Neither present nor a gap: a gap
+    # is evidence the run WANTED and could not get, and calling a deliberate
+    # decision one would mark every quiet symbol's report degraded and tell
+    # a reader something failed when nothing did.
+    skipped: list[EvidenceGap] = field(default_factory=list)
 
     def have(self, block: str) -> None:
         if block not in self.present:
             self.present.append(block)
+
+    def skip(self, block: str, reason: str) -> None:
+        """Record a block this run chose not to build, and why.
+
+        Never raises, whatever the block's severity: a skip is a decision the
+        caller has already made, and the ledger's job is to carry the reason
+        into the report so the absence is explained rather than silent.
+        """
+        self.skipped.append(EvidenceGap(block, OPTIONAL, reason))
 
     def missing(self, block: str, reason: str,
                 severity: str | None = None) -> None:
@@ -162,10 +176,24 @@ class EvidenceLedger:
                      "it were neutral.")
         return "\n".join(lines)
 
+    def skipped_block(self) -> str:
+        """The deliberate skips, phrased so the model does not read them as
+        failures. Separate from prompt_block because the two say opposite
+        things: one is evidence that went missing, this is evidence the run
+        decided it did not need."""
+        if not self.skipped:
+            return ""
+        lines = ["[Evidence deliberately NOT gathered for this report. This "
+                 "is a decision, not a failure, and not a gap.]"]
+        for g in self.skipped:
+            lines.append(f"- {g.label}: {g.reason}")
+        return "\n".join(lines)
+
     def to_dict(self) -> dict:
         return {
             "present": list(self.present),
             "gaps": [g.to_dict() for g in self.gaps],
+            "skipped": [g.to_dict() for g in self.skipped],
             "degraded": self.degraded,
         }
 

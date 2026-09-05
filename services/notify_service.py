@@ -229,7 +229,24 @@ def notify_analysis(summary: dict, cost: float | None = None,
     if summary.get("skipped"):
         meta.append(f"skipped: {', '.join(summary['skipped'])}")
 
+    # A budget stop reads nothing like a vendor outage and must not be left
+    # to look like one. Hoisted to the top of the mail rather than buried in
+    # the meta line: the calls below it were written with less evidence than
+    # a normal day, and a reader has to know that before reading them.
+    budget = [d for d in (summary.get("degraded") or [])
+              if "spend ceiling" in d]
+    banner = ""
+    if budget:
+        banner = (
+            f'<p style="margin:0 0 14px;padding:10px 12px;border-radius:6px;'
+            f'background:#FFF4E5;color:#8A4B00;font-size:13px">'
+            f'<strong>This run hit its spend ceiling.</strong> '
+            f'{budget[0]}. Later stages were not bought, so some calls rest '
+            f'on less evidence than usual. Raise RUN_SPEND_CEILING_USD if '
+            f'this was not intended.</p>')
+
     body = (
+        f'{banner}'
         f'<table style="border-collapse:collapse;min-width:280px">'
         f'<tr><th style="{_TH}">Symbol</th><th style="{_TH}">Call</th></tr>'
         f'{rows}</table>'
@@ -238,7 +255,8 @@ def notify_analysis(summary: dict, cost: float | None = None,
         f'{" · ".join(meta)}</p>'
     )
     subject = (f"Pre-open calls {summary.get('target_date', '')}: "
-               f"{counts['BUY']}B/{counts['SELL']}S/{counts['HOLD']}H")
+               f"{counts['BUY']}B/{counts['SELL']}S/{counts['HOLD']}H"
+               + (" [spend ceiling]" if budget else ""))
     return _send(subject, _wrap(
         "Pre-open calls",
         f"Target session {summary.get('target_date', '?')} · "
@@ -456,8 +474,25 @@ def notify_partial(job_id: str, reasons: list[str], summary: dict) -> bool:
         f'<td style="{_TD};color:{"#D93900" if n == 0 else "#666"}">{n}</td></tr>'
         for m, n in sorted(coverage.items())
     )
+    # A spend ceiling is the one "partial" reason that is not a fault to go
+    # and fix: the run did exactly what it was configured to do. It gets its
+    # own banner and its own subject line so it is not triaged as an outage,
+    # and so the closing "re-run it once the cause is fixed" below cannot be
+    # read as advice to re-run something that will just stop again.
+    budget = [r for r in reasons if "spend ceiling" in r]
+    banner = ""
+    if budget:
+        banner = (
+            f'<p style="margin:0 0 14px;padding:10px 12px;border-radius:6px;'
+            f'background:#FFF4E5;color:#8A4B00;font-size:13px">'
+            f'<strong>This run stopped on its spend ceiling.</strong> '
+            f'{budget[0]}. Nothing is broken: the run refused to spend more. '
+            f'Raise RUN_SPEND_CEILING_USD, or narrow the watchlist, if you '
+            f'want it to finish. Re-running it unchanged will stop again at '
+            f'the same point.</p>')
     body = (
-        "<p>The run completed and stored predictions, but did not produce "
+        banner
+        + "<p>The run completed and stored predictions, but did not produce "
         "everything it was asked for:</p><ul>"
         + "".join(f"<li>{r}</li>" for r in reasons)
         + "</ul>"
@@ -473,7 +508,9 @@ def notify_partial(job_id: str, reasons: list[str], summary: dict) -> bool:
              'Today is recorded as not-yet-successful, so /healthz reports it '
              'overdue. It will not retry on its own. Re-run it from the '
              'Schedule page once the cause is fixed.</p>')
-    return _send(f"⚠️ quant-news: {job_id} partial: {reasons[0] if reasons else 'incomplete'}",
+    headline = ("stopped on its spend ceiling" if budget
+                else (reasons[0] if reasons else "incomplete"))
+    return _send(f"⚠️ quant-news: {job_id} partial: {headline}",
                  _wrap("Partial run", summary.get("target_date", job_id), body))
 
 
