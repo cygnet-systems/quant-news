@@ -268,7 +268,7 @@ class ModelConfig:
     # the window, 0 = everything the window holds. The Run dialog, the
     # scheduler job form and the CLI all expose this; the trace records
     # when it bites (fetched vs kept, effective span).
-    NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "500"))
+    NEWS_MAX_ARTICLES: int = int(os.getenv("NEWS_MAX_ARTICLES", "50"))
     # The durable news store keeps every fetched article this long, then
     # prunes. A daily 7/14/30-day run reads its window from the store and
     # fetches only days it has not seen. The same articles are not paid for
@@ -314,7 +314,7 @@ class ModelConfig:
     TRADING_AGENTS_MODEL: str = "gpt-5.6-luna"
     # Evidence blocks the research prompt and synthesis carry by default
     # (the Run dialog checklist, scheduled runs and the CLI all start from
-    # this list). Adding a key here changes what every default run reads. 
+    # this list). Adding a key here changes what every default run reads.
     # bump PIPELINE_EPOCH alongside.
     #   options: point-in-time put/call positioning
     #   quality: Bad Apples screen + news red flags
@@ -343,11 +343,26 @@ class ModelConfig:
     INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "gpt-5.6-luna")
     # Reasoning effort for gpt-* investigators (OpenAI Responses API).
     INVESTIGATION_OPENAI_EFFORT: str = os.getenv("INVESTIGATION_OPENAI_EFFORT", "medium")
-    INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "6"))
+    # Searches per classification call. 6 was the first guess; the 09-04 full
+    # run averaged 4.75 and the names that stopped at 3 (VZ, HPQ, XYZ, DOC)
+    # came back with the same 7-9 sourced findings and 3 dated events as the
+    # 5-search names. Each search is billed twice: $10/1000 as a tool call
+    # AND ~8k input tokens of search content at the model rate, which is why
+    # a 5-search call reads ~36k input tokens against ~1.8k for triage. On a
+    # 20-symbol day the search line is ~3x the token line, so this cap, not
+    # the model or the prompt, is what the daily bill follows. It is a soft
+    # cap on OpenAI's side: passed as max_tool_calls, every measured call
+    # came back with cap + 1 web_search_call items (3 -> 4, 2 -> 3, 6 -> 5),
+    # so budget for one more than the number here.
+    INVESTIGATION_MAX_SEARCHES: int = int(os.getenv("INVESTIGATION_MAX_SEARCHES", "3"))
     # Two-stage triage: every name is classified web-free first (a
     # fraction of a cent); the web search runs only for situations that
     # can be researched. OpenAI bills the hosted search per call on top of
     # tokens, so searching all 20 names a day blew the $0.80/day budget.
+    # Do NOT add OTHER here: on the 09-04 run triage said OTHER for 12 names
+    # and the web run turned 11 of them into a real situation (three pending
+    # acquisitions, three leadership changes, two legal overhangs...). From
+    # supplied evidence alone OTHER means "cannot tell", not "nothing here".
     INVESTIGATION_WEB_SKIP: tuple[str, ...] = tuple(
         s.strip().upper() for s in
         os.getenv("INVESTIGATION_WEB_SKIP", "MOMENTUM_ONLY").split(",") if s.strip())
@@ -390,6 +405,15 @@ class ModelConfig:
     # 0 turns anomaly research off; a run may lift it by passing None.
     ANOMALY_RESEARCH_BUDGET: int = int(
         os.getenv("ANOMALY_RESEARCH_BUDGET", "18"))
+    # Floor on searches per anomaly question. The questions share the
+    # classification cap above (cap // questions), and at a cap of 3 two
+    # questions would get one search each; a single search answers a
+    # narrow "why did X stand out" question with "no reporting found" far
+    # more often than two do. Bounded by ANOMALY_RESEARCH_BUDGET questions a
+    # run, so the worst case is budget x floor searches on top of the
+    # classification searches.
+    ANOMALY_QUESTION_MIN_SEARCHES: int = int(
+        os.getenv("ANOMALY_QUESTION_MIN_SEARCHES", "2"))
 
     # Swappable research backend: "single_agent" (in-tree default) or
     # "tradingagents" (adapter over a pinned external release; see

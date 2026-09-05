@@ -375,21 +375,27 @@ def _paste_option(query: str, tokens: list[str]) -> list[dict]:
     if not syms:
         return []
     return [{"label": f"Add {len(syms)} symbols: {', '.join(syms)}",
-             "value": " ".join(syms), "search": query}]
+             "value": " ".join(syms), "kind": "paste"}]
+
+
+# The typeahead does not open until this many characters are typed: a
+# single letter matches hundreds of cache rows and the list is noise.
+MIN_SEARCH_CHARS = 2
 
 
 def run_symbol_options(query: str | None, hits: list[dict]) -> list[dict]:
     """Options for the symbol typeahead from the cache's hits for ``query``.
 
-    Every option carries ``search`` = the query: the Dropdown filters
-    options client-side by tokenising the search string and matching each
-    token against value, label and search, so without it a name hit
-    ("apple" -> AAPL) or a pasted "NVDA, AMD" would be filtered back out.
-    A comma-separated query is a paste and offers one option that adds
-    them all; a space-separated one is a company name first ("advanced
-    micro") and a paste only when the cache has nothing for it and every
-    word is a ticker. No hit at all offers "Add XYZ (check)", which the add
-    path validates with one price lookup before it becomes a chip.
+    Each option is ``{label, value, kind}``. ``kind`` says what picking it
+    does: a ``hit`` is a cache row (a listed symbol, added on a primary-key
+    read); a ``paste`` adds every symbol in a comma-separated list; a
+    ``verify`` is a ticker-shaped word the cache has never seen, and picking
+    it runs one price lookup that must succeed before anything is added. No
+    option ever adds a symbol on the strength of the typed text alone.
+
+    A comma-separated query is a paste; a space-separated one is a company
+    name first ("advanced micro") and a paste only when the cache has
+    nothing for it and every word is a ticker.
     """
     from services.ticker_service import normalize_symbol
 
@@ -406,16 +412,55 @@ def run_symbol_options(query: str | None, hits: list[dict]) -> list[dict]:
             continue
         name = (h.get("name") or "").strip()
         options.append({"label": f"{sym} · {name}" if name else sym,
-                        "value": sym, "search": q})
+                        "value": sym, "kind": "hit", "name": name})
     if options:
         return options
     if len(tokens) > 1:
         return _paste_option(q, tokens)
     sym = normalize_symbol(tokens[0])
     if sym:
-        options.append({"label": f"Add {sym} (check)", "value": sym,
-                        "search": q})
+        options.append({"label": f"Verify {sym}", "value": sym,
+                        "kind": "verify"})
     return options
+
+
+def run_symbol_suggestions(query: str | None, options: list[dict]) -> list:
+    """The suggestion rows under the search box.
+
+    Every row is a button carrying its option's value in a pattern id, so
+    one callback handles every pick. A ``verify`` row says out loud that
+    the symbol is not in the list and will be checked, and a query the
+    cache has nothing for gets one inert line saying so; the box never
+    offers to add text it cannot vouch for. Under MIN_SEARCH_CHARS the
+    list is empty, which hides it.
+    """
+    q = (query or "").strip()
+    if len(q) < MIN_SEARCH_CHARS:
+        return []
+    if not options:
+        return [html.Div(f"No listed symbol matches \u201c{q}\u201d",
+                         className="run-sym-suggest-empty")]
+    rows = []
+    for o in options:
+        kind = o.get("kind", "hit")
+        if kind == "hit":
+            body = [html.Span(o["value"], className="run-sym-suggest-sym"),
+                    html.Span(o.get("name") or "",
+                              className="run-sym-suggest-name")]
+        elif kind == "verify":
+            body = [html.Span(o["value"], className="run-sym-suggest-sym"),
+                    html.Span("Not in the symbol list. Checks for price data "
+                              "before adding.",
+                              className="run-sym-suggest-name")]
+        else:
+            body = [html.Span(o["label"], className="run-sym-suggest-name")]
+        rows.append(html.Button(
+            body, type="button",
+            id={"type": "run-sym-pick", "value": o["value"]},
+            n_clicks=0,
+            className=f"run-sym-suggest-row run-sym-suggest-{kind}",
+        ))
+    return rows
 
 # Wall-clock components for the pre-flight estimate, in seconds. These are the
 # numbers already recorded elsewhere in the codebase rather than guesses: a
@@ -1146,20 +1191,34 @@ def create_run_modal() -> dbc.Modal:
                         ),
                         html.Div(id="run-symbols-chips",
                                  className="run-symbols-chips"),
-                        dcc.Dropdown(
-                            id="run-symbol-search",
-                            options=[],
-                            value=None,
-                            multi=False,
-                            searchable=True,
-                            clearable=False,
-                            placeholder="Search ticker or company",
-                            className="run-symbol-search",
+                        # A plain text box with suggestions under it, not
+                        # a Dropdown: the Dropdown took a click to open and
+                        # a second field to type in, and offered "Add XYZ"
+                        # for any text that looked like a ticker. Rows come
+                        # from the local ticker cache once two characters
+                        # are typed; Enter takes the top row.
+                        html.Div(
+                            [
+                                dcc.Input(
+                                    id="run-symbol-search",
+                                    type="text",
+                                    value="",
+                                    debounce=False,
+                                    autoComplete="off",
+                                    placeholder="Type a ticker or company name",
+                                    className="run-symbol-search",
+                                ),
+                                html.Div(id="run-symbol-suggest",
+                                         className="run-symbol-suggest",
+                                         role="listbox"),
+                            ],
+                            className="run-symbol-search-wrap",
                         ),
                         html.Div(
-                            "Type a ticker or a company name, or paste a "
-                            "comma-separated list. Applies to this run only; "
-                            "the watchlist is not changed.",
+                            "Suggestions appear after two characters; Enter "
+                            "adds the first one. Paste a comma-separated list "
+                            "to add several. Applies to this run only; the "
+                            "watchlist is not changed.",
                             className="run-field-hint",
                         ),
                     ],

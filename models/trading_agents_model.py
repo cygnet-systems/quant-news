@@ -161,17 +161,28 @@ class TradingAgentsModel(BaseModel):
             return self._run_analysis(symbol, ohlcv_df, **kwargs)
         except MissingRequiredEvidence as e:
             # Deliberate refusal: the report is not written without this.
+            # Two kinds arrive here and the activity trail names which: a
+            # required block the source answered empty for, and a feed the
+            # run selected that did not answer at all (FeedUnavailable).
+            # Both stop this symbol's report; the payload carries the block
+            # and the reason so the Activity page can group them by feed.
             logger.error(str(e))
-            _emit("error", f"{symbol}: research report NOT written, {e.reason} "
-                           f"({e.block}). A report without it would read as "
-                           f"complete and be wrong.")
+            what = ("feed unavailable" if e.kind == "feed_unavailable"
+                    else "required evidence missing")
+            _emit("error",
+                  f"{symbol}: research report NOT written, {what}: "
+                  f"{e.reason} ({e.block}). A report without it would read "
+                  f"as complete and be wrong.",
+                  payload={"symbol": symbol, "block": e.block,
+                           "reason": e.reason, "kind": e.kind})
             return PredictionResult(
                 model_name=self.name,
                 decision="HOLD",
                 confidence=0.0,
                 up_probability=0.5,
                 details={"missing_required": e.block,
-                         "missing_reason": e.reason},
+                         "missing_reason": e.reason,
+                         "missing_kind": e.kind},
                 error=str(e),
             )
         except Exception as e:
@@ -200,6 +211,12 @@ class TradingAgentsModel(BaseModel):
         news = kwargs.get("news")                 # optional pre-fetched PIT news
         use_news = kwargs.get("use_news", True)   # False for the news-ablation arm
         use_reflection = kwargs.get("use_reflection", False)  # opt-in memory loop
+        # The SINCE LAST REPORT post-pass is one more model call per symbol.
+        # It serves a reader following a live name from one morning to the
+        # next; a backtest has no such reader, so it keeps the deterministic
+        # record and the call is not bought.
+        use_continuity = kwargs.get("use_continuity",
+                                    not kwargs.get("is_backtest", False))
         # research_model: the Full Analysis pipeline's explicit choice (a
         # distinct key, "model" is too generic to share across all models
         # in the prediction service's common kwargs).
@@ -276,6 +293,7 @@ class TradingAgentsModel(BaseModel):
             # The run's own window, frontend-owned: no fallback here, the
             # agent raises when it is asked to read news without one.
             news_lookback_days=kwargs.get("news_lookback_days"),
+            use_continuity=use_continuity,
             ledger=ledger,
             situation=(investigation.situation if investigation else None),
             anomalies=anomalies,
@@ -509,13 +527,18 @@ class TradingAgentsModel(BaseModel):
         except Exception:
             pass
 
-        # --- event calendar (expected) ---
+        # --- event calendar (expected when it answers; a dead lookup stops
+        # the report) ---
         try:
             events = get_upcoming_events(symbol, as_of)
-            block = format_events_block(symbol, events)
         except Exception as e:
-            events, block = {}, ""
-            logger.warning(f"{symbol}: events block failed: {e}")
+            logger.warning(f"{symbol}: events lookup failed: {e}")
+            ledger.unavailable("events", f"calendar lookup failed: {str(e)[:80]}")
+        if isinstance(events, dict) and events.get("unavailable"):
+            # get_upcoming_events swallows the vendor error and says so;
+            # that is the feed not answering, not a symbol with no events.
+            ledger.unavailable("events", "calendar lookup failed at the vendor")
+        block = format_events_block(symbol, events)
         if block:
             extra_blocks.append(block)
             ledger.have("events")
@@ -537,14 +560,13 @@ class TradingAgentsModel(BaseModel):
                 extra_blocks.append(block)
                 ledger.have("peers")
             else:
+                # The mapping exists and the price feed did not answer for
+                # it: a dead feed, not a coverage gap.
                 logger.warning(f"{symbol}: peer RS block empty "
                                f"(peers: {', '.join(peers[:6])})")
-                extra_blocks.append(
-                    f"[Peer relative strength. UNAVAILABLE]\n"
-                    f"Known peers: {', '.join(peers[:8])}. Their price "
-                    f"data could not be fetched for this run; do not "
-                    f"infer relative performance.")
-                ledger.missing("peers", "peer price data could not be fetched")
+                ledger.unavailable(
+                    "peers", f"peer price data could not be fetched "
+                             f"({', '.join(peers[:4])})")
         else:
             # A structural absence (no mapping), not a fetch failure: logged
             # and shown in the details, but it does not degrade the run.
@@ -602,23 +624,30 @@ class TradingAgentsModel(BaseModel):
         # reads the same numbers rather than fetching the chain a second time.
         metrics_pc = by_expiry = None
         if "options" in evidence:
+            from services.options_service import (
+                OptionsUnavailable, get_put_call_metrics,
+                get_put_call_by_expiry, format_options_block,
+            )
             try:
-                from services.options_service import (
-                    get_put_call_metrics, get_put_call_by_expiry,
-                    format_options_block,
-                )
                 metrics_pc = get_put_call_metrics(symbol, as_of)
                 by_expiry = get_put_call_by_expiry(symbol, as_of) if metrics_pc else None
                 block = format_options_block(symbol, metrics_pc, by_expiry)
+            except OptionsUnavailable as e:
+                # The chain could not be asked for. Before this, a throttle
+                # and "no listed options" were one None and one gap, and a
+                # report written through a throttle read as a symbol with
+                # no chain.
+                logger.warning(f"{symbol}: options feed unavailable: {e}")
+                ledger.unavailable("options", str(e)[:120])
             except Exception as e:
-                block = ""
                 logger.warning(f"{symbol}: options block failed: {e}")
+                ledger.unavailable("options", f"options block failed: {str(e)[:100]}")
             if block:
                 extra_blocks.append(block)
                 ledger.have("options")
             else:
-                ledger.missing("options", "no chain returned (vendor throttled, "
-                                          "no listed options, or no key)")
+                ledger.missing("options", "vendor answered with no chain: "
+                                          "no listed options for this symbol")
 
         # --- quality screen (expected when selected) ---
         quality_text = ""
@@ -633,11 +662,18 @@ class TradingAgentsModel(BaseModel):
                 quality_text = format_bad_apples_block(symbol, quality_result)
             except Exception as e:
                 logger.warning(f"{symbol}: quality screen failed: {e}")
+                ledger.unavailable("quality", f"quality screen failed: {str(e)[:100]}")
+            if isinstance(quality_result, dict) and quality_result.get("unavailable"):
+                # analyze_symbol never raises; this is its word that the
+                # fundamentals source did not answer and every check is n/a
+                # for that reason, not because the filer is thin.
+                ledger.unavailable("quality", quality_result["unavailable"])
             if quality_text:
                 extra_blocks.append(quality_text)
                 ledger.have("quality")
             else:
-                ledger.missing("quality", "quality screen could not be computed")
+                ledger.missing("quality", "every check came back n/a for "
+                                          "this filer")
 
         # --- political & institutional flows (optional: sparse by nature) ---
         if "political" in evidence:
@@ -661,7 +697,9 @@ class TradingAgentsModel(BaseModel):
             if blocks:
                 ledger.have("political")
             elif problems:
-                ledger.missing("political", "; ".join(problems))
+                # Nothing rendered and the sources said why: a dead feed,
+                # whatever this block's severity for an empty window.
+                ledger.unavailable("political", "; ".join(problems)[:160])
             else:
                 # Nothing fetched and nothing broken: 13F rows can simply be
                 # absent, and with the congressional half in the dossier
@@ -690,9 +728,12 @@ class TradingAgentsModel(BaseModel):
             if block:
                 extra_blocks.append(block)
                 ledger.have("insiders")
+            elif problems:
+                # insider_block returns no text only when the top-up failed
+                # AND nothing was stored to write from: the feed is down.
+                ledger.unavailable("insiders", "; ".join(problems)[:160])
             else:
-                ledger.missing("insiders", "; ".join(problems)
-                               or "no Form 4 rows stored for this symbol")
+                ledger.missing("insiders", "no Form 4 rows stored for this symbol")
 
         # --- congressional dossier (optional) ---
         # Passed the run's OWN news: the dossier names members the articles
@@ -711,9 +752,11 @@ class TradingAgentsModel(BaseModel):
             if block:
                 extra_blocks.append(block)
                 ledger.have("politicians")
+            elif problems:
+                ledger.unavailable("politicians", "; ".join(problems)[:160])
             else:
-                ledger.missing("politicians", "; ".join(problems)
-                               or "no congressional rows stored for this symbol")
+                ledger.missing("politicians",
+                               "no congressional rows stored for this symbol")
 
         web = WEB_RESEARCH_TOOL in set(tools or [])
 
@@ -735,7 +778,22 @@ class TradingAgentsModel(BaseModel):
         _gate_open = (_anomalies_found or detected[2]
                       or not MODEL.INVESTIGATE_ONLY_ANOMALIES)
 
-        if "investigation" in evidence and not _gate_open:
+        if "investigation" in evidence and not web:
+            # The web tool is the cost switch. Off means no investigation
+            # call of any kind: the web-free classification is a model call
+            # too, and it ran for every flagged symbol (and every symbol of
+            # every day in a backtest, where the path strips the tool) while
+            # the dialog said no research was being bought. The situation
+            # line already tells the report to classify from the news and
+            # filings blocks when no block was gathered.
+            ledger.skip(
+                "investigation",
+                "web research is off for this run, so no situation research "
+                "was bought; the situation is classified from the news and "
+                "filings blocks instead")
+            _emit("ta", f"Research {symbol}: web research off, skipping the "
+                        f"investigation")
+        elif "investigation" in evidence and not _gate_open:
             ledger.skip(
                 "investigation",
                 "nothing stood out for this symbol in "
@@ -751,13 +809,20 @@ class TradingAgentsModel(BaseModel):
                 from services.stock_data import get_company_profile
                 from services import usage_service as _usage
                 _emit("ta", f"Research {symbol}: investigating the situation "
-                            f"({'web research' if web else 'classification from supplied evidence only'})")
+                            f"(web research)")
                 ctx = _usage.current()
                 with _usage.track("investigation", symbol=symbol,
                                   trade_date=ctx.trade_date or as_of,
                                   section=f"investigation:{symbol}"):
                     investigation = investigate(
                         symbol, as_of, web=web, target=target,
+                        # The scan already established something is going
+                        # on with this name; a web-free triage asking
+                        # whether it is plain momentum would be a second
+                        # model call to answer a settled question. Triage
+                        # stays for the paths that reach here without a
+                        # finding (gate off, or the scan raised).
+                        triage=not _anomalies_found,
                         profile=get_company_profile(symbol) or "",
                         headlines=headlines_for_prompt(news or []),
                         filings=filings_text, quality=quality_text,

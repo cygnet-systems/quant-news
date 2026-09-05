@@ -64,7 +64,7 @@ def test_options_block_shows_by_expiry_skew():
 
 def test_research_prompt_maps_outcomes_and_positioning():
     from models.single_agent import (
-        EPILOGUE_INSTRUCTIONS, SINGLE_AGENT_PROMPT, render_output_sections,
+        EPILOGUE_INSTRUCTIONS, SINGLE_AGENT_SYSTEM_PROMPT, render_output_sections,
     )
     # With nothing anomalous the section list is the fixed frame it has
     # always been, numbered the same way.
@@ -72,7 +72,7 @@ def test_research_prompt_maps_outcomes_and_positioning():
     assert "5. Positioning & Flows" in sections
     assert "10. Scenarios" in sections
     assert "12. Trade Plan" in sections
-    assert "Step 3b: Map the outcomes" in SINGLE_AGENT_PROMPT
+    assert "Step 3b: Map the outcomes" in SINGLE_AGENT_SYSTEM_PROMPT
     assert '"scenarios"' in EPILOGUE_INSTRUCTIONS
 
 

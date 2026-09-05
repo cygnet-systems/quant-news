@@ -2867,10 +2867,20 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
             # Gated by the modal's Evidence-blocks checklist.
             if "options" in evidence_sel:
                 from services.options_service import (
-                    get_put_call_metrics, format_options_block,
+                    OptionsUnavailable, get_put_call_metrics,
+                    format_options_block,
                 )
-                block = format_options_block(
-                    symbol, get_put_call_metrics(symbol, as_of_str))
+                try:
+                    block = format_options_block(
+                        symbol, get_put_call_metrics(symbol, as_of_str))
+                except OptionsUnavailable as e:
+                    # This is the synthesis' evidence, not the research
+                    # report's: the contract that stops a report on a dead
+                    # feed lives in the research model. Here the block is
+                    # left out and the reason logged.
+                    logger.warning(f"{symbol}: options feed unavailable "
+                                   f"for synthesis evidence: {e}")
+                    block = ""
                 if block:
                     blocks["options"] = block
             if "quality" in evidence_sel:
@@ -6656,34 +6666,39 @@ def toggle_model_info(info_clicks, close_click, run_evidence, depth, run_tools):
     return True, title, body
 
 
-@callback(
-    Output("run-symbol-search", "options"),
-    Input("run-symbol-search", "search_value"),
-    prevent_initial_call=True,
-)
-async def search_run_symbols(search_value):
-    """Typeahead options from the local ticker cache, one indexed query
-    per keystroke and no vendor call. The Dropdown clears search_value on
-    select, which empties the list again."""
-    from layouts.modals import (is_symbol_list, run_symbol_options,
-                                split_symbol_input)
-
-    query = (search_value or "").strip()
-    if not split_symbol_input(query):
-        # The Dropdown clears search_value the moment an option is picked;
-        # emptying the list in that same round made the picked value
-        # invalid before its own callback ran. The last list stays.
-        raise PreventUpdate
+def _run_symbol_options_for(query):
+    """The typeahead's options for ``query``: one indexed cache query, no
+    vendor call. A paste needs no lookup; a failed lookup degrades to the
+    verify row so a cache outage cannot strand the dialog."""
+    from layouts.modals import is_symbol_list, run_symbol_options
     if is_symbol_list(query):
-        # A paste: one option that adds them all; nothing to look up.
         return run_symbol_options(query, [])
     from services import ticker_service
     try:
-        hits = await asyncio.to_thread(ticker_service.search, query, 12)
+        hits = ticker_service.search(query, 12)
     except Exception as e:
         logger.warning("Run dialog: symbol search failed: %s", e)
         hits = []
     return run_symbol_options(query, hits)
+
+
+@callback(
+    Output("run-symbol-suggest", "children"),
+    Input("run-symbol-search", "value"),
+    prevent_initial_call=True,
+)
+async def search_run_symbols(search_value):
+    """Suggestion rows for what is in the box, one cache query per
+    keystroke. Under two characters the list is empty, which is also how
+    the list closes: a pick clears the box, and this empties the rows."""
+    from layouts.modals import (MIN_SEARCH_CHARS, run_symbol_suggestions,
+                                split_symbol_input)
+
+    query = (search_value or "").strip()
+    if len(query) < MIN_SEARCH_CHARS or not split_symbol_input(query):
+        return []
+    options = await asyncio.to_thread(_run_symbol_options_for, query)
+    return run_symbol_suggestions(query, options)
 
 
 @callback(
@@ -6693,19 +6708,23 @@ async def search_run_symbols(search_value):
     Input("run-add-watchlist", "n_clicks"),
     Input("run-add-lastrun", "n_clicks"),
     Input({"type": "run-sym-remove", "symbol": ALL}, "n_clicks"),
-    Input("run-symbol-search", "value"),
+    Input({"type": "run-sym-pick", "value": ALL}, "n_clicks"),
+    Input("run-symbol-search", "n_submit"),
+    State("run-symbol-search", "value"),
     State("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
-async def set_run_symbols(add_watchlist, add_lastrun, remove_clicks, picked,
-                          store):
+async def set_run_symbols(add_watchlist, add_lastrun, remove_clicks,
+                          pick_clicks, submitted, typed, store):
     """Edit the run's symbol set without touching the watchlist.
 
     Every source is additive: "+ Watchlist" and "+ Last run" append what is
-    not there yet, a typeahead pick (or a pasted list) appends after the
-    cache or one price lookup vouches for it, and a chip's cross removes
-    it. The store's watchlist/lastrun snapshots were taken when the dialog
-    opened, which is the set the user was looking at.
+    not there yet, a suggestion row (or Enter, which takes the top row for
+    what is typed) appends after the cache or one price lookup vouches for
+    it, and a chip's cross removes it. Nothing is added on the strength of
+    typed text alone: text no row matches yields a message and no chip. The
+    store's watchlist/lastrun snapshots were taken when the dialog opened,
+    which is the set the user was looking at.
     """
     from layouts.modals import split_symbol_input
 
@@ -6731,21 +6750,37 @@ async def set_run_symbols(add_watchlist, add_lastrun, remove_clicks, picked,
         store["symbols"] = [s for s in symbols if s != sym]
         return store, dash.no_update, ""
 
-    if triggered == "run-symbol-search":
-        tokens = split_symbol_input(picked)
-        if not tokens:
-            raise PreventUpdate  # the echo of the clear below
-        accepted, rejected = await asyncio.to_thread(
-            _resolve_run_symbols, tokens, symbols)
-        msg = ""
-        if rejected:
-            msg = f"No price data for {', '.join(rejected)}"
-        if not accepted:
-            return dash.no_update, None, msg
-        store["symbols"] = symbols + accepted
-        return store, None, msg
+    picked = None
+    if isinstance(triggered, dict) and triggered.get("type") == "run-sym-pick":
+        if not any(c and c > 0 for c in pick_clicks):
+            raise PreventUpdate  # rows mounting, not a click
+        picked = triggered.get("value")
+    elif triggered == "run-symbol-search":
+        query = (typed or "").strip()
+        if not submitted or not split_symbol_input(query):
+            raise PreventUpdate
+        # Enter means "the first suggestion", never "the text as typed":
+        # the same options the rows were built from decide what that is.
+        options = await asyncio.to_thread(_run_symbol_options_for, query)
+        if not options:
+            return (dash.no_update, dash.no_update,
+                    f"No listed symbol matches \u201c{query}\u201d")
+        picked = options[0]["value"]
+    else:
+        raise PreventUpdate
 
-    raise PreventUpdate
+    tokens = split_symbol_input(picked)
+    if not tokens:
+        raise PreventUpdate
+    accepted, rejected = await asyncio.to_thread(
+        _resolve_run_symbols, tokens, symbols)
+    msg = ""
+    if rejected:
+        msg = f"No price data for {', '.join(rejected)}"
+    if not accepted:
+        return dash.no_update, "", msg
+    store["symbols"] = symbols + accepted
+    return store, "", msg
 
 
 @callback(
@@ -6844,16 +6879,45 @@ clientside_callback(
 
 # Cursor in the symbol search when the dialog opens: the modal fades in,
 # so the focus waits for the transition. Best effort: a missing element
-# costs nothing.
+# costs nothing. The same hook wires the suggestion list's keyboard once
+# per mount (a data attribute stops a second binding): ArrowDown from the
+# box walks the rows, Escape returns to the box, and a mousedown on a row
+# keeps focus in the box so the list stays open and the next symbol can be
+# typed straight away.
 clientside_callback(
     """
     function(open) {
         if (!open) { return ""; }
         setTimeout(function() {
-            var root = document.getElementById("run-symbol-search");
-            if (!root) { return; }
-            var el = root.querySelector('[role="combobox"], input, button, [tabindex]') || root;
-            try { el.focus(); } catch (e) {}
+            var input = document.getElementById("run-symbol-search");
+            if (!input) { return; }
+            try { input.focus(); } catch (e) {}
+            var wrap = input.closest(".run-symbol-search-wrap");
+            if (!wrap || wrap.dataset.keysBound) { return; }
+            wrap.dataset.keysBound = "1";
+            var rows = function() {
+                return Array.prototype.slice.call(
+                    wrap.querySelectorAll(".run-sym-suggest-row"));
+            };
+            wrap.addEventListener("mousedown", function(ev) {
+                if (ev.target.closest(".run-sym-suggest-row")) {
+                    ev.preventDefault();
+                }
+            });
+            wrap.addEventListener("keydown", function(ev) {
+                var list = rows();
+                var i = list.indexOf(document.activeElement);
+                if (ev.key === "ArrowDown" && list.length) {
+                    ev.preventDefault();
+                    list[Math.min(i + 1, list.length - 1)].focus();
+                } else if (ev.key === "ArrowUp" && i >= 0) {
+                    ev.preventDefault();
+                    (i === 0 ? input : list[i - 1]).focus();
+                } else if (ev.key === "Escape") {
+                    ev.preventDefault();
+                    input.focus();
+                }
+            });
         }, 300);
         return "";
     }

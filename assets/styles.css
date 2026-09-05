@@ -4520,11 +4520,15 @@ body {
 
 .home-call .home-chip { font-size: var(--text-sm); }
 
-.home-actual-cell {
-    display: flex;
+/* The flex goes on an inner line, never on the td: a display:flex cell
+   leaves the table layout and stops stretching with its row, so a row
+   grown by the open models expander showed the cell as a short box. */
+.home-actual-cell { white-space: nowrap; }
+
+.home-actual-line {
+    display: inline-flex;
     align-items: baseline;
     gap: var(--space-2);
-    white-space: nowrap;
 }
 
 .home-move { font-size: var(--text-xs); }
@@ -5385,7 +5389,90 @@ body {
 
 .run-symbols-empty { color: var(--text-muted); font-size: var(--text-xs); }
 
-.run-symbol-search { max-width: 360px; font-size: var(--text-sm); }
+/* Symbol typeahead: a text box with the suggestion list floated under
+   it. The list is shown only while focus is inside the wrap (box or a
+   row) and only when it has rows, so a pick, which clears the box and
+   empties the rows, closes it without any script. */
+.run-symbol-search-wrap { position: relative; max-width: 360px; }
+
+.run-symbol-search {
+    width: 100%;
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    padding: 6px 10px;
+}
+
+.run-symbol-search:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+}
+
+.run-symbol-suggest {
+    display: none;
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    z-index: 1060;
+    max-height: 280px;
+    overflow-y: auto;
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    padding: 4px 0;
+}
+
+.run-symbol-search-wrap:focus-within .run-symbol-suggest:not(:empty) {
+    display: block;
+}
+
+.run-sym-suggest-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: 0;
+    padding: 6px 10px;
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+    cursor: pointer;
+}
+
+.run-sym-suggest-row:hover,
+.run-sym-suggest-row:focus {
+    outline: none;
+    background-color: var(--bg-secondary);
+}
+
+.run-sym-suggest-sym {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--accent-primary);
+    min-width: 64px;
+    flex: 0 0 auto;
+}
+
+.run-sym-suggest-verify .run-sym-suggest-sym { color: var(--text-secondary); }
+
+.run-sym-suggest-name {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.run-sym-suggest-empty {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    padding: 6px 10px;
+}
 
 .run-add-btns {
     display: flex;

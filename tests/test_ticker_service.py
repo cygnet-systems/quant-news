@@ -151,8 +151,9 @@ class TestEnsureSymbols:
 
 
 class Info:
-    def __init__(self, name):
+    def __init__(self, name, current_price=100.0):
         self.name = name
+        self.current_price = current_price
 
 
 class TestValidate:
@@ -180,6 +181,14 @@ class TestValidate:
         monkeypatch.setattr(ts, "_fetch_info", boom)
         out = ts.validate_symbol("ZZZZ")
         assert out["ok"] is False and out["symbol"] == "ZZZZ"
+        assert rows() == {}
+
+    def test_profile_without_a_price_is_not_ok(self, db, monkeypatch):
+        # Delisted and placeholder names come back with a name and no
+        # quote; the dialog promises "has price data", not "has a page".
+        monkeypatch.setattr(ts, "_fetch_info", lambda s: Info("Gone Corp", 0))
+        out = ts.validate_symbol("GONE")
+        assert out["ok"] is False and out["reason"].startswith("no price")
         assert rows() == {}
 
     def test_garbage_never_fetches(self, db, monkeypatch):

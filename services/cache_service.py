@@ -1194,7 +1194,10 @@ class CacheService:
                 select(TradingAgentReport)
                 .where(TradingAgentReport.symbol == symbol.upper())
                 .where(_visible(TradingAgentReport))
-                .order_by(TradingAgentReport.created_at.desc())
+                # Newest trading day first, not newest write: a backfill that
+                # regenerates an old day must not outrank the current one.
+                .order_by(TradingAgentReport.trade_date.desc(),
+                          TradingAgentReport.created_at.desc())
                 .limit(limit)
             ).scalars().all()
             return [
@@ -1268,6 +1271,10 @@ class CacheService:
         needs "does this name have a report, and what did it say" for every
         row, and report_text would drag megabytes through the session for a
         headline that only needs the verdict fields.
+
+        "Newest" is by trade_date, then created_at. Ordering by write time
+        alone let a backfill that regenerated an old day's reports hide the
+        current day's from the watchlist rail.
         """
         from db.models import TradingAgentReport
         with get_session() as session:
@@ -1279,6 +1286,7 @@ class CacheService:
                 .where(_visible(TradingAgentReport))
                 .distinct(TradingAgentReport.symbol)
                 .order_by(TradingAgentReport.symbol,
+                          TradingAgentReport.trade_date.desc(),
                           TradingAgentReport.created_at.desc())
             )
             if symbols:

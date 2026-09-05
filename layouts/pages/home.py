@@ -508,8 +508,9 @@ def scheduled_row(row: dict, models: list[str], expanded: bool = False) -> html.
     prev = row.get("previous_close")
     if summary["state"] == "pending":
         actual_cell = html.Td(
-            html.Span(f"awaiting {row.get('target_date') or ''} close",
-                      className="home-pending-pill"),
+            html.Div(html.Span(f"awaiting {row.get('target_date') or ''} close",
+                               className="home-pending-pill"),
+                     className="home-actual-line"),
             className="home-actual-cell",
         )
         result_cell = html.Td(html.Span("pending", className="home-result-pending"),
@@ -523,7 +524,11 @@ def scheduled_row(row: dict, models: list[str], expanded: bool = False) -> html.
             move = (actual - prev) / prev
             move_cls = "positive" if move > 0 else "negative" if move < 0 else ""
             bits.append(html.Span(f"{move:+.1%}", className=f"num home-move {move_cls}"))
-        actual_cell = html.Td(bits, className="home-actual-cell",
+        # The flex line is an inner div, not the td itself: a flex td stops
+        # behaving as a table cell and no longer stretches with the row, so
+        # opening the models expander left it a short dark box.
+        actual_cell = html.Td(html.Div(bits, className="home-actual-line"),
+                              className="home-actual-cell",
                               title=f"previous close {prev:.2f}" if prev else "")
         label, cls = _result_label(row, summary)
         result_cell = html.Td(

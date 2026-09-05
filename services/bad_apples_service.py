@@ -782,6 +782,13 @@ def analyze_symbol(symbol: str, as_of: str,
         bench_prices = _pit_prices(get_ticker(bench), as_of)
     except Exception:
         bench_prices = None
+    # "Never raises" holds, but a screen computed from a source that did not
+    # answer is not a screen. With no ticker handle, no profile and no price
+    # history there was nothing to check, and every row below comes back
+    # n/a for a reason the caller has to be able to tell from a thin filer.
+    if tk is None or (not info and stock_prices is None):
+        out["unavailable"] = ("fundamentals source did not answer "
+                              "(no profile and no price history)")
 
     price = None
     if stock_prices is not None and len(stock_prices):

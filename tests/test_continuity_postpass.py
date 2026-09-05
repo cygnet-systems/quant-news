@@ -8,6 +8,7 @@ no prior-stance block, and the line writer can only record, not decide.
 
 from models.single_agent import (
     SINGLE_AGENT_PROMPT,
+    SINGLE_AGENT_SYSTEM_PROMPT,
     _insert_since_line,
     _since_last_report_line,
 )
@@ -42,10 +43,11 @@ PRIOR = {"trade_date": "2026-08-28", "decision": "BUY", "confidence": 0.55,
 
 
 def test_research_prompt_carries_no_prior_stance():
-    assert "{continuity_block}" not in SINGLE_AGENT_PROMPT
-    assert "PRIOR STANCE" not in SINGLE_AGENT_PROMPT
-    # The model is not asked to write the line; it is inserted afterwards.
-    assert "SINCE LAST REPORT" not in SINGLE_AGENT_PROMPT
+    for half in (SINGLE_AGENT_PROMPT, SINGLE_AGENT_SYSTEM_PROMPT):
+        assert "{continuity_block}" not in half
+        assert "PRIOR STANCE" not in half
+        # The model is not asked to write the line; it is inserted afterwards.
+        assert "SINCE LAST REPORT" not in half
 
 
 def test_insert_after_measured_accuracy():

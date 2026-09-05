@@ -779,7 +779,7 @@ class TestAnalyzeNow:
         def _info(sym):
             calls.append(sym)
             if sym in ("NVDA", "AMD"):
-                return SimpleNamespace(name="NVIDIA Corp")
+                return SimpleNamespace(name="NVIDIA Corp", current_price=120.0)
             raise ValueError("no data")
 
         monkeypatch.setattr(ts, "_fetch_info", _info)

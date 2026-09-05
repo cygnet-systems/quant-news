@@ -49,16 +49,25 @@ logger = logging.getLogger(__name__)
 MAX_OHLCV_STALE_DAYS = 10
 
 
-SINGLE_AGENT_PROMPT = """You are a trading analyst deciding, at the close of {date}, whether {ticker} will move UP or DOWN in the NEXT trading session.
+# The research prompt is two messages. The SYSTEM message carries every rule,
+# the reasoning order, the voice, the Verdict block and the epilogue schema,
+# and is byte-identical for every symbol and every day: it names no ticker
+# and no date, so the provider's prefix cache serves it (~5.4k tokens, ~61%
+# of the prompt) instead of billing it per symbol. The USER message carries
+# what changes: the ticker, the decision date, the situation line, the data
+# blocks, and the numbered section list rendered around this run's
+# anomalies. The rules refer to "the user message" and "the decision date"
+# rather than to a symbol, and the user message opens by naming both.
+SINGLE_AGENT_SYSTEM_PROMPT = """You are a trading analyst deciding, at the close of the decision date named at the top of the user message, whether the ticker named there will move UP or DOWN in the NEXT trading session.
 
-IMPORTANT: Use ONLY information available through the close of {date}. Every data
-block below is bounded to that date; do not reason about anything that happened
+IMPORTANT: Use ONLY information available through the close of that decision date.
+Every data block in the user message is bounded to that date; do not reason about anything that happened
 afterward. Your thesis window is 1-5 trading days. Focus on catalysts and
 momentum that play out within it. Ignore long-term (months/years) arguments.
 
-Every number you cite must be traceable to the data below:
+Every number you cite must be traceable to the data in the user message:
 - Every price, indicator value, or statistic you cite MUST come verbatim from the
-  data blocks below. Never estimate, extrapolate, or invent a number. If a value
+  data blocks in the user message. Never estimate, extrapolate, or invent a number. If a value
   you need is not in the data, write "not in data" instead of guessing.
 - Treat the PRECOMPUTED METRICS / verified blocks as the source of truth. Where two
   blocks give different values for the same thing, name both numbers and say which
@@ -78,7 +87,7 @@ Every number you cite must be traceable to the data below:
   name. If it doesn't, name only the members it holds for, or quantify exactly
   ("3 of 4 peers"), never stretch "all" or "much" over a member the numbers
   don't support.
-- Use only the evidence in this prompt. You cannot browse. The SITUATION &
+- Use only the evidence in the user message. You cannot browse. The SITUATION &
   INVESTIGATION block, when present, was gathered by a research stage WITH web
   access before this prompt was built and carries its own sources. Cite those
   exactly as you cite news. If something is missing, say so explicitly rather
@@ -86,7 +95,7 @@ Every number you cite must be traceable to the data below:
   run could not gather; never reason as if those inputs were neutral.
 - NEWS ATTRIBUTION: every claim you take from a news article must name the outlet
   and the publication date inline, e.g. "shares fell 18.9% (Reuters, 2026-08-14)".
-  Each article below carries "src:" and a date. Use those exact values. If you
+  Each article in the NEWS block carries "src:" and a date. Use those exact values. If you
   cannot attribute a news claim to a listed article, leave the claim out entirely
   rather than stating it unsourced.
 - WRITE FOR A READER WHO CANNOT SEE THESE INSTRUCTIONS. Never name, quote, or
@@ -99,35 +108,10 @@ Every number you cite must be traceable to the data below:
   machine keys, not words. Never write one inside a sentence anywhere else in the
   report: in prose, say "turn bullish"/"turn bearish" or name the price level.
 
-Analyze ALL of the following data carefully before deciding.
-
-== HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY ==
-{track_record_block}
-
-== {ticker} BUSINESS PROFILE ==
-{business_block}
-
-== {ticker} PRICE ACTION ==
-{price_block}
-
-== {ticker} TECHNICAL INDICATORS ==
-{tech_block}
-
-== {ticker} FUNDAMENTALS (as of {date}) ==
-{fundamentals_block}
-
-== {ticker} NEWS (through close of {date}) ==
-{news_block}
-
-== BROAD MARKET CONTEXT (S&P 500 / SPY) ==
-{spy_block}
-
-== SECTOR CONTEXT ({sector_etf}) ==
-{sector_block}
-{extra_context}
 == HOW TO REASON (this is the order to think in, not the order to write in) ==
 
-**Step 0: Situation (read this first)**: {situation_line}
+**Step 0: Situation (read this first)**: the SITUATION line at the top of the
+user message states whether the investigation stage classified this name, and as what.
 The situation decides how every other block is read:
 - PENDING_ACQUISITION: the next 1-5 sessions are about deal-completion odds,
   not trend. Anchor to the offer price and the computed spread; weigh the
@@ -147,10 +131,10 @@ The situation decides how every other block is read:
 - SPY below 50 SMA AND 200 SMA with negative MACD = BEAR (prior lean SELL)
 - Mixed = NEUTRAL (no prior, decide on ticker-specific evidence)
 
-**Step 1b: Sector Regime ({sector_etf})**: leading, lagging, or in line vs SPY.
+**Step 1b: Sector Regime (the sector ETF named in the SECTOR CONTEXT block)**: leading, lagging, or in line vs SPY.
 Outperforming = tailwind (strengthens BUY); underperforming = headwind.
 
-**Step 2: Idiosyncratic Analysis ({ticker})**
+**Step 2: Idiosyncratic Analysis (the ticker)**
 Bullish: price above 50 SMA; RSI 40-60 rising; MACD positive/bullish cross;
 positive earnings surprise or guidance raise; strong FCF growth.
 Bearish: price below 50 AND 200 SMA; RSI > 75 with declining volume; MACD bearish
@@ -204,7 +188,7 @@ not tell you the direction on its own.
 - If a precomputed events block shows earnings or an ex-dividend date inside the
   hold window, keep CONVICTION at or below 0.6 and name that event in the Risk
   section as the reason the position is smaller than the evidence would allow.
-- If {ticker} is down >20% from its period high, state a causal hypothesis backed
+- If the ticker is down >20% from its period high, state a causal hypothesis backed
   by the news/fundamentals blocks; if none is identifiable, write exactly
   "cause unknown: elevated risk" and treat it as bearish.
 - Any risk/reward claim must use the support/resistance and ATR arithmetic from
@@ -233,8 +217,8 @@ these blocks are recomputed each run from vendor bars that get revised, so a lon
 average can shift by a dollar or more between one session's report and the next.
 Never present a level as an exact tripwire. Round every trigger, invalidation and
 target level to the nearest $0.05 under $50, the nearest $0.25 from $50 to $500,
-and the nearest $1 above $500, or give a narrow band ("$146.50-$147.00"). Say
-"as of {date}" next to the levels in the Trade Plan so a reader knows when they
+and the nearest $1 above $500, or give a narrow band ("$146.50-$147.00"). Stamp
+the levels in the Trade Plan "as of" the decision date so a reader knows when they
 were measured.
 
 
@@ -258,18 +242,19 @@ You MUST BEGIN your response with exactly this block:
 ## Verdict
 FINAL TRANSACTION PROPOSAL: **BUY** (or **SELL** or **HOLD**)
 CONVICTION: **0.X** (this report's own probability that the direction is right, not a measured hit rate)
-MEASURED ACCURACY: <copy the single line under "HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY" above, word for word and digit for digit; do not paraphrase it, do not round it, and do not substitute a number of your own>
+MEASURED ACCURACY: <copy the single line under "HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY" in the user message, word for word and digit for digit; do not paraphrase it, do not round it, and do not substitute a number of your own>
 REASSESS_TO_BUY: <one concrete single-line trigger with a rounded level from the data, e.g. "close above 50-day SMA (~$X.XX) on >1.2x avg volume">
 MOVE_TO_SELL: <one concrete single-line trigger with a rounded level from the data, e.g. "close below 20-day support (~$X.XX)">
 - <the single strongest reason for this call>
 - <the strongest opposing evidence, and why it does not flip the call>
 - <what the next session must show for the thesis to stay alive>
 
-Then the analysis, as sections in this order. Formatting rules:
+Then the analysis, as the sections listed at the end of the user message, in that
+order. Formatting rules:
 - Section headings: "### <n>. <Name>: <one-line takeaway>" (the takeaway IS the
   interpretation, e.g. "### 1. Technicals: bearish trend, but stretched").
 - END each section with one line: "**Read:** <what this means for the trade>".
-  The Read line must be usable ONLY for {ticker}: anchor it to at least one of
+  The Read line must be usable ONLY for the ticker under analysis: anchor it to at least one of
   this symbol's own values from the blocks (a level, an indicator reading, a
   named article, a peer gap). If the same sentence would still be true with a
   different ticker pasted in, it is wrong. Rewrite it. In particular, never
@@ -284,7 +269,43 @@ Then the analysis, as sections in this order. Formatting rules:
   "1.52M shares": never paste raw unformatted values like "4694163968".
   Rounding for readability is not estimating; the underlying digits must come
   from the data.
+"""
 
+
+# The per-symbol half. Every placeholder is supplied by ``analyze`` (and by
+# the tests' ``build_prompt`` helpers); a missing one is a KeyError on a live
+# run, which is the intended failure.
+SINGLE_AGENT_PROMPT = """Decide, at the close of {date}, whether {ticker} will move UP or DOWN in the NEXT
+trading session. Analyze ALL of the following data carefully before deciding.
+
+== SITUATION ==
+{situation_line}
+
+== HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY ==
+{track_record_block}
+
+== {ticker} BUSINESS PROFILE ==
+{business_block}
+
+== {ticker} PRICE ACTION ==
+{price_block}
+
+== {ticker} TECHNICAL INDICATORS ==
+{tech_block}
+
+== {ticker} FUNDAMENTALS (as of {date}) ==
+{fundamentals_block}
+
+== {ticker} NEWS (through close of {date}) ==
+{news_block}
+
+== BROAD MARKET CONTEXT (S&P 500 / SPY) ==
+{spy_block}
+
+== SECTOR CONTEXT ({sector_etf}) ==
+{sector_block}
+{extra_context}
+== SECTIONS (write these, in this order) ==
 {output_sections}
 """
 
@@ -547,6 +568,17 @@ THESIS_EPILOGUE_SCHEMA = (
 
 VALID_STANCES = {"BULLISH", "CAUTIOUS_BULLISH", "NEUTRAL",
                  "CAUTIOUS_BEARISH", "BEARISH"}
+
+
+def build_system_prompt(include_thesis: bool = True) -> str:
+    """The research call's system message: rules, reasoning order, Verdict
+    block and epilogue schema. Exactly two variants exist (with and without
+    the company-thesis epilogue fields) and neither mentions a ticker or a
+    date, so each is one stable prefix for the provider's prompt cache
+    across every symbol in a run and every run in a day."""
+    return SINGLE_AGENT_SYSTEM_PROMPT + EPILOGUE_INSTRUCTIONS % {
+        "thesis": THESIS_EPILOGUE_SCHEMA if include_thesis else "",
+    }
 
 
 # Sector ETF resolution lives in models.sector_map: the symbol's OWN sector
@@ -1320,8 +1352,11 @@ class SingleAgentResearch:
                     sector_etf, _as_of_slice(_cached_frame(sector_etf), as_of))
                 ledger.have("sector")
             except Exception as e:
-                sector_block = f"{sector_etf} data unavailable."
-                ledger.missing("sector", f"{sector_etf} bars unavailable: {str(e)[:60]}")
+                # The ETF is mapped and its bars could not be fetched: the
+                # price feed did not answer, which stops the report. A
+                # symbol with no mapped ETF is the gap branch above.
+                ledger.unavailable("sector",
+                                   f"{sector_etf} bars unavailable: {str(e)[:60]}")
 
         # --- news (point-in-time) ---
         # The window is the run's, never this module's: with no value there
@@ -1353,8 +1388,9 @@ class SingleAgentResearch:
         if business:
             ledger.have("business")
         else:
-            business = "Business profile not available."
-            ledger.missing("business", "company profile lookup failed")
+            # get_company_profile answers "" only when the profile lookup
+            # failed; a listed company always has one. The feed is down.
+            ledger.unavailable("business", "company profile lookup failed")
 
         # --- prior stance (cross-day continuity) ---
         # Gathered here, used ONLY after generation: the research prompt never
@@ -1432,9 +1468,8 @@ class SingleAgentResearch:
             # into a brace inside one of them.
             output_sections=render_output_sections(
                 symbol, as_of, sector_etf, anomalies, screened, scan_failed),
-        ) + EPILOGUE_INSTRUCTIONS % {
-            "thesis": THESIS_EPILOGUE_SCHEMA if include_thesis else "",
-        }
+        )
+        system_prompt = build_system_prompt(include_thesis)
 
         from services.llm_service import get_llm
         llm = get_llm()
@@ -1460,6 +1495,7 @@ class SingleAgentResearch:
             attempt_usage: dict = {}
             raw_text = llm.generate(
                 prompt,
+                system_prompt=system_prompt,
                 max_tokens=self.max_tokens,
                 temperature=0.3,
                 model=self.model,
@@ -1616,7 +1652,8 @@ class SingleAgentResearch:
             # The stated conviction is the model's own judgement, so it exists
             # in no data block by construction. Auditing it guaranteed one
             # false positive on every report.
-            fc = check_figures(raw_text, prompt, ignore_values=(confidence,))
+            fc = check_figures(raw_text, system_prompt + "\n" + prompt,
+                               ignore_values=(confidence,))
             figure_check = {
                 "checked": fc.checked,
                 "unmatched": fc.unmatched[:12],

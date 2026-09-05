@@ -84,7 +84,16 @@ in this order — skipping any one of them fails quietly rather than loudly:
 4. `models/trading_agents_model.py::_build_extra_context` — the branch that
    builds it. **Call `ledger.have(key)` whenever a block is written**, even
    when the source was partly stale. A block that rendered is present
-   evidence; only an empty block is a gap.
+   evidence; only an empty block is a gap. And tell the two kinds of empty
+   apart: the source answered with nothing (`ledger.missing`, graded by the
+   block's severity) versus the source did not answer (`ledger.unavailable`,
+   which always raises `FeedUnavailable` and stops the symbol's report, and
+   is emitted to the activity trail with the block and reason). A throttle,
+   a missing key, a transport error or an unreadable payload is the second
+   kind whatever the block's severity; "no Form 4 rows this window" is the
+   first. Services that swallow their errors have to say so in their result
+   (`options_service.OptionsUnavailable`, `analyze_symbol()["unavailable"]`,
+   `get_upcoming_events()["unavailable"]`) or the site cannot tell.
 5. `models/trading_agents_model.py::_scan_and_research` — add the key to the
    `looked` map so `anomaly_service.screened()` can say the category was
    examined. `screened` reads gathered-ness from `ledger.present`, never from

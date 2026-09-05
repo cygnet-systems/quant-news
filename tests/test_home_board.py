@@ -197,6 +197,11 @@ class TestScheduledRow:
         assert call.startswith("BUY")
         assert _find(tr, className="home-call") is not None
         assert "104.00" in actual and "+4.0%" in actual
+        # The flex line is inside the td, never the td itself: a flex td
+        # leaves table layout and stops stretching with an expanded row.
+        actual_td = _find(tr, className="home-actual-cell")
+        assert actual_td.className == "home-actual-cell"
+        assert _find(actual_td, className="home-actual-line") is not None
         assert result == "hit"
         assert _find(tr, className="home-result-hit") is not None
         # Sum over every scored call on the row, as before.

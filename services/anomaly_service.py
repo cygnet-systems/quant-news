@@ -68,6 +68,7 @@ SCREENS = (
     ("news volume", "any", ("news",)),
     ("insider and options positioning against the price trend", "all",
      ("options", "insiders", "trend")),
+    ("the price and volume tape", "any", ("bars",)),
 )
 
 # --- options -------------------------------------------------------------
@@ -196,6 +197,42 @@ TREND_DAYS = 20
 TREND_PCT = 3.0
 MIN_TREND_BARS = 10
 
+# --- price shock ------------------------------------------------------------
+# One session's close-to-close move against the symbol's OWN recent daily
+# moves, so a 4% day on a utility fires and the same day on a biotech does
+# not. The z-score is over the prior SHOCK_LOOKBACK sessions excluding the
+# day itself; the absolute floor stops a dead-calm name flagging a 1% day.
+SHOCK_LOOKBACK = 60
+MIN_SHOCK_BARS = 21
+SHOCK_Z = 2.5
+SHOCK_MIN_PCT = 3.0
+SHOCK_BASE = 0.4
+SHOCK_SPAN = 0.45
+SHOCK_SATURATION = 3.0     # z-score points past SHOCK_Z that saturate
+
+# --- volume shock -----------------------------------------------------------
+# The last session's volume against the median of the prior VOLUME_LOOKBACK
+# sessions. Median, not mean: one earlier blow-off day would otherwise hide
+# this one. The share floor keeps a name that trades a few thousand shares
+# from firing on a single block.
+VOLUME_LOOKBACK = 20
+VOLUME_MULTIPLE = 2.5
+MIN_SHOCK_VOLUME = 100_000
+VOLUME_BASE = 0.35
+VOLUME_SPAN = 0.45
+VOLUME_SATURATION = 3.0    # multiples past VOLUME_MULTIPLE that saturate
+
+# --- options order flow -----------------------------------------------------
+# Contracts traded in the session against contracts standing open: turnover
+# near or above 1.0 means the session opened (or closed) as many positions as
+# existed, which is orders being placed, not a skew that has stood for weeks.
+# Reads off the same metrics block as the skew detector, so it fires on a
+# balanced chain too: heavy two-sided flow is its own question.
+FLOW_TURNOVER = 0.75
+FLOW_BASE = 0.4
+FLOW_SPAN = 0.45
+FLOW_SATURATION = 1.5      # turnover past FLOW_TURNOVER that saturates
+
 # --- positioning vs price ------------------------------------------------
 # Two independent parties positioned against the tape. Weighted above every
 # single-source detector on purpose: it is the only one that speaks to how the
@@ -277,6 +314,29 @@ def _closes(ohlcv) -> list[float]:
     return out
 
 
+def _column(ohlcv, name: str) -> list:
+    """One OHLCV column as floats (None for a blank), or [] when the caller's
+    frame does not carry it. A Close-only frame is a valid input for every
+    detector that only needs closes."""
+    if ohlcv is None:
+        return []
+    try:
+        series = ohlcv[name]
+    except Exception:
+        return []
+    try:
+        return [_num(v) for v in list(series)]
+    except TypeError:
+        return []
+
+
+def _bar_dates(ohlcv) -> list[str]:
+    try:
+        return [str(d)[:10] for d in list(ohlcv.index)]
+    except Exception:
+        return []
+
+
 def price_trend(ohlcv, days: int = TREND_DAYS) -> dict | None:
     """Direction and size of the recent move, or None when there are too few
     bars to call one. Public because the positioning detector's facts quote it
@@ -293,6 +353,144 @@ def price_trend(ohlcv, days: int = TREND_DAYS) -> dict | None:
                  else "down" if pct <= -TREND_PCT else "flat")
     return {"direction": direction, "pct": round(pct, 2),
             "sessions": len(window) - 1, "first": first, "last": last}
+
+
+def _detect_price_shock(symbol, ohlcv) -> dict | None:
+    closes = _closes(ohlcv)
+    if len(closes) < MIN_SHOCK_BARS:
+        return None
+    rets = [(b - a) / abs(a) * 100.0 for a, b in zip(closes[:-1], closes[1:])
+            if a]
+    if len(rets) < MIN_SHOCK_BARS - 1:
+        return None
+    today, prior = rets[-1], rets[-(SHOCK_LOOKBACK + 1):-1]
+    if abs(today) < SHOCK_MIN_PCT or len(prior) < MIN_SHOCK_BARS - 1:
+        return None
+    mean = sum(prior) / len(prior)
+    var = sum((r - mean) ** 2 for r in prior) / max(1, len(prior) - 1)
+    sigma = math.sqrt(var)
+    if not sigma:
+        return None
+    z = (today - mean) / sigma
+    if abs(z) < SHOCK_Z:
+        return None
+
+    dates = _bar_dates(ohlcv)
+    day = dates[-1] if dates else "the last session"
+    direction = "up" if today > 0 else "down"
+    facts = [
+        f"{symbol} closed {direction} {abs(today):.1f}% on {day} "
+        f"({closes[-2]:.2f} to {closes[-1]:.2f})",
+        f"that is {abs(z):.1f} standard deviations from its own mean daily "
+        f"move over the prior {len(prior)} sessions (sigma {sigma:.2f}%), "
+        f"measured against {symbol} alone",
+    ]
+    opens = _column(ohlcv, "Open")
+    if opens and opens[-1] is not None and closes[-2]:
+        gap = (opens[-1] - closes[-2]) / abs(closes[-2]) * 100.0
+        if abs(gap) >= 1.0:
+            facts.append(f"it opened {'up' if gap > 0 else 'down'} "
+                         f"{abs(gap):.1f}% from the prior close, so most of "
+                         f"the move was overnight, not intraday")
+        else:
+            facts.append("it opened within 1% of the prior close, so the "
+                         "move was built during the session")
+    return _anomaly(
+        "price_shock",
+        f"Price moved {abs(today):.1f}% in one session, {abs(z):.1f} sigma",
+        _severity(SHOCK_BASE, SHOCK_SPAN, (abs(z) - SHOCK_Z) / SHOCK_SATURATION),
+        facts,
+        f"What moved {symbol} {abs(today):.1f}% on {day}, and is the cause "
+        f"a one-off print or a change in the business?",
+        "ohlcv")
+
+
+def _detect_volume_shock(symbol, ohlcv) -> dict | None:
+    volumes = _column(ohlcv, "Volume")
+    vols = [v for v in volumes if v is not None and v >= 0]
+    if len(vols) < len(volumes) or len(vols) < VOLUME_LOOKBACK + 1:
+        return None
+    today, prior = vols[-1], sorted(vols[-(VOLUME_LOOKBACK + 1):-1])
+    median = prior[len(prior) // 2]
+    if today < MIN_SHOCK_VOLUME or not median or today < median * VOLUME_MULTIPLE:
+        return None
+    multiple = today / median
+
+    closes = _closes(ohlcv)
+    dates = _bar_dates(ohlcv)
+    day = dates[-1] if dates else "the last session"
+    facts = [
+        f"{int(today):,} shares traded on {day} against a median of "
+        f"{int(median):,} over the prior {len(prior)} sessions",
+        f"that is {multiple:.1f}x the symbol's own recent norm, measured "
+        f"against {symbol} alone and not against any cross-symbol constant",
+    ]
+    if len(closes) >= 2 and closes[-2]:
+        move = (closes[-1] - closes[-2]) / abs(closes[-2]) * 100.0
+        facts.append(f"the price {'rose' if move >= 0 else 'fell'} "
+                     f"{abs(move):.1f}% on that volume"
+                     + ("" if abs(move) >= 1.0 else
+                        ", so the tape absorbed the flow without moving: "
+                        "a hand-off, not a break"))
+    return _anomaly(
+        "volume_shock",
+        f"Volume {multiple:.1f}x its own norm",
+        _severity(VOLUME_BASE, VOLUME_SPAN,
+                  (multiple - VOLUME_MULTIPLE) / VOLUME_SATURATION),
+        facts,
+        f"Who was trading {symbol} on {day} at {multiple:.1f}x its normal "
+        f"volume, and was it a print, an index or fund event, or news?",
+        "ohlcv")
+
+
+def _detect_options_flow(symbol, options) -> dict | None:
+    if not isinstance(options, dict):
+        return None
+    total = _num(options.get("total_volume"))
+    put_vol = _num(options.get("put_volume")) or 0.0
+    call_vol = _num(options.get("call_volume")) or 0.0
+    put_oi = _num(options.get("put_oi")) or 0.0
+    call_oi = _num(options.get("call_oi")) or 0.0
+    open_interest = put_oi + call_oi
+    if total is None or total < MIN_LIQUID_VOLUME or open_interest <= 0:
+        return None
+    turnover = total / open_interest
+    if turnover < FLOW_TURNOVER:
+        return None
+
+    put_turn = (put_vol / put_oi) if put_oi else None
+    call_turn = (call_vol / call_oi) if call_oi else None
+    if put_turn is not None and call_turn is not None:
+        if put_turn >= call_turn * 1.5:
+            side = "puts"
+        elif call_turn >= put_turn * 1.5:
+            side = "calls"
+        else:
+            side = "both sides"
+        split = (f"the session's orders were concentrated in {side}: put "
+                 f"volume was {put_turn:.2f}x put open interest, call volume "
+                 f"{call_turn:.2f}x call open interest")
+    else:
+        side = "puts" if put_turn is not None else "calls"
+        split = (f"the session's orders were all in {side}: the other side "
+                 f"has no open interest to measure against")
+    facts = [
+        f"{int(total):,} contracts traded against {int(open_interest):,} "
+        f"standing open, a turnover of {turnover:.2f} as of "
+        f"{options.get('as_of') or 'the chain date'}",
+        split,
+        f"the chain covers {options.get('expiry_window') or 'all'} "
+        f"expiries, sourced from {options.get('source') or 'the vendor'}",
+    ]
+    return _anomaly(
+        "options_flow",
+        f"Options orders at {turnover:.2f}x open interest, concentrated in {side}",
+        _severity(FLOW_BASE, FLOW_SPAN, (turnover - FLOW_TURNOVER) / FLOW_SATURATION),
+        facts,
+        f"Who placed a session's worth of {symbol} options orders equal to "
+        f"{turnover:.2f}x the standing open interest, weighted to {side}, "
+        f"and against what event?",
+        "options")
 
 
 def _insider_people(insiders):
@@ -840,7 +1038,8 @@ def detect(symbol, as_of, *, options=None, by_expiry=None, insiders=None,
     ``politician_dossier.build_dossier`` (names only, it adds no detector of
     its own), ``quality`` from ``bad_apples_service.analyze_symbol`` or its
     ``summarize`` form, ``news`` the run's point-in-time articles and
-    ``ohlcv`` the truncated price frame.
+    ``ohlcv`` the truncated price frame (Close for the trend and the price
+    shock, Volume for the volume shock, Open for the gap fact when present).
 
     Nothing is fetched and nothing is inferred from an absent block: passing
     no arguments returns an empty list, which is the correct description of a
@@ -852,7 +1051,10 @@ def detect(symbol, as_of, *, options=None, by_expiry=None, insiders=None,
                    if isinstance(insiders, dict) else None)
 
     found = [a for a in (
+        _detect_price_shock(symbol, ohlcv),
+        _detect_volume_shock(symbol, ohlcv),
         _detect_options_skew(symbol, options),
+        _detect_options_flow(symbol, options),
         _detect_options_term_divergence(symbol, by_expiry, as_of),
         _detect_insider_cluster(symbol, insiders, window_days, as_of),
         _detect_congress_activity(symbol, congress, dossier, trend),
@@ -896,12 +1098,14 @@ def screened(gathered: "dict | None" = None, *, ohlcv=None) -> list[str]:
     as "nothing stands out anywhere", which is a claim about evidence the run
     may never have fetched.
 
-    "trend" is not a fetch and is not the caller's to declare: a frame with
-    three bars in it was gathered but still cannot carry a trend, so it is
-    derived from ``ohlcv`` here and the cross-source screen counts it absent.
+    "trend" and "bars" are not fetches and are not the caller's to declare:
+    a frame with three bars in it was gathered but still cannot carry a
+    trend or a shock baseline, so both are derived from ``ohlcv`` here and
+    the screens that need them count it absent.
     """
     have = {k: bool(v) for k, v in (gathered or {}).items()}
     have["trend"] = bool(price_trend(ohlcv))
+    have["bars"] = len(_closes(ohlcv)) >= MIN_SHOCK_BARS
     out = []
     for label, mode, needs in SCREENS:
         got = [have.get(k, False) for k in needs]

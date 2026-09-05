@@ -20,6 +20,18 @@ def test_required_block_raises_with_symbol_and_reason():
     assert ledger.gaps == []
 
 
+def test_a_feed_that_did_not_answer_raises_whatever_the_block_is():
+    from services.evidence_contract import FeedUnavailable
+    ledger = EvidenceLedger("BHF")
+    # "political" is OPTIONAL for an empty window; a dead feed is not graded.
+    with pytest.raises(FeedUnavailable) as exc:
+        ledger.unavailable("political", "AV throttled")
+    assert isinstance(exc.value, MissingRequiredEvidence)
+    assert exc.value.block == "political" and exc.value.kind == "feed_unavailable"
+    assert "feed unavailable" in str(exc.value)
+    assert ledger.gaps == []
+
+
 def test_expected_gap_is_carried_not_raised():
     ledger = EvidenceLedger("BHF")
     ledger.have("metrics")

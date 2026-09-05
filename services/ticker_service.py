@@ -211,6 +211,13 @@ def validate_symbol(symbol: str) -> dict:
         logger.info("validate_symbol %s: %s", sym, e)
         return {"ok": False, "symbol": sym, "name": None,
                 "reason": "no price data for this symbol"}
+    # The vendor answers for delisted and placeholder names with a profile
+    # and no quote; "has price data" is the promise this makes, so a
+    # profile alone is not enough.
+    if not (getattr(info, "current_price", None) or 0) > 0:
+        logger.info("validate_symbol %s: profile without a price", sym)
+        return {"ok": False, "symbol": sym, "name": None,
+                "reason": "no price data for this symbol"}
     name = (getattr(info, "name", None) or "").strip() or None
     upsert([{"symbol": sym, "name": name}], "validated")
     return {"ok": True, "symbol": sym, "name": name}

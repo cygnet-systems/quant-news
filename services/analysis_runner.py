@@ -82,7 +82,12 @@ ALL_MODELS: tuple[str, ...] = (
 # 2026-09-03.3: the quiet-symbol note and the unresearched-anomaly wording
 # now name only what the run actually screened and why a question went
 # unasked; the prompt a report was written from is different again.
-PIPELINE_EPOCH = "2026-09-03.3"
+# 2026-09-05.1: the anomaly scan gains a price shock, a volume shock and an
+# options order-flow detector, so a symbol that gapped or traded on unusual
+# volume now gets its own researched section (and buys an investigation)
+# where before it read as quiet. A feed that did not answer now stops the
+# symbol's report instead of degrading it (evidence_contract.FeedUnavailable).
+PIPELINE_EPOCH = "2026-09-05.2"
 
 # Conviction labels map to nominal confidences for display only, backtests
 # showed they carry no calibration signal, so the label stays in details.
@@ -645,6 +650,7 @@ def run_predictions(
                     news_status=sym_status,
                     target_date=str(target_date),
                     tools=tools_set,
+                    is_backtest=is_backtest,
                 )
         except Exception as e:
             # Per-model errors come back inside the result; an exception

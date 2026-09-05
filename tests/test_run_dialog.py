@@ -15,6 +15,7 @@ model or calls an LLM.
 """
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -96,7 +97,7 @@ def tickers(db):
 
 def _trigger(monkeypatch, triggered_id, value=1, **extra):
     prop = (triggered_id if isinstance(triggered_id, str)
-            else '{"symbol":"%s","type":"new-report-btn"}' % triggered_id["symbol"])
+            else json.dumps(triggered_id, sort_keys=True, separators=(",", ":")))
     monkeypatch.setattr(app_module, "ctx", SimpleNamespace(
         triggered_id=triggered_id,
         triggered=[{"prop_id": f"{prop}.n_clicks", "value": value}],
@@ -196,8 +197,10 @@ class TestPresetFields:
         # checklist has to open on them, not on the checklist's own
         # default (apply_run_preset never fires for an untouched preset).
         assert find(modal, "run-tools").value == std["tools"]
+        # A plain text box, not a Dropdown: typing is the whole interaction.
         search = find(modal, "run-symbol-search")
-        assert search.multi is False and search.searchable is True
+        assert search.type == "text" and search.debounce is False
+        assert find(modal, "run-symbol-suggest") is not None
 
         # Every model box, TradingAgents included, is ticked on open.
         boxes = {}
@@ -418,12 +421,19 @@ class TestOpeners:
 
 class TestSymbols:
     def _set(self, monkeypatch, triggered, store, picked=None, clicks=1,
-             remove=()):
+             remove=(), typed=None):
+        """One firing of set_run_symbols. ``picked`` is a suggestion row's
+        value (the row's pattern id becomes the trigger); ``typed`` is the
+        box's text with Enter as the trigger."""
+        if picked is not None:
+            triggered = {"type": "run-sym-pick", "value": picked}
         _trigger(monkeypatch, triggered)
         add_wl = clicks if triggered == "run-add-watchlist" else None
         add_lr = clicks if triggered == "run-add-lastrun" else None
+        picks = [clicks] if picked is not None else []
+        submit = clicks if typed is not None else None
         return asyncio.run(app_module.set_run_symbols(
-            add_wl, add_lr, list(remove), picked, store))
+            add_wl, add_lr, list(remove), picks, submit, typed, store))
 
     def test_sources_add_and_dedupe(self, monkeypatch):
         store = {"symbols": ["NVDA"], "watchlist": ["AAPL", "NVDA"],
@@ -444,36 +454,54 @@ class TestSymbols:
             triggered_id={"type": "run-sym-remove", "symbol": "AAPL"},
             triggered=[{"prop_id": "x.n_clicks", "value": 1}]))
         out, _, _ = asyncio.run(app_module.set_run_symbols(
-            None, None, [1, None], None,
+            None, None, [1, None], [], None, "",
             {"symbols": ["NVDA", "AAPL"], "watchlist": ["AAPL"]}))
         assert out["symbols"] == ["NVDA"]
         with pytest.raises(PreventUpdate):
             asyncio.run(app_module.set_run_symbols(
-                None, None, [None], None, {"symbols": ["AAPL"]}))
+                None, None, [None], [], None, "", {"symbols": ["AAPL"]}))
 
-    def test_known_pick_becomes_a_chip_and_clears_the_search(self, monkeypatch,
-                                                            tickers):
+    def test_known_pick_becomes_a_chip_and_clears_the_box(self, monkeypatch,
+                                                         tickers):
         def _never(sym):
             raise AssertionError("cached symbol must not be fetched")
         monkeypatch.setattr(ts, "_fetch_info", _never)
-        out, value, msg = self._set(monkeypatch, "run-symbol-search",
-                                    {"symbols": ["NVDA"]}, picked="aapl")
+        out, value, msg = self._set(monkeypatch, None,
+                                    {"symbols": ["NVDA"]}, picked="AAPL")
         assert out["symbols"] == ["NVDA", "AAPL"]
-        assert value is None and msg == ""
-        # The clear echoes back as a None value: nothing happens.
+        assert value == "" and msg == ""
+        # Rows mounting report n_clicks of 0/None: not a pick.
         with pytest.raises(PreventUpdate):
-            self._set(monkeypatch, "run-symbol-search", out, picked=None)
+            self._set(monkeypatch, None, out, picked="AAPL", clicks=0)
 
-    def test_unknown_symbol_is_validated_once_then_cached(self, monkeypatch,
-                                                         tickers):
+    def test_enter_takes_the_top_suggestion_not_the_text(self, monkeypatch,
+                                                        tickers):
+        def _never(sym):
+            raise AssertionError("a cache hit must not be fetched")
+        monkeypatch.setattr(ts, "_fetch_info", _never)
+        # "nvi" is nobody's ticker; the top row for it is NVDA.
+        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+                                    {"symbols": []}, typed="nvi")
+        assert out["symbols"] == ["NVDA"] and value == "" and msg == ""
+        # Enter on text no row matches adds nothing and says so; the text
+        # stays in the box for the user to fix.
+        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+                                    {"symbols": []}, typed="not a ticker!")
+        assert out is dash.no_update and value is dash.no_update
+        assert msg == "No listed symbol matches \u201cnot a ticker!\u201d"
+        with pytest.raises(PreventUpdate):     # Enter on an empty box
+            self._set(monkeypatch, "run-symbol-search", {"symbols": []},
+                      typed="  ")
+
+    def test_verify_row_is_validated_once_then_cached(self, monkeypatch,
+                                                     tickers):
         calls = []
 
         def _info(sym):
             calls.append(sym)
-            return SimpleNamespace(name="Bloom Energy")
+            return SimpleNamespace(name="Bloom Energy", current_price=21.5)
         monkeypatch.setattr(ts, "_fetch_info", _info)
-        out, _, msg = self._set(monkeypatch, "run-symbol-search",
-                                {"symbols": []}, picked="be")
+        out, _, msg = self._set(monkeypatch, None, {"symbols": []}, picked="BE")
         assert out["symbols"] == ["BE"] and msg == ""
         assert calls == ["BE"]
         assert ts.get("BE")["source"] == "validated"
@@ -483,23 +511,38 @@ class TestSymbols:
         def _info(sym):
             raise ValueError("no data")
         monkeypatch.setattr(ts, "_fetch_info", _info)
-        out, value, msg = self._set(monkeypatch, "run-symbol-search",
+        # Picking the verify row for a name the vendor has nothing on.
+        out, value, msg = self._set(monkeypatch, None,
                                     {"symbols": ["NVDA"]}, picked="ZZZQ")
-        assert out is dash.no_update and value is None
+        assert out is dash.no_update and value == ""
         assert msg == "No price data for ZZZQ"
         assert ts.get("ZZZQ") is None
-        # A paste with one bad name still adds the good ones and says why.
+        # Enter on the same text goes through the same gate.
         out, _, msg = self._set(monkeypatch, "run-symbol-search",
-                                {"symbols": []}, picked="AMD ZZZQ, nvda")
+                                {"symbols": ["NVDA"]}, typed="zzzq")
+        assert out is dash.no_update and msg == "No price data for ZZZQ"
+        # A paste with one bad name still adds the good ones and says why.
+        out, _, msg = self._set(monkeypatch, None, {"symbols": []},
+                                picked="AMD ZZZQ NVDA")
         assert out["symbols"] == ["AMD", "NVDA"]
         assert msg == "No price data for ZZZQ"
 
+    def test_profile_without_a_price_is_refused(self, monkeypatch, tickers):
+        # The vendor knows the name but quotes nothing: not a tradable symbol.
+        monkeypatch.setattr(ts, "_fetch_info",
+                            lambda s: SimpleNamespace(name="Gone", current_price=0))
+        out, _, msg = self._set(monkeypatch, None, {"symbols": []}, picked="GONE")
+        assert out is dash.no_update and msg == "No price data for GONE"
+        assert ts.get("GONE") is None
+
     def test_paste_adds_every_symbol_once(self, monkeypatch, tickers):
+        # Enter on a comma-separated paste: the single paste row is the top
+        # (and only) suggestion.
         out, value, msg = self._set(monkeypatch, "run-symbol-search",
                                     {"symbols": ["AMD"]},
-                                    picked="nvda, AMD;aapl nvda")
+                                    typed="nvda, AMD;aapl nvda")
         assert out["symbols"] == ["AMD", "NVDA", "AAPL"]
-        assert value is None and msg == ""
+        assert value == "" and msg == ""
 
     def test_chips_and_source_buttons(self):
         chips, wl_label, wl_off, lr_label, lr_off = app_module.render_run_symbol_chips(
@@ -521,52 +564,67 @@ class TestSymbols:
         assert [i["id"] for i in cb["inputs"]] == ["run-symbols-store"]
 
 
+def _row_values(rows):
+    return [r.id["value"] for r in rows if getattr(r, "id", None)]
+
+
 class TestSearch:
     def _search(self, q):
         return asyncio.run(app_module.search_run_symbols(q))
 
-    def test_cache_ranking_reaches_the_options_untouched(self, tickers):
+    def test_cache_ranking_reaches_the_rows_untouched(self, tickers):
         got = self._search("ap")
-        assert [o["value"] for o in got] == [r["symbol"] for r in ts.search("ap")]
-        assert got[0]["value"] == "APLE"
-        assert all(o["search"] == "ap" for o in got)
-        assert self._search("nvi") == [
-            {"label": "NVDA · NVIDIA Corp", "value": "NVDA", "search": "nvi"}]
-        assert [o["value"] for o in self._search("a")][:3] == ["A", "AMD", "AAPL"]
+        assert _row_values(got) == [r["symbol"] for r in ts.search("ap")]
+        assert got[0].id == {"type": "run-sym-pick", "value": "APLE"}
+        assert got[0].className == "run-sym-suggest-row run-sym-suggest-hit"
+        rows = self._search("nvi")
+        assert _row_values(rows) == ["NVDA"]
+        sym, name = rows[0].children
+        assert (sym.children, name.children) == ("NVDA", "NVIDIA Corp")
 
-    def test_empty_and_blank_keep_the_last_list(self, tickers):
-        # The Dropdown clears search_value as it picks; emptying the options
-        # in that same round invalidated the pick before its callback ran.
-        for q in (None, "", "  ,"):
-            with pytest.raises(PreventUpdate):
-                self._search(q)
+    def test_under_two_characters_shows_nothing(self, tickers, monkeypatch):
+        def _never(*a, **kw):
+            raise AssertionError("no lookup under the minimum")
+        monkeypatch.setattr(ts, "search", _never)
+        for q in (None, "", " ", "a", "  ,"):
+            assert self._search(q) == []
+        assert modals.MIN_SEARCH_CHARS == 2
 
-    def test_no_hit_offers_a_check(self, tickers):
-        assert self._search("zzzq") == [
-            {"label": "Add ZZZQ (check)", "value": "ZZZQ", "search": "zzzq"}]
-        assert self._search("not a ticker!") == []
-        assert self._search("zz!!") == []
+    def test_no_hit_offers_a_verify_row_never_an_add(self, tickers):
+        rows = self._search("zzzq")
+        assert _row_values(rows) == ["ZZZQ"]
+        assert "run-sym-suggest-verify" in rows[0].className
+        assert "Checks for price data" in rows[0].children[1].children
+        # Text that cannot be a ticker gets one inert line, no button.
+        rows = self._search("not a ticker!")
+        assert len(rows) == 1 and rows[0].className == "run-sym-suggest-empty"
+        assert _row_values(rows) == []
+        assert rows[0].children == "No listed symbol matches \u201cnot a ticker!\u201d"
 
     def test_spaces_are_a_company_name_first(self, tickers):
         # "advanced micro" is a name, not two tickers; only when the cache
         # has nothing and every word is a ticker does it read as a paste.
-        assert [o["value"] for o in self._search("advanced micro")] == ["AMD"]
-        assert self._search("nvda amd")[0]["label"] == "Add 2 symbols: NVDA, AMD"
-        assert self._search("apple hosp")[0]["value"] == "APLE"
+        assert _row_values(self._search("advanced micro")) == ["AMD"]
+        paste = self._search("nvda amd")[0]
+        assert paste.id["value"] == "NVDA AMD"
+        assert paste.children[0].children == "Add 2 symbols: NVDA, AMD"
+        assert _row_values(self._search("apple hosp")) == ["APLE"]
 
-    def test_paste_is_one_option_without_a_lookup(self, monkeypatch):
+    def test_paste_is_one_row_without_a_lookup(self, monkeypatch):
         def _never(*a, **kw):
             raise AssertionError("a paste needs no search")
         monkeypatch.setattr(ts, "search", _never)
-        assert self._search("nvda, amd amd") == [
-            {"label": "Add 2 symbols: NVDA, AMD", "value": "NVDA AMD",
-             "search": "nvda, amd amd"}]
+        rows = self._search("nvda, amd amd")
+        assert _row_values(rows) == ["NVDA AMD"]
+        assert "run-sym-suggest-paste" in rows[0].className
 
-    def test_search_failure_degrades_to_the_check_option(self, monkeypatch):
+    def test_search_failure_degrades_to_the_verify_row(self, monkeypatch):
         def _boom(*a, **kw):
             raise RuntimeError("db down")
         monkeypatch.setattr(ts, "search", _boom)
-        assert self._search("nvda")[0]["label"] == "Add NVDA (check)"
+        rows = self._search("nvda")
+        assert _row_values(rows) == ["NVDA"]
+        assert "run-sym-suggest-verify" in rows[0].className
 
     def test_cap_is_twelve(self, monkeypatch):
         seen = {}
@@ -575,8 +633,17 @@ class TestSearch:
             seen["limit"] = limit
             return []
         monkeypatch.setattr(ts, "search", _search)
-        self._search("a")
+        self._search("ab")
         assert seen["limit"] == 12
+
+    def test_option_shapes(self, tickers):
+        # The pure builder the rows and Enter both read.
+        assert modals.run_symbol_options("nvi", ts.search("nvi")) == [
+            {"label": "NVDA · NVIDIA Corp", "value": "NVDA", "kind": "hit",
+             "name": "NVIDIA Corp"}]
+        assert modals.run_symbol_options("zzzq", []) == [
+            {"label": "Verify ZZZQ", "value": "ZZZQ", "kind": "verify"}]
+        assert modals.run_symbol_options("zz!!", []) == []
 
 
 class TestRetryScope:

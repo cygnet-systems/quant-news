@@ -14,6 +14,18 @@ block cannot be built:
   optional: absence is normal (a symbol with no congressional trades, a
               first report with no prior stance) and is only logged.
 
+The classes above describe a block whose SOURCE ANSWERED and had nothing to
+say. A source that did not answer at all is a different thing and is not
+graded by block: a throttled vendor, a transport error, a missing key or a
+parser that could not read the payload leaves the run without evidence it
+was configured to gather, whatever that block's severity for an empty
+window. ``EvidenceLedger.unavailable`` records that case and always raises
+``FeedUnavailable`` (a ``MissingRequiredEvidence``): the report for that
+symbol is not written, the failure is emitted to the activity trail with
+the block and the reason, and the run reports a failed symbol. The feeds
+are the research model's primary input; a report written around one that
+was down reads as complete and is not.
+
 Before this, an options fetch that hit the vendor's rate limit produced a
 report with no positioning block and no trace that one was ever attempted;
 a symbol with no mapped peers lost its peer section the same way. The
@@ -86,13 +98,30 @@ BLOCK_LABELS: dict[str, str] = {
 class MissingRequiredEvidence(RuntimeError):
     """A block the report cannot honestly be written without is absent."""
 
+    kind = "required_missing"
+
     def __init__(self, symbol: str, block: str, reason: str):
         self.symbol = symbol
         self.block = block
         self.reason = reason
-        super().__init__(
-            f"{symbol}: required evidence missing, "
-            f"{BLOCK_LABELS.get(block, block)}: {reason}")
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        return (f"{self.symbol}: required evidence missing, "
+                f"{BLOCK_LABELS.get(self.block, self.block)}: {self.reason}")
+
+
+class FeedUnavailable(MissingRequiredEvidence):
+    """A source the run selected did not answer. Not "the window was empty":
+    the vendor was throttled, down, unreadable, or had no key. Raised for
+    every block, whatever its severity for an empty answer, because a feed
+    that is down is not evidence of anything."""
+
+    kind = "feed_unavailable"
+
+    def _message(self) -> str:
+        return (f"{self.symbol}: feed unavailable, "
+                f"{BLOCK_LABELS.get(self.block, self.block)}: {self.reason}")
 
 
 @dataclass
@@ -149,6 +178,17 @@ class EvidenceLedger:
         if severity == REQUIRED:
             raise MissingRequiredEvidence(self.symbol, block, reason)
         self.gaps.append(EvidenceGap(block, severity, reason))
+
+    def unavailable(self, block: str, reason: str) -> None:
+        """The source behind ``block`` did not answer. Always raises.
+
+        ``missing`` is for a source that answered with nothing (no Form 4
+        rows this window, no listed options); this is for one that could
+        not be asked. The distinction is the whole point: an empty window
+        is a finding and a dead feed is not, and a report that treats the
+        second as the first says something false about its own inputs.
+        """
+        raise FeedUnavailable(self.symbol, block, reason)
 
     def expected_gaps(self) -> list[EvidenceGap]:
         return [g for g in self.gaps if g.severity == EXPECTED]

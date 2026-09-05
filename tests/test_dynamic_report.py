@@ -30,7 +30,7 @@ from unittest.mock import patch
 import pytest
 
 from models.single_agent import (
-    SINGLE_AGENT_PROMPT, render_output_sections,
+    SINGLE_AGENT_PROMPT, SINGLE_AGENT_SYSTEM_PROMPT, render_output_sections,
 )
 from models.trading_agents_model import (
     MIN_BLOCK_CHARS, TradingAgentsModel, _fit_blocks,
@@ -132,8 +132,11 @@ def test_this_phases_modules_parse_under_the_containers_python():
 def put_tilted_chain():
     """A liquid chain positioned nearly two to one against the tape, through
     the vendor aggregation so the keys are the vendor's."""
-    contracts = ([{"type": "put", "volume": 62_000, "open_interest": 41_000}]
-                 + [{"type": "call", "volume": 34_000, "open_interest": 30_000}])
+    # Open interest an order of magnitude over the session's volume: this
+    # fixture is a standing skew, not an order-flow event, and the flow
+    # detector (volume against open interest) must stay silent on it.
+    contracts = ([{"type": "put", "volume": 62_000, "open_interest": 410_000}]
+                 + [{"type": "call", "volume": 34_000, "open_interest": 300_000}])
     return options_service._aggregate(contracts, AS_OF)
 
 
@@ -700,9 +703,9 @@ class TestNothingStandsOut:
 
     def test_the_prompt_says_movement_is_not_a_forecast(self):
         assert ("PRICE AND INDICATOR MOVEMENT DESCRIBE WHAT ALREADY HAPPENED"
-                in SINGLE_AGENT_PROMPT)
+                in SINGLE_AGENT_SYSTEM_PROMPT)
         assert ("the evidence does not support a directional call"
-                in SINGLE_AGENT_PROMPT)
+                in SINGLE_AGENT_SYSTEM_PROMPT)
 
 
 # --- the cache key -------------------------------------------------------
@@ -886,8 +889,10 @@ def test_the_report_frame_is_intact(monkeypatch):
                            insiders=insider_summary(monkeypatch))
     prompt = build_prompt("", found)
 
-    assert "FINAL TRANSACTION PROPOSAL" in prompt
-    assert "MEASURED ACCURACY" in prompt
+    # The Verdict block is specified in the system half; the section list
+    # the model fills is in the user half.
+    assert "FINAL TRANSACTION PROPOSAL" in SINGLE_AGENT_SYSTEM_PROMPT
+    assert "MEASURED ACCURACY" in SINGLE_AGENT_SYSTEM_PROMPT
     for name in ("Positioning & Flows", "Bull vs Bear", "Scenarios",
                  "Trade Plan", "Situation & Key Figures"):
         assert name in prompt

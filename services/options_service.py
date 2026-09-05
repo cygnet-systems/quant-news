@@ -35,14 +35,22 @@ def _chain_date(as_of: str) -> str:
     return d.isoformat()
 
 
+class OptionsUnavailable(RuntimeError):
+    """The chain could not be asked for: no key, throttled, transport or
+    parse failure. Distinct from ``None`` (the vendor answered and the
+    symbol has no listed options), which is a finding about the symbol."""
+
+
 def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
     """Aggregate put/call volume and open interest as of a trading day.
 
     Tiered: the Terminal's warmed L2 cache first (nightly post-close warmer,
     no network cost beyond a local cache read), then Alpha Vantage
-    HISTORICAL_OPTIONS. Returns None when neither has the chain (unlisted
-    options, throttled, no key), callers must treat that as "no data",
-    not neutral positioning.
+    HISTORICAL_OPTIONS. Returns None when the vendor answered with no
+    contracts (unlisted options); callers must treat that as "no data",
+    not neutral positioning. Raises ``OptionsUnavailable`` when the chain
+    could not be asked for at all (no key, throttled, transport failure),
+    which the evidence contract treats as a dead feed rather than a gap.
     """
     chain_date = _chain_date(as_of)
     key = (symbol.upper(), chain_date)
@@ -62,7 +70,7 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
         return result
 
     if not API.ALPHA_VANTAGE_API_KEY:
-        return None
+        raise OptionsUnavailable("no Alpha Vantage key and no warmed chain")
 
     result = None
     try:
@@ -75,10 +83,10 @@ def get_put_call_metrics(symbol: str, as_of: str) -> dict | None:
     except AlphaVantageUnavailable as e:
         # A throttle is transient and must not be cached as "no chain".
         logger.warning(f"{symbol}: {e}")
-        return None
+        raise OptionsUnavailable(f"vendor throttled or down: {str(e)[:100]}") from e
     except Exception as e:
         logger.warning(f"{symbol}: options chain fetch failed: {e}")
-        return None
+        raise OptionsUnavailable(f"chain fetch failed: {str(e)[:100]}") from e
 
     with _CACHE_LOCK:
         _CACHE[key] = result

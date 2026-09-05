@@ -156,6 +156,54 @@ def check_spend_ceiling(stage: str = "") -> None:
         f"run spend ${spent:.2f} reached the ${ceiling:.2f} ceiling")
 
 
+_UNPRICED_WARNED: set[str] = set()
+
+
+def _ceiling_charge(cost: float | None, tool_cost: float | None, *,
+                    model: str | None, provider: str | None,
+                    input_tokens: int, output_tokens: int,
+                    searches: int) -> float:
+    """What a call counts for against the run's ceiling.
+
+    The stored row keeps ``None`` for an unpriced model or provider, so the
+    ledger shows the call as unpriced rather than free. The CEILING cannot
+    afford that honesty: a served model name missing from the rate table
+    used to accrue nothing, so a run on an unpriced model could never trip
+    it. An unpriced call is charged at the dearest rate in the table (and
+    the dearest search rate), which overstates it, and overstating is the
+    safe direction for a limit whose job is to stop the spend.
+    """
+    from config import LLM_PRICING, WEB_SEARCH_PRICING
+
+    charge = 0.0
+    if cost is not None:
+        charge += cost
+    elif input_tokens or output_tokens:
+        in_rate = max((r["input"] for r in LLM_PRICING.values()), default=0.0)
+        out_rate = max((r["output"] for r in LLM_PRICING.values()), default=0.0)
+        charge += ((input_tokens or 0) / 1_000_000) * in_rate \
+            + ((output_tokens or 0) / 1_000_000) * out_rate
+        key = f"model:{model}"
+        if key not in _UNPRICED_WARNED:
+            _UNPRICED_WARNED.add(key)
+            logger.warning("model %r has no entry in LLM_PRICING: its calls "
+                           "count against the spend ceiling at the table's "
+                           "dearest rate ($%.2f/$%.2f per Mtok) and are stored "
+                           "unpriced", model, in_rate, out_rate)
+    if tool_cost is not None:
+        charge += tool_cost
+    elif searches:
+        rate = max(WEB_SEARCH_PRICING.values(), default=0.0)
+        charge += searches * rate / 1000.0
+        key = f"provider:{provider}"
+        if key not in _UNPRICED_WARNED:
+            _UNPRICED_WARNED.add(key)
+            logger.warning("provider %r has no web-search rate: its searches "
+                           "count against the spend ceiling at $%.2f/1000",
+                           provider, rate)
+    return charge
+
+
 def compute_tool_cost(provider: str | None,
                       searches: int) -> float | None:
     """What ``searches`` server-side web searches cost, or None if unpriced.
@@ -233,7 +281,10 @@ def record(
             )
             session.add(row)
             session.flush()
-            _accrue(run_id, (cost or 0.0) + (tool_cost or 0.0))
+            _accrue(run_id, _ceiling_charge(
+                cost, tool_cost, model=model, provider=provider,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                searches=searches))
             return row.id
     except Exception as e:
         logger.debug(f"usage telemetry write failed: {e}")

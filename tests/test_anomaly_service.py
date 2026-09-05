@@ -125,9 +125,26 @@ def article(day, n=0):
         summary="")
 
 
-def bars(*closes):
+def bars(*closes, volume=None, opens=None):
+    """A Close-only frame by default (what the trend tests use); Volume and
+    Open columns only when a test hands them over."""
     idx = pd.date_range(end=AS_OF, periods=len(closes), freq="D")
-    return pd.DataFrame({"Close": list(closes)}, index=idx)
+    cols = {"Close": list(closes)}
+    if volume is not None:
+        cols["Volume"] = list(volume)
+    if opens is not None:
+        cols["Open"] = list(opens)
+    return pd.DataFrame(cols, index=idx)
+
+
+def calm(n=61, level=100.0, wobble=0.5):
+    """n closes that alternate +/- wobble percent around level: a symbol
+    with a small, steady daily move and a known sigma."""
+    out, sign = [], 1
+    for i in range(n):
+        out.append(level * (1 + sign * wobble / 100.0))
+        sign = -sign
+    return out
 
 
 def ramp(start, end, n=25):
@@ -141,6 +158,122 @@ def only(result, key):
 
 
 # --- detectors -----------------------------------------------------------
+
+class TestPriceShock:
+    def test_a_move_far_outside_the_symbols_own_range_fires(self):
+        closes = calm() + [100.0 * 1.08]        # +8% on a +/-0.5% name
+        hit = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes)), "price_shock")
+        assert hit is not None
+        assert hit["evidence_key"] == "ohlcv"
+        assert "closed up" in hit["facts"][0] and "8." in hit["facts"][0]
+        assert "standard deviations" in hit["facts"][1]
+        assert AS_OF in hit["question"]
+
+    def test_the_same_move_on_a_volatile_name_is_its_norm(self):
+        # +/-6% every day: an 8% day is barely over one sigma.
+        closes = [100.0 * (1 + (0.06 if i % 2 else -0.06)) for i in range(61)]
+        closes.append(closes[-1] * 1.08)
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes)), "price_shock") is None
+
+    def test_a_dead_calm_name_still_needs_the_absolute_floor(self):
+        # +/-0.05%: a 1% day is 20 sigma but under SHOCK_MIN_PCT.
+        closes = calm(wobble=0.05) + [100.0 * 1.01]
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes)), "price_shock") is None
+
+    def test_the_gap_fact_reads_the_open_when_there_is_one(self):
+        closes = calm() + [108.0]
+        opens = closes[:-1] + [107.5]           # opened up 7.5%: overnight
+        hit = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, opens=opens)),
+                   "price_shock")
+        assert any("overnight" in f for f in hit["facts"])
+        opens = closes[:-1] + [closes[-2]]      # opened flat: built in-session
+        hit = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, opens=opens)),
+                   "price_shock")
+        assert any("during the session" in f for f in hit["facts"])
+
+    def test_too_few_bars_produce_nothing(self):
+        closes = calm(n=15) + [108.0]
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes)), "price_shock") is None
+
+    def test_severity_grows_with_the_z_score(self):
+        # calm() ends on its +0.5% bar (100.5), so 104.0 is a +3.5% day:
+        # over the absolute floor and about three sigma on a +/-1% tape.
+        low = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*(calm() + [104.0]))),
+                   "price_shock")
+        high = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*(calm() + [112.0]))),
+                    "price_shock")
+        assert low is not None and high["severity"] > low["severity"]
+
+
+class TestVolumeShock:
+    def test_a_session_far_above_the_median_fires(self):
+        closes = calm(n=30)
+        vol = [1_000_000] * 29 + [4_000_000]
+        hit = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, volume=vol)),
+                   "volume_shock")
+        assert hit is not None and hit["evidence_key"] == "ohlcv"
+        assert "4,000,000 shares" in hit["facts"][0]
+        assert "4.0x" in hit["facts"][1]
+
+    def test_the_median_ignores_one_earlier_blow_off_day(self):
+        closes = calm(n=30)
+        vol = [1_000_000] * 20 + [30_000_000] + [1_000_000] * 8 + [4_000_000]
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, volume=vol)),
+                    "volume_shock") is not None
+
+    def test_a_thin_name_does_not_fire_on_one_block(self):
+        closes = calm(n=30)
+        vol = [10_000] * 29 + [50_000]          # 5x, but under the share floor
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, volume=vol)),
+                    "volume_shock") is None
+
+    def test_a_close_only_frame_is_silent_not_an_error(self):
+        assert only(anom.detect("NVDA", AS_OF, ohlcv=bars(*calm(n=30))),
+                    "volume_shock") is None
+
+    def test_absorbed_flow_is_named_as_a_hand_off(self):
+        closes = calm(n=30)
+        vol = [1_000_000] * 29 + [5_000_000]
+        hit = only(anom.detect("NVDA", AS_OF, ohlcv=bars(*closes, volume=vol)),
+                   "volume_shock")
+        assert any("hand-off" in f for f in hit["facts"])
+
+
+class TestOptionsFlow:
+    def test_a_session_that_turned_over_the_open_interest_fires(self):
+        # 3,000 traded against 2,000 standing: turnover 1.5, calls heavier.
+        hit = only(anom.detect("NVDA", AS_OF,
+                               options=chain(500, 2500, put_oi=1000, call_oi=1000)),
+                   "options_flow")
+        assert hit is not None and hit["evidence_key"] == "options"
+        assert "1.50" in hit["facts"][0] and "calls" in hit["title"]
+
+    def test_a_balanced_chain_can_still_carry_heavy_orders(self):
+        # Skew is silent (pc 0.8, inside the neutral band); flow is not.
+        found = anom.detect("NVDA", AS_OF,
+                            options=chain(800, 1000, put_oi=600, call_oi=600))
+        assert only(found, "options_skew") is None
+        assert only(found, "options_flow")["title"].endswith("both sides")
+
+    def test_ordinary_turnover_is_silent(self):
+        assert only(anom.detect("NVDA", AS_OF,
+                                options=chain(500, 500, put_oi=20_000, call_oi=20_000)),
+                    "options_flow") is None
+
+    def test_no_open_interest_or_a_thin_chain_produces_nothing(self):
+        assert only(anom.detect("NVDA", AS_OF, options=chain(300, 100)),
+                    "options_flow") is None
+        assert only(anom.detect("NVDA", AS_OF,
+                                options=chain(100, 100, put_oi=10, call_oi=10)),
+                    "options_flow") is None
+
+
+class TestTapeScreen:
+    def test_enough_bars_count_as_a_screen_of_the_tape(self):
+        assert "the price and volume tape" in anom.screened({}, ohlcv=bars(*calm()))
+        assert "the price and volume tape" not in anom.screened({}, ohlcv=bars(*calm(n=5)))
+        assert "the price and volume tape" not in anom.screened({}, ohlcv=None)
+
 
 class TestOptionsSkew:
     def test_a_liquid_put_tilted_chain_fires_with_its_own_numbers(self):

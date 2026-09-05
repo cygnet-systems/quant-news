@@ -361,10 +361,17 @@ def investigate(
     quality: str = "",
     last_close: Optional[float] = None,
     model: Optional[str] = None,
+    triage: bool = True,
 ) -> Investigation:
     """Run the stage. ``web`` is the frontend's tool switch (default off).
     Raises on provider failure, the caller classes the block (expected
-    evidence) and records the gap."""
+    evidence) and records the gap.
+
+    ``triage`` controls the web-free classification that runs ahead of a web
+    call so a plain-momentum name never pays for a search. A caller that
+    already knows the name is not plain momentum (the anomaly scan flagged
+    it) passes False and buys the web call directly: the triage would be a
+    second model call to answer a settled question."""
     key = (symbol.upper(), str(as_of)[:10], web,
            model or MODEL.INVESTIGATION_MODEL,
            _evidence_digest(profile, headlines, filings, quality))
@@ -379,7 +386,7 @@ def investigate(
     # fraction of a cent, and a name that comes back MOMENTUM_ONLY has
     # nothing for the web to add. The web result is cached under its own
     # key; the triage result under web=False, so nothing runs twice.
-    if web and MODEL.INVESTIGATION_WEB_SKIP:
+    if web and triage and MODEL.INVESTIGATION_WEB_SKIP:
         try:
             triage = investigate(symbol, as_of, web=False, target=target,
                                  profile=profile, headlines=headlines,
@@ -673,8 +680,11 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
 
     # One shared search budget: the run's ceiling divided over the questions
     # it is spending it on, never per question on top of it. Cache hits are
-    # not spending it, so they do not shrink the others' share.
-    per_question = max(1, MODEL.INVESTIGATION_MAX_SEARCHES // max(len(claimed), 1))
+    # not spending it, so they do not shrink the others' share. The floor
+    # keeps a question from being asked with a single search once the cap
+    # is small enough to split that thin (config: ANOMALY_QUESTION_MIN_SEARCHES).
+    per_question = max(MODEL.ANOMALY_QUESTION_MIN_SEARCHES,
+                       MODEL.INVESTIGATION_MAX_SEARCHES // max(len(claimed), 1))
 
     def _one(question: str) -> dict:
         key = keys[question]

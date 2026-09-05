@@ -33,7 +33,7 @@ from db.models import (
     PoliticianAlias,
 )
 from models.single_agent import (
-    SINGLE_AGENT_PROMPT, render_output_sections,
+    SINGLE_AGENT_PROMPT, SINGLE_AGENT_SYSTEM_PROMPT, render_output_sections,
 )
 from services import av_store, insider_service
 from services import politician_dossier as pd_
@@ -156,13 +156,13 @@ def blocks(news=NEWS) -> str:
 
 class TestPromptRules:
     def test_the_positioning_step_reads_both_disclosure_blocks(self):
-        step = SINGLE_AGENT_PROMPT.split("**Step 2b")[1].split("**Step 3:")[0]
+        step = SINGLE_AGENT_SYSTEM_PROMPT.split("**Step 2b")[1].split("**Step 3:")[0]
         assert "insider (Form 4)" in step and "congressional-dossier" in step
         assert "DISCLOSURE-LAGGED" in step
         assert "second trading day after the transaction" in step
 
     def test_it_forbids_the_four_over_readings(self):
-        step = SINGLE_AGENT_PROMPT.split("**Step 2b")[1].split("**Step 3:")[0]
+        step = SINGLE_AGENT_SYSTEM_PROMPT.split("**Step 2b")[1].split("**Step 3:")[0]
         # Disclosure lag is not timing.
         assert "read the gap between a transaction date and its" in step
         # One member is noise; a cluster of executives is the pattern.
