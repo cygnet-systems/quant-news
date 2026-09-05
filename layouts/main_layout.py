@@ -195,6 +195,10 @@ def create_layout() -> html.Div:
             # clear_data wiped the token, so every tick saw "new" and
             # re-snapped the scroll in a loop.
             html.Div(id="progress-snap-sink", style={"display": "none"}),
+            # Sink for the timezone-cookie callback below it. Inert: the
+            # cookie is the payload, this output exists only because a
+            # clientside callback must write somewhere.
+            html.Div(id="tz-cookie-sink", style={"display": "none"}),
             # Fingerprint of the panel's last render (visible window +
             # active flag). The panel rewrites its children only when this
             # changes: rebuilding the ~45 row nodes on every tick destroyed

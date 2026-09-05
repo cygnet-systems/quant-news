@@ -267,8 +267,8 @@ def feed_lines(events, window: int = 45) -> html.Div:
         rows.append(html.Div(
             [
                 html.Span(prog.event_clock(e), className="progress-ts",
-                          title=f"{prog.DISPLAY_TZ_LABEL} "
-                                f"({prog.DISPLAY_TZ.key})"),
+                          title=f"{prog.display_tz_label()} "
+                                f"({prog.display_tz().key})"),
                 html.I(className=f"bi {icon} progress-icon progress-icon-{stage}"),
                 html.Span(e.get("message", ""), className="progress-msg"),
             ],

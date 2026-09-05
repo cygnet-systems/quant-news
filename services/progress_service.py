@@ -54,6 +54,43 @@ logger = logging.getLogger(__name__)
 DISPLAY_TZ = ZoneInfo("US/Eastern")
 DISPLAY_TZ_LABEL = "ET"
 
+# The zone a READER sees. Storage is Eastern and fixed (that is what the
+# market dates beside these stamps are cut on); display is the viewer's own,
+# because "18:04" means nothing to somebody in London who has to subtract
+# five in their head to know whether the run they are watching is running
+# now. The browser reports its zone into the `qn_tz` cookie (set by the
+# clientside callback in app.py); this reads it back per request. Eastern
+# stays the fallback, so a reader with no cookie -- a server-side render, a
+# scheduled mail, a browser that blocks cookies -- sees exactly what this
+# app has always shown. The name is only ever used to build a ZoneInfo, and
+# an unknown one falls back rather than raising.
+TZ_COOKIE = "qn_tz"
+
+
+def display_tz() -> ZoneInfo:
+    """The viewer's timezone for this request, or Eastern."""
+    try:
+        from flask import has_request_context, request
+        if not has_request_context():
+            return DISPLAY_TZ
+        name = (request.cookies.get(TZ_COOKIE) or "").strip()
+        if not name:
+            return DISPLAY_TZ
+        return ZoneInfo(name)
+    except Exception:
+        # No flask, no request, or a zone name this box has no tzdata for.
+        return DISPLAY_TZ
+
+
+def display_tz_label(tz: "ZoneInfo | None" = None) -> str:
+    """How the zone is written next to a stamp: "ET" when it is the default,
+    otherwise the zone's own abbreviation for the current date ("BST",
+    "JST"), falling back to the IANA name when it has none."""
+    tz = tz or display_tz()
+    if tz is DISPLAY_TZ or getattr(tz, "key", None) == DISPLAY_TZ.key:
+        return DISPLAY_TZ_LABEL
+    return datetime.now(tz).strftime("%Z") or getattr(tz, "key", "")
+
 _CACHE_DIR = "cache/progress"
 # Rolling log across runs (and the events written outside any run).
 _EVENTS_KEY = "events"
@@ -796,8 +833,9 @@ def get_activity_runs(limit_runs: int = 50, scope: str = "all",
         return []
 
 
-def to_display_tz(value: "datetime | float | str | None") -> "datetime | None":
-    """Normalize an epoch, ISO string or datetime to a DISPLAY_TZ datetime.
+def to_display_tz(value: "datetime | float | str | None",
+                  tz: "ZoneInfo | None" = None) -> "datetime | None":
+    """Normalize an epoch, ISO string or datetime to the reader's zone.
 
     A naive value is *assumed UTC*. The same rule services/news_window.py
     documents, and correct for every naive value this app persists (Postgres
@@ -805,10 +843,11 @@ def to_display_tz(value: "datetime | float | str | None") -> "datetime | None":
     ``datetime.utcnow()``-shaped code). Strings are accepted because several
     cache accessors hand timestamps to the UI already str()-ed.
     """
+    tz = tz or display_tz()
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(DISPLAY_TZ)
+        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(tz)
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
@@ -816,7 +855,7 @@ def to_display_tz(value: "datetime | float | str | None") -> "datetime | None":
             return None
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(DISPLAY_TZ)
+    return value.astimezone(tz)
 
 
 def format_stamp(value: "datetime | float | str | None",
@@ -827,11 +866,12 @@ def format_stamp(value: "datetime | float | str | None",
     evening ET rendered under tomorrow's DATE. Microseconds are always dropped:
     nothing a reader does with a stamp needs them.
     """
-    dt = to_display_tz(value)
+    tz = display_tz()
+    dt = to_display_tz(value, tz)
     if dt is None:
         return ""
     fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
-    return f"{dt.strftime(fmt)} {DISPLAY_TZ_LABEL}"
+    return f"{dt.strftime(fmt)} {display_tz_label(tz)}"
 
 
 def format_clock(value: "datetime | float | None") -> str:

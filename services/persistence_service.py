@@ -18,12 +18,32 @@ import logging
 import time
 from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
 from db.models import DataSnapshot, ModelPrediction, RecommendationRun, ReportCatalog
 from db.session import get_session
 from services import storage_service
+
+# Every stamp this module writes is Eastern, explicitly. The columns are
+# timestamptz, so what is stored is the instant either way -- the point is
+# that it is AWARE. `datetime.utcnow()` returned a naive value that Postgres
+# read in the server's own zone, so the same call recorded a different
+# instant depending on where it ran, and it is deprecated from 3.12. Eastern
+# rather than UTC because it is the zone the rest of this platform's day
+# boundaries are cut on (the scheduler's windows, the evaluation cutoff,
+# `cache_service.evaluate_predictions`), and one zone for all of them means
+# a stamp can be compared with a trade date without a conversion nobody
+# remembers to do. US/Eastern, not a fixed -05:00: a hard EST offset is
+# wrong from March to November and would put these stamps an hour off the
+# market dates they sit beside.
+STORAGE_TZ = ZoneInfo("US/Eastern")
+
+
+def _stamp() -> datetime:
+    """Now, in the zone this module stores in."""
+    return datetime.now(STORAGE_TZ)
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +109,7 @@ def upsert_data_snapshot(
                 return False
             existing.content_hash = content_hash
             existing.record_count = record_count
-            existing.created_at = datetime.utcnow()
+            existing.created_at = _stamp()
             return True
 
         session.add(DataSnapshot(

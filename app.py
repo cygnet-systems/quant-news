@@ -71,7 +71,6 @@ from layouts.history_sections import (
     applied_filter_chips,
     build_activity_section,
     build_predictions_section,
-    filter_history_data,
 )
 from layouts.nav import SECTION_TITLES
 from layouts.pages import activity as activity_page
@@ -2069,7 +2068,6 @@ def update_summary_cards(stock_data, symbols):
             continue
 
         metrics = stock_data[symbol].get("metrics", {})
-        signals = stock_data[symbol].get("signals", {})
 
         # Current price card with dynamic period label
         price = metrics.get("end_price", 0)
@@ -2702,7 +2700,6 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
         fetch_run_news, symbols or [], as_of_str, target_str,
         overnight=overnight_news, lookback_days=lookback_days,
         max_articles=max_articles, on_symbol=_news_progress)
-    total_articles = sum(len(a) for a in articles_by_symbol.values())
     news_payload = news_window_payload(
         overnight=overnight_news, lookback_days=lookback_days,
         max_articles=max_articles, as_of=as_of_str, target=target_str,
@@ -3815,8 +3812,6 @@ def generate_model_signals(run_store, dispatched):
         # inside this function.
         os.environ["_DASH_BG_SUBPROCESS"] = "1"
 
-        from datetime import date as date_cls
-
         # The row's target_date is the TARGET session, the close being
         # predicted. Models are truncated to `predict_date`, the previous
         # trading day, so a Monday target trains and scores on nothing
@@ -3827,7 +3822,10 @@ def generate_model_signals(run_store, dispatched):
             else None
         )
 
-        is_backtest = target_date < date_cls.today()
+        # No backtest gate here: whether a run may search the open web is
+        # decided once, in analysis_runner.run_predictions, where every
+        # surface's tools meet. This callback used to compute is_backtest
+        # and never read it.
 
         # An empty list runs the runner's full set, as an unticked dialog
         # always did.
@@ -4330,6 +4328,32 @@ clientside_callback(
     Output("progress-snap-sink", "children"),
     Input("progress-snap-store", "data"),
     prevent_initial_call=True,
+)
+
+
+# Report the browser's timezone so stamps render in the reader's own zone
+# (progress_service.display_tz reads this cookie; Eastern when it is absent).
+# A cookie rather than a Store because the formatters run deep inside
+# callbacks and page renders that have a flask request but no access to any
+# particular component's state -- threading a Store value into every one of
+# them would mean touching every caller of format_stamp. Written on each
+# page load, so a laptop that travels updates itself. SameSite=Lax and no
+# expiry beyond the year: it is a display preference, not an identifier.
+clientside_callback(
+    """
+    function(_) {
+        try {
+            var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (tz) {
+                document.cookie = "qn_tz=" + encodeURIComponent(tz) +
+                    ";path=/;max-age=31536000;SameSite=Lax";
+            }
+        } catch (e) { /* no Intl, or cookies blocked: the server uses ET */ }
+        return "";
+    }
+    """,
+    Output("tz-cookie-sink", "children"),
+    Input("url", "pathname"),
 )
 
 

@@ -52,7 +52,7 @@ def _search_history_rows(searches: list[dict]) -> html.Div:
                     html.Th("Symbols"), html.Th("Count"),
                     html.Th("Times used"),
                     html.Th("Last used", title=f"Times are "
-                                               f"{_prog.DISPLAY_TZ.key}"),
+                                               f"{_prog.display_tz().key}"),
                 ])),
                 html.Tbody(rows),
             ],
