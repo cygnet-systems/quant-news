@@ -79,6 +79,24 @@ def compute_cost(model: str | None, input_tokens: int,
     return round(cost, 6), in_rate, out_rate
 
 
+def compute_tool_cost(provider: str | None,
+                      searches: int) -> float | None:
+    """What ``searches`` server-side web searches cost, or None if unpriced.
+
+    Separate from token cost because it is billed separately: a provider
+    charges per search regardless of how many tokens the surrounding call
+    used. Zero searches is a real zero, not an unknown.
+    """
+    if not searches:
+        return 0.0
+    from config import get_web_search_rate
+
+    rate = get_web_search_rate(provider)
+    if rate is None:
+        return None
+    return round(searches * rate / 1000.0, 6)
+
+
 def record(
     *,
     model: str | None,
@@ -88,6 +106,8 @@ def record(
     duration_ms: int | None = None,
     ok: bool = True,
     error: str | None = None,
+    searches: int = 0,
+    cached_input_tokens: int = 0,
 ) -> int | None:
     """Write one usage row. Never raises: telemetry must not break a run.
 
@@ -101,6 +121,8 @@ def record(
 
         ctx = current()
         cost, in_rate, out_rate = compute_cost(model, input_tokens, output_tokens)
+        searches = int(searches or 0)
+        tool_cost = compute_tool_cost(provider, searches)
 
         try:
             owner_uid = _current_uid()
@@ -124,6 +146,9 @@ def record(
                 input_rate_per_mtok=in_rate,
                 output_rate_per_mtok=out_rate,
                 cost_usd=cost,
+                searches=searches,
+                tool_cost_usd=tool_cost,
+                cached_input_tokens=int(cached_input_tokens or 0),
                 duration_ms=duration_ms,
                 ok=ok,
                 error=(error or None) and str(error)[:500],
@@ -155,6 +180,13 @@ def summarize(days: int = 7) -> list[dict]:
                    sum(input_tokens) as in_tok,
                    sum(output_tokens) as out_tok,
                    sum(cost_usd) as cost,
+                   sum(searches) as searches,
+                   sum(cached_input_tokens) as cached_in,
+                   sum(tool_cost_usd) as tool_cost,
+                   -- What was actually spent: tokens plus the searches the
+                   -- old ledger could not see.
+                   sum(coalesce(cost_usd, 0) + coalesce(tool_cost_usd, 0))
+                       as total_cost,
                    count(*) filter (where cost_usd is null) as unpriced
             from llm_usage
             where created_at >= now() - (:days || ' days')::interval

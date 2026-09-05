@@ -70,7 +70,7 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
     Returns the llm_usage row id (or None) so the trace row for the same
     physical call can link to its cost record.
     """
-    in_tok = out_tok = 0
+    in_tok = out_tok = cached_tok = 0
     try:
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -82,6 +82,16 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
                 raw_out = getattr(usage, "completion_tokens", None)
             in_tok = int(raw_in) if raw_in is not None else 0
             out_tok = int(raw_out) if raw_out is not None else 0
+            # Provider-reported cache hit on the input. OpenAI reports it
+            # under prompt_tokens_details.cached_tokens, Anthropic as
+            # cache_read_input_tokens. Recorded so "should we add prompt
+            # caching?" is answerable from the table instead of guessed.
+            if provider == "anthropic":
+                cached_in = getattr(usage, "cache_read_input_tokens", None)
+            else:
+                details = getattr(usage, "prompt_tokens_details", None)
+                cached_in = getattr(details, "cached_tokens", None)
+            cached_tok = int(cached_in) if cached_in else 0
 
         if usage_out is not None:
             usage_out.update({
@@ -97,7 +107,7 @@ def _record_usage(usage_out: Optional[dict], response, provider: str,
     return usage_service.record(
         model=model, provider=provider,
         input_tokens=in_tok, output_tokens=out_tok,
-        duration_ms=duration_ms,
+        duration_ms=duration_ms, cached_input_tokens=cached_tok,
     )
 
 
@@ -679,6 +689,10 @@ class LLMService:
 
             stop_reason = getattr(response, "stop_reason", None)
             round_text: list[str] = []
+            # `searches` accumulates across pause_turn rounds, but a usage row
+            # is written per ROUND. Recording the running total on each would
+            # bill round one's searches again in round two.
+            searches_before = searches
             for block in response.content:
                 btype = getattr(block, "type", "")
                 if btype == "text":
@@ -717,7 +731,8 @@ class LLMService:
             usage_id = usage_service.record(
                 model=use_model, provider="anthropic",
                 input_tokens=in_tok, output_tokens=out_tok,
-                duration_ms=duration_ms)
+                duration_ms=duration_ms,
+                searches=searches - searches_before)
             try:
                 from services.trace_service import record_llm_call
                 record_llm_call(
@@ -831,11 +846,15 @@ class LLMService:
         usage = getattr(response, "usage", None)
         in_tok = int(getattr(usage, "input_tokens", 0) or 0)
         out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+        _details = getattr(usage, "input_tokens_details", None)
+        cached_tok = int(getattr(_details, "cached_tokens", 0) or 0)
         duration_ms = int((_time.time() - t0) * 1000)
         from services import usage_service
         usage_id = usage_service.record(model=model, provider="openai",
                                         input_tokens=in_tok, output_tokens=out_tok,
-                                        duration_ms=duration_ms)
+                                        duration_ms=duration_ms,
+                                        searches=searches,
+                                        cached_input_tokens=cached_tok)
         try:
             from services.trace_service import record_llm_call
             record_llm_call(

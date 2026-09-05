@@ -434,8 +434,16 @@ def _llm_call_row(c: dict) -> html.Div:
     tokens = ", "
     if c.get("input_tokens") is not None or c.get("output_tokens") is not None:
         tokens = f"{c.get('input_tokens') or 0}→{c.get('output_tokens') or 0}"
-    cost = (f"${c['cost_usd']:.4f}" if isinstance(c.get("cost_usd"), float)
-            else "n/a")
+    # Token cost plus the search fee, because the two are billed separately
+    # and quoting only the first is what hid half the investigation stage.
+    _tok = c.get("cost_usd")
+    _tool = c.get("tool_cost_usd")
+    if isinstance(_tok, float) or isinstance(_tool, float):
+        cost = f"${(_tok or 0) + (_tool or 0):.4f}"
+        if c.get("searches"):
+            cost += f" ({c['searches']} search{'es' if c['searches'] != 1 else ''})"
+    else:
+        cost = "n/a"
     dur = (f"{c['duration_ms'] / 1000:.1f}s"
            if isinstance(c.get("duration_ms"), (int, float)) else "n/a")
     ts = c.get("created_at")

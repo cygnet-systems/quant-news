@@ -666,6 +666,19 @@ class LLMUsage(Base):
     output_rate_per_mtok: Mapped[float | None] = mapped_column(Double)
     cost_usd: Mapped[float | None] = mapped_column(Double)
 
+    # Server-side web searches this call ran, and what they cost. The count
+    # is observed (the provider's response carries it); the cost is that
+    # count priced by config.WEB_SEARCH_PRICING, NULL when the rate is
+    # unknown. cost_usd above stays TOKENS ONLY so historical rows keep
+    # their meaning -- the real spend is cost_usd + tool_cost_usd.
+    searches: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0)
+    tool_cost_usd: Mapped[float | None] = mapped_column(Double)
+    # Input tokens the provider served from its prompt cache. Makes "is
+    # caching landing?" a query rather than an assumption.
+    cached_input_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0)
+
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     ok: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     error: Mapped[str | None] = mapped_column(Text)

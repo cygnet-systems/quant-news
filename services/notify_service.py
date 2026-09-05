@@ -181,7 +181,12 @@ def run_cost(since, until=None) -> Optional[float]:
         from sqlalchemy import text
         with get_session() as session:
             return session.execute(
-                text("select sum(cost_usd) from llm_usage "
+                # tokens PLUS server-side search fees: the mail quoted
+                # token cost alone and so under-reported the investigation
+                # stage by roughly half.
+                text("select sum(coalesce(cost_usd, 0) "
+                     "         + coalesce(tool_cost_usd, 0)) "
+                     "from llm_usage "
                      "where created_at >= :a and created_at <= :b"),
                 {"a": since, "b": until or _dt.now()},
             ).scalar()

@@ -506,6 +506,26 @@ LLM_PRICING: Final[dict[str, dict[str, float]]] = {
 }
 LLM_PRICING_VERIFIED_ON: Final[str] = "2026-09-02"
 
+# Server-side web search, in dollars per THOUSAND searches. Billed per call,
+# entirely separately from tokens, which is why llm_usage priced tokens only
+# and the investigation stage reported about half what it really cost (the
+# 2026-09-04 day read $9.67 against a bill near $20; 881 searches were the
+# difference). The COUNT that gets priced here is observed from the
+# provider's own response; only the rate is a constant, so a correction is
+# a one-line change and every stored count re-prices with it.
+# Anthropic publishes $10/1000. The OpenAI figure is the same order and is
+# the one to check first if the ledger and the invoice disagree.
+WEB_SEARCH_PRICING: Final[dict[str, float]] = {
+    "anthropic": 10.00,
+    "openai": 10.00,
+}
+WEB_SEARCH_PRICING_VERIFIED_ON: Final[str] = "2026-09-05 (openai rate UNVERIFIED)"
+
+
+def get_web_search_rate(provider: str | None) -> float | None:
+    """$/1000 server-side searches, or None when the provider is unpriced."""
+    return WEB_SEARCH_PRICING.get((provider or "").strip().lower())
+
 
 def get_llm_rates(model: str | None) -> tuple[float | None, float | None]:
     """(input, output) $/Mtok for a model, or (None, None) when unpriced.

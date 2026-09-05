@@ -159,6 +159,8 @@ def list_llm_calls(run_id: str, after_id: int = 0, limit: int = 500) -> list[dic
                     LLMTrace.duration_ms, LLMTrace.created_at,
                     LLMUsage.input_tokens, LLMUsage.output_tokens,
                     LLMUsage.cost_usd,
+                    LLMUsage.searches,
+                    LLMUsage.tool_cost_usd,
                 )
                 .join(LLMUsage, LLMUsage.id == LLMTrace.usage_id, isouter=True)
                 .where(LLMTrace.run_id == run_id,
@@ -175,6 +177,8 @@ def list_llm_calls(run_id: str, after_id: int = 0, limit: int = 500) -> list[dic
             "created_at": r.created_at,
             "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
             "cost_usd": r.cost_usd,
+            "searches": r.searches,
+            "tool_cost_usd": r.tool_cost_usd,
         } for r in rows]
     except Exception as e:
         logger.debug(f"llm trace list query failed: {e}")
