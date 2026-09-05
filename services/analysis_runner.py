@@ -381,6 +381,24 @@ def run_predictions(
     tools_set = sorted(set(tools or []))
     service = get_prediction_service()
     is_backtest = target_date < date_cls.today()
+    from services.investigation_service import WEB_RESEARCH_TOOL
+    # The date rule, enforced where every surface meets rather than where
+    # each one happens to remember it. modals.preset_run_tools drops web
+    # research for a past target and apply_run_preset rewrites the control
+    # when the picker moves, but both are DEFAULTS: the confirm takes the
+    # checklist verbatim, so a box ticked before the date was moved back (or
+    # carried in by a retry, a stored run row, or a saved schedule whose
+    # target has since gone by) still arrived here as tools=["web_research"].
+    # The open web cannot be bounded to a past as-of, and a backtest is the
+    # measurement this platform judges its models by, so the leak has to be
+    # closed on the path, not on the form. Both readers of the switch
+    # (the prefetch pool below and trading_agents_model, which takes
+    # tools_set through run_report_for_symbol) see the stripped set.
+    if is_backtest and WEB_RESEARCH_TOOL in tools_set:
+        tools_set = [t for t in tools_set if t != WEB_RESEARCH_TOOL]
+        logger.warning(
+            "target %s is a backtest: web research dropped from this run's "
+            "tools (the open web would leak the future)", target_date)
 
     spy_df = None
     spy_regime = None
@@ -435,8 +453,7 @@ def run_predictions(
     # container down three times on 2026-09-02. The pool starts once that
     # symbol is through and covers the rest; symbol one investigates
     # in-loop, one thread wide, as it did before the prefetch existed.
-    from services.investigation_service import (
-        WEB_RESEARCH_TOOL, begin_research_budget)
+    from services.investigation_service import begin_research_budget
     # One ceiling for the whole run's anomaly research. Those questions are
     # asked inside the serial per-symbol loop, so without a run-level ceiling
     # a long watchlist could add an hour of web searches to a job that is

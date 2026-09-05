@@ -446,7 +446,7 @@ class TradingAgentsModel(BaseModel):
         news: list | None = None,
         target: str | None = None,
         tools: "set[str] | list[str] | None" = None,
-    ) -> "tuple[list[str], object | None, list[dict], list[str]]":
+    ) -> "tuple[list[str], object | None, list[dict], list[str], bool]":
         """Assemble validated, lookahead-safe context blocks for the prompt.
 
         ``evidence`` gates the optional blocks per run (Run-Analysis modal

@@ -512,3 +512,85 @@ class TestWebResearchSlots:
         fake = _FakeLLM(_wrapped(BHF_JSON))
         with patch("services.llm_service.get_llm", return_value=fake):
             assert investigate("BBB", "2026-09-01", web=True).web is True
+
+
+class TestTheBacktestRuleIsEnforcedOnThePath:
+    """The open web is off for a backtest wherever the run came from.
+
+    The rule had two witnesses and neither was on the wire: the dialog's
+    ``preset_run_tools`` drops web research for a past target and
+    ``apply_run_preset`` rewrites the control when the picker moves, but a
+    box ticked BEFORE the date was moved back reached the confirm intact,
+    and the confirm records the checklist verbatim. A retry, a stored run
+    row and a saved schedule whose target has since gone by all copy that
+    config forward. run_predictions is where every surface meets, so that
+    is where the tools are stripped, and both readers of the switch -- the
+    prefetch pool and trading_agents_model, which takes the same list
+    through run_report_for_symbol -- see the stripped set.
+    """
+
+    def _run(self, target, cutoff, tools):
+        """run_predictions with the models stubbed; returns the web flag the
+        prefetch pool was started with and the tools the report stage got."""
+        from contextlib import nullcontext
+        from datetime import date
+
+        import pandas as pd
+
+        from services import analysis_runner
+
+        seen = {}
+
+        class _Service:
+            def predict_symbol_no_store(self, symbol, df, **kw):
+                seen["report_tools"] = kw.get("tools")
+                return {}
+
+        class _Pool:
+            def shutdown(self, wait=False):
+                pass
+
+        def _prefetch(remaining, as_of, **kw):
+            seen["prefetch_web"] = kw.get("web")
+            return _Pool()
+
+        idx = pd.date_range("2026-06-01", periods=60, freq="B")
+        frame = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0,
+                              "Close": 1.0, "Volume": 1}, index=idx)
+        symbols = ["A", "B"]
+        spy = pd.DataFrame({"Close": [1.0] * 10},
+                           index=pd.date_range("2026-08-01", periods=10,
+                                               freq="B"))
+        with patch("services.prediction_service.get_prediction_service",
+                   return_value=_Service()), \
+             patch("services.stock_data.fetch_stock_data", return_value=spy), \
+             patch("services.investigation_service.prefetch_many",
+                   side_effect=_prefetch), \
+             patch("services.analysis_runner._reusable_predictions",
+                   return_value=None), \
+             patch("services.usage_service.track", return_value=nullcontext()):
+            analysis_runner.run_predictions(
+                symbols,
+                {s: {"prices": frame.to_json(date_format="iso")}
+                 for s in symbols},
+                {s: [] for s in symbols},
+                target_date=target, cutoff_date=cutoff,
+                models={"trading_agents"}, evidence=["investigation"],
+                news_lookback_days=14, tools=tools)
+        return seen
+
+    def test_a_ticked_box_cannot_put_the_web_into_a_backtest(self):
+        from datetime import date, timedelta
+
+        past = date.today() - timedelta(days=30)
+        seen = self._run(past, past - timedelta(days=1), ["web_research"])
+        assert seen["prefetch_web"] is False
+        assert "web_research" not in (seen["report_tools"] or [])
+
+    def test_a_forward_run_keeps_the_tool_it_asked_for(self):
+        from datetime import date, timedelta
+
+        ahead = date.today() + timedelta(days=1)
+        seen = self._run(ahead, date.today(), ["web_research"])
+        assert seen["prefetch_web"] is True
+        assert "web_research" in (seen["report_tools"] or [])
