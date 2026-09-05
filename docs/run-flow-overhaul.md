@@ -127,7 +127,7 @@ future of the cutoff, else `newest row visible from <date>`, else no date.
 
 **Alias fabrication.** `av_store.matchable_alias` requires two tokens of at
 least two characters before an alias may be matched against article prose.
-The roster's 1,144 members contribute 69 aliases starting with the bare
+The roster's 1,144 members contribute 70 aliases starting with the bare
 article "a" ("a green", "a gray", "a king"); scanned over prose, "regulators
 gave the deal a green light" would name a sitting member as appearing in the
 story and the prompt would then assert it as fact. Bare surnames are dropped
@@ -182,6 +182,45 @@ fails late at the price fetch, and `_start_manual_run`'s `ensure_symbols` has
 already written the typo into the typeahead cache for good. Any new surface
 that starts a run owes the same gate.
 
+**The backfill ledger must agree with what the writer stamps.** The sweep in
+`scheduler_service._backfill_missed_sessions` decides a session was never
+analysed by counting predictions that target it. Two correct rules made that
+count unsatisfiable and the sweep ran one session 109 times over 2026-09-02..04
+(~190s and a full LLM bill each): `store_prediction` deliberately preserves an
+existing row's owner across a rerun, and the ledger counted only rows owned by
+the job -- so a session whose rows predate the job having an owner keeps
+`owner_uid IS NULL` for ever and the count stays zero however many times it is
+re-run. The ledger now counts a NULL owner as the job's, the same legacy rule
+`cache_service._visible` and `_by_run_kind` read. Independently,
+`_BACKFILL_ATTEMPTED` caps the sweep at one run per date per process: any
+future disagreement between the writer and the ledger costs one run and a loud
+log line instead of an unbounded bill. Pinned by `tests/test_backfill_loop.py`.
+Anything that adds a filter to that count owes both halves.
+
+**A safety net that is never exercised is not a safety net.** The same
+incident: OpenAI ran out of credits, the recommendations synthesis fell back
+to Anthropic exactly as designed, and the fallback died on
+`Messages.create() got an unexpected keyword argument 'temperature'` -- the
+image had resolved a different `anthropic` than the dev environment, because
+`requirements.txt` pinned only `>=0.34.0`. The SDK is pinned now, and
+`llm_service.generate` drops sampling parameters and re-asks when the SDK
+rejects them: a preference must never cost the answer.
+
+**Web research is off for a backtest, and the path says so.** The rule had
+two witnesses and neither was on the wire: `modals.preset_run_tools` drops
+the tool for a past target and `apply_run_preset` rewrites the control when
+the date picker moves, but both are DEFAULTS. The confirm records the
+checklist verbatim, so a box ticked before the date was moved back reached
+`config["tools"]` intact, and a retry, a stored run row or a saved schedule
+whose target has since gone by copies that config forward. The gate now
+lives in `analysis_runner.run_predictions`, beside `is_backtest`, where
+every surface's tools meet; both readers of the switch (the prefetch pool
+and `trading_agents_model`, which takes the same list through
+`run_report_for_symbol`) see the stripped set. Pinned by
+`TestTheBacktestRuleIsEnforcedOnThePath` in `tests/test_investigation_stage.py`.
+Any new web-backed tool owes the same treatment: a form default is not an
+invariant on a platform that measures alpha out of backtests.
+
 **The open-web bound has to be cross-process.** A manual run's model stage is
 a forked background-callback subprocess (dash's `DiskcacheManager` forks per
 invocation), so a `threading.Semaphore` in the web process bounds one run's
@@ -232,10 +271,15 @@ the dates, the count and the total alike.
   -p no:cacheprovider
 ```
 
-887 passing at the close of this work, plus three failures that predate it and
-are not this branch's: `test_confidence_weighted_score` in
-`test_ensemble_methods.py`, and two timezone tests in
-`test_scheduler_run_bookkeeping.py`.
+903 passing at the close of this work, plus one failure that predates it and
+is not this branch's: `test_confidence_weighted_score` in
+`test_ensemble_methods.py`. The two `test_scheduler_run_bookkeeping.py`
+failures were not timezone bugs at all -- the fixture seeded an analysis job
+with no `lookback`/`max_articles`, which `_build_command` has refused since
+14535fe, so both tests asserted an error status instead of guarding the
+finalize block they were written for. They also stubbed `subprocess.run`
+after `run_job` had moved to `Popen`, so repairing the params made them spawn
+the real CLI. Both fixed; they guard the finalize again.
 
 Importing `app` proves nothing about a callback body. Boot the app
 (`PORT=8082 DEBUG=false python app.py`) and POST `/_dash-update-component`

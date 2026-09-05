@@ -290,7 +290,16 @@ def _sync_lock(function: str, subject: str) -> threading.Lock:
 def _fresh_reason(previous: Optional[dict], max_age_days: float
                   ) -> Optional[str]:
     """Why the stored copy still answers, or None when it does not. A failed
-    attempt is not freshness, however recent it is."""
+    attempt is not freshness, however recent it is.
+
+    Deliberately NO cool-down after a failure: the next caller tries again.
+    A subject here is one SYMBOL, so a run's 20 symbols are 20 independent
+    subjects and a retry costs exactly what the first attempt would have --
+    the shared token bucket, not this function, is what bounds pressure on
+    the vendor. Suppressing retries would instead mean a throttle early in
+    a run silently costs later runs their evidence block. Pinned by
+    test_a_throttle_is_reported_not_raised_and_is_retried_next_time.
+    """
     if not previous or not previous["ok"]:
         return None
     age = _age_days(previous["last_fetched_at"])
@@ -762,7 +771,7 @@ def matchable_alias(alias: Optional[str]) -> bool:
     """Whether an alias is specific enough to match against running prose.
 
     It needs two tokens of at least two characters. That is not fussiness:
-    the vendor stores initial forms, and the roster's 1,144 members put 69
+    the vendor stores initial forms, and the roster's 1,144 members put 70
     aliases beginning with the bare article "a" into the table ("a green",
     "a gray", "a king"). Scanned over article text those match ordinary
     English -- "regulators gave the deal a green light" would name Al Green
@@ -770,8 +779,8 @@ def matchable_alias(alias: Optional[str]) -> bool:
     prompt then asserts it as fact. A bare surname is dropped for the
     milder version of the same reason: "Kelly said" identifies nobody.
 
-    Measured on the live roster: 2,153 of 3,246 aliases survive this and no
-    member loses every alias they have.
+    Measured on the live roster (re-checked 2026-09-04): 2,153 of 3,278
+    distinct aliases survive this and no member loses every alias they have.
     """
     return sum(1 for token in (alias or "").split() if len(token) >= 2) >= 2
 

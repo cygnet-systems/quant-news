@@ -100,6 +100,38 @@ _KEY_LOCKS: dict[tuple, threading.Lock] = {}
 _ANSWER_CACHE: dict[tuple, dict] = {}
 _ANSWER_LOCKS: dict[tuple, threading.Lock] = {}
 
+# Both caches are keyed by (symbol, as_of, ...), so every run of every day
+# adds entries that nothing can ever hit again -- yesterday's as_of is not
+# coming back. Unbounded, they are a slow leak in the one process that must
+# not leak: the scheduler shares the web process, and this container has
+# already died of memory three times (2026-09-02). The caps are generous
+# next to one run's working set (a 20-symbol watchlist is 20 investigations
+# and at most 80 answers) so a run never evicts its own entries mid-flight,
+# and small next to the process lifetime.
+_MAX_CACHE = 512
+_MAX_ANSWERS = 2048
+
+
+def _evict(cache: dict, locks: dict, cap: int) -> None:
+    """Trim ``cache`` to ``cap``, oldest insertion first, and drop the locks
+    that go with the evicted keys.
+
+    Call under ``_CACHE_LOCK``. Insertion order is dict order; a plain FIFO
+    rather than an LRU because the key carries an as_of and the access
+    pattern is one run's worth of one date, not a long tail of re-reads.
+    A lock that is currently HELD is kept: dropping it would let a second
+    thread take a fresh lock for the same key and pay for the same search
+    the holder is already running.
+    """
+    excess = len(cache) - cap
+    if excess <= 0:
+        return
+    for key in list(cache)[:excess]:
+        cache.pop(key, None)
+        lock = locks.get(key)
+        if lock is not None and not lock.locked():
+            locks.pop(key, None)
+
 # A run-level ceiling on question research, claimed here and opened by
 # whoever starts a run. The per-symbol cap alone does not bound a run:
 # three questions on each of a 20-symbol watchlist is 60 more web-search
@@ -364,6 +396,7 @@ def investigate(
                                    f"supplied evidence; web research not spent")
             with _CACHE_LOCK:
                 _CACHE[key] = skipped
+            _evict(_CACHE, _KEY_LOCKS, _MAX_CACHE)
             return skipped
     with key_lock:
         with _CACHE_LOCK:
@@ -385,6 +418,7 @@ def investigate(
                                 web=web, parse_ok=False, error=str(e)[:300])
         with _CACHE_LOCK:
             _CACHE[key] = inv
+            _evict(_CACHE, _KEY_LOCKS, _MAX_CACHE)
     if inv.error:
         raise RuntimeError(inv.error)
     return inv
@@ -675,6 +709,7 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
                 cached = _answer(question, error=str(e)[:200], parse_ok=False)
             with _CACHE_LOCK:
                 _ANSWER_CACHE[key] = cached
+                _evict(_ANSWER_CACHE, _ANSWER_LOCKS, _MAX_ANSWERS)
             return cached
 
     if len(asked) == 1:
