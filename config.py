@@ -521,6 +521,26 @@ WEB_SEARCH_PRICING: Final[dict[str, float]] = {
 }
 WEB_SEARCH_PRICING_VERIFIED_ON: Final[str] = "2026-09-05 (openai rate UNVERIFIED)"
 
+# The most one run may spend before it stops buying model calls. A cause-
+# independent ceiling: the 2026-09-02..05 runaway cost roughly $20 through a
+# bug nobody had thought of, and no amount of fixing that particular bug
+# bounds the next one. A healthy 20-symbol run costs about $0.90 all-in, so
+# $1.00 is deliberately close: it caps the blast radius of one run without
+# room for a run to quietly double.
+#
+# NOTE what this does and does not do. It bounds ONE run. It does not bound a
+# day, so a scheduler that starts runs in a loop can still spend the ceiling
+# many times over -- that specific hole is closed separately by
+# scheduler_service._BACKFILL_ATTEMPTED. Set DAILY_SPEND_CEILING_USD above 0
+# to add the second bound.
+RUN_SPEND_CEILING_USD: Final[float] = float(
+    os.getenv("RUN_SPEND_CEILING_USD", "1.00"))
+# Off by default: a day-wide kill switch that trips at 07:05 takes the
+# morning report with it, and that is a decision to make deliberately rather
+# than inherit. Any value above 0 arms it.
+DAILY_SPEND_CEILING_USD: Final[float] = float(
+    os.getenv("DAILY_SPEND_CEILING_USD", "0"))
+
 
 def get_web_search_rate(provider: str | None) -> float | None:
     """$/1000 server-side searches, or None when the provider is unpriced."""

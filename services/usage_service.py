@@ -22,6 +22,7 @@ label into the models it fans out. A stage that forgets this records as
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -77,6 +78,82 @@ def compute_cost(model: str | None, input_tokens: int,
         return None, in_rate, out_rate
     cost = (input_tokens / 1_000_000) * in_rate + (output_tokens / 1_000_000) * out_rate
     return round(cost, 6), in_rate, out_rate
+
+
+class SpendCeilingReached(RuntimeError):
+    """Raised instead of buying another model call once a run is over budget.
+
+    A RuntimeError rather than a new base: every caller of ``generate`` already
+    treats an exception as "this block is unavailable" and degrades, which is
+    exactly the behaviour wanted here. The run finishes and says what it could
+    not afford, rather than dying or silently spending on.
+    """
+
+
+# Spend per run, accumulated in this process as rows are written. Deliberately
+# not a query: the check runs before every model call, and a database round
+# trip per call would tax the healthy path to police the pathological one.
+# A run's model stage is one forked subprocess, so per-process is per-run in
+# practice; a restart resets it, which fails OPEN (a resumed run gets a fresh
+# budget) because a ceiling that strands a half-finished run is worse than
+# one that occasionally allows a second.
+_SPENT: dict[str, float] = {}
+_SPENT_LOCK = threading.Lock()
+
+
+def spent_on_run(run_id: str | None) -> float:
+    """Dollars this process has recorded against ``run_id`` (tokens + tools)."""
+    if not run_id:
+        return 0.0
+    with _SPENT_LOCK:
+        return _SPENT.get(run_id, 0.0)
+
+
+def _accrue(run_id: str | None, amount: float) -> None:
+    if not run_id or not amount:
+        return
+    with _SPENT_LOCK:
+        _SPENT[run_id] = _SPENT.get(run_id, 0.0) + amount
+
+
+def reset_run_spend(run_id: str | None = None) -> None:
+    """Forget accumulated spend, for one run or all. Tests and run start."""
+    with _SPENT_LOCK:
+        if run_id is None:
+            _SPENT.clear()
+        else:
+            _SPENT.pop(run_id, None)
+
+
+def check_spend_ceiling(stage: str = "") -> None:
+    """Raise ``SpendCeilingReached`` when the current run is over budget.
+
+    Called before a model call, never after: the point is not to spend the
+    money. Never raises anything else -- a telemetry fault must not be able
+    to stop a run that is within budget.
+    """
+    try:
+        from config import RUN_SPEND_CEILING_USD
+        from services import progress_service as prog
+
+        ceiling = float(RUN_SPEND_CEILING_USD or 0)
+        if ceiling <= 0:
+            return
+        run_id = prog.current_run_id()
+        spent = spent_on_run(run_id)
+        if spent < ceiling:
+            return
+    except SpendCeilingReached:
+        raise
+    except Exception as e:
+        logger.debug(f"spend ceiling check skipped: {e}")
+        return
+    logger.error(
+        "run %s has spent $%.2f, at or over the $%.2f ceiling: refusing "
+        "further model calls%s. Raise RUN_SPEND_CEILING_USD to allow more.",
+        run_id, spent, ceiling, f" for {stage}" if stage else "")
+    raise SpendCeilingReached(
+        f"run spend ${spent:.2f} reached the ${ceiling:.2f} ceiling")
 
 
 def compute_tool_cost(provider: str | None,
@@ -156,6 +233,7 @@ def record(
             )
             session.add(row)
             session.flush()
+            _accrue(run_id, (cost or 0.0) + (tool_cost or 0.0))
             return row.id
     except Exception as e:
         logger.debug(f"usage telemetry write failed: {e}")

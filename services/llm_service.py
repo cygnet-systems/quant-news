@@ -338,6 +338,11 @@ class LLMService:
         if not use_model:
             use_model = _DEFAULT_MODELS.get(use_provider, "")
 
+        # Before the first token is bought, not after: a ceiling that
+        # reports overspend is an invoice, not a limit.
+        from services import usage_service as _usage_svc
+        _usage_svc.check_spend_ceiling(stage=f"{use_provider}/{use_model}")
+
         import time as _time
         _call_t0 = _time.time()
 
@@ -632,6 +637,10 @@ class LLMService:
         tool. Both do the browsing on the provider's side.
         """
         use_model = model or MODEL.INVESTIGATION_MODEL
+        # Checked here rather than only in the per-provider helpers so both
+        # the OpenAI and Anthropic search paths are covered by one gate.
+        from services import usage_service as _usage_svc
+        _usage_svc.check_spend_ceiling(stage=f"web_search/{use_model}")
         if use_model.startswith("gpt-"):
             return self._web_search_openai(
                 prompt, system_prompt, model=use_model, max_tokens=max_tokens,
