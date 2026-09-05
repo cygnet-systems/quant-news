@@ -31,6 +31,17 @@ def _rejects_sampling_params(model: str) -> bool:
     return any(model.startswith(p) for p in _NO_SAMPLING_PARAMS)
 
 
+# OpenAI model families that took `max_tokens` away in favour of
+# `max_completion_tokens`: the whole gpt-5 line and the o-series reasoners.
+# Sending the old name is a hard 400, so the choice belongs to the MODEL.
+_COMPLETION_TOKEN_MODELS = ("gpt-5", "o1", "o3", "o4")
+
+
+def _uses_completion_tokens(model: str) -> bool:
+    """True if `model` wants max_completion_tokens rather than max_tokens."""
+    return any(model.startswith(p) for p in _COMPLETION_TOKEN_MODELS)
+
+
 def _first_text(response) -> Optional[str]:
     """Extract the first text block, skipping thinking blocks."""
     for block in response.content:
@@ -390,7 +401,29 @@ class LLMService:
                         }
 
                 _begin_attempt("anthropic", use_model, api_kwargs)
-                response = use_client.messages.create(**api_kwargs)
+                try:
+                    response = use_client.messages.create(**api_kwargs)
+                except TypeError as e:
+                    # The SDK, not the API, rejected a parameter: an installed
+                    # anthropic version whose messages.create() has no such
+                    # keyword. This is the fallback path's own failure mode --
+                    # on 2026-09-04 the OpenAI account ran out of credits, the
+                    # recommendations synthesis fell back to Anthropic exactly
+                    # as designed, and the fallback died on
+                    # "Messages.create() got an unexpected keyword argument
+                    # 'temperature'", losing the whole day's synthesis to the
+                    # safety net rather than to the outage. Sampling params are
+                    # a preference; the answer is not. Drop them and re-ask.
+                    dropped = [k for k in ("temperature", "top_p", "top_k")
+                               if k in api_kwargs]
+                    if not dropped or "unexpected keyword" not in str(e):
+                        raise
+                    logger.warning(
+                        "anthropic SDK rejected %s (%s); retrying without "
+                        "sampling parameters", ", ".join(dropped), e)
+                    for k in dropped:
+                        api_kwargs.pop(k, None)
+                    response = use_client.messages.create(**api_kwargs)
                 if getattr(response, "stop_reason", None) == "max_tokens":
                     # Truncation was previously silent; on report prompts the
                     # decision footer is the first casualty, so make it loud.
@@ -414,18 +447,28 @@ class LLMService:
                 "model": use_model,
                 "messages": messages,
             }
-            is_reasoning = bool(kwargs.get("reasoning_effort") and use_provider == "openai")
-            if is_reasoning:
+            # Which token parameter this model accepts is a property of the
+            # MODEL, not of whether this particular caller asked for an
+            # effort. Keying it off reasoning_effort meant every gpt-5.6-luna
+            # call that did not pass one sent `max_tokens` and took a hard
+            # 400 ("Unsupported parameter: 'max_tokens' is not supported with
+            # this model"). That was invisible while the account was out of
+            # credits -- the 429 came first -- and surfaced the moment
+            # billing was restored on 2026-09-04.
+            effort = kwargs.get("reasoning_effort") if use_provider == "openai" else None
+            if _uses_completion_tokens(use_model) or effort:
                 # Reasoning models spend completion budget on reasoning FIRST.
                 # max_completion_tokens == desired content size returns HTTP 200
                 # with EMPTY content once reasoning eats the budget, give
                 # headroom on top of the requested content size.
-                effort = kwargs["reasoning_effort"]
                 if effort == "max":
                     effort = "high"
                 headroom = {"low": 2, "medium": 4, "high": 8}.get(effort, 4)
                 api_kwargs["max_completion_tokens"] = max(max_tokens * headroom, 16000)
-                api_kwargs["reasoning_effort"] = effort
+                if effort:
+                    api_kwargs["reasoning_effort"] = effort
+                # These models reject temperature the same way they reject
+                # max_tokens, so it is not sent here either.
             else:
                 api_kwargs["max_tokens"] = max_tokens
                 api_kwargs["temperature"] = temperature
@@ -451,7 +494,10 @@ class LLMService:
 
             # Empty content despite HTTP 200 = reasoning consumed the budget.
             # Retry once at low effort with a large budget rather than failing.
-            if is_reasoning and not (content or "").strip():
+            # Keyed on the request actually built the reasoning way, which is
+            # what "the budget was spent thinking" means; a caller that passed
+            # no effort can still be on a model that reasons by default.
+            if "max_completion_tokens" in api_kwargs and not (content or "").strip():
                 finish = getattr(response.choices[0], "finish_reason", "?")
                 logger.warning(
                     f"Reasoning model returned empty content (finish_reason={finish}): "
@@ -459,7 +505,8 @@ class LLMService:
                 )
                 # The empty answer is itself evidence, keep its row.
                 _trace(content, error=f"empty content (finish_reason={finish})")
-                api_kwargs["reasoning_effort"] = "low"
+                if "reasoning_effort" in api_kwargs:
+                    api_kwargs["reasoning_effort"] = "low"
                 api_kwargs["max_completion_tokens"] = max(max_tokens * 4, 20000)
                 _begin_attempt(use_provider, use_model, api_kwargs)
                 response = use_client.chat.completions.create(**api_kwargs)

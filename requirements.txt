@@ -31,7 +31,13 @@ ta>=0.11.0
 # LLM Integration
 openai>=1.12.0
 # Anthropic fallback provider (lazy-imported in llm_service; was undeclared)
-anthropic>=0.34.0
+# Pinned below 1.0: the 1.x line moves to httpx2 and drops
+# deprecated parameters. An unpinned >=0.34.0 meant the image
+# resolved to whatever was newest at build time, so prod and the
+# dev environment ran different SDKs -- prod's messages.create()
+# rejected `temperature` while 0.85 accepted it, and the
+# recommendations fallback died on it (2026-09-04).
+anthropic>=0.85.0,<1.0
 
 # Configuration
 python-dotenv>=1.0.0
