@@ -21,6 +21,7 @@ cutoff survives a run being re-executed or topped up one symbol at a time.
 """
 
 import dash_bootstrap_components as dbc
+import re
 from dash import dcc, html
 
 from layouts.formatters import MODEL_DISPLAY
@@ -29,46 +30,89 @@ from layouts.report_view import build_report_view
 DECISION_CLASS = {"BUY": "positive", "SELL": "negative", "HOLD": "neutral"}
 
 
-def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
+_LEVEL_RE = re.compile(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)")
+
+
+def exit_level(pred: dict, row: dict | None = None) -> str:
+    """The level that kills the call, as "out below $148.25".
+
+    For a BUY the exit is the published move-to-sell trigger, for a SELL the
+    reassess-to-buy trigger; the synthesis's own change_trigger is read
+    first, then the research report's triggers off the same row. A HOLD
+    shows the synthesis's key level as "watch". Empty when nothing on the
+    row names a price, never a level invented from elsewhere.
+    """
+    decision = (pred.get("decision") or "").upper()
+    levels = dict(pred.get("levels") or {})
+    ta = ((row or {}).get("models") or {}).get("trading_agents") or {}
+    for k, v in (ta.get("levels") or {}).items():
+        levels.setdefault(k, v)
+    if decision == "BUY":
+        texts = [levels.get("change_trigger"), levels.get("move_to_sell")]
+        word = "out below"
+    elif decision == "SELL":
+        texts = [levels.get("change_trigger"), levels.get("reassess_to_buy")]
+        word = "out above"
+    else:
+        texts = [levels.get("key_level"), levels.get("change_trigger")]
+        word = "watch"
+    for text in texts:
+        m = _LEVEL_RE.search(str(text or ""))
+        if m:
+            return f"{word} ${m.group(1)}"
+    return ""
+
+
+def _decision_chip(pred: dict, compact: bool = True,
+                   row: dict | None = None) -> html.Span:
+    """The call as a reader acts on it: the action, the level that kills it,
+    and a record badge only when the platform's own scored history says
+    calls at this score have an edge or are fading.
+
+    No probabilities. The old chip printed the calibrated hit rate as a bare
+    "48%", which read as the model's confidence and, at n≈130 around 50%,
+    carried no information anyway. The numbers stay in the tooltip.
+    """
     if not pred:
         return html.Span("no call", className="home-chip home-chip-none")
     decision = (pred.get("decision") or "HOLD").upper()
     raw_conf = pred.get("confidence")
-    label = decision if compact else f"{decision}"
-
-    # Raw model confidence is anti-calibrated on this platform and is never
-    # shown. The badge is the CALIBRATED value. What this raw confidence has
-    # historically meant for this model, or nothing when the model lacks
-    # enough evaluated history to earn a number.
-    cal = None
+    record = None
     try:
-        from services.calibration_service import calibrate
-        cal = calibrate(pred.get("model_name", ""), raw_conf)
+        from services.calibration_service import record_state
+        record = record_state(pred.get("model_name", ""), raw_conf)
     except Exception:
-        cal = None
+        record = None
 
     made = pred.get("prediction_date")
     target = pred.get("target_date")
     title = decision
-    if cal is not None:
-        title += (f": calls like this one have been right {cal:.0%} of the "
-                  f"time (calibrated from evaluated history; model claimed "
-                  f"{raw_conf:.0%})")
+    if record:
+        title += (f": calls at this score have resolved right "
+                  f"{record['rate']:.0%} of the time over {record['n']} scored "
+                  f"calls"
+                  + (", not distinguishable from a coin flip"
+                     if record["state"] == "coin flip" else
+                     ", a measured edge" if record["state"] == "edge" else
+                     ", a measured deficit: the record argues against this "
+                     "score"))
     elif raw_conf is not None:
-        title += (f": model claims {raw_conf:.0%}, but has too little "
-                  f"evaluated history to calibrate; treat as unsized")
+        title += ": too little scored history at this score to say how such calls resolve"
     if made:
-        title += f": made with data through {made}"
+        title += f". Made with data through {made}"
     if target:
         title += f", predicting the {target} close"
+    level = exit_level(pred, row)
+    if level:
+        title += f". Exit: {level}"
+    children = [html.Span(decision, className="home-chip-decision")]
+    if level:
+        children.append(html.Span(level, className="home-chip-level num"))
+    if record and record["state"] in ("edge", "fading"):
+        children.append(html.Span(record["state"],
+                                  className=f"home-chip-badge home-chip-badge-{record['state']}"))
     return html.Span(
-        [
-            html.Span(label, className="home-chip-decision"),
-            # "48%" alone read as the model's confidence; it is the share
-            # of past calls at this score that were right.
-            html.Span(f"{cal:.0%} hit", className="home-chip-conf num")
-            if cal is not None else "",
-        ],
+        children,
         className=f"home-chip home-chip-{DECISION_CLASS.get(decision, 'neutral')}",
         title=title,
     )
@@ -404,7 +448,7 @@ def symbol_row(row: dict, models: list[str], extra_cells: list | None = None,
                     className="num"),
         ]
         + [html.Td(_decision_chip(row["models"].get(m))) for m in models]
-        + [html.Td(_decision_chip(row.get("synthesis"))),
+        + [html.Td(_decision_chip(row.get("synthesis"), row=row)),
            _resolution_cell(row)]
         + list(extra_cells or []),
         **tr_props,
@@ -440,7 +484,7 @@ def _majority_chip(models: dict) -> html.Span | None:
 
 def _call_cell(row: dict) -> html.Td:
     if row.get("synthesis"):
-        return html.Td(_decision_chip(row["synthesis"]), className="home-call")
+        return html.Td(_decision_chip(row["synthesis"], row=row), className="home-call")
     chip = _majority_chip(row.get("models") or {})
     return html.Td(chip or html.Span("no call", className="home-chip home-chip-none"),
                    className="home-call")
@@ -469,9 +513,11 @@ def _result_label(row: dict, summary: dict) -> tuple[str, str]:
 def scheduled_headers() -> list:
     return [
         html.Th("Symbol"),
-        html.Th("Call", title="The synthesis verdict with its calibrated "
-                              "confidence, or the models' majority when no "
-                              "synthesis was stored"),
+        html.Th("Call", title="The run's action, the level that kills it, "
+                              "and a record badge only when scored history "
+                              "shows an edge or a deficit at this score; "
+                              "the models' majority when no synthesis was "
+                              "stored"),
         html.Th("Actual", title="The target session's close and its move "
                                 "against the previous close"),
         html.Th("Result", title="Whether the call shown was right"),
@@ -759,20 +805,15 @@ def _rolling(rolling: list[dict], days: int) -> html.Div:
 def report_verdict_text(report: dict, action: str | None) -> tuple[str, str]:
     """What the report line says about the research report, and its tooltip.
 
-    The line used to print ``decision + confidence`` where ``confidence``
-    is the model layer's track-record weight (0.5 until a model has earned
-    one), so every unrated report read "BUY 50%" under a chip that said
-    "BUY 48%": two actions, two numbers, neither explained. Now: the chip
-    is the run's action, this line is the report behind it. The report's
-    decision is spelled out only when it differs from the action (the HOLD
-    rule held it back), and the number is the report's own conviction,
-    never the weight.
+    The chip is the run's action; this line is the report behind it. The
+    report's decision is spelled out only when it differs from the action
+    (the HOLD rule held it back). No numbers: the line used to print the
+    track-record weight as "BUY 50%", then the report's stated conviction,
+    and neither helped a reader next to the chip. The conviction is defined
+    and shown inside the report's Verdict block.
     """
     decision = (report.get("decision") or "?").upper()
     action = (action or "").upper()
-    conviction = report.get("stated_conviction")
-    conv = (f"conviction {conviction:.2f}"
-            if isinstance(conviction, (int, float)) else "")
     if action and decision != action:
         text = f"report said {decision}"
         title = (f"The research report called {decision}; the run's action "
@@ -785,11 +826,11 @@ def report_verdict_text(report: dict, action: str | None) -> tuple[str, str]:
     else:
         text = f"report {decision}"
         title = "The research report's own verdict; no run action recorded."
-    if conv:
-        text += f" · {conv}"
-        title += (f" Conviction {conviction:.2f} is the report's own stated "
-                  f"probability that its direction is right, not a measured "
-                  f"hit rate.")
+    conviction = report.get("stated_conviction")
+    if isinstance(conviction, (int, float)):
+        title += (f" Its stated conviction was {conviction:.2f}, the report's "
+                  f"own probability that its direction is right, not a "
+                  f"measured hit rate.")
     return text, title
 
 
@@ -828,7 +869,7 @@ def _symbol_row(row: dict, report: dict | None, active: bool,
                     html.Span(sym, className="home-sym-name"),
                     html.Span(f"{prev:.2f}" if prev is not None else "",
                               className="num home-sym-close"),
-                    _decision_chip(row.get("synthesis")),
+                    _decision_chip(row.get("synthesis"), row=row),
                 ],
                 id={"type": "home-sym-btn", "symbol": sym},
                 className="home-sym-head",

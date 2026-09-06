@@ -3956,6 +3956,20 @@ body {
 
 .home-chip-conf { color: var(--text-muted); font-size: var(--text-2xs); }
 
+.home-chip-level { color: var(--text-muted); font-size: var(--text-2xs); font-weight: 500; }
+
+.home-chip-badge {
+    font-size: var(--text-2xs);
+    padding: 0 4px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.home-chip-badge-edge { color: var(--positive); background: rgba(0, 200, 5, 0.14); }
+
+.home-chip-badge-fading { color: var(--warning, #e5a50a); background: rgba(229, 165, 10, 0.16); }
+
 .home-chip-positive { color: var(--positive); background: rgba(0, 200, 5, 0.08); }
 
 .home-chip-negative { color: var(--negative); background: rgba(255, 80, 0, 0.08); }

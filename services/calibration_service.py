@@ -41,6 +41,9 @@ class _ModelFit:
     n: int = 0
     # Step function: sorted list of (raw_threshold, calibrated_value).
     steps: list[tuple[float, float]] = field(default_factory=list)
+    # The same knots with the number of scored calls pooled into each:
+    # (raw_threshold, calibrated_value, count). What record_state reads.
+    bins: list[tuple[float, float, int]] = field(default_factory=list)
     base_rate: Optional[float] = None
 
 
@@ -107,6 +110,20 @@ def _pav(pairs: list[tuple[float, float]]) -> list[tuple[float, float]]:
     return [(b[2], b[0] / b[1]) for b in blocks]
 
 
+def _pav_bins(pairs: list[tuple[float, float]]) -> list[tuple[float, float, int]]:
+    """_pav with the pooled count kept on each knot."""
+    pairs = sorted(pairs, key=lambda p: p[0])
+    blocks: list[list[float]] = []
+    for x, y in pairs:
+        blocks.append([y, 1, x])
+        while len(blocks) > 1 and (blocks[-2][0] / blocks[-2][1]
+                                   > blocks[-1][0] / blocks[-1][1]):
+            y2, n2, x2 = blocks.pop()
+            blocks[-1][0] += y2
+            blocks[-1][1] += n2
+    return [(b[2], b[0] / b[1], int(b[1])) for b in blocks]
+
+
 def _fit_all(as_of: Optional[str] = None) -> dict[str, _ModelFit]:
     """Isotonic fits per model. ``as_of`` bounds the outcomes used (by
     target_date, the session whose close resolved the call) so a backtest
@@ -131,7 +148,8 @@ def _fit_all(as_of: Optional[str] = None) -> dict[str, _ModelFit]:
     for model, pairs in by_model.items():
         fit = _ModelFit(n=len(pairs))
         if len(pairs) >= MIN_SAMPLES:
-            fit.steps = _pav(pairs)
+            fit.bins = _pav_bins(pairs)
+            fit.steps = [(x, v) for x, v, _ in fit.bins]
             fit.base_rate = sum(y for _, y in pairs) / len(pairs)
         fits[model] = fit
     return fits
@@ -197,6 +215,45 @@ def calibrate(model_name: str, raw_confidence: Optional[float],
         else:
             break
     return round(value, 3)
+
+
+# A record badge is shown only when the measured hit rate at a score is
+# distinguishable from a coin flip: more than RECORD_SIGMAS standard errors
+# from 50% over at least RECORD_MIN_CALLS scored calls. "48% over 133" is
+# noise around 50% and earns no badge; a digit there read as a confidence.
+RECORD_MIN_CALLS = 50
+RECORD_SIGMAS = 2.0
+
+
+def record_state(model_name: str, raw_confidence: Optional[float],
+                 as_of: Optional[str] = None) -> Optional[dict]:
+    """How calls at this score have actually resolved, as a state.
+
+    ``{"state": "edge"|"fading"|"coin flip", "rate": float, "n": int}``,
+    or None when no fit exists (fewer than MIN_SAMPLES scored calls for the
+    model, or no score). "edge" and "fading" are the only states worth a
+    badge; "coin flip" is the honest default and carries the numbers for
+    a tooltip.
+    """
+    if raw_confidence is None:
+        return None
+    fit = _fits_for(as_of).get(model_name)
+    if fit is None or not fit.bins:
+        return None
+    rate, n = fit.bins[0][1], fit.bins[0][2]
+    for threshold, calibrated, count in fit.bins:
+        if raw_confidence >= threshold:
+            rate, n = calibrated, count
+        else:
+            break
+    state = "coin flip"
+    if n >= RECORD_MIN_CALLS:
+        se = (0.25 / n) ** 0.5
+        if rate - 0.5 > RECORD_SIGMAS * se:
+            state = "edge"
+        elif 0.5 - rate > RECORD_SIGMAS * se:
+            state = "fading"
+    return {"state": state, "rate": round(rate, 3), "n": int(n)}
 
 
 _hit_cache: dict[tuple[str, int], tuple[float, Optional[float]]] = {}

@@ -72,6 +72,30 @@ def _parse_topics(topics_json) -> list:
     return []
 
 
+_LEVEL_KEYS = ("key_level", "change_trigger", "reassess_to_buy", "move_to_sell")
+
+
+def _levels_of(details) -> dict:
+    """The few short strings a row needs to show the level that kills the
+    call, without dragging the whole details payload (feature values, the
+    report text) through the session. The synthesis row carries key_level
+    and change_trigger; the research row carries its published triggers."""
+    if not isinstance(details, dict):
+        return {}
+    out = {}
+    for k in ("key_level", "change_trigger"):
+        v = details.get(k)
+        if v:
+            out[k] = str(v)[:160]
+    trig = details.get("triggers")
+    if isinstance(trig, dict):
+        for k in ("reassess_to_buy", "move_to_sell"):
+            v = trig.get(k)
+            if v:
+                out[k] = str(v)[:160]
+    return out
+
+
 def _pred_to_dict(r, include_details: bool = False) -> dict:
     """Serialize a ModelPrediction row for the UI.
 
@@ -103,6 +127,7 @@ def _pred_to_dict(r, include_details: bool = False) -> dict:
         # rebuild exactly those inputs (None = predates the stamp).
         "news_window_days": ((r.details_json or {}).get("news_window_days")
                              if isinstance(r.details_json, dict) else None),
+        "levels": _levels_of(r.details_json),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "evaluated_at": r.evaluated_at.isoformat() if r.evaluated_at else None,
     }
@@ -2134,6 +2159,7 @@ class CacheService:
                     "model_version": r.model_version,
                     "duration_ms": r.duration_ms,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "levels": _levels_of(r.details_json),
                 }
                 for r in rows
             ]

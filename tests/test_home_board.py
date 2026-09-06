@@ -836,35 +836,77 @@ class TestWiring:
             app_module.track_home_tab(None, "scheduled")
 
 
+class TestTheChipIsActionLevelAndRecord:
+    """The chip shows the action and the level that kills it. A record
+    badge appears only when scored history at this score is distinguishable
+    from a coin flip; the numbers live in the tooltip. Probabilities on the
+    row (a bare "48%", a "conviction 0.55") read as confidence and were
+    dropped."""
+
+    def _chip(self, monkeypatch, record, levels=None, row=None, decision="BUY"):
+        monkeypatch.setattr("services.calibration_service.record_state",
+                            lambda *_a, **_k: record)
+        p = pred(model="recommendation_synthesis", decision=decision)
+        if levels is not None:
+            p["levels"] = levels
+        return home._decision_chip(p, row=row)
+
+    def test_a_coin_flip_record_shows_no_number(self, monkeypatch):
+        chip = self._chip(monkeypatch, {"state": "coin flip", "rate": 0.48, "n": 133})
+        assert _text(chip) == "BUY"
+        assert "48% of the time over 133" in chip.title
+        assert "not distinguishable from a coin flip" in chip.title
+
+    def test_an_edge_or_a_deficit_earns_a_word_not_a_digit(self, monkeypatch):
+        chip = self._chip(monkeypatch, {"state": "edge", "rate": 0.61, "n": 140})
+        assert _text(chip).split() == ["BUY", "edge"]
+        assert "%" not in _text(chip)
+        chip = self._chip(monkeypatch, {"state": "fading", "rate": 0.39, "n": 90},
+                          decision="SELL")
+        assert _text(chip).split() == ["SELL", "fading"]
+
+    def test_the_exit_level_rides_on_the_chip(self, monkeypatch):
+        chip = self._chip(monkeypatch, None, levels={
+            "change_trigger": "Flip to HOLD if ORCL closes below the 20-day SMA near $148.25"})
+        assert _text(chip) == "BUY out below $148.25"
+        assert "Exit: out below $148.25" in chip.title
+
+    def test_the_research_triggers_fill_in_when_the_synthesis_names_no_price(self, monkeypatch):
+        row_ = row("ORCL", models={"trading_agents": dict(
+            pred(model="trading_agents", decision="SELL"),
+            levels={"reassess_to_buy": "close above 200-day SMA (~$168.00)"})})
+        chip = self._chip(monkeypatch, None, levels={}, row=row_, decision="SELL")
+        assert _text(chip) == "SELL out above $168.00"
+
+    def test_exit_level_never_invents_a_price(self):
+        assert home.exit_level({"decision": "BUY", "levels": {
+            "change_trigger": "a close above resistance on volume"}}) == ""
+        assert home.exit_level({"decision": "HOLD", "levels": {
+            "key_level": "$159.70 resistance"}}) == "watch $159.70"
+
+
 class TestReportLineReadsAsTheReport:
-    """The rail used to print the report's track-record WEIGHT (0.5 until
-    earned) as "BUY 50%" under a chip saying "BUY 48%" (a calibrated hit
-    rate): two actions, two unlike numbers. The chip names its number, the
-    report line names the report and its own conviction."""
+    """The report line names the report behind the chip. It carries no
+    number: not the 0.5 track-record placeholder that read as "BUY 50%",
+    and not the report's stated conviction, which is defined inside the
+    report's own Verdict block."""
 
-    def test_chip_number_is_labelled_as_a_hit_rate(self, monkeypatch):
-        monkeypatch.setattr("services.calibration_service.calibrate",
-                            lambda *_a, **_k: 0.48)
-        chip = home._decision_chip(pred(model="recommendation_synthesis",
-                                        decision="BUY"))
-        assert _text(chip).split() == ["BUY", "48%", "hit"]
-
-    def test_report_line_never_prints_the_weight(self):
+    def test_report_line_carries_no_number(self):
         report = {"id": "r1", "decision": "BUY", "confidence": 0.5,
                   "stated_conviction": 0.61, "trade_date": "2026-09-04"}
         node = home._symbol_row(row("ORCL", synthesis=pred(
             model="recommendation_synthesis", decision="BUY")), report, False)
-        verdict = _text(_find(node, className="home-sym-report-verdict"))
-        assert verdict == "report · conviction 0.61"
-        assert "50%" not in _text(node)
+        verdict = _find(node, className="home-sym-report-verdict")
+        assert _text(verdict) == "report"
+        assert "0.61" in verdict.title and "not a measured hit rate" in verdict.title
+        assert "50%" not in _text(node) and "0.61" not in _text(node)
 
     def test_a_held_back_verdict_is_spelled_out(self):
         report = {"id": "r1", "decision": "SELL", "confidence": 0.5,
                   "stated_conviction": 0.56, "trade_date": "2026-09-04"}
         node = home._symbol_row(row("ORCL", synthesis=pred(
             model="recommendation_synthesis", decision="HOLD")), report, False)
-        verdict = _text(_find(node, className="home-sym-report-verdict"))
-        assert verdict == "report said SELL · conviction 0.56"
+        assert _text(_find(node, className="home-sym-report-verdict")) == "report said SELL"
 
     def test_without_a_run_action_the_report_verdict_stands_alone(self):
         report = {"id": "r1", "decision": "BUY", "confidence": 0.5,
