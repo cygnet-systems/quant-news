@@ -834,3 +834,47 @@ class TestWiring:
             app_module.track_home_tab("session", "session")
         with pytest.raises(PreventUpdate):
             app_module.track_home_tab(None, "scheduled")
+
+
+class TestReportLineReadsAsTheReport:
+    """The rail used to print the report's track-record WEIGHT (0.5 until
+    earned) as "BUY 50%" under a chip saying "BUY 48%" (a calibrated hit
+    rate): two actions, two unlike numbers. The chip names its number, the
+    report line names the report and its own conviction."""
+
+    def test_chip_number_is_labelled_as_a_hit_rate(self, monkeypatch):
+        monkeypatch.setattr("services.calibration_service.calibrate",
+                            lambda *_a, **_k: 0.48)
+        chip = home._decision_chip(pred(model="recommendation_synthesis",
+                                        decision="BUY"))
+        assert _text(chip).split() == ["BUY", "48%", "hit"]
+
+    def test_report_line_never_prints_the_weight(self):
+        report = {"id": "r1", "decision": "BUY", "confidence": 0.5,
+                  "stated_conviction": 0.61, "trade_date": "2026-09-04"}
+        node = home._symbol_row(row("ORCL", synthesis=pred(
+            model="recommendation_synthesis", decision="BUY")), report, False)
+        verdict = _text(_find(node, className="home-sym-report-verdict"))
+        assert verdict == "report · conviction 0.61"
+        assert "50%" not in _text(node)
+
+    def test_a_held_back_verdict_is_spelled_out(self):
+        report = {"id": "r1", "decision": "SELL", "confidence": 0.5,
+                  "stated_conviction": 0.56, "trade_date": "2026-09-04"}
+        node = home._symbol_row(row("ORCL", synthesis=pred(
+            model="recommendation_synthesis", decision="HOLD")), report, False)
+        verdict = _text(_find(node, className="home-sym-report-verdict"))
+        assert verdict == "report said SELL · conviction 0.56"
+
+    def test_without_a_run_action_the_report_verdict_stands_alone(self):
+        report = {"id": "r1", "decision": "BUY", "confidence": 0.5,
+                  "trade_date": "2026-09-04"}
+        node = home._symbol_row(row("ORCL"), report, False)
+        assert _text(_find(node, className="home-sym-report-verdict")) == "report BUY"
+
+    def test_conviction_is_read_off_the_verdict_block(self):
+        from services.cache_service import _stated_conviction
+        head = "## Verdict\nFINAL TRANSACTION PROPOSAL: **SELL**\nCONVICTION: **0.56** (own)"
+        assert _stated_conviction(head) == 0.56
+        assert _stated_conviction("no verdict here") is None
+        assert _stated_conviction(None) is None

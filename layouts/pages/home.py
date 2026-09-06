@@ -64,7 +64,9 @@ def _decision_chip(pred: dict, compact: bool = True) -> html.Span:
     return html.Span(
         [
             html.Span(label, className="home-chip-decision"),
-            html.Span(f"{cal:.0%}", className="home-chip-conf num")
+            # "48%" alone read as the model's confidence; it is the share
+            # of past calls at this score that were right.
+            html.Span(f"{cal:.0%} hit", className="home-chip-conf num")
             if cal is not None else "",
         ],
         className=f"home-chip home-chip-{DECISION_CLASS.get(decision, 'neutral')}",
@@ -754,6 +756,43 @@ def _rolling(rolling: list[dict], days: int) -> html.Div:
     return html.Div(cells, className="home-stat-row")
 
 
+def report_verdict_text(report: dict, action: str | None) -> tuple[str, str]:
+    """What the report line says about the research report, and its tooltip.
+
+    The line used to print ``decision + confidence`` where ``confidence``
+    is the model layer's track-record weight (0.5 until a model has earned
+    one), so every unrated report read "BUY 50%" under a chip that said
+    "BUY 48%": two actions, two numbers, neither explained. Now: the chip
+    is the run's action, this line is the report behind it. The report's
+    decision is spelled out only when it differs from the action (the HOLD
+    rule held it back), and the number is the report's own conviction,
+    never the weight.
+    """
+    decision = (report.get("decision") or "?").upper()
+    action = (action or "").upper()
+    conviction = report.get("stated_conviction")
+    conv = (f"conviction {conviction:.2f}"
+            if isinstance(conviction, (int, float)) else "")
+    if action and decision != action:
+        text = f"report said {decision}"
+        title = (f"The research report called {decision}; the run's action "
+                 f"is {action} (the HOLD rule holds a verdict back when the "
+                 f"independent models mostly disagree and the report lacked "
+                 f"expected evidence).")
+    elif action:
+        text = "report"
+        title = f"The research report behind the {action} call."
+    else:
+        text = f"report {decision}"
+        title = "The research report's own verdict; no run action recorded."
+    if conv:
+        text += f" · {conv}"
+        title += (f" Conviction {conviction:.2f} is the report's own stated "
+                  f"probability that its direction is right, not a measured "
+                  f"hit rate.")
+    return text, title
+
+
 def _symbol_row(row: dict, report: dict | None, active: bool,
                 in_watchlist: bool = True) -> html.Div:
     """One name on the index: the call, the report, and the way in.
@@ -802,15 +841,16 @@ def _symbol_row(row: dict, report: dict | None, active: bool,
     )
 
     if report:
-        conf = report.get("confidence")
+        verdict, verdict_title = report_verdict_text(
+            report, ((row.get("synthesis") or {}).get("decision")))
         report_line = html.Div(
             [
                 html.I(className="bi bi-journal-text home-sym-report-icon"),
                 html.Span(
-                    (report.get("decision") or "?")
-                    + (f" {conf:.0%}" if conf is not None else ""),
+                    verdict,
                     className="home-sym-report-verdict "
                               + DECISION_CLASS.get(report.get("decision"), "neutral"),
+                    title=verdict_title,
                 ),
                 html.Span(report.get("trade_date", ""),
                           className="num home-sym-report-date"),

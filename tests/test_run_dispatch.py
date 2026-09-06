@@ -577,7 +577,10 @@ class TestReportStageProgress:
             investigation_service.begin_research_budget(1)
             with pytest.raises(_Stop):
                 asyncio.run(app_module.generate_ai_analysis(store, {}, None))
-            assert seen["left"] == MODEL.ANOMALY_RESEARCH_BUDGET
+            # One symbol in the run: its own per-symbol ceiling, not a
+            # run-wide 18.
+            assert seen["left"] == investigation_service.research_budget_for(1)
+            assert seen["left"] == MODEL.ANOMALY_RESEARCH_PER_SYMBOL
             # The callback opened its own and left the other run's alone.
             assert investigation_service.research_budget_left() == 1
 

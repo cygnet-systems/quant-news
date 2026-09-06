@@ -43,6 +43,18 @@ from utils.figure_check import check_figures
 AS_OF = "2026-09-02"
 
 
+# These tests exercise the research MECHANICS (budget, caps, failures, the
+# facts reaching the researcher) on a put-tilted chain and an insider
+# cluster. Since the 2026-09-06 spend review an options skew is a flag, not
+# a question the web is asked (anomaly_service.RESEARCHABLE_KINDS); the
+# mechanics are unchanged, so this module lets the skew through.
+@pytest.fixture(autouse=True)
+def _let_the_options_skew_be_researched(monkeypatch):
+    from services import anomaly_service
+    monkeypatch.setattr(anomaly_service, "RESEARCHABLE_KINDS",
+                        anomaly_service.RESEARCHABLE_KINDS | {"options_skew"})
+
+
 @pytest.fixture(autouse=True)
 def no_outside_world(monkeypatch):
     """Every door out of the process except the stubbed LLM."""

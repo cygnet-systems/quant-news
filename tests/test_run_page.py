@@ -396,7 +396,10 @@ class TestLayout:
         assert [b.id["report"] for b in opens] == [
             view["symbols"][0]["report"]["id"], view["symbols"][1]["report"]["id"]]
         assert all(_text(b) == "Open" for b in opens)
-        assert "SELL 55%" in _text(rows[1])
+        # The report line names the report, never the 0.55 track-record
+        # weight; AMD has no synthesis action, so the report's own SELL stands.
+        assert "report SELL" in _text(rows[1])
+        assert "55%" not in _text(rows[1])
         assert "no report" in _text(rows[2])
 
         adds = _buttons(page, "add-symbol")

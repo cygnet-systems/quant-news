@@ -39,12 +39,31 @@ logger = logging.getLogger(__name__)
 # fits a report a person will read to the end.
 MAX_ANOMALIES = 4
 
+# The kinds a web search can answer: something happened that reporting
+# covers (a burst of stories, a gap, a volume shock, executives filing,
+# a member of Congress disclosing, a dated event the chain is positioned
+# around). The rest are our own arithmetic over the chain or the screen;
+# searching "why is ORCL's chain call-tilted" returned "no reporting found"
+# by construction and cost the same as a real lead. Those stay flags with
+# their figures. Lever 1 of the 2026-09-06 spend review.
+RESEARCHABLE_KINDS = frozenset({
+    "news_spike", "price_shock", "volume_shock", "insider_cluster",
+    "congress_activity", "options_term_divergence",
+})
+
+
+def researchable(anomaly: dict) -> bool:
+    return (anomaly.get("key") or "") in RESEARCHABLE_KINDS
+
 # Why a question came back unresearched, in the words the prompt block uses.
 # The caller stamps the key on the anomaly; the block never infers it. There
 # are three live reasons and they contradict each other, so a block that
 # guessed would have the report state something false about its own run.
 UNRESEARCHED_REASONS = {
     "no_web": "web research was off for this run",
+    "not_researchable": "the open web cannot answer this: the figure is the "
+                        "finding (nobody reports why a chain is tilted or "
+                        "why a screen fails), so no search was bought for it",
     "capped": "this run's research budget went to higher-ranked questions",
     "failed": "the search failed on this run",
     "stage_failed": "the research stage failed for this symbol",
@@ -1188,6 +1207,10 @@ def format_anomaly_block(symbol: str, anomaly: dict,
         searches = answer.get("searches") or 0
         lines.append(f"Web research on that question ({searches} "
                      f"{'search' if searches == 1 else 'searches'}):")
+        if answer.get("reused_from"):
+            lines.append(f"(Researched on {answer['reused_from']} for the same "
+                         f"figures and reused today; say so, with that date, "
+                         f"if you cite it.)")
         lines.append(finding)
         cites = [c for c in (answer.get("citations") or []) if isinstance(c, dict)]
         if cites:

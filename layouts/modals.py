@@ -227,9 +227,9 @@ TOOL_OPTIONS = [
 # Standard is the default, so it has to produce both primary outputs, the
 # research report and the recommendation synthesis: it shipped with recs
 # "off", which silently disabled synthesis for every default run and for
-# every schedule saved through the dialog. What Deep buys over Standard is
-# the extra evidence blocks.
-RUN_PRESET_ORDER = ["quick", "standard", "deep"]
+# every schedule saved through the dialog. There is no Deep any more:
+# Standard is the full run.
+RUN_PRESET_ORDER = ["quick", "standard"]
 DEFAULT_RUN_PRESET = "standard"
 PRESET_FIELDS = ("scope", "models", "recs", "evidence", "tools")
 RUN_PRESETS = {
@@ -246,30 +246,20 @@ RUN_PRESETS = {
     },
     "standard": {
         "label": "Standard",
-        "hint": "Research report, every model, and the recommendation "
-                "synthesis. Open-web research runs only for the symbols "
-                "the anomaly scan flags (next-day runs; never a backtest).",
+        "hint": "Research report, every model, every evidence block, "
+                "open-web research for the names the anomaly scan flags "
+                "(next-day runs; never a backtest), and the recommendation "
+                "synthesis.",
         "fields": {
             "scope": "full",
             "models": [mid for mid, _, _ in RUN_MODELS],
             "recs": "auto",
-            # On by default since 2026-09-06: with it off, a run whose scan
-            # flagged something wrote "the cause was not researched" over
-            # every flag. The anomaly gate (INVESTIGATE_ONLY_ANOMALIES) is
-            # what bounds the spend, not this switch; the date rule still
-            # strips it from any backtest.
-            "tools": [o["value"] for o in TOOL_OPTIONS],
-        },
-    },
-    "deep": {
-        "label": "Deep",
-        "hint": "Standard plus every evidence block, so the scan has more "
-                "to flag and the investigation more to read. Slowest, "
-                "most spend.",
-        "fields": {
-            "scope": "full",
-            "models": [mid for mid, _, _ in RUN_MODELS],
-            "recs": "auto",
+            # Everything on. Until 2026-09-06 this was a three-way split
+            # (Standard without the web or the extra evidence, Deep with
+            # both), and the default run wrote "the cause was not
+            # researched" over every flag. The anomaly gate
+            # (INVESTIGATE_ONLY_ANOMALIES) is what bounds the spend, not a
+            # preset; the date rule still strips the web from a backtest.
             "evidence": [o["value"] for o in EVIDENCE_OPTIONS],
             "tools": [o["value"] for o in TOOL_OPTIONS],
         },
@@ -507,8 +497,8 @@ ML_MODEL_SECONDS = 4          # per symbol per numerical model
 # is minutes, not seconds. The situation call overlaps the model loop in the
 # background prefetch pool, so it costs the run roughly one call per
 # INVESTIGATION_WORKERS symbols; the anomaly questions run on the serial
-# per-symbol loop and are capped for the whole run by
-# MODEL.ANOMALY_RESEARCH_BUDGET, three at a time per symbol.
+# per-symbol loop, three concurrent per symbol, with a per-symbol question
+# ceiling (MODEL.ANOMALY_RESEARCH_PER_SYMBOL) rather than a run-wide one.
 WEB_SEARCH_SECONDS = 60
 
 _LLM_MODELS = {"trading_agents"}
@@ -565,10 +555,10 @@ def estimate_run_seconds(scope: str, n_symbols: int, models: list,
     if web and (does_report or "trading_agents" in models):
         # Situation investigations run in a pool of INVESTIGATION_WORKERS
         # alongside the model loop; anomaly questions run inside it, three
-        # concurrent per symbol, until the run's budget is spent.
+        # concurrent per symbol, and every symbol may spend its own ceiling.
         workers = max(1, int(MODEL.INVESTIGATION_WORKERS))
         total += -(-n // workers) * WEB_SEARCH_SECONDS
-        researched = min(n, max(0, int(MODEL.ANOMALY_RESEARCH_BUDGET)) // 3)
+        researched = n if int(MODEL.ANOMALY_RESEARCH_PER_SYMBOL or 0) > 0 else 0
         total += researched * WEB_SEARCH_SECONDS
     if recs_on and scope == "full":
         total += SYNTHESIS_SECONDS

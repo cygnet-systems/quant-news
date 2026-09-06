@@ -108,17 +108,17 @@ class TestTheQuestionSearchFloor:
         # or every later test in the process runs without a ceiling.
         token = inv._BUDGET.set(None)
         # MODEL is a frozen dataclass; monkeypatch.setattr cannot write it.
-        saved = (MODEL.INVESTIGATION_MAX_SEARCHES, MODEL.ANOMALY_QUESTION_MIN_SEARCHES)
+        saved = (MODEL.INVESTIGATION_MAX_SEARCHES, MODEL.ANOMALY_SEARCHES_PER_QUESTION)
         yield seen
         inv._BUDGET.reset(token)
         object.__setattr__(MODEL, "INVESTIGATION_MAX_SEARCHES", saved[0])
-        object.__setattr__(MODEL, "ANOMALY_QUESTION_MIN_SEARCHES", saved[1])
+        object.__setattr__(MODEL, "ANOMALY_SEARCHES_PER_QUESTION", saved[1])
 
     @staticmethod
-    def _set(cap, floor):
+    def _set(cap, per_question):
         from config import MODEL
         object.__setattr__(MODEL, "INVESTIGATION_MAX_SEARCHES", cap)
-        object.__setattr__(MODEL, "ANOMALY_QUESTION_MIN_SEARCHES", floor)
+        object.__setattr__(MODEL, "ANOMALY_SEARCHES_PER_QUESTION", per_question)
 
     def _ask(self, tag, n):
         import services.investigation_service as inv
@@ -126,19 +126,22 @@ class TestTheQuestionSearchFloor:
             "ETR", "2026-09-04", [f"{tag} question {i}" for i in range(n)],
             web=True, model="gpt-5.6-luna")
 
-    def test_the_floor_holds_at_the_new_cap(self, recorder):
-        self._set(cap=3, floor=2)
+    def test_every_question_gets_its_own_allowance(self, recorder):
+        # Per section, not the classification cap shared out: two questions
+        # under a cap of 3 used to get one search each.
+        self._set(cap=3, per_question=3)
         assert len(self._ask("floor", 2)) == 2
-        assert recorder == [2, 2]
+        assert recorder == [3, 3]
 
-    def test_a_large_cap_still_splits_above_the_floor(self, recorder):
-        self._set(cap=6, floor=2)
+    def test_the_allowance_does_not_grow_with_the_cap(self, recorder):
+        self._set(cap=6, per_question=3)
         self._ask("split", 2)
         assert recorder == [3, 3]
 
-    def test_the_default_cap_is_three(self):
+    def test_the_default_allowance_is_three(self):
         import os
         from config import MODEL
         if "INVESTIGATION_MAX_SEARCHES" not in os.environ:
             assert MODEL.INVESTIGATION_MAX_SEARCHES == 3
-        assert MODEL.ANOMALY_QUESTION_MIN_SEARCHES == 2
+        if "ANOMALY_SEARCHES_PER_QUESTION" not in os.environ:
+            assert MODEL.ANOMALY_SEARCHES_PER_QUESTION == 3

@@ -6,6 +6,7 @@ and enable fast local data access with SQL query capabilities.
 Migrated from DuckDB, same public API, Postgres backend.
 """
 
+import re
 import hashlib
 import json
 import logging
@@ -225,6 +226,26 @@ def _fallback_run_id(what: str):
     logger.warning("%s written without an explicit run_id; falling back to "
                    "the process-local run %r", what, run_id)
     return run_id
+
+
+_CONVICTION_RE = re.compile(r"CONVICTION:\s*\**\s*([01](?:\.\d+)?)", re.I)
+
+
+def _stated_conviction(head: str | None):
+    """The report's own CONVICTION line (its probability that the direction
+    is right), read off the Verdict block. None when the head has none: the
+    rail then shows no number rather than the 0.5 track-record placeholder
+    the ``confidence`` column carries, which read as "50% sure"."""
+    if not head:
+        return None
+    m = _CONVICTION_RE.search(head)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    return v if 0.0 <= v <= 1.0 else None
 
 
 class CacheService:
@@ -1439,31 +1460,29 @@ class CacheService:
         generated_before: "datetime | None" = None,
         exclude_id: str | None = None,
     ) -> dict | None:
-        """The stance a reader last saw for ``symbol``, or None.
+        """The last TRADING DAY's stance for ``symbol``, or None.
 
-        Two separate bounds, because trade_date alone cannot do both jobs:
+        ``trade_date < as_of``, strictly: the prior report is the most
+        recent one written on an EARLIER data cutoff, so "since last report"
+        always spans real price action. It used to be ``<=``, which made a
+        same-day re-run's predecessor this morning's own report over
+        identical data; the line then read "today's BUY is a change of
+        interpretation on identical evidence" against a SELL from an hour
+        earlier, and a reader took it as the model contradicting itself for
+        the sake of it. A re-run on the same cutoff now compares to
+        yesterday's report, the same as the first run did. The strict bound
+        is also the lookahead guard: a report for a later session is never
+        visible to a walk-forward run.
 
-        * ``trade_date <= as_of`` is the lookahead guard. A report for a LATER
-          session is never visible, so a walk-forward run can only ever see
-          stances for sessions that had already happened.
-        * ``created_at < generated_before`` is the self-exclusion guard, and it
-          is what makes a same-cutoff re-run work. Every report this app writes
-          carries trade_date = the run's DATA CUTOFF, and the run dialog caps
-          the target at the next session, so re-running a name today produces
-          a report with the identical trade_date as this morning's. A strict
-          ``<`` on trade_date silently hid the predecessor in exactly the case
-          a reader is checking continuity. Ordering by (trade_date, created_at)
-          descending then picks the genuinely most recent earlier stance.
-
-        ``exclude_id`` drops one specific row (a regeneration replacing a
-        known report) without relying on clock resolution.
+        ``generated_before`` and ``exclude_id`` stay as belt and braces
+        against clock or regeneration edge cases.
         """
         from db.models import TradingAgentReport
         with get_session() as session:
             q = (
                 select(TradingAgentReport)
                 .where(TradingAgentReport.symbol == symbol.upper())
-                .where(TradingAgentReport.trade_date <= as_of)
+                .where(TradingAgentReport.trade_date < as_of)
                 .where(_visible(TradingAgentReport))
             )
             if generated_before is not None:
@@ -1486,6 +1505,7 @@ class CacheService:
             }
 
     def latest_reports_by_symbol(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        # (stated conviction rides along: see _stated_conviction below)
         """Newest research report per symbol, without the report body.
 
         One DISTINCT ON query instead of a query per symbol, the Home page
@@ -1503,7 +1523,11 @@ class CacheService:
                 select(TradingAgentReport.id, TradingAgentReport.symbol,
                        TradingAgentReport.trade_date, TradingAgentReport.decision,
                        TradingAgentReport.confidence, TradingAgentReport.model_name,
-                       TradingAgentReport.created_at, TradingAgentReport.owner_uid)
+                       TradingAgentReport.created_at, TradingAgentReport.owner_uid,
+                       # The Verdict block sits at the top of the report;
+                       # its first ~1.5k chars carry the stated conviction
+                       # without dragging the whole body through.
+                       func.substr(TradingAgentReport.report_text, 1, 1500).label("head"))
                 .where(_visible(TradingAgentReport))
                 .distinct(TradingAgentReport.symbol)
                 .order_by(TradingAgentReport.symbol,
@@ -1517,7 +1541,11 @@ class CacheService:
                 r.symbol: {
                     "id": r.id, "symbol": r.symbol,
                     "trade_date": str(r.trade_date),
+                    # `confidence` is the model layer's track-record WEIGHT
+                    # (0.5 = no record yet), not what the report claimed;
+                    # `stated_conviction` is the report's own number.
                     "decision": r.decision, "confidence": r.confidence,
+                    "stated_conviction": _stated_conviction(r.head),
                     "model_name": r.model_name,
                     "created_at": str(r.created_at),
                     "owner_uid": r.owner_uid,
@@ -1583,6 +1611,7 @@ class CacheService:
                 select(TradingAgentReport.id, TradingAgentReport.symbol,
                        TradingAgentReport.trade_date, TradingAgentReport.decision,
                        TradingAgentReport.confidence, TradingAgentReport.model_name,
+                       func.substr(TradingAgentReport.report_text, 1, 1500).label("head"),
                        TradingAgentReport.created_at, TradingAgentReport.owner_uid)
                 .where(TradingAgentReport.run_id == run_id)
                 .where(_visible(TradingAgentReport))
@@ -1593,6 +1622,7 @@ class CacheService:
                     "id": r.id, "symbol": r.symbol,
                     "trade_date": str(r.trade_date),
                     "decision": r.decision, "confidence": r.confidence,
+                    "stated_conviction": _stated_conviction(r.head),
                     "model_name": r.model_name,
                     "created_at": str(r.created_at),
                     "owner_uid": r.owner_uid,

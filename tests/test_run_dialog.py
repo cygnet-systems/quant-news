@@ -123,12 +123,12 @@ class TestPresetFields:
         standard = modals.preset_fields("standard")
         # Standard turns the open web on too (2026-09-06): the anomaly gate,
         # not the switch, is what bounds the spend.
-        assert standard == {"scope": "full", "models": ALL_MODELS,
-                            "recs": "auto", "tools": ["web_research"]}
-        deep = modals.preset_fields("deep")
-        assert deep["scope"] == "full" and deep["recs"] == "auto"
-        assert deep["evidence"] == [o["value"] for o in modals.EVIDENCE_OPTIONS]
-        assert deep["tools"] == ["web_research"]
+        assert standard == {
+            "scope": "full", "models": ALL_MODELS, "recs": "auto",
+            "evidence": [o["value"] for o in modals.EVIDENCE_OPTIONS],
+            "tools": ["web_research"]}
+        # Two presets, not three: the default IS the full run.
+        assert modals.RUN_PRESET_ORDER == ["quick", "standard"]
         assert set(modals.RUN_PRESET_ORDER) == set(modals.RUN_PRESETS)
 
     def test_quick_is_the_cheapest_preset(self):
@@ -139,7 +139,7 @@ class TestPresetFields:
             return modals.estimate_run_seconds(
                 f["scope"], n, f["models"], f["recs"] != "off")
         for n in (1, 3, 8):
-            assert est("quick", n) < est("standard", n) <= est("deep", n)
+            assert est("quick", n) < est("standard", n)
         assert "trading_agents" not in modals.preset_fields("quick")["models"]
 
     def test_the_default_preset_produces_both_primary_outputs(self):
@@ -163,7 +163,7 @@ class TestPresetFields:
         hint = modals.RUN_PRESETS["quick"]["hint"]
         assert "no research report" in hint
         assert "no recommendation synthesis" in hint
-        for name in ("standard", "deep"):
+        for name in ("standard",):
             f = modals.preset_fields(name)
             assert f["recs"] == "auto" and "trading_agents" in f["models"]
 
@@ -231,7 +231,7 @@ class TestPresetFields:
         assert tools == ["web_research"]
 
         scope, checks, recs, evidence, tools = app_module.apply_run_preset(
-            "deep", "2099-01-05", CHECK_IDS)
+            "standard", "2099-01-05", CHECK_IDS)
         assert scope == "full" and recs == "auto"
         assert evidence == [o["value"] for o in modals.EVIDENCE_OPTIONS]
         assert tools == ["web_research"]
@@ -241,12 +241,12 @@ class TestPresetFields:
 
     def test_backtest_date_never_turns_the_web_on(self, monkeypatch):
         _trigger(monkeypatch, "run-preset")
-        *_, tools = app_module.apply_run_preset("deep", "2024-03-05", CHECK_IDS)
+        *_, tools = app_module.apply_run_preset("standard", "2024-03-05", CHECK_IDS)
         assert tools == []
         # A date change alone touches only the tools. The ALL output still
         # gets a list (a bare no_update for a wildcard output is a 500).
         _trigger(monkeypatch, "run-date-picker")
-        out = app_module.apply_run_preset("deep", "2024-03-05", CHECK_IDS)
+        out = app_module.apply_run_preset("standard", "2024-03-05", CHECK_IDS)
         assert out[0] is dash.no_update and out[2] is dash.no_update
         assert out[1] == [dash.no_update] * 5
         assert out[3] is dash.no_update and out[4] == []
@@ -257,7 +257,7 @@ class TestDivergence:
         assert modals.preset_divergence("standard", {
             "scope": "full", "models": list(reversed(ALL_MODELS)),
             "recs": "auto", "tools": ["web_research"],
-            "evidence": ["options"]}) == []
+            "evidence": [o["value"] for o in modals.EVIDENCE_OPTIONS]}) == []
 
     def test_the_date_rule_is_not_a_divergence(self):
         # An untouched Standard dialog on a past date has its web tool
@@ -270,14 +270,14 @@ class TestDivergence:
             "tools": []}, target_date="2099-01-01") == ["tools"]
 
     def test_each_named_field_is_reported(self):
-        got = modals.preset_divergence("deep", {
+        got = modals.preset_divergence("standard", {
             "scope": "report", "models": ALL_MODELS[:2], "recs": "off",
             "evidence": ["options"], "tools": []})
         assert got == ["scope", "models", "recs", "evidence", "tools"]
 
     def test_unmounted_values_are_not_divergence(self):
-        assert modals.preset_divergence("deep", {"scope": None, "models": None,
-                                                 "recs": None}) == []
+        assert modals.preset_divergence("standard", {"scope": None, "models": None,
+                                                     "recs": None}) == []
         assert modals.preset_divergence("quick", {"scope": "models",
                                                   "tools": ["web_research"]}) == []
 
@@ -307,7 +307,7 @@ class TestDivergence:
     def test_customize_unfolds_only_on_divergence(self, monkeypatch):
         preflight, hint, collapse, auto = self._preflight(
             monkeypatch, "standard", "full", [True] * 5, "auto",
-            ["options"], ["web_research"])
+            [o["value"] for o in modals.EVIDENCE_OPTIONS], ["web_research"])
         assert collapse is dash.no_update
         assert auto == {"diverged": []}
         assert hint == [modals.RUN_PRESETS["standard"]["hint"]]
@@ -387,13 +387,13 @@ class TestOpeners:
         rs.create_run("manual", ["NVDA"], "u2")      # someone else's
 
         out = _open(monkeypatch, "run-analysis-btn", watchlist=["AAPL", "BE"],
-                    prefs={"preset": "deep", "symbols": ["XYZ"]})
+                    prefs={"preset": "quick", "symbols": ["XYZ"]})
 
         assert out[IS_OPEN] is True
         assert out[SYMBOLS] == {"symbols": [], "watchlist": ["AAPL", "BE"],
                                 "lastrun": ["TSLA", "AMD"]}
         assert out[SCOPE] is dash.no_update      # the preset sets it
-        assert out[PRESET] == "deep"
+        assert out[PRESET] == "quick"
         assert out[CUSTOMIZE] is False
         assert out[VALIDATION] == ""
         assert out[BTN_DISABLED] is False and out[BTN_LABEL][-1] == "Run"

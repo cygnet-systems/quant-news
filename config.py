@@ -404,24 +404,34 @@ class ModelConfig:
     # Output budget covers thinking + interim text between searches + the
     # JSON; 6000 truncated the first live run before the JSON was written.
     INVESTIGATION_MAX_TOKENS: int = int(os.getenv("INVESTIGATION_MAX_TOKENS", "20000"))
-    # Ceiling on anomaly-research questions for a WHOLE run, not per symbol.
-    # Anomaly questions are researched inside the serial per-symbol model
-    # loop, so the per-symbol cap of three would let a 20-symbol watchlist
-    # add 60 web-search turns to a job that already runs ~40 minutes against
-    # a 95-minute kill. 18 is six symbols' worth: enough that the names a run
-    # actually flags get researched, bounded enough that the job still lands.
-    # 0 turns anomaly research off; a run may lift it by passing None.
-    ANOMALY_RESEARCH_BUDGET: int = int(
-        os.getenv("ANOMALY_RESEARCH_BUDGET", "18"))
-    # Floor on searches per anomaly question. The questions share the
-    # classification cap above (cap // questions), and at a cap of 3 two
-    # questions would get one search each; a single search answers a
-    # narrow "why did X stand out" question with "no reporting found" far
-    # more often than two do. Bounded by ANOMALY_RESEARCH_BUDGET questions a
-    # run, so the worst case is budget x floor searches on top of the
+    # Anomaly-research questions allowed PER SYMBOL; the run's ceiling is
+    # this times the symbols in the run (investigation_service
+    # .research_budget_for). It used to be 18 questions for the whole run,
+    # which on a 20-name watchlist left most flagged sections "not
+    # researched: budget went to higher-ranked questions". 4 is
+    # anomaly_service.MAX_ANOMALIES: every section a symbol can raise gets
+    # researched when the scan warrants it. 0 turns anomaly research off.
+    ANOMALY_RESEARCH_PER_SYMBOL: int = int(
+        os.getenv("ANOMALY_RESEARCH_PER_SYMBOL", "4"))
+    # Web searches per anomaly question, i.e. per report section. Fixed per
+    # section, not the classification cap shared out over the questions:
+    # that split gave two questions one search each, and one search answers
+    # a narrow "why did X stand out" with "no reporting found" far more
+    # often than three do. The aim is a lead the reader can follow, not the
+    # whole story. Worst case per symbol: MAX_ANOMALIES x this on top of the
     # classification searches.
-    ANOMALY_QUESTION_MIN_SEARCHES: int = int(
-        os.getenv("ANOMALY_QUESTION_MIN_SEARCHES", "2"))
+    ANOMALY_SEARCHES_PER_QUESTION: int = int(
+        os.getenv("ANOMALY_SEARCHES_PER_QUESTION", "3"))
+    # How long a sourced answer to an anomaly question is reused for the
+    # same symbol, question and figures before it is bought again. A
+    # quality screen fails for a quarter and a congressional disclosure
+    # stays what it was, so the answer found on Monday is the answer on
+    # Thursday; the figures are in the key, so a question raised off new
+    # numbers is a new question. Point-in-time is kept: an answer is only
+    # reused by a run whose as-of is on or after the day it was found.
+    # 0 turns reuse off.
+    ANOMALY_ANSWER_REUSE_DAYS: int = int(
+        os.getenv("ANOMALY_ANSWER_REUSE_DAYS", "7"))
 
     # Swappable research backend: "single_agent" (in-tree default) or
     # "tradingagents" (adapter over a pinned external release; see
@@ -572,9 +582,14 @@ WEB_SEARCH_PRICING_VERIFIED_ON: Final[str] = "2026-09-05 (openai rate UNVERIFIED
 # The most one run may spend before it stops buying model calls. A cause-
 # independent ceiling: the 2026-09-02..05 runaway cost roughly $20 through a
 # bug nobody had thought of, and no amount of fixing that particular bug
-# bounds the next one. A healthy 20-symbol run costs about $0.90 all-in, so
-# $1.00 is deliberately close: it caps the blast radius of one run without
-# room for a run to quietly double.
+# bounds the next one. Sized 2026-09-06 for the research the run is now
+# asked to do: a flagged symbol buys ~4 classification searches plus up to
+# MAX_ANOMALIES x ANOMALY_SEARCHES_PER_QUESTION question searches at $0.01
+# each plus their tokens, about $0.20-0.25; a 20-name day with every name
+# flagged is ~$4.50 all-in, a typical day (the gate fires on a minority)
+# $1.50-2.50. $6.00 covers the worst case without room for a runaway to
+# double it. The old $1.00 sat under a single busy day's research and would
+# have stopped the run mid-watchlist.
 #
 # NOTE what this does and does not do. It bounds ONE run. It does not bound a
 # day, so a scheduler that starts runs in a loop can still spend the ceiling
@@ -582,7 +597,7 @@ WEB_SEARCH_PRICING_VERIFIED_ON: Final[str] = "2026-09-05 (openai rate UNVERIFIED
 # scheduler_service._BACKFILL_ATTEMPTED. Set DAILY_SPEND_CEILING_USD above 0
 # to add the second bound.
 RUN_SPEND_CEILING_USD: Final[float] = float(
-    os.getenv("RUN_SPEND_CEILING_USD", "1.00"))
+    os.getenv("RUN_SPEND_CEILING_USD", "6.00"))
 # Off by default: a day-wide kill switch that trips at 07:05 takes the
 # morning report with it, and that is a decision to make deliberately rather
 # than inherit. Any value above 0 arms it.

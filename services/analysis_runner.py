@@ -466,7 +466,8 @@ def run_predictions(
     # written from the figures and labelled unresearched. The ledger belongs
     # to THIS run's context, so an interactive report opened in the same
     # process neither drains it nor is drained by it.
-    begin_research_budget(MODEL.ANOMALY_RESEARCH_BUDGET)
+    from services.investigation_service import research_budget_for
+    begin_research_budget(research_budget_for(len(symbols)))
     investigation_pool = None
     # The prefetch investigates every symbol ahead of the loop, which is
     # exactly what the anomaly gate exists to stop: it cannot know which

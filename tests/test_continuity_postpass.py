@@ -93,10 +93,17 @@ def test_provider_failure_falls_back_to_deterministic_record():
     assert "2026-08-28" in line and "BUY" in line and "SELL" in line
 
 
-def test_same_cutoff_flip_is_labelled_in_fallback():
-    prior = {**PRIOR, "trade_date": "2026-09-02"}
+def test_a_different_call_is_recorded_not_characterised():
+    # The line records the prior call and this one; it never frames a
+    # different call as a reversal or "a change of interpretation".
+    from models.single_agent import _SINCE_LINE_PROMPT, _continuity_block
     line, source = _since_last_report_line(
-        _StubLLM(raise_=True), prior, "c", "AAPL", "2026-09-02", "SELL", 0.62,
+        _StubLLM(raise_=True), PRIOR, "c", "AAPL", "2026-09-02", "SELL", 0.62,
         "m", "p", {"input_tokens": 0, "output_tokens": 0})
     assert source == "fallback"
-    assert "identical evidence" in line
+    assert "identical evidence" not in line and "interpretation" not in line
+    assert "Never characterise a different call as a reversal" in _SINCE_LINE_PROMPT
+    assert "written blind to the previous one" in _SINCE_LINE_PROMPT
+    block = _continuity_block(PRIOR, None, "2026-09-02")
+    assert "change of interpretation" not in block
+    assert "SAME data cutoff" not in block

@@ -1113,10 +1113,13 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     never meant to introduce. Accountability survives because the SINCE LAST
     REPORT line is written afterwards, once the new call is already fixed.
 
-    A predecessor written against the SAME data cutoff is called out as such:
-    no new price exists between the two, so a different call there is a change
-    of interpretation on identical evidence, which is the more damning case and
-    the one the reader most needs named.
+    The predecessor is the last TRADING DAY's report (cache_service
+    .get_prior_trading_agent_report, strict trade_date < as_of), never an
+    earlier run on the same cutoff: the line then always spans real price
+    action, and a re-run today is compared to yesterday the same way the
+    first run was. It used to compare same-cutoff re-runs to each other and
+    label a different call "a change of interpretation on identical
+    evidence", which read as the model contradicting itself on purpose.
     """
     if not prior:
         return NO_PRIOR_REPORT_BLOCK
@@ -1126,12 +1129,9 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
     triggers = _extract_triggers(text_)
     weight = prior.get("confidence")
     prior_date = str(prior.get("trade_date") or "")[:10]
-    same_cutoff = bool(as_of) and prior_date == str(as_of)[:10]
 
     lines = [
         (f"Previous report: trade date {prior_date or '?'}"
-         + (" (SAME data cutoff as this run. An earlier run today)"
-            if same_cutoff else "")
          + f", written by {prior.get('model_name') or 'an earlier run'}."),
         f"  Call: {(prior.get('decision') or '?').upper()}"
         + (f" | conviction stated then: {stated:.2f}" if stated is not None else "")
@@ -1146,13 +1146,7 @@ def _continuity_block(prior: Optional[dict], df: pd.DataFrame,
                      f"{triggers['move_to_sell'][:220]}")
     if not triggers:
         lines.append("  It published no machine-readable trigger levels.")
-    if same_cutoff:
-        lines.append("  No new price data exists since that report, it saw "
-                     "exactly the bars shown below. Any difference in your call "
-                     "is a change of interpretation, not a response to news or "
-                     "price.")
-    else:
-        lines.append("  " + _price_since(df, prior_date))
+    lines.append("  " + _price_since(df, prior_date))
     return "\n".join(lines)
 
 
@@ -1161,13 +1155,8 @@ _SINCE_LINE_PROMPT = """A research report on {ticker} was just finalized. Its ca
 The previous report on {ticker} and what price actually did since:
 {continuity}
 
-Write the finalized report's "SINCE LAST REPORT" line. One sentence of plain text, no markdown, no label. Name the prior report's date and call. Say whether either trigger it published was met by the price action shown. If today's call differs from the prior one and neither trigger was met, say so plainly.{same_cutoff_clause}
+Write the finalized report's "SINCE LAST REPORT" line. One sentence of plain text, no markdown, no label. Name the prior report's date and call. Say whether either trigger it published was met by the price action shown since. Then state today's call next to it as a fact: the same call, or a different one. Never characterise a different call as a reversal, a contradiction, or a change of interpretation, and never suggest either call was made in reaction to the other: each report is written blind to the previous one.
 Do not use an em dash or en dash; use a comma, a period, or a colon after a label. Do not argue for or against either call; this line records what changed, nothing else. Output only the line."""
-
-_SAME_CUTOFF_CLAUSE = (" That prior report used the SAME data cutoff as this"
-                       " run, so no new price exists between them; if the calls"
-                       " differ, label it a change of interpretation on"
-                       " identical evidence.")
 
 
 def _since_last_report_line(llm, prior: Optional[dict], continuity: str,
@@ -1185,15 +1174,13 @@ def _since_last_report_line(llm, prior: Optional[dict], continuity: str,
         return "no prior report on record", "none"
     prior_date = str(prior.get("trade_date") or "")[:10]
     prior_call = (prior.get("decision") or "?").upper()
-    same_cutoff = bool(as_of) and prior_date == str(as_of)[:10]
     try:
         usage: dict = {}
         line = llm.generate(
             _SINCE_LINE_PROMPT.format(
                 ticker=symbol, decision=decision,
                 conviction=f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "n/a",
-                continuity=continuity,
-                same_cutoff_clause=_SAME_CUTOFF_CLAUSE if same_cutoff else ""),
+                continuity=continuity),
             max_tokens=200, temperature=0.0, model=model, provider=provider,
             usage_out=usage)
         usage_total["input_tokens"] += usage.get("input_tokens", 0)
@@ -1206,10 +1193,7 @@ def _since_last_report_line(llm, prior: Optional[dict], continuity: str,
     except Exception as e:
         logger.debug(f"{symbol}: since-last-report writer failed: {e}")
     line = (f"prior report {prior_date} called {prior_call}; this run calls "
-            f"{decision}" + (", on the same data cutoff, a change of "
-                             "interpretation on identical evidence"
-                             if same_cutoff and prior_call != decision else "")
-            + " (trigger check unavailable)")
+            f"{decision} (trigger check unavailable)")
     return line, "fallback"
 
 
@@ -1577,12 +1561,12 @@ class SingleAgentResearch:
         # carries the prior stance, so the fresh call cannot anchor to it. The
         # SINCE LAST REPORT line is written by a separate post-hoc call once
         # the decision is already extracted (see _since_last_report_line).
-        # trade_date <= as_of is the lookahead guard (a later session's report
-        # is never visible); `started_at` excludes anything written after this
-        # call began, which is what lets a same-cutoff re-run see this
-        # morning's stance instead of reporting "no prior report on record".
-        # A missing/failed lookup degrades to "first stance on record" rather
-        # than taking the report down.
+        # The prior is the last TRADING DAY's report (trade_date strictly
+        # before as_of): a re-run on today's cutoff compares to yesterday,
+        # never to this morning's own report over identical data.
+        # `started_at` stays as a guard against anything written after this
+        # call began. A missing/failed lookup degrades to "first stance on
+        # record" rather than taking the report down.
         prior_report = None
         if use_continuity:
             try:
@@ -1776,6 +1760,14 @@ class SingleAgentResearch:
             "anomalies": [a.get("key") for a in (anomalies or [])],
             "anomalies_researched": sum(1 for a in (anomalies or [])
                                         if a.get("researched")),
+            # Per section: sourced (a finding with a citation), unsourced
+            # (a finding with none), or why it was not researched. This is
+            # what says which kinds are worth a search.
+            "anomaly_findings": {
+                a.get("key"): ("sourced" if a.get("sourced")
+                               else "unsourced" if a.get("researched")
+                               else a.get("unresearched") or "unresearched")
+                for a in (anomalies or [])},
             "anomalies_sectioned": [a.get("key") for a in
                                     split_anomalies(anomalies)[0]],
             "anomalies_flagged": [a.get("key") for a in

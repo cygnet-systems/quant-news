@@ -55,7 +55,11 @@ SITUATIONS = (
 # Each researched question is its own web search, so this is a spend cap as
 # much as a reading cap: three sourced answers is what a report can carry
 # without the sections turning into a list.
-MAX_RESEARCH_QUESTIONS = 3
+# Per symbol. Equal to anomaly_service.MAX_ANOMALIES (not imported, the
+# two modules would be circular): every section the scan can raise for a
+# symbol can be researched. It was 3 against 4 anomalies, so the fourth
+# section was always "not researched" by construction.
+MAX_RESEARCH_QUESTIONS = 4
 
 # Every open-web call on this BOX passes through _web_slot, whatever run or
 # process it belongs to. INVESTIGATION_WORKERS bounds ONE run's prefetch pool;
@@ -99,6 +103,65 @@ _KEY_LOCKS: dict[tuple, threading.Lock] = {}
 # shape, and a key that carries the question itself.
 _ANSWER_CACHE: dict[tuple, dict] = {}
 _ANSWER_LOCKS: dict[tuple, threading.Lock] = {}
+
+# Lever 3 of the 2026-09-06 spend review: a sourced answer outlives the
+# process. Keyed WITHOUT the as-of (symbol, question, model, figures digest)
+# and stamped with the day it was found, so a later run over the same
+# figures reads it back instead of buying the searches again, and an
+# earlier as-of (a backtest) never sees an answer from its future.
+_REUSE_DIR = "cache/research_answers"
+_reuse_disk = None
+_REUSE_LOCK = threading.Lock()
+
+
+def _reuse_cache():
+    global _reuse_disk
+    if _reuse_disk is None:
+        import diskcache
+        _reuse_disk = diskcache.Cache(_REUSE_DIR)
+    return _reuse_disk
+
+
+def _reuse_key(key: tuple) -> str:
+    symbol, _as_of, question, model, digest = key
+    return repr((symbol, question, model, digest))
+
+
+def _reuse_get(key: tuple, as_of: str) -> "dict | None":
+    """A sourced answer found on or before ``as_of`` for the same figures."""
+    if int(MODEL.ANOMALY_ANSWER_REUSE_DAYS or 0) <= 0:
+        return None
+    try:
+        with _REUSE_LOCK:
+            stored = _reuse_cache().get(_reuse_key(key))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"research answer reuse read failed: {e}")
+        return None
+    if not isinstance(stored, dict):
+        return None
+    found = str(stored.get("found_as_of") or "")[:10]
+    if not found or found > str(as_of)[:10]:
+        return None
+    if not stored.get("finding") or stored.get("error") or not stored.get("citations"):
+        return None
+    answer = dict(stored)
+    answer["reused_from"] = found
+    answer["searches"] = 0
+    return answer
+
+
+def _reuse_put(key: tuple, as_of: str, answer: dict) -> None:
+    days = int(MODEL.ANOMALY_ANSWER_REUSE_DAYS or 0)
+    if days <= 0 or not answer.get("finding") or answer.get("error") \
+            or not answer.get("citations"):
+        return
+    stored = {k: v for k, v in answer.items() if k != "reused_from"}
+    stored["found_as_of"] = str(as_of)[:10]
+    try:
+        with _REUSE_LOCK:
+            _reuse_cache().set(_reuse_key(key), stored, expire=days * 86400)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"research answer reuse write failed: {e}")
 
 # Both caches are keyed by (symbol, as_of, ...), so every run of every day
 # adds entries that nothing can ever hit again -- yesterday's as_of is not
@@ -151,6 +214,14 @@ def _evict(cache: dict, locks: dict, cap: int) -> None:
 # counter. Unset (a caller outside any run, e.g. an export) means unlimited.
 _BUDGET: "ContextVar[dict | None]" = ContextVar("research_budget", default=None)
 _BUDGET_LOCK = threading.Lock()
+
+
+def research_budget_for(n_symbols: int) -> "int | None":
+    """This run's question ceiling: ANOMALY_RESEARCH_PER_SYMBOL for each
+    symbol in it, so every section the scan raises can be researched. 0 in
+    config turns anomaly research off (a zero ceiling)."""
+    per_symbol = int(MODEL.ANOMALY_RESEARCH_PER_SYMBOL or 0)
+    return max(0, per_symbol * max(0, int(n_symbols or 0)))
 
 
 def begin_research_budget(questions: "int | None") -> None:
@@ -666,6 +737,18 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
     # went to higher-ranked questions". Nothing had gone anywhere.
     with _CACHE_LOCK:
         free = {q for q in asked if keys[q] in _ANSWER_CACHE}
+    # Answers found on an earlier day for the same figures cost nothing
+    # either; they enter the in-process cache and are never claimed for.
+    for q in asked:
+        if q in free:
+            continue
+        reused = _reuse_get(keys[q], str(as_of)[:10])
+        if reused is not None:
+            with _CACHE_LOCK:
+                _ANSWER_CACHE[keys[q]] = reused
+            free.add(q)
+            logger.info("%s: reusing the %s answer for %r", symbol,
+                        reused["reused_from"], q[:60])
     searching = [q for q in asked if q not in free]
     allowed = _claim_budget(len(searching))
     if allowed < len(searching):
@@ -678,13 +761,11 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
     if not asked:
         return []
 
-    # One shared search budget: the run's ceiling divided over the questions
-    # it is spending it on, never per question on top of it. Cache hits are
-    # not spending it, so they do not shrink the others' share. The floor
-    # keeps a question from being asked with a single search once the cap
-    # is small enough to split that thin (config: ANOMALY_QUESTION_MIN_SEARCHES).
-    per_question = max(MODEL.ANOMALY_QUESTION_MIN_SEARCHES,
-                       MODEL.INVESTIGATION_MAX_SEARCHES // max(len(claimed), 1))
+    # A fixed search allowance per question, i.e. per report section
+    # (config: ANOMALY_SEARCHES_PER_QUESTION). It used to be the
+    # classification cap shared out over the questions, which handed two
+    # questions one search each; the aim is a lead the reader can follow.
+    per_question = max(1, int(MODEL.ANOMALY_SEARCHES_PER_QUESTION or 1))
 
     def _one(question: str) -> dict:
         key = keys[question]
@@ -720,6 +801,7 @@ def research_questions(symbol: str, as_of: str, questions: list[str], *,
             with _CACHE_LOCK:
                 _ANSWER_CACHE[key] = cached
                 _evict(_ANSWER_CACHE, _ANSWER_LOCKS, _MAX_ANSWERS)
+            _reuse_put(key, str(as_of)[:10], cached)
             return cached
 
     if len(asked) == 1:

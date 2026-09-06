@@ -978,17 +978,21 @@ class TradingAgentsModel(BaseModel):
                         f"{looked_at}, the report stays short")
             return anomalies, screened, False
 
+        from services.anomaly_service import researchable
         for anomaly in anomalies:
             anomaly["answer"] = None
             anomaly["researched"] = False
-            anomaly["unresearched"] = "no_web" if not web else "capped"
+            anomaly["unresearched"] = ("not_researchable"
+                                       if not researchable(anomaly)
+                                       else "no_web" if not web else "capped")
+        askable = [a for a in anomalies if researchable(a)]
 
         _emit("ta", f"Research {symbol}: {len(anomalies)} anomaly/anomalies to "
                     f"write about ("
                     + ", ".join(a["title"] for a in anomalies) + ")",
               payload={"event": "anomalies", "symbol": symbol,
                        "keys": [a["key"] for a in anomalies]})
-        if not web:
+        if not web or not askable:
             return anomalies, screened, False
 
         try:
@@ -1006,23 +1010,27 @@ class TradingAgentsModel(BaseModel):
                 # and disclosure sizes that make the question answerable are
                 # exactly what these facts carry.
                 answers = research_questions(
-                    symbol, as_of, [a["question"] for a in anomalies],
+                    symbol, as_of, [a["question"] for a in askable],
                     web=True, target=target,
                     context_by_question={a["question"]: "\n".join(a["facts"])
-                                         for a in anomalies})
+                                         for a in askable})
         except Exception as e:
             logger.warning(f"{symbol}: anomaly research failed: {e}")
-            for anomaly in anomalies:
+            for anomaly in askable:
                 anomaly["unresearched"] = "stage_failed"
             return anomalies, screened, False
 
         by_question = {a["question"]: a for a in answers}
-        for anomaly in anomalies:
+        for anomaly in askable:
             answer = by_question.get(anomaly["question"])
             if answer and answer.get("finding") and not answer.get("error"):
                 anomaly["answer"] = answer
                 anomaly["researched"] = True
                 anomaly.pop("unresearched", None)
+                # Lever 5: whether the search produced a lead with a source
+                # behind it, per section, so the spend can be judged per
+                # kind instead of guessed.
+                anomaly["sourced"] = bool(answer.get("citations"))
             elif answer:
                 # A failed search still travels: the block prints the reason
                 # instead of reading as though the question was never asked.
@@ -1032,6 +1040,12 @@ class TradingAgentsModel(BaseModel):
             # per-symbol cap or the run's ceiling took it, which is what
             # "capped" (stamped above) says.
         researched = sum(1 for a in anomalies if a["researched"])
+        sourced = sum(1 for a in anomalies if a.get("sourced"))
+        reused = sum(1 for a in anomalies
+                     if (a.get("answer") or {}).get("reused_from"))
         _emit("ta", f"Research {symbol}: researched {researched} of "
-                    f"{len(anomalies)} anomaly question(s) on the web")
+                    f"{len(askable)} askable anomaly question(s) on the web "
+                    f"({sourced} with a source, {reused} reused from an "
+                    f"earlier day; {len(anomalies) - len(askable)} kind(s) "
+                    f"the web cannot answer kept as flags)")
         return anomalies, screened, False

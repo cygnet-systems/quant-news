@@ -2614,7 +2614,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     report_model = config.get("report_model") or "gpt-5.6-luna"
     include_thesis_flag = (config.get("depth") or "thesis") != "standard"
     recs_mode = config.get("recs") or "auto"
-    recs_model_val = config.get("recs_model") or "claude-sonnet-5"
+    recs_model_val = config.get("recs_model") or "gpt-5.6-luna"
     # Terminal-derived evidence blocks (modal checklist); None only when the
     # modal had not rendered once at confirm. Treat as the default, both on.
     evidence_sel = (sorted(config["evidence"])
@@ -2629,8 +2629,9 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     # the 07:00 job's spent counter and reported every question as ranked
     # out. The ledger lives in this task's context, which asyncio.to_thread
     # copies into the per-symbol research workers below.
-    from services.investigation_service import begin_research_budget
-    begin_research_budget(MODEL.ANOMALY_RESEARCH_BUDGET)
+    from services.investigation_service import (begin_research_budget,
+                                                research_budget_for)
+    begin_research_budget(research_budget_for(len(symbols or [])))
     report_provider = "openai" if report_model.startswith("gpt-") else "anthropic"
     # Per-symbol analysis is always the full research agent now, the shallow
     # summarize_news_structured pass produced a thinner second opinion on the
@@ -2730,7 +2731,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
                   f"the report has NO news for them; treat their sections "
                   f"as unsupported, not as quiet weeks.")
 
-    # One key dict for both the cache check here and the store at the end. 
+    # One key dict for both the cache check here and the store at the end.
     # and the trace payload records its hash plus a compact summary of what
     # fed it, so a cross-restart cache miss stops being undiagnosable.
     from services.analysis_runner import report_cache_key as _report_key
@@ -3102,7 +3103,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
                                        or _stance.get(res.get("decision"), "NEUTRAL"))
             entry["confidence"] = res.get("confidence")
             entry["stance_source"] = "research_verdict"
-            # The epilogue supplies the panel fields the shallow pass used to. 
+            # The epilogue supplies the panel fields the shallow pass used to.
             # one analyst call now feeds banner, watch items, and thesis.
             if st.get("sentiment_alignment"):
                 entry["sentiment_explanation"] = st["sentiment_alignment"]
@@ -3911,6 +3912,11 @@ def generate_model_signals(run_store, dispatched):
             include_thesis=research_kwargs.get("include_thesis", True),
             force=True,
             evidence=research_kwargs.get("evidence"),
+            # The dialog's Tools section. This call built the list into
+            # research_kwargs and then never passed it, so every manual run
+            # reached the research model with web research off whatever the
+            # checkbox said (the scheduled path always forwarded it).
+            tools=research_kwargs.get("tools"),
             news_lookback_days=lookback_days,
             ensemble_config=ensemble_config,
             run_ensemble=bool(run_ensemble),
@@ -4088,7 +4094,7 @@ def evaluate_predictions_now(n_clicks):
     Input("download-report", "data"),
     Input("history-eval-status", "data"),
     # A report-only run never touches prediction-store-status, so reload
-    # when the report itself lands and when a recommendation run persists. 
+    # when the report itself lands and when a recommendation run persists.
     # otherwise a fresh report only appears after re-navigating.
     Input("ai-analysis-store", "data"),
     Input("recommendations-store", "data"),
@@ -7321,7 +7327,7 @@ async def generate_recommendations_callback(ai_analysis, model_signals,
     }
     if not valid_signals:
         if basis == "signals":
-            # Predictions-only synthesis with no predictions is a no-op. 
+            # Predictions-only synthesis with no predictions is a no-op.
             # say so instead of silently doing nothing.
             prog.emit("error", "Recommendations (predictions only) skipped, "
                                "no model predictions in this session. Run Predict first.",

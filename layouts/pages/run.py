@@ -198,14 +198,17 @@ def _report_cell(row: dict) -> html.Td:
     if not report:
         return html.Td(html.Span("no report", className="run-report-none"),
                        className="run-report-cell")
-    conf = report.get("confidence")
+    from layouts.pages.home import report_verdict_text
     decision = report.get("decision") or "?"
+    text, title = report_verdict_text(
+        report, ((row.get("synthesis") or {}).get("decision")))
     return html.Td(
         [
             html.Span(
-                decision + (f" {conf:.0%}" if conf is not None else ""),
+                text,
                 className="home-sym-report-verdict "
                           + DECISION_CLASS.get(decision, "neutral"),
+                title=title,
             ),
             html.Span(report.get("trade_date") or "",
                       className="num home-sym-report-date"),
