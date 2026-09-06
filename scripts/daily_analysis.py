@@ -76,6 +76,11 @@ def main() -> int:
                         help="Per-symbol cap: keep the newest N articles of "
                              "the window, 0 = all (default: config "
                              "NEWS_MAX_ARTICLES)")
+    parser.add_argument("--relevance", type=float,
+                        default=config.MODEL.NEWS_RELEVANCE_THRESHOLD,
+                        help="Alpha Vantage ticker-relevance floor (0..1), "
+                             "applied before the cap; 0 = keep all "
+                             f"(default: {config.MODEL.NEWS_RELEVANCE_THRESHOLD})")
     parser.add_argument("--report-model", default=None,
                         help="Research/report model "
                              "(default: config REPORT_MODEL)")
@@ -85,8 +90,7 @@ def main() -> int:
                         choices=["lookback", "overnight"],
                         help="News window formula: 'lookback' (past N days) or "
                              "'overnight' (anchor close 16:00 ET to target "
-                             "open 09:30 ET, relevance >= "
-                             "NEWS_OVERNIGHT_RELEVANCE). Default: config "
+                             "open 09:30 ET). Default: config "
                              "NEWS_FILTER_MODE")
     parser.add_argument("--models", default=None,
                         help="Comma-separated model ids to run (default: all)")
@@ -293,6 +297,7 @@ def main() -> int:
         target=args.target,
         lookback_days=args.lookback,
         max_articles=args.max_articles,
+        relevance=args.relevance,
         report_model=args.report_model,
         recs_model=args.recs_model,
         include_thesis=args.depth != "standard",

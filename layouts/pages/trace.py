@@ -229,7 +229,8 @@ def _payload_detail(payload: dict) -> html.Div:
         parts.append(_kv("requested",
                          f"{payload.get('filter')} "
                          f"{payload.get('lookback_days')}d → "
-                         f"{payload.get('as_of')}, cap "
+                         f"{payload.get('as_of')}, relevance ≥ "
+                         f"{payload.get('relevance_threshold')}, cap "
                          f"{payload.get('max_articles') or 'none'}/symbol"))
         parts.append(_kv("articles", payload.get("articles")))
         per_sym = payload.get("articles_by_symbol") or {}
@@ -241,6 +242,8 @@ def _payload_detail(payload: dict) -> html.Div:
             bits = [f"{s}:{n}"]
             if d.get("oldest") and d.get("newest"):
                 bits.append(f"{d['oldest']}→{d['newest']}")
+            if d.get("below_relevance"):
+                bits.append(f"{d['below_relevance']} below relevance")
             if d.get("capped"):
                 bits.append(f"CAPPED {d.get('fetched')}→{d.get('kept')}, "
                             f"effective {d.get('effective_days')}d")

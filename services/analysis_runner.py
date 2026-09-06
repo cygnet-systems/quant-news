@@ -991,6 +991,7 @@ def build_ai_report(
     max_articles: Optional[int] = None,
     overnight: bool = False,
     run_id: Optional[str] = None,
+    relevance: Optional[float] = None,
 ) -> dict:
     """Portfolio-level AI analysis for the run.
 
@@ -1005,9 +1006,9 @@ def build_ai_report(
     from services.llm_service import get_llm
     from services.stock_data import get_stock_info
 
-    if lookback_days is None or max_articles is None:
+    if lookback_days is None or max_articles is None or relevance is None:
         raise RunParameterMissing("build_ai_report called without the news "
-                                  "window / article cap")
+                                  "window / article cap / relevance floor")
     as_of = cutoff_date.isoformat()
     prog.emit_progress("report", state="running", total=len(symbols),
                        run_id=run_id)
@@ -1019,7 +1020,8 @@ def build_ai_report(
         # What this report was built from. The input-data export and the
         # renderers read it back instead of assuming a window.
         "news_window": {"lookback_days": lookback_days, "overnight": overnight,
-                        "max_articles": int(max_articles)},
+                        "max_articles": int(max_articles),
+                        "relevance": float(relevance)},
     }
 
     enriched: dict = {}
@@ -1045,7 +1047,7 @@ def build_ai_report(
     cache_key = report_cache_key(news_by_symbol, symbols, as_of, report_model,
                                  lookback_days, include_thesis,
                                  evidence=evidence, max_articles=max_articles,
-                                 overnight=overnight)
+                                 overnight=overnight, relevance=relevance)
     try:
         from services import persistence_service as ps
         cache_hash = ps.compute_data_hash(cache_key)
@@ -1117,12 +1119,13 @@ def report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
                      overnight: bool = False,
                      include_research: bool = False,
                      recs_mode: str = "auto",
-                     tools: Optional[Iterable[str]] = None) -> dict:
+                     tools: Optional[Iterable[str]] = None,
+                     relevance: Optional[float] = None) -> dict:
     """The ONE set of AI-report cache inputs. The Run dialog and the
     scheduled run both build their key here; when each had its own copy an
     overnight run or a non-default recommendations basis could never share
     the other's entry (and one of them silently mis-keyed the window)."""
-    from services.news_window import normalize_article_cap
+    from services.news_window import normalize_article_cap, normalize_relevance
     return {
         "news": news_by_symbol,
         "symbols": sorted(symbols),
@@ -1131,6 +1134,7 @@ def report_cache_key(news_by_symbol: dict, symbols: list[str], as_of: str,
         "model": report_model,
         "lookback": "overnight" if overnight else lookback_days,
         "max_articles": normalize_article_cap(max_articles),
+        "relevance": normalize_relevance(relevance),
         "thesis": include_thesis,
         "research": include_research,
         "recs": recs_mode,
@@ -1436,6 +1440,7 @@ def run_full_analysis(
     recs_mode: str = "auto",
     ensemble_config: Optional[dict] = None,
     run_ensemble: bool = True,
+    relevance: Optional[float] = None,
 ) -> dict:
     """Run the whole Full Analysis pipeline for ``symbols``.
 
@@ -1446,21 +1451,23 @@ def run_full_analysis(
     ``target`` is the session whose close is being predicted (defaults to the
     next unresolved session); data is cut off at the previous trading day.
     ``news_filter`` selects the news window formula ("lookback" | "overnight",
-    default from config). ``lookback_days`` and ``max_articles`` (newest N per
-    symbol, 0 = all) are REQUIRED. They come from the job's params or the
-    CLI, never from a default here. Returns a summary dict, the durable
-    output is in Postgres.
+    default from config). ``lookback_days``, ``max_articles`` (newest N per
+    symbol, 0 = all) and ``relevance`` (AV ticker-relevance floor applied
+    before the cap, 0 = all) are REQUIRED. They come from the job's params
+    or the CLI, never from a default here. Returns a summary dict, the
+    durable output is in Postgres.
 
     This layer owns the run record: an analysis_runs row (kind=scheduled)
     created BEFORE the feed opens and closed from here, whatever the stages
     do. The scheduler's own JobRun bookkeeping stays where it is; nothing
     about this row is decided in run_job's finalize block.
     """
-    if lookback_days is None or max_articles is None:
+    if lookback_days is None or max_articles is None or relevance is None:
         raise RunParameterMissing(
-            "run_full_analysis needs lookback_days and max_articles from the "
-            "job params / CLI (got "
-            f"lookback_days={lookback_days!r}, max_articles={max_articles!r})")
+            "run_full_analysis needs lookback_days, max_articles and relevance "
+            "from the job params / CLI (got "
+            f"lookback_days={lookback_days!r}, max_articles={max_articles!r}, "
+            f"relevance={relevance!r})")
     from services import progress_service as prog
     from utils.trading_calendar import resolve_target_and_cutoff
 
@@ -1468,6 +1475,7 @@ def run_full_analysis(
     row_id = _create_scheduled_run_row(symbols, cutoff_date, target_date, {
         "lookback_days": lookback_days,
         "max_articles": max_articles,
+        "relevance": relevance,
         "report_model": report_model or MODEL.REPORT_MODEL,
         "recs_model": recs_model or MODEL.RECOMMENDATIONS_MODEL,
         "include_thesis": bool(include_thesis),
@@ -1495,7 +1503,7 @@ def run_full_analysis(
             force_refresh=force_refresh, force=force, news_filter=news_filter,
             evidence=evidence, max_articles=max_articles, tools=tools,
             recs_mode=recs_mode, ensemble_config=ensemble_config,
-            run_ensemble=run_ensemble, run_id=run_id)
+            run_ensemble=run_ensemble, run_id=run_id, relevance=relevance)
     except Exception as e:
         # An escaped stage error used to leave the feed open until the
         # watchdog's stall timer; the run is over the moment it raises.
@@ -1529,12 +1537,13 @@ def _run_stages(
     ensemble_config: Optional[dict] = None,
     run_ensemble: bool = True,
     run_id: Optional[str] = None,
+    relevance: Optional[float] = None,
 ) -> dict:
     """The stages of run_full_analysis, inside an already-open run."""
     from services import progress_service as prog
     from services.news_window import (
         describe_news_window, fetch_run_news, news_window_payload,
-        normalize_article_cap, normalize_lookback)
+        normalize_article_cap, normalize_lookback, normalize_relevance)
     from utils.trading_calendar import resolve_target_and_cutoff
 
     report_model = report_model or MODEL.REPORT_MODEL
@@ -1566,6 +1575,7 @@ def _run_stages(
         return {"error": "no price data", "symbols": symbols}
 
     max_articles = normalize_article_cap(max_articles)
+    relevance = normalize_relevance(relevance)
     _, lookback_days = normalize_lookback(lookback_days)
     news_seen = {"symbols": 0, "articles": 0}
 
@@ -1590,7 +1600,7 @@ def _run_stages(
         priced, as_of, target_date.isoformat(),
         overnight=(news_filter == "overnight"),
         lookback_days=lookback_days, max_articles=max_articles,
-        on_symbol=_news_progress)
+        relevance=relevance, on_symbol=_news_progress)
     news_unavailable = [s for s in priced
                         if news_stats[s]["status"] == "unavailable"]
     news_empty = [s for s in priced if news_stats[s]["status"] == "empty"]
@@ -1599,7 +1609,7 @@ def _run_stages(
 
     payload = news_window_payload(
         overnight=(news_filter == "overnight"), lookback_days=lookback_days,
-        max_articles=max_articles, as_of=as_of,
+        max_articles=max_articles, relevance=relevance, as_of=as_of,
         target=target_date.isoformat(), stats_by_symbol=news_stats)
     prog.emit("news", describe_news_window(payload), payload=payload)
 
@@ -1635,6 +1645,7 @@ def _run_stages(
             content=json.dumps({
                 "as_of": as_of, "lookback_days": lookback_days,
                 "max_articles": max_articles,
+                "relevance": relevance,
                 "news_filter": news_filter,
                 "news_unavailable": news_unavailable,
                 "news_empty": news_empty,
@@ -1671,7 +1682,7 @@ def _run_stages(
         stock_data=stock_data, lookback_days=lookback_days,
         include_thesis=include_thesis, evidence=evidence,
         max_articles=max_articles, overnight=(news_filter == "overnight"),
-        run_id=run_id,
+        run_id=run_id, relevance=relevance,
     )
     # After the cache check on purpose: a restored report predating these
     # sections gets them attached instead of silently lacking them.
@@ -1722,7 +1733,8 @@ def _run_stages(
                 news_by_symbol, priced, as_of, report_model,
                 lookback_days, include_thesis, evidence=evidence,
                 max_articles=max_articles,
-                overnight=(news_filter == "overnight"), tools=tools)),
+                overnight=(news_filter == "overnight"), tools=tools,
+                relevance=relevance)),
             content=json.dumps(merged, default=str, indent=2),
             file_format="json",
         )

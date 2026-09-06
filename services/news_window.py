@@ -206,13 +206,16 @@ def select_spread(articles: list, n: int) -> list:
 
 
 def cap_newest(articles: list, max_articles: int,
-               as_of: Union[str, datetime, None] = None) -> tuple[list, dict]:
+               as_of: Union[str, datetime, None] = None,
+               below_relevance: int = 0) -> tuple[list, dict]:
     """Keep the newest ``max_articles`` (0 = all) and say what that did.
 
     The stats dict is what makes the cap visible downstream: ``fetched`` vs
     ``kept``, whether it bit, and the date span actually kept, so a trace
     can print "requested 30d, effective 6d" instead of implying the model
-    saw the whole month.
+    saw the whole month. ``below_relevance`` is how many of the window's
+    articles the relevance floor dropped BEFORE the cap saw them; it rides
+    along so the two filters are never confused for each other.
     """
     ordered = sort_newest_first(articles)
     fetched = len(ordered)
@@ -232,6 +235,7 @@ def cap_newest(articles: list, max_articles: int,
         "oldest": oldest,
         "newest": newest,
         "effective_days": effective_days,
+        "below_relevance": int(below_relevance or 0),
     }
 
 
@@ -368,7 +372,7 @@ def fetch_point_in_time_news(
     as_of: Union[str, datetime],
     lookback_days: int,
     max_articles: int = 0,
-    relevance_threshold: float = 0.5,
+    relevance_threshold: Optional[float] = None,
 ) -> list:
     """Articles only: see :func:`fetch_point_in_time_news_with_stats`.
     ``max_articles`` 0 = everything the window holds (the default for
@@ -382,7 +386,7 @@ def fetch_point_in_time_news_with_stats(
     as_of: Union[str, datetime],
     lookback_days: int,
     max_articles: int = 0,
-    relevance_threshold: float = 0.5,
+    relevance_threshold: Optional[float] = None,
 ) -> tuple[list, dict]:
     """Fetch ticker news bounded to ``[as_of - lookback, as_of]`` (no lookahead).
 
@@ -392,10 +396,14 @@ def fetch_point_in_time_news_with_stats(
     back to yfinance news (also as-of filtered) when AV returns nothing.
 
     ``max_articles`` keeps the newest N of the window (0 = everything the
-    window holds). The returned stats (see :func:`cap_newest`) record what
-    the cap did so no caller has to infer it.
+    window holds). ``relevance_threshold`` is applied first: an article
+    whose AV ticker relevance is below it never reaches the cap (None =
+    config NEWS_RELEVANCE_THRESHOLD, the library default; run paths pass
+    the frontend's value). The returned stats (see :func:`cap_newest`)
+    record what both filters did so no caller has to infer it.
     """
     max_articles = int(max_articles or 0)
+    relevance_threshold = _resolve_relevance(relevance_threshold)
 
     # max_articles and relevance are part of the key: a smaller earlier fetch
     # must not be served to a caller asking for the full window.
@@ -417,9 +425,10 @@ def _fetch_point_in_time_uncached(symbol, as_of, lookback_days, max_articles,
                                   relevance_threshold, cache_key) -> tuple[list, dict]:
     end_day = _coerce_dt(as_of).date()
     start_day = end_day - timedelta(days=lookback_days)
-    articles = _store_window(symbol, start_day, end_day, relevance_threshold)
+    articles, below = _store_window(symbol, start_day, end_day,
+                                    relevance_threshold)
     windowed = filter_articles_as_of(articles, as_of, lookback_days)
-    result = cap_newest(windowed, max_articles, as_of)
+    result = cap_newest(windowed, max_articles, as_of, below_relevance=below)
     _cache_put(cache_key, result, live=_window_is_live(as_of))
     return result
 
@@ -480,11 +489,12 @@ def coverage_gaps(days: list, covered: dict, *, now: datetime,
     return ranges
 
 
-def _store_window(symbol: str, start_day, end_day, relevance_threshold: float) -> list:
+def _store_window(symbol: str, start_day, end_day,
+                  relevance_threshold: float) -> tuple[list, int]:
     """Articles for [start_day, end_day] from the store, fetching only the
-    uncovered days from the vendor first. Raises NewsUnavailable when a
-    needed day cannot be fetched. An incomplete window is not served as a
-    complete one."""
+    uncovered days from the vendor first, plus how many the relevance floor
+    dropped. Raises NewsUnavailable when a needed day cannot be fetched. An
+    incomplete window is not served as a complete one."""
     from services.cache_service import get_cache
     from services.news_service import fetch_alpha_vantage_news, fetch_yfinance_news
 
@@ -515,17 +525,19 @@ def _store_window(symbol: str, start_day, end_day, relevance_threshold: float) -
     rows = cache.get_historical_news(symbol, start_date=start_day.isoformat(),
                                      end_date=end_day.isoformat())
     articles = [_row_to_article(r) for r in rows]
+    in_window = len(articles)
     if relevance_threshold > 0:
         articles = [a for a in articles
                     if a.ticker_relevance_score is not None
                     and a.ticker_relevance_score >= relevance_threshold]
+    below = in_window - len(articles)
     if not articles and not gaps:
-        return articles
+        return articles, below
     if not articles:
         # The vendor answered with nothing for a freshly fetched window; the
         # yfinance fallback has no server-side window, fetch then filter.
-        return fetch_yfinance_news(symbol, max_articles=0)
-    return articles
+        return fetch_yfinance_news(symbol, max_articles=0), below
+    return articles, below
 
 
 def _article_row(a) -> dict:
@@ -602,7 +614,7 @@ def fetch_overnight_news(
     symbol: str,
     anchor_date: Union[str, datetime],
     target_date: Union[str, datetime],
-    relevance_threshold: float = 0.7,
+    relevance_threshold: Optional[float] = None,
     max_articles: int = 500,
     start_time_et: str = "16:00",
     end_time_et: str = "09:30",
@@ -617,7 +629,7 @@ def fetch_overnight_news_with_stats(
     symbol: str,
     anchor_date: Union[str, datetime],
     target_date: Union[str, datetime],
-    relevance_threshold: float = 0.7,
+    relevance_threshold: Optional[float] = None,
     max_articles: int = 500,
     start_time_et: str = "16:00",
     end_time_et: str = "09:30",
@@ -634,6 +646,7 @@ def fetch_overnight_news_with_stats(
     now_utc = datetime.now(timezone.utc)
     end_utc = min(end_utc, now_utc)
     max_articles = int(max_articles or 0)
+    relevance_threshold = _resolve_relevance(relevance_threshold)
     if end_utc <= start_utc:
         return cap_newest([], max_articles, anchor_date)
 
@@ -654,8 +667,8 @@ def fetch_overnight_news_with_stats(
 
 def _fetch_overnight_uncached(symbol, start_utc, end_utc, now_utc, anchor_date,
                               max_articles, relevance_threshold, cache_key):
-    articles = _store_window(symbol, start_utc.date(), end_utc.date(),
-                             relevance_threshold)
+    articles, below = _store_window(symbol, start_utc.date(), end_utc.date(),
+                                    relevance_threshold)
     # Strict client-side window, unlike the lookback path an undated
     # article can never qualify (its position relative to a 17.5-hour window
     # is unknowable).
@@ -664,7 +677,8 @@ def _fetch_overnight_uncached(symbol, start_utc, end_utc, now_utc, anchor_date,
         if (pub := _article_pub_date(a)) is not None
         and start_utc <= as_utc(pub) < end_utc
     ]
-    result = cap_newest(windowed, max_articles, anchor_date)
+    result = cap_newest(windowed, max_articles, anchor_date,
+                        below_relevance=below)
     # Live while the gap is still open (the clamp to now trimmed it).
     _cache_put(cache_key, result, live=(end_utc >= now_utc - timedelta(minutes=1)))
     return result
@@ -710,6 +724,32 @@ def normalize_article_cap(value) -> int:
     return cap
 
 
+def normalize_relevance(value) -> float:
+    """Relevance floor from the frontend (0 = keep every article). None or
+    blank raises, the same rule as the window and the cap: a run on a floor
+    the user did not pick is worse than no run."""
+    try:
+        rel = float(value)
+    except (TypeError, ValueError):
+        raise RunParameterMissing(
+            f"relevance threshold not supplied by the frontend (got {value!r})"
+        ) from None
+    if not 0.0 <= rel <= 1.0:
+        raise RunParameterMissing(
+            f"relevance threshold must be between 0 and 1 (got {rel})")
+    return rel
+
+
+def _resolve_relevance(value: Optional[float]) -> float:
+    """Library-call default: config NEWS_RELEVANCE_THRESHOLD when the caller
+    passed nothing. Run paths never reach this with None (fetch_run_news
+    normalizes first)."""
+    if value is None:
+        from config import MODEL
+        return float(MODEL.NEWS_RELEVANCE_THRESHOLD)
+    return float(value)
+
+
 def fetch_run_news(
     symbols: list[str],
     as_of: str,
@@ -718,11 +758,16 @@ def fetch_run_news(
     overnight: bool,
     lookback_days: int,
     max_articles: int,
+    relevance: float,
     retries: int = 3,
     sleep=None,
     on_symbol=None,
 ) -> tuple[dict[str, list[dict]], dict[str, dict]]:
     """Point-in-time news for a run, one implementation for every path.
+
+    ``relevance`` is the AV ticker-relevance floor (0 = keep all), applied
+    before ``max_articles`` on both window formulas; the run's value, from
+    the dialog, the job or the CLI, never a default of this module's.
 
     Returns ``(articles_by_symbol, stats_by_symbol)``. Articles are dicts (the
     store/model/prompt shape). Each stats entry is :func:`cap_newest`'s dict
@@ -742,6 +787,7 @@ def fetch_run_news(
 
     sleep = sleep or _time.sleep
     cap = normalize_article_cap(max_articles)
+    relevance = normalize_relevance(relevance)
     if not overnight:
         _, lookback_days = normalize_lookback(lookback_days)
     by_symbol: dict[str, list[dict]] = {}
@@ -755,7 +801,7 @@ def fetch_run_news(
                 if overnight:
                     articles, stats = fetch_overnight_news_with_stats(
                         sym, as_of, target,
-                        relevance_threshold=MODEL.NEWS_OVERNIGHT_RELEVANCE,
+                        relevance_threshold=relevance,
                         max_articles=cap,
                         start_time_et=MODEL.NEWS_OVERNIGHT_START_ET,
                         end_time_et=MODEL.NEWS_OVERNIGHT_END_ET,
@@ -763,7 +809,7 @@ def fetch_run_news(
                 else:
                     articles, stats = fetch_point_in_time_news_with_stats(
                         sym, as_of, lookback_days=lookback_days,
-                        max_articles=cap)
+                        max_articles=cap, relevance_threshold=relevance)
                 error = None
                 break
             except NewsUnavailable as e:
@@ -792,8 +838,8 @@ def fetch_run_news(
 
 
 def news_window_payload(*, overnight: bool, lookback_days: int,
-                        max_articles: int, as_of: str, target: str,
-                        stats_by_symbol: dict[str, dict]) -> dict:
+                        max_articles: int, relevance: float, as_of: str,
+                        target: str, stats_by_symbol: dict[str, dict]) -> dict:
     """The structured trace event for a run's news window.
 
     Carries what was REQUESTED (window, cap) and what was actually KEPT per
@@ -801,15 +847,12 @@ def news_window_payload(*, overnight: bool, lookback_days: int,
     "requested 30d → effective 6d (capped 512→100)" instead of the request
     alone.
     """
-    from config import MODEL
-
     return {
         "event": "news_window",
         "filter": "overnight" if overnight else "lookback",
         "lookback_days": lookback_days,
         "max_articles": int(max_articles or 0),
-        "relevance_threshold": (MODEL.NEWS_OVERNIGHT_RELEVANCE
-                                if overnight else 0.5),
+        "relevance_threshold": float(relevance),
         "as_of": as_of,
         "target_date": target,
         "articles": sum(int(s.get("kept") or 0) for s in stats_by_symbol.values()),
@@ -820,7 +863,7 @@ def news_window_payload(*, overnight: bool, lookback_days: int,
         "by_symbol": {
             s: {k: v.get(k) for k in
                 ("fetched", "kept", "capped", "oldest", "newest",
-                 "effective_days", "status", "error")}
+                 "effective_days", "below_relevance", "status", "error")}
             for s, v in stats_by_symbol.items()
         },
     }
@@ -838,11 +881,15 @@ def describe_news_window(payload: dict) -> str:
     else:
         head = (f"News window {payload.get('lookback_days')}d ending "
                 f"{payload.get('as_of')} (target {payload.get('target_date')} "
-                f"minus 1 trading day)")
+                f"minus 1 trading day, relevance ≥ "
+                f"{payload.get('relevance_threshold')})")
     cap = int(payload.get("max_articles") or 0)
     head += f", cap {cap or 'none'}/symbol"
     line = f"{head}: {payload.get('articles', 0)} articles fetched (point-in-time)"
     by_sym = payload.get("by_symbol") or {}
+    below = sum(int(v.get("below_relevance") or 0) for v in by_sym.values())
+    if below:
+        line += f", {below} below relevance dropped first"
     capped = [f"{s} {v.get('fetched')}→{v.get('kept')} "
               f"(effective {v.get('effective_days')}d)"
               for s, v in sorted(by_sym.items()) if v.get("capped")]

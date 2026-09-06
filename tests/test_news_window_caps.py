@@ -69,6 +69,7 @@ class TestCapNewest:
         assert stats == {
             "fetched": 40, "kept": 10, "cap": 10, "capped": True,
             "oldest": "2026-08-22", "newest": "2026-08-31", "effective_days": 10,
+            "below_relevance": 0,
         }
 
     def test_empty(self):
@@ -124,7 +125,7 @@ class TestFetchRunNews:
         with patch.object(nw, "fetch_point_in_time_news_with_stats", side_effect=fake):
             by_sym, stats = nw.fetch_run_news(
                 ["OK", "QUIET", "DOWN"], "2026-08-31", "2026-09-01",
-                overnight=False, lookback_days=30, max_articles=100,
+                overnight=False, lookback_days=30, max_articles=100, relevance=0.7,
                 retries=3, sleep=slept.append)
 
         assert stats["OK"]["status"] == "ok" and by_sym["OK"][0]["published_at"] == "2026-08-30T00:00:00"
@@ -140,7 +141,7 @@ class TestFetchRunNews:
                     "status": "ok"},
         }
         payload = nw.news_window_payload(
-            overnight=False, lookback_days=30, max_articles=5, as_of="2026-08-31",
+            overnight=False, lookback_days=30, max_articles=5, relevance=0.7, as_of="2026-08-31",
             target="2026-09-01", stats_by_symbol=stats)
         assert payload["articles"] == 6
         assert payload["by_symbol"]["NVDA"]["capped"] is True
@@ -245,12 +246,14 @@ class TestDurableStore:
         with patch("services.cache_service.get_cache", return_value=store), \
              patch.object(ns, "fetch_alpha_vantage_news", side_effect=av):
             kept, stats = nw.fetch_point_in_time_news_with_stats(
-                "TYL", "2026-08-20", lookback_days=7, max_articles=0)
+                "TYL", "2026-08-20", lookback_days=7, max_articles=0,
+                relevance_threshold=0.5)
             assert stats["kept"] == 8 and calls == [("20260813", "20260820")]
             # Next session: one new day, everything else served from the store.
             nw.clear_pit_news_cache()
             kept2, stats2 = nw.fetch_point_in_time_news_with_stats(
-                "TYL", "2026-08-21", lookback_days=7, max_articles=0)
+                "TYL", "2026-08-21", lookback_days=7, max_articles=0,
+                relevance_threshold=0.5)
             assert stats2["kept"] == 8 and calls[1:] == [("20260821", "20260821")]
             assert store.pruned == 1, "retention prune runs once per day"
 
@@ -284,10 +287,41 @@ class TestFetchCapIsExplicit:
         with patch("services.cache_service.get_cache", return_value=store), \
              patch.object(ns, "fetch_alpha_vantage_news", return_value=arts) as av:
             kept, stats = nw.fetch_point_in_time_news_with_stats(
-                "TYL", "2026-08-31", lookback_days=30, max_articles=4)
+                "TYL", "2026-08-31", lookback_days=30, max_articles=4,
+                relevance_threshold=0.5)
             again = nw.fetch_point_in_time_news("TYL", "2026-08-31", lookback_days=30,
-                                                max_articles=4)
+                                                max_articles=4, relevance_threshold=0.5)
         assert av.call_count == 1, "second call is served from the cache"
         assert "max_articles" not in av.call_args.kwargs, "no hidden vendor-side cap"
         assert len(kept) == 4 and again == kept
         assert stats["fetched"] == 12 and stats["capped"] and stats["effective_days"] == 4
+        assert stats["below_relevance"] == 0
+
+    def test_relevance_floor_applies_before_the_cap_and_is_counted(self):
+        """The cap keeps the newest N RELEVANT articles: an irrelevant
+        mention never spends a cap slot, and the stats say how many the
+        floor removed so the trace can tell the two filters apart."""
+        import services.news_service as ns
+        nw.clear_pit_news_cache()
+        store = _FakeStore()
+        # The 4 newest are passing mentions; the cap must reach past them.
+        arts = [_av_article("TYL", datetime(2026, 8, 31 - d, 12),
+                            rel=0.2 if d < 4 else 0.9) for d in range(12)]
+        with patch("services.cache_service.get_cache", return_value=store), \
+             patch.object(ns, "fetch_alpha_vantage_news", return_value=arts):
+            kept, stats = nw.fetch_point_in_time_news_with_stats(
+                "TYL", "2026-08-31", lookback_days=30, max_articles=4,
+                relevance_threshold=0.7)
+        assert [a.ticker_relevance_score for a in kept] == [0.9] * 4
+        assert stats["below_relevance"] == 4
+        assert stats["fetched"] == 8 and stats["kept"] == 4 and stats["capped"]
+        assert stats["newest"] == "2026-08-27", "the newest kept is the newest RELEVANT"
+
+    def test_library_default_is_the_config_floor(self):
+        from config import MODEL
+        assert MODEL.NEWS_RELEVANCE_THRESHOLD == 0.7
+        assert nw._resolve_relevance(None) == 0.7
+        assert nw.normalize_relevance("0.5") == 0.5 and nw.normalize_relevance(0) == 0.0
+        for bad in (None, "", "x", 1.5, -0.1):
+            with pytest.raises(nw.RunParameterMissing):
+                nw.normalize_relevance(bad)

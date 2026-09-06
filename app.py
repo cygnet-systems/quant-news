@@ -442,7 +442,8 @@ def serve_saved_report(key: str = ""):
 
 @server.get("/api/download/report-inputs")
 def serve_report_inputs(symbols: str = "", date: str = "",
-                        lookback: int | None = None, max_articles: int = 0):
+                        lookback: int | None = None, max_articles: int = 0,
+                        relevance: float | None = None):
     """Serve the point-in-time model-input workbook for a report/prediction.
 
     Reconstructs inputs with the same lookahead-safe builders the models use,
@@ -466,7 +467,8 @@ def serve_report_inputs(symbols: str = "", date: str = "",
     try:
         from services.export_service import build_model_inputs_xlsx
         payload = build_model_inputs_xlsx(syms, as_of, news_lookback_days=lookback,
-                                          max_articles=max_articles)
+                                          max_articles=max_articles,
+                                          relevance=relevance)
     except Exception as e:
         logger.warning(f"Input-data export failed for {syms} @ {as_of}: {e}")
         raise HTTPException(status_code=500)
@@ -634,6 +636,18 @@ def _serialize_articles(articles) -> list[dict]:
     """NewsArticle objects -> the store/UI dict shape."""
     from services.news_window import article_to_dict
     return [article_to_dict(a) for a in articles]
+
+
+def _run_relevance(config: dict):
+    """The run row's relevance floor, or the config default for a row that
+    predates the setting (2026-09-06). Such a row ran at the floor the code
+    then applied; a retry of it should run, not be refused for a knob that
+    did not exist when it was recorded. Rows written since carry the value
+    and a missing one is a wiring fault normalize_relevance reports."""
+    rel = (config or {}).get("relevance")
+    if rel is None and "relevance" not in (config or {}):
+        return MODEL.NEWS_RELEVANCE_THRESHOLD
+    return rel
 
 
 def _fill_run_inputs(symbols, stock_data, news_data=None):
@@ -2585,10 +2599,12 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
 
     # One set of settings, read once, from the row.
     from services.news_window import (
-        RunParameterMissing, normalize_article_cap, normalize_lookback)
+        RunParameterMissing, normalize_article_cap, normalize_lookback,
+        normalize_relevance)
     try:
         overnight_news, lookback_days = normalize_lookback(config.get("lookback"))
         max_articles = normalize_article_cap(config.get("max_articles"))
+        relevance = normalize_relevance(_run_relevance(config))
     except RunParameterMissing as e:
         # Refuse, visibly. No default: a report on a window the user did not
         # pick would be indistinguishable from the one they asked for.
@@ -2699,11 +2715,12 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     articles_by_symbol, news_stats = await asyncio.to_thread(
         fetch_run_news, symbols or [], as_of_str, target_str,
         overnight=overnight_news, lookback_days=lookback_days,
-        max_articles=max_articles, on_symbol=_news_progress)
+        max_articles=max_articles, relevance=relevance,
+        on_symbol=_news_progress)
     news_payload = news_window_payload(
         overnight=overnight_news, lookback_days=lookback_days,
-        max_articles=max_articles, as_of=as_of_str, target=target_str,
-        stats_by_symbol=news_stats)
+        max_articles=max_articles, relevance=relevance, as_of=as_of_str,
+        target=target_str, stats_by_symbol=news_stats)
     emit("news", describe_news_window(news_payload), payload=news_payload)
     news_down = [s for s, v in news_stats.items() if v["status"] == "unavailable"]
     if news_down:
@@ -2722,7 +2739,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
         lookback_days, include_thesis_flag, evidence=evidence_sel,
         max_articles=max_articles, overnight=overnight_news,
         include_research=include_research, recs_mode=recs_mode,
-        tools=tools_sel)
+        tools=tools_sel, relevance=relevance)
 
     # Check persistent cache (Postgres + S3) before running LLM. A retry
     # exists because the cached (or failed) answer was not good enough.
@@ -2772,7 +2789,7 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     result = {
         "overall": None,
         "news_window": {"lookback_days": lookback_days, "overnight": overnight_news,
-                        "max_articles": max_articles},
+                        "max_articles": max_articles, "relevance": relevance},
         "by_symbol": {},
         "as_of": as_of_str,
         "generated_at": datetime.now().isoformat(),
@@ -3797,9 +3814,10 @@ def generate_model_signals(run_store, dispatched):
         # dialog said. The window's days ride along so the research agent
         # does not re-filter to its own default.
         from services.news_window import (
-            normalize_article_cap, normalize_lookback)
+            normalize_article_cap, normalize_lookback, normalize_relevance)
         overnight_news, lookback_days = normalize_lookback(config.get("lookback"))
         max_articles = normalize_article_cap(config.get("max_articles"))
+        relevance = normalize_relevance(_run_relevance(config))
         research_kwargs = {"news_lookback_days": lookback_days}
         if is_full_analysis:
             # The research report (trading_agents) honours the report
@@ -3867,11 +3885,12 @@ def generate_model_signals(run_store, dispatched):
         run_news, news_stats = fetch_run_news(
             priced, str(predict_date), str(target_date),
             overnight=overnight_news, lookback_days=lookback_days,
-            max_articles=max_articles)
+            max_articles=max_articles, relevance=relevance)
         news_payload = news_window_payload(
             overnight=overnight_news, lookback_days=lookback_days,
-            max_articles=max_articles, as_of=str(predict_date),
-            target=str(target_date), stats_by_symbol=news_stats)
+            max_articles=max_articles, relevance=relevance,
+            as_of=str(predict_date), target=str(target_date),
+            stats_by_symbol=news_stats)
         _emit("news", describe_news_window(news_payload),
               payload=news_payload)
         news_down = [s for s, v in news_stats.items()
@@ -5512,6 +5531,7 @@ _SJ_SCALARS = [
     ("sj-minute", "value"), ("sj-days", "value"), ("sj-tz", "value"),
     ("sj-visibility", "value"), ("sj-enabled", "value"), ("sj-symbols", "value"),
     ("sj-lookback", "value"), ("sj-max-articles", "value"),
+    ("sj-relevance", "value"),
     ("sj-ensemble-check", "value"), ("sj-ensemble-method", "value"),
     ("sj-ensemble-min-agree", "value"), ("sj-model", "value"), ("sj-type", "value"),
     ("sj-evidence", "value"), ("sj-tools", "value"), ("sj-recs", "value"),
@@ -5529,6 +5549,7 @@ def _sj_values_from_params(kind: str, params: dict, model_ids, member_ids,
     return {
         "sj-lookback": str(p.get("lookback", "")),
         "sj-max-articles": p.get("max_articles"),
+        "sj-relevance": p.get("relevance"),
         "models": [m in set(p.get("models") or model_ids) for m in model_ids],
         "sj-ensemble-check": bool(p.get("run_ensemble", True)),
         "sj-ensemble-method": ens.get("method"),
@@ -5699,7 +5720,8 @@ def save_schedule_job(n_clicks, job_id, *rest):
         raise PreventUpdate
     from services import scheduler_service
     from services.news_window import (
-        RunParameterMissing, normalize_article_cap, normalize_lookback)
+        RunParameterMissing, normalize_article_cap, normalize_lookback,
+        normalize_relevance)
 
     n = len(_SJ_SCALARS)
     scalars = dict(zip([cid for cid, _ in _SJ_SCALARS], rest[:n]))
@@ -5728,6 +5750,7 @@ def save_schedule_job(n_clicks, job_id, *rest):
         try:
             overnight, days = normalize_lookback(scalars["sj-lookback"])
             cap = normalize_article_cap(scalars["sj-max-articles"])
+            relevance = normalize_relevance(scalars["sj-relevance"])
         except RunParameterMissing as e:
             return err(str(e))
         models = [i["model"] for i, on in zip(model_ids, model_vals or []) if on]
@@ -5747,6 +5770,7 @@ def save_schedule_job(n_clicks, job_id, *rest):
             "only_trading_days": True,
             "lookback": "overnight" if overnight else days,
             "max_articles": cap,
+            "relevance": relevance,
             "models": models,
             "run_ensemble": bool(scalars["sj-ensemble-check"]),
             "ensemble": {
@@ -5988,13 +6012,14 @@ def apply_run_preset(preset, run_date, check_ids):
     Input("run-modal", "is_open"),
     Input("run-lookback", "value"),
     Input("run-max-articles", "value"),
+    Input("run-relevance", "value"),
     Input("run-date-picker", "date"),
     # Input, not State: editing the run's symbol set refreshes the counts.
     Input("run-symbols-store", "data"),
     prevent_initial_call=True,
 )
 async def preview_ai_report_articles(is_open, lookback, max_articles_val,
-                                     ai_date, run_symbols):
+                                     relevance_val, ai_date, run_symbols):
     """Fetch and show article availability for the chosen window BEFORE
     generation: the same point-in-time fetch generation uses, so the
     preview counts are the counts, not an estimate from the news store.
@@ -6015,7 +6040,7 @@ async def preview_ai_report_articles(is_open, lookback, max_articles_val,
     from utils.trading_calendar import resolve_target_and_cutoff
     from services.news_window import (
         RunParameterMissing, fetch_run_news, normalize_article_cap,
-        normalize_lookback)
+        normalize_lookback, normalize_relevance)
 
     # Same target/cutoff resolution as generation: the window ends at the
     # cutoff (previous trading day), not the target, previewing a window
@@ -6026,6 +6051,7 @@ async def preview_ai_report_articles(is_open, lookback, max_articles_val,
     try:
         overnight, lookback_days = normalize_lookback(lookback)
         max_articles = normalize_article_cap(max_articles_val)
+        relevance = normalize_relevance(relevance_val)
     except RunParameterMissing as e:
         return html.Div(f"Cannot preview: {e}", className="text-danger")
 
@@ -6038,25 +6064,30 @@ async def preview_ai_report_articles(is_open, lookback, max_articles_val,
             _, stats = await asyncio.to_thread(
                 fetch_run_news, [sym], as_of, target, overnight=overnight,
                 lookback_days=lookback_days, max_articles=max_articles,
-                retries=1)
+                relevance=relevance, retries=1)
             return stats[sym]
 
     stats = await asyncio.gather(*(_one(s) for s in symbols))
 
-    rows, total, capped = [], 0, []
+    rows, total, capped, below_total = [], 0, [], 0
     for sym, st in zip(symbols, stats):
         n = int(st.get("kept") or 0)
         total += n
+        below = int(st.get("below_relevance") or 0)
+        below_total += below
         if st.get("capped"):
             capped.append(sym)
         span = (f"{st['oldest']} → {st['newest']}"
                 if st.get("oldest") and st.get("newest") else "n/a")
-        note = ""
+        notes = []
         if st.get("status") == "unavailable":
-            note = "source unavailable"
-        elif st.get("capped"):
-            note = (f"capped {st['fetched']}→{n}, effective "
-                    f"{st.get('effective_days')}d")
+            notes.append("source unavailable")
+        if below:
+            notes.append(f"{below} below relevance")
+        if st.get("capped"):
+            notes.append(f"capped {st['fetched']}→{n}, effective "
+                         f"{st.get('effective_days')}d")
+        note = ", ".join(notes)
         rows.append(html.Tr([
             html.Td(sym),
             html.Td(str(n), style={"textAlign": "right"}),
@@ -6067,10 +6098,12 @@ async def preview_ai_report_articles(is_open, lookback, max_articles_val,
 
     window_label = (
         f" in the overnight window {as_of} {_M.NEWS_OVERNIGHT_START_ET} ET → "
-        f"{target} {_M.NEWS_OVERNIGHT_END_ET} ET (relevance ≥ {_M.NEWS_OVERNIGHT_RELEVANCE})"
+        f"{target} {_M.NEWS_OVERNIGHT_END_ET} ET"
         if overnight else
         f" in the {lookback_days}-day window ending {as_of} (data cutoff for target {target})"
-    ) + (f", newest {max_articles} per symbol" if max_articles else ", no cap")
+    ) + (f", relevance ≥ {relevance:g}" if relevance else ", any relevance") \
+      + (f", newest {max_articles} per symbol" if max_articles else ", no cap") \
+      + (f"; {below_total} dropped below relevance first" if below_total else "")
     warn = None
     if capped:
         warn = html.Div(
@@ -6324,6 +6357,7 @@ def _resolve_run_symbols(tokens, existing):
     State("run-date-picker", "date"),
     State("run-lookback", "value"),
     State("run-max-articles", "value"),
+    State("run-relevance", "value"),
     State("run-model", "value"),
     State("run-type", "value"),
     State("run-recs", "value"),
@@ -6348,7 +6382,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
                      confirm_clicks, stock_data, watchlist,
                      news_data, is_open, run_store, run_scope, panel_state,
                      run_date=None, lookback=None, max_articles=None,
-                     report_model=None, depth=None, recs=None,
+                     relevance=None, report_model=None, depth=None, recs=None,
                      recs_model=None, run_evidence=None, run_tools=None,
                      model_checks=None, run_ensemble=None, ens_method=None,
                      ens_min_agree=None, preset=None, prefs=None,
@@ -6468,6 +6502,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             "picked_date": picked,
             "lookback": lookback,
             "max_articles": max_articles,
+            "relevance": relevance,
             "report_model": report_model,
             "depth": depth,
             "recs": recs,

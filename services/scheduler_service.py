@@ -213,6 +213,7 @@ def default_run_params() -> dict:
         "only_trading_days": True,
         "lookback": MODEL.NEWS_LOOKBACK_DAYS,          # days, or "overnight"
         "max_articles": MODEL.NEWS_MAX_ARTICLES,        # newest N, 0 = all
+        "relevance": MODEL.NEWS_RELEVANCE_THRESHOLD,    # AV floor before the cap, 0 = all
         "models": [mid for mid, _, _ in RUN_MODELS],
         "run_ensemble": True,
         "ensemble": {
@@ -622,6 +623,17 @@ def _build_command(job: dict, overrides: Optional[dict] = None) -> list[str]:
     cmd += ["--news-filter", "overnight" if overnight else "lookback"]
     cmd += ["--lookback", "1" if overnight else str(int(params["lookback"]))]
     cmd += ["--max-articles", str(int(params["max_articles"]))]
+    # The relevance floor arrived after the window and the cap (2026-09-06).
+    # A job saved before it exists ran at the floor the code then applied;
+    # the config default stands in for it rather than refusing the morning
+    # run, and the log says so until the job is re-saved.
+    if params.get("relevance") is None:
+        logger.warning("job params predate the relevance floor; running at "
+                       "config default %s, re-save the job to pin it",
+                       MODEL.NEWS_RELEVANCE_THRESHOLD)
+    cmd += ["--relevance", str(float(
+        params["relevance"] if params.get("relevance") is not None
+        else MODEL.NEWS_RELEVANCE_THRESHOLD))]
     models = params.get("models")
     if models:
         cmd += ["--models", models if isinstance(models, str) else ",".join(models)]

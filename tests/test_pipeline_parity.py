@@ -51,13 +51,14 @@ class TestOneImplementation:
         key = ar.report_cache_key(
             {"TYL": []}, ["TYL"], "2026-08-31", "gpt-5.6-luna", 30, True,
             evidence=["quality"], max_articles=100, overnight=False,
-            include_research=True, recs_mode="signals")
+            include_research=True, recs_mode="signals", relevance=0.7)
         assert key["lookback"] == 30 and key["max_articles"] == 100
+        assert key["relevance"] == 0.7
         assert key["research"] is True and key["recs"] == "signals"
         assert key["evidence"] == ["quality"]
         overnight = ar.report_cache_key(
             {"TYL": []}, ["TYL"], "2026-08-31", "m", 1, True, overnight=True,
-            max_articles=0)
+            max_articles=0, relevance=0)
         assert overnight["lookback"] == "overnight"
 
     def test_report_cache_key_refuses_a_missing_cap(self):
@@ -121,6 +122,7 @@ class TestSchedulerCommand:
                                  "params": params}, None)
         flag = lambda f: cmd[cmd.index(f) + 1]  # noqa: E731
         assert flag("--max-articles") == "0" and flag("--lookback") == "30"
+        assert flag("--relevance") == str(float(params["relevance"]))
         assert flag("--news-filter") == "lookback"
         assert flag("--models") == "kronos_mini" and "--no-ensemble" in cmd
         assert flag("--depth") == "standard" and flag("--recs") == "off"
@@ -142,6 +144,21 @@ class TestSchedulerCommand:
                                             "web_research": 1}}, None)
         assert cmd[cmd.index("--tools") + 1] == "web_research"
 
+    def test_job_predating_the_relevance_floor_runs_at_the_default(self):
+        """The floor arrived 2026-09-06; a job saved before it must not
+        refuse the morning run. It runs at the config default until it is
+        re-saved, and a saved value is passed through untouched."""
+        from config import MODEL
+        from services import scheduler_service as ss
+        cmd = ss._build_command({"kind": "analysis", "symbols_csv": "TYL",
+                                 "params": {"lookback": 7, "max_articles": 500}},
+                                None)
+        assert cmd[cmd.index("--relevance") + 1] == str(float(MODEL.NEWS_RELEVANCE_THRESHOLD))
+        cmd = ss._build_command({"kind": "analysis", "symbols_csv": "TYL",
+                                 "params": {"lookback": 7, "max_articles": 500,
+                                            "relevance": 0}}, None)
+        assert cmd[cmd.index("--relevance") + 1] == "0.0"
+
     def test_job_without_window_or_cap_is_refused(self):
         from services import scheduler_service as ss
         with pytest.raises(ValueError, match="missing"):
@@ -155,6 +172,7 @@ class TestSchedulerCommand:
         d = ss.default_run_params()
         assert d["lookback"] == MODEL.NEWS_LOOKBACK_DAYS
         assert d["max_articles"] == MODEL.NEWS_MAX_ARTICLES
+        assert d["relevance"] == MODEL.NEWS_RELEVANCE_THRESHOLD == 0.7
         assert d["models"] == [m for m, _, _ in RUN_MODELS]
         assert set(d["evidence"]) == set(MODEL.DEFAULT_EVIDENCE)
         assert d["recs"] == "auto" and d["depth"] == "thesis"

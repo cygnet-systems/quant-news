@@ -137,7 +137,7 @@ def test_clean_run_creates_links_and_closes_the_row(db, feed, stages, monkeypatc
     monkeypatch.setenv("QUANTNEWS_RUN_PUBLIC", "0")
 
     summary = ar.run_full_analysis(["NVDA", "AMD"], lookback_days=7,
-                                   max_articles=50, recs_mode="auto")
+                                   max_articles=50, relevance=0.7, recs_mode="auto")
 
     run = _only_run()
     assert run["kind"] == "scheduled"
@@ -173,7 +173,7 @@ def test_scheduled_estimate_comes_from_past_scheduled_runs(db, feed, stages,
     from db.models import AnalysisRun
 
     # One symbol: its own band, so this run is not in the sample below.
-    ar.run_full_analysis(["NVDA"], lookback_days=7, max_articles=50,
+    ar.run_full_analysis(["NVDA"], lookback_days=7, max_articles=50, relevance=0.7,
                          recs_mode="auto")
     assert _only_run()["estimate_s"] is None
 
@@ -184,7 +184,7 @@ def test_scheduled_estimate_comes_from_past_scheduled_runs(db, feed, stages,
             row = session.get(AnalysisRun, past)
             row.finished_at = row.started_at + timedelta(seconds=secs)
 
-    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=7, max_articles=50,
+    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=7, max_articles=50, relevance=0.7,
                          recs_mode="auto")
     newest = rs.list_runs()[0]
     assert newest["estimate_s"] == 240
@@ -194,7 +194,7 @@ def test_cli_run_without_a_job_has_no_link(db, feed, stages, monkeypatch):
     monkeypatch.delenv("QUANTNEWS_JOB_RUN_ID", raising=False)
     monkeypatch.delenv("QUANTNEWS_RUN_OWNER", raising=False)
     monkeypatch.delenv("QUANTNEWS_RUN_PUBLIC", raising=False)
-    ar.run_full_analysis(["AAPL"], lookback_days=3, max_articles=0,
+    ar.run_full_analysis(["AAPL"], lookback_days=3, max_articles=0, relevance=0.7,
                          recs_mode="off")
     run = _only_run()
     assert run["job_run_id"] is None and run["owner_uid"] is None
@@ -213,7 +213,7 @@ def test_row_is_running_before_the_price_load(db, feed, stages, monkeypatch):
         seen["status"] = _only_run()["status"]
         return {s: {"prices": "{}"} for s in symbols}
     monkeypatch.setattr(ar, "load_market_data", _market)
-    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0,
+    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0, relevance=0.7,
                          recs_mode="off")
     assert seen["status"] == "running"
     assert _only_run()["status"] == "done"
@@ -225,7 +225,7 @@ def test_symbols_join_the_lookup_cache(db, feed, stages, monkeypatch):
     monkeypatch.setattr(ts, "ensure_symbols",
                         lambda symbols, source="run": calls.append(
                             (list(symbols), source)))
-    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=3, max_articles=0,
+    ar.run_full_analysis(["NVDA", "AMD"], lookback_days=3, max_articles=0, relevance=0.7,
                          recs_mode="off")
     assert calls == [(["NVDA", "AMD"], "run")]
 
@@ -236,13 +236,13 @@ def test_symbol_cache_failure_never_stops_a_run(db, feed, stages, monkeypatch):
     def _boom(*a, **kw):
         raise RuntimeError("tickers table missing")
     monkeypatch.setattr(ts, "ensure_symbols", _boom)
-    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0,
+    ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0, relevance=0.7,
                          recs_mode="off")
     assert _only_run()["status"] == "done"
 
 
 def test_early_abort_fails_the_row(db, feed, stages):
-    summary = ar.run_full_analysis(["NOPX"], lookback_days=3, max_articles=0)
+    summary = ar.run_full_analysis(["NOPX"], lookback_days=3, max_articles=0, relevance=0.7)
     assert summary["error"] == "no price data"
     run = _only_run()
     assert run["status"] == "failed"
@@ -256,7 +256,7 @@ def test_raising_stage_fails_the_row_and_reraises(db, feed, stages, monkeypatch)
 
     monkeypatch.setattr(ar, "run_predictions", _boom)
     with pytest.raises(RuntimeError):
-        ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0)
+        ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0, relevance=0.7)
     run = _only_run()
     assert run["status"] == "failed"
     assert "model weights missing" in run["error"]
@@ -267,7 +267,7 @@ def test_raising_stage_fails_the_row_and_reraises(db, feed, stages, monkeypatch)
 def test_row_failure_does_not_stop_the_run(db, feed, stages, monkeypatch):
     monkeypatch.setattr(rs, "create_run",
                         lambda *a, **kw: (_ for _ in ()).throw(OSError("db down")))
-    summary = ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0)
+    summary = ar.run_full_analysis(["NVDA"], lookback_days=3, max_articles=0, relevance=0.7)
     assert summary["predictions_stored"] == 1
     assert rs.list_runs() == []
     assert feed._active_runs() == []
@@ -277,13 +277,13 @@ def test_news_hook_reports_each_symbol(monkeypatch):
     calls = []
     monkeypatch.setattr(
         "services.news_window.fetch_point_in_time_news_with_stats",
-        lambda sym, as_of, lookback_days, max_articles: (
+        lambda sym, as_of, lookback_days, max_articles, **kw: (
             [] if sym == "QUIET" else [object()],
             {"kept": 0 if sym == "QUIET" else 1}))
     monkeypatch.setattr("services.news_window.article_to_dict",
                         lambda a: {"title": "x"})
     by, stats = fetch_run_news(
         ["NVDA", "QUIET"], "2026-09-01", "2026-09-02", overnight=False,
-        lookback_days=7, max_articles=50,
+        lookback_days=7, max_articles=50, relevance=0.7,
         on_symbol=lambda s, arts, st: calls.append((s, len(arts), st["status"])))
     assert calls == [("NVDA", 1, "ok"), ("QUIET", 0, "empty")]

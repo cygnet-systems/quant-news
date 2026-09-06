@@ -915,6 +915,7 @@ class TestAnalyzeNow:
         d = run_field_defaults()
         out = confirm(["NVDA"], scope="full", run_date="2026-09-03",
                       lookback=d["lookback"], max_articles=d["max_articles"],
+                      relevance=d["relevance"],
                       report_model=d["report_model"], depth=d["depth"],
                       recs=d["recs"], recs_model=d["recs_model"],
                       run_evidence=list(d["evidence"]), run_tools=[],
@@ -1007,6 +1008,7 @@ class TestRunConfigAuthority:
     CONFIG = {
         "scope": "full", "target_date": "2026-09-03",
         "prediction_date": "2026-09-02", "lookback": 7, "max_articles": 10,
+        "relevance": 0.5,
         "report_model": "gpt-5.6-luna", "depth": "standard", "recs": "off",
         "recs_model": "claude-sonnet-5", "evidence": [], "tools": [],
         "models": ["kronos_mini", "lightgbm"], "ensemble": True,
@@ -1025,7 +1027,8 @@ class TestRunConfigAuthority:
     def test_stage_callbacks_read_no_dialog_control(self):
         from dash._callback import GLOBAL_CALLBACK_MAP
         dialog = {"run-scope", "run-symbols-store", "run-date-picker",
-                  "run-lookback", "run-max-articles", "run-model", "run-type",
+                  "run-lookback", "run-max-articles", "run-relevance",
+                  "run-model", "run-type",
                   "run-recs", "run-recs-model", "run-evidence", "run-tools",
                   "run-ensemble-check", "run-ensemble-method",
                   "run-ensemble-min-agree", "ensemble-config-store"}
@@ -1134,7 +1137,7 @@ class TestRunConfigAuthority:
         assert seen["as_of"] == "2026-09-02" and seen["target"] == "2026-09-03"
         assert out["scope"] == "full" and out["run_id"] == run_id
         assert out["news_window"] == {"lookback_days": 7, "overnight": False,
-                                      "max_articles": 10}
+                                      "max_articles": 10, "relevance": 0.5}
         assert out["as_of"] == "2026-09-02"
         assert out.get("recs_off") is True and "recs_request" not in out
         options = next(e["message"] for e in feed.get_feed(run_id)["events"]

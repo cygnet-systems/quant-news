@@ -64,6 +64,7 @@ def run_field_defaults() -> dict:
     return {
         "lookback": MODEL.NEWS_LOOKBACK_DAYS,
         "max_articles": MODEL.NEWS_MAX_ARTICLES,
+        "relevance": MODEL.NEWS_RELEVANCE_THRESHOLD,
         "report_model": "gpt-5.6-luna",
         "depth": "thesis",
         "recs": "auto",
@@ -116,6 +117,19 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
             step=1,
             value=(v["max_articles"] if v.get("max_articles") is not None
                    else d["max_articles"]),
+            size="sm",
+        ),
+        # AV's ticker-relevance floor, applied BEFORE the cap: the cap then
+        # keeps the newest N articles that are actually about the company.
+        # 0 keeps passing mentions too.
+        "relevance": dbc.Input(
+            id=f"{prefix}-relevance",
+            type="number",
+            min=0,
+            max=1,
+            step=0.05,
+            value=(v["relevance"] if v.get("relevance") is not None
+                   else d["relevance"]),
             size="sm",
         ),
         "model": dbc.Select(
@@ -1041,6 +1055,10 @@ def run_settings_sections(prefix: str, values: dict | None = None,
                 field("Article cap per symbol", sel["max_articles"],
                       "Keep the newest N of the window; 0 = all. The trace "
                       "reports when this drops articles."),
+                field("Minimum relevance", sel["relevance"],
+                      "Alpha Vantage scores how much each article is about "
+                      "this ticker (0 to 1). Below this it is dropped before "
+                      "the cap; 0 = keep all."),
             ], className="run-field-grid"),
         ], id=f"{prefix}-news-section"),
         html.Div([
@@ -1288,6 +1306,11 @@ def create_run_modal() -> dbc.Modal:
                                       "Keep the newest N of the window; "
                                       "0 = all. The trace reports when this "
                                       "drops articles."),
+                                field("Minimum relevance", sel["relevance"],
+                                      "Alpha Vantage scores how much each "
+                                      "article is about this ticker (0 to "
+                                      "1). Below this it is dropped before "
+                                      "the cap; 0 = keep all."),
                             ],
                             className="run-field-grid",
                         ),

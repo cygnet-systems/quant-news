@@ -271,6 +271,7 @@ def build_model_inputs_xlsx(
     as_of: str,
     news_lookback_days: Optional[int] = None,
     max_articles: int = 0,
+    relevance: Optional[float] = None,
 ) -> bytes:
     """Workbook of the point-in-time inputs behind a report/prediction/rec.
 
@@ -334,7 +335,8 @@ def build_model_inputs_xlsx(
         try:
             articles = fetch_point_in_time_news(sym, as_of,
                                                 lookback_days=news_lookback_days,
-                                                max_articles=max_articles)
+                                                max_articles=max_articles,
+                                                relevance_threshold=relevance)
         except Exception:
             articles = []
         news_all.extend(_news_rows(sym, articles))

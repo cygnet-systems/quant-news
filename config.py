@@ -260,10 +260,14 @@ class ModelConfig:
     NEWS_LOOKBACK_DAYS: int = int(os.getenv("NEWS_LOOKBACK_DAYS", "14"))
     NEWS_OVERNIGHT_START_ET: str = os.getenv("NEWS_OVERNIGHT_START_ET", "16:00")
     NEWS_OVERNIGHT_END_ET: str = os.getenv("NEWS_OVERNIGHT_END_ET", "09:30")
-    # The overnight window is short, so it uses the stricter FEATURE-grade
-    # relevance bar (matches DEBERTA_RELEVANCE_THRESHOLD) vs the lookback
-    # path's looser 0.5.
-    NEWS_OVERNIGHT_RELEVANCE: float = float(os.getenv("NEWS_OVERNIGHT_RELEVANCE", "0.7"))
+    # Alpha Vantage scores every article's relevance to the ticker (0..1).
+    # Articles below this are dropped BEFORE the cap, so a cap of 50 keeps
+    # the newest 50 RELEVANT articles, never 50 mentions in passing. The
+    # feature-grade bar DeBERTa applies (DEBERTA_RELEVANCE_THRESHOLD); the
+    # lookback path used to sit at a looser 0.5 that nothing exposed.
+    # FRONTEND default only, like NEWS_LOOKBACK_DAYS: the Run dialog, the
+    # job form and the CLI carry it per run; 0 keeps everything.
+    NEWS_RELEVANCE_THRESHOLD: float = float(os.getenv("NEWS_RELEVANCE_THRESHOLD", "0.7"))
     # Default per-symbol cap on a run's news window: keep the NEWEST N of
     # the window, 0 = everything the window holds. The Run dialog, the
     # scheduler job form and the CLI all expose this; the trace records

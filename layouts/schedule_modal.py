@@ -135,6 +135,7 @@ def settings_summary(job: dict) -> str:
     bits = [
         window,
         f"cap {p.get('max_articles', '?')}",
+        f"relevance ≥ {p.get('relevance', '?')}",
         f"{n_models} models" + ("" if p.get("run_ensemble", True) else ", no ensemble"),
         f"report {p.get('report_model', '?')} ({p.get('depth', 'thesis')})",
         f"recs {p.get('recs', 'auto')}",
