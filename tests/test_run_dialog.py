@@ -554,10 +554,51 @@ class TestSymbols:
         chips, *_ = app_module.render_run_symbol_chips({})
         assert chips[0].className == "run-symbols-empty"
 
-    def test_data_summary_follows_the_chip_set(self):
-        out = app_module.render_run_data_summary({"symbols": ["NVDA"]}, {}, {})
-        assert "NVDA" in str(out.to_plotly_json())
-        empty = app_module.render_run_data_summary({}, {}, {})
+    def test_data_summary_resolves_prices_on_selection(self, monkeypatch):
+        """A symbol the browser store lacks is fetched server-side when it
+        is selected, so the table shows its bars before the run, the way
+        the News preview shows articles. It used to say "at run time"."""
+        import pandas as pd
+        calls = []
+
+        class Cache:
+            def get_stock_prices(self, sym, period):
+                calls.append((sym, period))
+                if sym == "BAD":
+                    return pd.DataFrame(), {"api_error": "no such ticker",
+                                            "from_cache": False}
+                idx = pd.date_range("2026-08-01", periods=3, freq="B")
+                return (pd.DataFrame({"Close": [1.0, 2.0, 3.0]}, index=idx),
+                        {"from_cache": sym == "ORCL"})
+
+        monkeypatch.setattr(app_module, "get_cache", lambda: Cache())
+        monkeypatch.setattr(app_module, "_RUN_PRICE_SUMMARIES", {})
+        store_df = pd.DataFrame(
+            {"Date": pd.date_range("2026-01-02", periods=5, freq="B"),
+             "Close": range(5)})
+        stock_data = {"NVDA": {"prices": store_df.to_json(date_format="iso"),
+                               "from_cache": False}}
+        out = asyncio.run(app_module.render_run_data_summary(
+            {"symbols": ["NVDA", "ORCL", "BAD"]}, stock_data))
+        text = str(out.to_plotly_json())
+        # The store symbol is not refetched; the others are, at the run's
+        # own 1y horizon.
+        assert sorted(calls) == [("BAD", "1y"), ("ORCL", "1y")]
+        assert "at run time" not in text
+        assert "8 daily bars" in text
+        assert "2026-08-03 to 2026-08-05" in text and "Cached" in text
+        assert "unavailable: no such ticker" in text
+        assert "No prices for BAD" in text
+
+        # Editing the chip set again re-renders from the day cache: history
+        # on record does not change, so the good symbol is not refetched.
+        # The failed one is, in case the vendor is back.
+        again = asyncio.run(app_module.render_run_data_summary(
+            {"symbols": ["ORCL", "BAD"]}, {}))
+        assert sorted(calls) == [("BAD", "1y"), ("BAD", "1y"), ("ORCL", "1y")]
+        assert "2026-08-03 to 2026-08-05" in str(again.to_plotly_json())
+
+        empty = asyncio.run(app_module.render_run_data_summary({}, {}))
         assert "No symbols selected" in str(empty.to_plotly_json())
         from dash._callback import GLOBAL_CALLBACK_MAP
         cb = GLOBAL_CALLBACK_MAP["run-data-summary.children"]

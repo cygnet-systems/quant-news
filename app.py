@@ -13,7 +13,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -6127,12 +6127,48 @@ def update_predict_date_label(date_str):
         ], {"fontSize": "0.85rem", "color": "var(--warning, #ffc107)"}
 
 
-def _run_data_summary(symbols, stock_data, news_data):
-    """The dialog's per-symbol input summary for the resolved run set.
+def _price_row_summary(sym_data) -> dict:
+    """Bars, span and origin of one symbol's price entry, store-shaped.
 
-    A symbol outside the browser stores shows "at run time", its data is
-    fetched server-side when the run starts (see _fill_run_inputs), so an
-    empty row here is a statement of when, not a problem.
+    Works on a browser-store entry and on the dict _fill_run_inputs builds
+    alike, so the dialog table and the run see the same numbers.
+    """
+    out = {"bars": None, "span": None, "source": None, "error": None}
+    if not (sym_data or {}).get("prices"):
+        out["error"] = sym_data.get("error") if sym_data else None
+        return out
+    try:
+        df = pd.read_json(StringIO(sym_data["prices"]))
+        out["bars"] = len(df)
+        if not df.empty:
+            dates = df["Date"] if "Date" in df.columns else df.index
+            out["span"] = (f"{str(dates.min())[:10]} to "
+                           f"{str(dates.max())[:10]}")
+        out["source"] = "Cached" if sym_data.get("from_cache") else "Live"
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+# Server-resolved price summaries for the run dialog, keyed by (symbol,
+# calendar day). A day's history never changes once it is on record; only
+# tomorrow adds a bar, and the day in the key retires the entry then. So a
+# symbol costs one resolve per day no matter how often the chip set is
+# edited. Errors are not kept: a throttled vendor should be retried on the
+# next edit, not remembered until midnight. FIFO-bounded like the
+# investigation caches, for the same reason (the scheduler shares this
+# process).
+_RUN_PRICE_SUMMARIES: dict[tuple[str, str], dict] = {}
+_RUN_PRICE_SUMMARIES_MAX = 512
+
+
+def _run_data_summary(symbols, summaries):
+    """The dialog's per-symbol price summary for the resolved run set.
+
+    ``summaries`` maps symbol -> _price_row_summary() output. Every symbol
+    is resolved before this renders (render_run_data_summary fetches the
+    ones the browser stores don't hold), so a row without bars is a real
+    gap: the run will start without that symbol's prices.
     """
     if not symbols:
         return html.Div(
@@ -6144,52 +6180,53 @@ def _run_data_summary(symbols, stock_data, news_data):
             ],
             className="empty-state",
         )
-    stock_data = stock_data or {}
-    articles_by_symbol = (news_data or {}).get("articles_by_symbol", {})
-    sym_rows = []
+    summaries = summaries or {}
+    sym_rows, total, missing = [], 0, []
     for sym in symbols:
-        sym_data = stock_data.get(sym, {})
-        data_points = ", "
-        date_range = ", "
-        source = "at run time"
-        if sym_data.get("prices"):
-            try:
-                df = pd.read_json(StringIO(sym_data["prices"]))
-                data_points = str(len(df))
-                if not df.empty and "Date" in df.columns:
-                    date_range = (
-                        f"{str(df['Date'].min())[:10]} to "
-                        f"{str(df['Date'].max())[:10]}"
-                    )
-                elif not df.empty:
-                    date_range = (
-                        f"{str(df.index.min())[:10]} to "
-                        f"{str(df.index.max())[:10]}"
-                    )
-                source = ("Cached" if sym_data.get("from_cache")
-                          else "Live")
-            except Exception:
-                pass
-        news_count = len(articles_by_symbol.get(sym, []))
+        s = summaries.get(sym) or _price_row_summary(None)
+        if s["bars"]:
+            total += s["bars"]
+            note = ""
+        else:
+            missing.append(sym)
+            note = "unavailable" + (f": {s['error']}" if s["error"] else "")
         sym_rows.append(html.Tr([
-            html.Td(sym), html.Td(data_points),
-            html.Td(date_range),
-            html.Td(str(news_count) if sym in articles_by_symbol else "n/a"),
-            html.Td(source),
+            html.Td(sym),
+            html.Td(str(s["bars"]) if s["bars"] else "0",
+                    style={"textAlign": "right"}),
+            html.Td(s["span"] or "n/a",
+                    style={"color": "var(--text-secondary)"}),
+            html.Td(s["source"] or "", style={"color": "var(--text-secondary)"}),
+            html.Td(note, style={"color": ("var(--warning, #ffc107)"
+                                           if note else "inherit")}),
         ]))
 
+    warn = None
+    if missing:
+        warn = html.Div(
+            f"No prices for {', '.join(missing)}: the run would start "
+            f"without them. Check the symbol, or retry once the source "
+            f"is back.",
+            style={"color": "var(--warning, #ffc107)"}, className="mb-1")
     return html.Div([
-        html.H6("Stock Data", className="mb-3"),
+        html.Div([
+            html.Strong(f"{total} daily bars"),
+            html.Span(f" across {len(symbols)} symbol"
+                      f"{'s' if len(symbols) != 1 else ''}, 1y each; the "
+                      f"run truncates to the data cutoff",
+                      style={"color": "var(--text-secondary)"}),
+        ], className="mb-1"),
+        warn,
         dbc.Table(
             [
                 html.Thead(html.Tr([
-                    html.Th("Symbol"), html.Th("Bars"),
-                    html.Th("Date Range"), html.Th("Articles"),
-                    html.Th("Source"),
+                    html.Th("Symbol"),
+                    html.Th("Bars", style={"textAlign": "right"}),
+                    html.Th("Span"), html.Th("Source"), html.Th(""),
                 ])),
                 html.Tbody(sym_rows),
             ],
-            bordered=True, color="dark", size="sm",
+            bordered=False, color="dark", size="sm", className="mb-0",
         ),
     ])
 
@@ -6832,12 +6869,57 @@ def render_run_symbol_chips(store):
     # article preview does; it used to render once on open and go stale.
     Input("run-symbols-store", "data"),
     State("stock-data-store", "data"),
-    State("news-data-store", "data"),
     prevent_initial_call=True,
 )
-def render_run_data_summary(store, stock_data, news_data):
-    return _run_data_summary((store or {}).get("symbols") or [],
-                             stock_data, news_data)
+async def render_run_data_summary(store, stock_data):
+    """Resolve every run symbol's prices BEFORE the run, like the article
+    preview does for news.
+
+    The browser store only holds watchlist symbols; a name added by search
+    used to show "at run time" and never resolve, so nobody could tell a
+    pending fetch from a broken one until the run finished. Fetching here
+    goes through the same cache layer _fill_run_inputs uses, so the run's
+    own fetch is then a Postgres read.
+    """
+    symbols = (store or {}).get("symbols") or []
+    stock_data = stock_data or {}
+    today = date.today().isoformat()
+    summaries: dict[str, dict] = {}
+    gaps = []
+    for sym in symbols:
+        if (stock_data.get(sym) or {}).get("prices"):
+            summaries[sym] = _price_row_summary(stock_data[sym])
+        elif (sym, today) in _RUN_PRICE_SUMMARIES:
+            summaries[sym] = _RUN_PRICE_SUMMARIES[(sym, today)]
+        else:
+            gaps.append(sym)
+    if gaps:
+        sem = asyncio.Semaphore(APP.NEWS_FETCH_CONCURRENCY)
+
+        async def _one(sym):
+            async with sem:
+                try:
+                    df, meta = await asyncio.to_thread(
+                        get_cache().get_stock_prices, sym, "1y")
+                    if df is None or df.empty:
+                        return sym, _price_row_summary(
+                            {"error": meta.get("api_error")
+                             or "no bars returned"})
+                    return sym, _price_row_summary(
+                        {"prices": df.to_json(date_format="iso"),
+                         "from_cache": meta.get("from_cache", False)})
+                except Exception as e:
+                    logger.warning("Run dialog: price fetch failed for %s: %s",
+                                   sym, e)
+                    return sym, _price_row_summary({"error": str(e)})
+
+        for sym, s in await asyncio.gather(*(_one(g) for g in gaps)):
+            summaries[sym] = s
+            if s["bars"]:
+                _RUN_PRICE_SUMMARIES[(sym, today)] = s
+        while len(_RUN_PRICE_SUMMARIES) > _RUN_PRICE_SUMMARIES_MAX:
+            del _RUN_PRICE_SUMMARIES[next(iter(_RUN_PRICE_SUMMARIES))]
+    return _run_data_summary(symbols, summaries)
 
 
 @callback(

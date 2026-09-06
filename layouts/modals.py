@@ -1246,7 +1246,16 @@ def create_run_modal() -> dbc.Modal:
                     "The close being predicted. Data is cut off at the previous "
                     "trading day, so a Monday target sees nothing after Friday.",
                 ),
-                html.Div(id="run-data-summary"),
+                # --- Stock data (resolved on selection, like the News preview) ---
+                html.Div(
+                    [
+                        html.Hr(),
+                        html.H6("Stock Data", className="mb-2"),
+                        html.Div(id="run-data-summary",
+                                 className="run-article-preview"),
+                    ],
+                    id="run-data-section",
+                ),
 
                 # --- Customize ---
                 # Everything a preset decides lives here, folded away until
