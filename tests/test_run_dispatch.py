@@ -155,7 +155,9 @@ class TestConfirmDispatch:
         assert run_id in feed._active_runs()
         assert out[PANEL]["closed"] is False
         assert out[TOAST_OPEN] is True
-        assert "nvda, AMD" in out[TOAST_MSG]
+        toast_text, follow = out[TOAST_MSG]
+        assert "nvda, AMD" in toast_text.children
+        assert follow.href == f"/runs/{run_id}"
         assert out[INTERVAL] == app_module._PROGRESS_POLL_ACTIVE_MS
         # What the browser remembers, and the confirm button back at rest.
         assert out[PREFS] == {"preset": "standard", "symbols": ["nvda", "AMD"]}
@@ -720,11 +722,13 @@ class TestRetry:
         assert app_module._dispatch_run_id(dispatch, None) == new_id
         # Acknowledged like a confirm: panel forced open, toast with the
         # previous run's symbols and estimate, poll at the active rate.
-        panel, toast_open, toast_msg, interval = out[4:]
+        panel, toast_open, toast_body, interval = out[4:]
         assert panel["closed"] is False and panel["mode"] == "normal"
         assert toast_open is True
-        assert toast_msg.startswith("NVDA, AMD · ")
-        assert "Reports" in toast_msg
+        toast_msg, follow = toast_body
+        assert toast_msg.children.startswith("NVDA, AMD · ")
+        assert "Reports" in toast_msg.children
+        assert follow.href == f"/runs/{new_id}"
         assert interval == app_module._PROGRESS_POLL_ACTIVE_MS
 
     def test_retry_refused_while_a_run_is_in_flight(self, prev, feed):
@@ -749,7 +753,11 @@ class TestRetry:
         rs.set_status(prev_id, "failed", error="x")
         out = app_module.retry_run(1, {"run_id": prev_id, "scope": "report"})
         assert out[0]["retry_of"] == prev_id
-        assert out[5] is True and "duration unknown" in out[6]
+        assert out[5] is True
+        text, follow = out[6]
+        assert "duration unknown" in text.children
+        # The started toast links the run page: rows fill in live there.
+        assert follow.href == f"/runs/{out[0]['run_id']}"
 
     def test_retry_without_a_row_says_so(self, db, feed, monkeypatch):
         monkeypatch.setattr(app_module, "_run_owner_uid", lambda: "u1")
@@ -809,7 +817,9 @@ class TestAnalyzeNow:
                                                         priced):
         out = self._analyze(1, " nvda ", {"closed": True})
         store, dispatch, cleared, modal, msg = out[:5]
-        panel, toast_open, toast_msg, interval = out[5:]
+        panel, toast_open, toast_body, interval = out[5:]
+        toast_msg = toast_body[0].children
+        assert toast_body[1].href == f"/runs/{store['run_id']}"
 
         assert store == dispatch
         assert store["symbols"] == ["NVDA"]

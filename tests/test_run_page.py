@@ -6,8 +6,8 @@ but never wrote anything about still gets a row. The layout renders the
 header, the failure/cancel banner, the board rows with the report and
 watchlist cells, and the synthesis card. The router serves the page for a
 run path and "Run not found" for a stale id, and ?open=first opens the
-reader on the first symbol's report through the same builder the click
-path uses. Everything runs on in-memory SQLite; no model, no LLM.
+reader on the first symbol's report (?open=<SYMBOL> on that symbol's)
+through the same builder the click path uses. Everything runs on in-memory SQLite; no model, no LLM.
 """
 
 import os
@@ -425,10 +425,20 @@ class TestLayout:
     def test_open_first_marks_the_row_the_reader_opened(self, db):
         run_id = seed(db)
         view = ds.get_run_view(run_id)
-        page = run_page.layout(view, [], open_first=True)
+        page = run_page.layout(view, [], opened="first")
         opened = _find_all(page, className="run-row-opened")
         assert len(opened) == 1 and _text(opened[0].children[0]) == "NVDA"
         assert _find_all(run_page.layout(view, []), className="run-row-opened") == []
+        # A named symbol marks its own row, report or not (TSLA has none):
+        # the reader landed where the link said, and the row says "no report".
+        page = run_page.layout(view, [], opened="AMD")
+        opened = _find_all(page, className="run-row-opened")
+        assert len(opened) == 1 and _text(opened[0].children[0]) == "AMD"
+        page = run_page.layout(view, [], opened="TSLA")
+        opened = _find_all(page, className="run-row-opened")
+        assert len(opened) == 1 and _text(opened[0].children[0]) == "TSLA"
+        assert _find_all(run_page.layout(view, [], opened="ZZZ"),
+                         className="run-row-opened") == []
 
     def test_synthesis_card_shows_positions_model_and_duration(self, db):
         run_id = seed(db)
@@ -524,6 +534,9 @@ class TestRouter:
         run_id = seed(db)
         page, _ = _render(f"/runs/{run_id}", [], search="?open=first")
         assert len(_find_all(page, className="run-row-opened")) == 1
+        page, _ = _render(f"/runs/{run_id}", [], search="?open=amd")
+        opened = _find_all(page, className="run-row-opened")
+        assert len(opened) == 1 and _text(opened[0].children[0]) == "AMD"
         page, _ = _render(f"/runs/{run_id}", [])
         assert _find_all(page, className="run-row-opened") == []
 
@@ -552,16 +565,23 @@ class TestRouter:
         with pytest.raises(PreventUpdate):
             app_module.refresh_run_watchlist_cells(["NVDA"], "/runs/nope")
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("?open=first", "/runs/nope")
+            app_module.open_linked_report("?open=first", "/runs/nope")
         with pytest.raises(PreventUpdate):
             app_module.refresh_live_run(1, "/runs/nope", ["NVDA"], None)
 
-    def test_wants_first_report(self):
-        assert app_module._wants_first_report("?open=first") is True
-        assert app_module._wants_first_report("?x=1&open=first") is True
-        assert app_module._wants_first_report("?open=none") is False
-        assert app_module._wants_first_report("") is False
-        assert app_module._wants_first_report(None) is False
+    def test_arrival_target(self):
+        assert app_module._arrival_target("?open=first") == "first"
+        assert app_module._arrival_target("?x=1&open=first") == "first"
+        assert app_module._arrival_target("?open=GEV") == "GEV"
+        assert app_module._arrival_target("?open=gev") == "GEV"
+        assert app_module._arrival_target("?open=BRK.B") == "BRK.B"
+        # "none" is a legal ticker shape; it names a row that will not exist.
+        assert app_module._arrival_target("?open=none") == "NONE"
+        assert app_module._arrival_target("?open=") is None
+        assert app_module._arrival_target("?open=<script>") is None
+        assert app_module._arrival_target("?open=" + "A" * 13) is None
+        assert app_module._arrival_target("") is None
+        assert app_module._arrival_target(None) is None
 
     def test_watchlist_change_swaps_the_cells_on_the_run_page(self, db):
         run_id = seed(db)
@@ -711,7 +731,7 @@ class TestLivePoll:
 class TestOpenFirst:
     def test_arrival_opens_the_first_symbols_report(self, db):
         run_id = seed(db)
-        is_open, title, body, footer = app_module.open_first_report(
+        is_open, title, body, footer = app_module.open_linked_report(
             "?open=first", f"/runs/{run_id}")
         assert is_open is True
         assert title.startswith("NVDA: BUY")
@@ -721,9 +741,30 @@ class TestOpenFirst:
 
     def test_first_report_skips_symbols_without_one(self, db):
         run_id = seed(db, symbols=("TSLA", "NVDA", "AMD"))
-        _, title, _, _ = app_module.open_first_report(
+        _, title, _, _ = app_module.open_linked_report(
             "?open=first", f"/runs/{run_id}")
         assert title.startswith("NVDA")
+
+    def test_a_named_symbol_opens_its_own_report(self, db):
+        run_id = seed(db)
+        _, title, _, footer = app_module.open_linked_report(
+            "?open=AMD", f"/runs/{run_id}")
+        assert title.startswith("AMD")
+        rows = {r["symbol"]: r for r in ds.get_run_view(run_id)["symbols"]}
+        assert footer.href == f"/api/download/ta-report/{rows['AMD']['report']['id']}"
+        # Case-insensitive: a hand-typed link still lands.
+        _, title, _, _ = app_module.open_linked_report(
+            "?open=amd", f"/runs/{run_id}")
+        assert title.startswith("AMD")
+
+    def test_a_named_symbol_without_a_report_opens_nothing(self, db):
+        """Never another symbol's report: that substitution is the confusion
+        the per-symbol links exist to remove."""
+        run_id = seed(db)
+        with pytest.raises(PreventUpdate):
+            app_module.open_linked_report("?open=TSLA", f"/runs/{run_id}")
+        with pytest.raises(PreventUpdate):
+            app_module.open_linked_report("?open=ZZZ", f"/runs/{run_id}")
 
     def test_same_builder_as_the_click_path(self, db, monkeypatch):
         run_id = seed(db)
@@ -734,7 +775,7 @@ class TestOpenFirst:
         seen = []
         monkeypatch.setattr(app_module, "_report_modal_parts",
                             lambda r: seen.append(r["id"]) or ("t", "b", "f"))
-        assert app_module.open_first_report("?open=first", f"/runs/{run_id}") \
+        assert app_module.open_linked_report("?open=first", f"/runs/{run_id}") \
             == (True, "t", "b", "f")
         monkeypatch.setattr(app_module, "ctx", SimpleNamespace(
             triggered_id={"type": "ta-view-btn", "report": "x"}))
@@ -747,14 +788,14 @@ class TestOpenFirst:
     def test_no_update_without_the_flag_or_a_report(self, db):
         run_id = seed(db)
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("", f"/runs/{run_id}")
+            app_module.open_linked_report("", f"/runs/{run_id}")
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("?open=first", "/reports")
+            app_module.open_linked_report("?open=first", "/reports")
         bare = seed(db, with_report=False)
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("?open=first", f"/runs/{bare}")
+            app_module.open_linked_report("?open=first", f"/runs/{bare}")
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("?open=first", "/runs/" + "0" * 36)
+            app_module.open_linked_report("?open=first", "/runs/" + "0" * 36)
 
     def test_db_failure_leaves_the_modal_alone(self, db, monkeypatch):
         run_id = seed(db)
@@ -764,7 +805,7 @@ class TestOpenFirst:
 
         monkeypatch.setattr(ds, "get_run_view", boom)
         with pytest.raises(PreventUpdate):
-            app_module.open_first_report("?open=first", f"/runs/{run_id}")
+            app_module.open_linked_report("?open=first", f"/runs/{run_id}")
 
 
 # --- wiring ---------------------------------------------------------------
@@ -832,7 +873,14 @@ class TestWiring:
             [("ta-report-modal", "is_open")]
         assert cb["clientside_function"] is not None
         assert cb["prevent_initial_call"] is True
-        assert any("open=first" in s for s in _inline_scripts())
+        # Any open= target (first or a symbol) is what the closer strips.
+        script = next(s for s in _inline_scripts() if "open=[^&]*" in s)
+        m = re.search(r"if \(!onRun \|\| !/(.*?)/\.test", script)
+        assert m is not None
+        assert re.search(m.group(1), "?open=first")
+        assert re.search(m.group(1), "?open=GEV")
+        assert re.search(m.group(1), "?x=1&open=GEV")
+        assert not re.search(m.group(1), "?x=1")
 
     def test_watchlist_refresh_targets_the_run_table(self):
         cbs = _callbacks_writing("run-symbol-table.children")

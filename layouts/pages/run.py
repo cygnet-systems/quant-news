@@ -7,7 +7,9 @@ the same cells as the Home board plus the research report and a way to
 add the name to the watchlist, and the portfolio synthesis under the rows.
 
 Pure rendering over the dict services.dashboard_service.get_run_view
-returns; the reader modal is opened by app.py on ``?open=first``.
+returns; the reader modal is opened by app.py on ``?open=first`` (the
+first symbol with a report) or ``?open=<SYMBOL>`` (that symbol's report,
+the completion toast's per-symbol links).
 """
 
 from datetime import datetime, timezone
@@ -238,31 +240,53 @@ def _watchlist_cell(symbol: str, in_watchlist: bool) -> html.Td:
     )
 
 
-def first_report(view: dict) -> dict | None:
-    """The report the reader opens on arrival: the first row that has one,
-    in the run's own symbol order."""
+def arrival_row(view: dict, target: str | None) -> dict | None:
+    """The symbol row an arrival link asks for, or None.
+
+    ``target`` is the URL's open= value: "first" is the first row that has
+    a report, in the run's own symbol order; a symbol is that row whether
+    or not it has a report (the reader landed where the link said, and
+    the row says "no report" when there is none).
+    """
+    if not target:
+        return None
     for row in view.get("symbols") or []:
-        if row.get("report"):
-            return row["report"]
+        if target == "first":
+            if row.get("report"):
+                return row
+        elif row.get("symbol") == target:
+            return row
     return None
 
 
-def symbol_table(view: dict, watchlist=None, open_first: bool = False) -> html.Div:
+def arrival_report(view: dict, target: str | None) -> dict | None:
+    """The report the reader opens on arrival, or None. A symbol without
+    a report opens nothing: sending the reader into another symbol's
+    report is exactly the confusion the per-symbol links exist to
+    remove."""
+    row = arrival_row(view, target)
+    return row.get("report") if row else None
+
+
+def symbol_table(view: dict, watchlist=None, opened: str | None = None) -> html.Div:
     """The board rows with the report and watchlist cells appended.
 
-    Rendered into #run-symbol-table so the watchlist callback can swap it
-    when a name is added without rebuilding the page.
+    ``opened`` is the URL's open= target; the row it lands on is marked so
+    the reader can tell which report the modal showed (or which row they
+    were sent to when it has no report). Rendered into #run-symbol-table
+    so the watchlist callback can swap it when a name is added without
+    rebuilding the page.
     """
     run = view["run"]
     models = view.get("model_names") or []
     rows = view.get("symbols") or []
     wl = set(watchlist or [])
-    opened = first_report(view) if open_first else None
+    marked = (arrival_row(view, opened) or {}).get("symbol")
 
     trs = []
     for row in rows:
         props = {}
-        if opened and row.get("report") is opened:
+        if marked and row.get("symbol") == marked:
             props["className"] = "run-row-opened"
         trs.append(symbol_row(
             row, models,
@@ -407,14 +431,14 @@ def synthesis_card(recommendation: dict | None, run: dict) -> html.Div:
     )
 
 
-def layout(view: dict, watchlist=None, open_first: bool = False) -> html.Div:
+def layout(view: dict, watchlist=None, opened: str | None = None) -> html.Div:
     run = view["run"]
     top = banner(run)
     return html.Div(
         [
             top if top is not None else "",
             header(view),
-            html.Div(symbol_table(view, watchlist, open_first),
+            html.Div(symbol_table(view, watchlist, opened),
                      id="run-symbol-table"),
             synthesis_card(view.get("recommendation"), run),
             # Seeded from the render so the first poll tick after a load

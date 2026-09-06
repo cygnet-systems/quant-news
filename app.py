@@ -806,23 +806,35 @@ def _run_route(pathname) -> str | None:
     return m.group(1) if m else None
 
 
-def _wants_first_report(search) -> bool:
-    """True when the query string carries open=first (the toast/pill link)."""
+# What a run link may ask the reader to open on arrival: "first" (the
+# pill), or a ticker (the completion toast's per-symbol links). Anything
+# else in the query is ignored rather than looked up.
+_OPEN_TARGET_RE = re.compile(r"^(first|[A-Z0-9.\-^]{1,12})$")
+
+
+def _arrival_target(search) -> str | None:
+    """The reader's arrival target from the query string: "first", a
+    symbol (upper-cased), or None when the link asks for nothing."""
     from urllib.parse import parse_qs
     if not search:
-        return False
+        return None
     values = parse_qs(str(search).lstrip("?")).get("open") or []
-    return "first" in values
+    for value in values:
+        value = str(value).strip().upper()
+        value = "first" if value == "FIRST" else value
+        if _OPEN_TARGET_RE.match(value):
+            return value
+    return None
 
 
-def _build_run_page(run_id: str, watchlist, open_first: bool):
+def _build_run_page(run_id: str, watchlist, opened: str | None):
     from layouts.pages import run as run_page
     from services import dashboard_service as ds
 
     view = ds.get_run_view(run_id)
     if view is None:
         return run_page.not_found(run_id)
-    return run_page.layout(view, watchlist or [], open_first=open_first)
+    return run_page.layout(view, watchlist or [], opened=opened)
 
 
 @callback(
@@ -866,7 +878,7 @@ def render_page(pathname, history_data, filter_symbols, filter_range,
     if run_id:
         try:
             return (_build_run_page(run_id, watchlist,
-                                    _wants_first_report(search)),
+                                    _arrival_target(search)),
                     RUN_PAGE_TITLE)
         except Exception as e:
             logger.exception("Failed to render run %s", run_id)
@@ -2329,15 +2341,18 @@ def _run_symbols_of(row, run_store) -> list:
                 or (run_store or {}).get("symbols") or [])
 
 
-def _run_acknowledgement(panel_state, symbols, estimate_s, scope) -> tuple:
+def _run_acknowledgement(panel_state, symbols, estimate_s, scope,
+                         run_id=None) -> tuple:
     """What every accepted run answers with, confirm and retry alike:
     the activity panel forced open (a user who once closed it otherwise
-    gets zero feedback), the started toast with symbols, estimate and
-    where the output lands, and the panel's poll snapped to the active
-    rate (waiting for a slow idle tick to notice the active flag cost an
-    idle interval before the first run events rendered). Returns the
-    values for progress-panel-state, run-started-toast is_open/children and
-    progress-interval, in that order."""
+    gets zero feedback), the started toast with symbols, estimate, where
+    the output lands and a link to the run page (its rows fill in live,
+    and it is where the completion links land), and the panel's poll
+    snapped to the active rate (waiting for a slow idle tick to notice
+    the active flag cost an idle interval before the first run events
+    rendered). Returns the values for progress-panel-state,
+    run-started-toast is_open/children and progress-interval, in that
+    order."""
     from layouts.modals import _fmt_duration
 
     panel = dict(panel_state or {})
@@ -2351,7 +2366,11 @@ def _run_acknowledgement(panel_state, symbols, estimate_s, scope) -> tuple:
     # or a scope the estimator prices at zero) still gets its toast.
     duration = _fmt_duration(estimate_s) if estimate_s else "duration unknown"
     toast_msg = f"{', '.join(symbols)} · {duration} · {where}."
-    return panel, True, toast_msg, _PROGRESS_POLL_ACTIVE_MS
+    body = [html.Span(toast_msg, className="run-done-text")]
+    if run_id:
+        body.append(dcc.Link("Follow the run", href=f"/runs/{run_id}",
+                             className="run-done-link"))
+    return panel, True, body, _PROGRESS_POLL_ACTIVE_MS
 
 
 def _active_run_refusal():
@@ -2462,7 +2481,7 @@ def _start_manual_run(symbols, config, scope, preset, estimate_s,
     if extra:
         run_data.update(extra)
     return run_data, _run_acknowledgement(panel_state, symbols, estimate_s,
-                                          scope)
+                                          scope, run_id=run_id)
 
 
 def _close_run(run_id, message: str, status: str = "done", error=None) -> None:
@@ -4968,7 +4987,8 @@ def _report_modal_parts(report: dict) -> tuple:
     """(title, body, footer) of the reader modal for one full report dict.
 
     Shared by the click path (ta-view-btn) and the arrival path
-    (/runs/<id>?open=first) so both open the identical reader.
+    (/runs/<id>?open=first or ?open=<SYMBOL>) so both open the identical
+    reader.
     """
     from models.single_agent import extract_confidence
     from layouts.formatters import conviction_label, weight_label
@@ -5012,28 +5032,31 @@ def _report_modal_parts(report: dict) -> tuple:
     Input("url", "pathname"),
     prevent_initial_call="initial_duplicate",
 )
-def open_first_report(search, pathname):
-    """Arriving on /runs/<id>?open=first opens the run's first report.
+def open_linked_report(search, pathname):
+    """Arriving on /runs/<id>?open=first opens the run's first report;
+    ?open=<SYMBOL> opens that symbol's.
 
-    The toast and the pill link here. Nothing to open (no such run, no
-    report yet, a different page) leaves the modal alone. The URL is
-    cleaned of the query once the reader closes (clientside below), so the
-    same link opens it again next time.
+    The pill links with "first" (single-symbol runs name the symbol), the
+    completion toast with one symbol per link. Nothing to open (no such
+    run, no report for that symbol, a different page) leaves the modal
+    alone. The URL is cleaned of the query once the reader closes
+    (clientside below), so the same link opens it again next time.
     """
     run_id = _run_route(pathname)
-    if not run_id or not _wants_first_report(search):
+    target = _arrival_target(search)
+    if not run_id or not target:
         raise PreventUpdate
     from layouts.pages import run as run_page
     from services import dashboard_service as ds
 
     try:
         view = ds.get_run_view(run_id)
-        headline = run_page.first_report(view) if view else None
+        headline = run_page.arrival_report(view, target) if view else None
         report = (get_cache().get_trading_agent_report(str(headline["id"]))
                   if headline else None)
     except Exception as e:
-        logger.warning("Could not open the first report of run %s: %s",
-                       run_id, e)
+        logger.warning("Could not open the %s report of run %s: %s",
+                       target, run_id, e)
         raise PreventUpdate
     if not report or not report.get("report_text"):
         raise PreventUpdate
@@ -5041,7 +5064,7 @@ def open_first_report(search, pathname):
     return True, title, body, footer
 
 
-# Closing the reader on a run page drops ?open=first from the URL, so the
+# Closing the reader on a run page drops ?open=... from the URL, so the
 # page stays put (no navigation) and the next click on the same link is a
 # URL change again, which is what re-opens the reader.
 clientside_callback(
@@ -5051,7 +5074,7 @@ clientside_callback(
             return window.dash_clientside.no_update;
         }
         var onRun = /^[/]runs[/][0-9a-fA-F-]{36}[/]?$/.test(pathname || "");
-        if (!onRun || !/(^|[?&])open=first(&|$)/.test(search || "")) {
+        if (!onRun || !/(^|[?&])open=[^&]*(&|$)/.test(search || "")) {
             return window.dash_clientside.no_update;
         }
         return "";
@@ -5061,6 +5084,29 @@ clientside_callback(
     Input("ta-report-modal", "is_open"),
     State("url", "pathname"),
     State("url", "search"),
+    prevent_initial_call=True,
+)
+
+
+# The completion toast closes itself once its run page is open: the seen
+# store (written on the URL below) naming the announced run means the
+# reader followed a link, or was already there. Leaving the toast up
+# under the page it points at was the clutter every reader dismissed by
+# hand; leaving it up on any OTHER page is right, so this keys on the
+# run id and not on the route alone.
+clientside_callback(
+    """
+    function(seen, notified) {
+        if (!seen || !notified || !seen.run_id
+                || seen.run_id !== notified.run_id) {
+            return window.dash_clientside.no_update;
+        }
+        return false;
+    }
+    """,
+    Output("run-done-toast", "is_open", allow_duplicate=True),
+    Input("run-seen-store", "data"),
+    Input("run-notified-store", "data"),
     prevent_initial_call=True,
 )
 

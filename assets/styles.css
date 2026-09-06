@@ -3049,7 +3049,45 @@ body {
    .progress-panel, so at equal specificity its width would win on order. */
 .progress-panel.progress-panel-expanded {
     width: min(1100px, calc(100vw - 48px));
+    /* A fixed height, not just a ceiling: the log below sizes itself to
+       fill whatever the stepper leaves (flex: 1 needs a definite parent),
+       so the expanded panel is always the full reading window rather than
+       a wide box hugging a two-line log. */
+    height: min(82vh, 900px);
     max-height: min(82vh, 900px);
+}
+
+/* Expanded: the log takes every pixel the stepper does not, and the
+   symbol lines get room for a 20-name run instead of a 6-row scroller.
+   Selectors doubled for the same ordering reason as above. */
+.progress-panel.progress-panel-expanded .progress-feed {
+    flex: 1 1 auto;
+}
+
+/* Expanded, the symbol lines use the width: a 20-name run is five rows
+   of four instead of a 20-line column, and the log below keeps the
+   height. */
+.progress-panel.progress-panel-expanded .progress-symbols {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    column-gap: 16px;
+    max-height: min(22vh, 220px);
+}
+
+/* The log under the stepper's Details cannot be sized from CSS alone:
+   browsers wrap a <details>'s content in a pseudo-element, so neither a
+   percentage height nor flex reaches the lines. assets/feed_details_state.js
+   measures what the stepper leaves and sets the lines' max-height inline
+   while the panel is expanded; the rule below is the fallback until it
+   runs. The rolling log with no run pinned sits directly in the feed and
+   fills it through flex. */
+.progress-panel.progress-panel-expanded .progress-details {
+    min-height: 0;
+}
+
+.progress-panel.progress-panel-expanded .progress-feed > .progress-feed-lines {
+    flex: 1 1 auto;
+    max-height: none;
 }
 
 /* Minimised keeps the header (and its controls) reachable, hiding only the
@@ -3497,10 +3535,62 @@ body {
     font-size: 0.85rem;
 }
 
-/* The completion toast's body: symbols (or the error line) and the link. */
+/* The completion toast's body: one link per symbol (each opens that
+   symbol's report on the run page), the run page link, or for a failed
+   run the error line and a View link. */
 .run-done-text {
     margin-right: 0.5rem;
 }
+
+.run-done-symbols {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.run-done-symbol {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 4px;
+    border: 1px solid rgba(0,212,170,0.45);
+    background: rgba(0,212,170,0.08);
+    color: var(--accent, #00D4AA);
+    font-family: 'SF Mono', 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-decoration: none;
+    line-height: 1.4;
+}
+
+a.run-done-symbol:hover,
+a.run-done-symbol:focus {
+    background: rgba(0,212,170,0.2);
+    color: var(--accent, #00D4AA);
+    text-decoration: none;
+}
+
+.run-done-symbol-failed {
+    border-color: rgba(239,68,68,0.45);
+    background: rgba(239,68,68,0.08);
+    color: var(--negative, #ef4444);
+    text-decoration: line-through;
+    cursor: help;
+}
+
+.run-done-more {
+    align-self: center;
+    font-size: 0.74rem;
+    color: var(--text-secondary, #888);
+}
+
+.run-done-link {
+    font-weight: 600;
+    color: var(--accent, #00D4AA);
+    text-decoration: none;
+}
+
+.run-done-link:hover { text-decoration: underline; }
 
 .progress-line {
     display: flex;

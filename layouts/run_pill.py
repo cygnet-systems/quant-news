@@ -22,6 +22,13 @@ and only for a run that ended within the hour (TOAST_WINDOW_S): a
 browser that never recorded the announcement (a fresh profile, cleared
 storage) must not greet the viewer with last week's report.
 
+Where the links land: a single-symbol run opens that symbol's report on
+arrival (/runs/<id>?open=<SYMBOL>); a multi-symbol run lands on the run
+page with every row listed, and the toast names each symbol as its own
+link so the reader picks which report opens. It used to open the first
+symbol's report whatever was clicked, which read as "AAPL only" to a
+user who had asked for AAPL and GEV.
+
 A cancelled run is never shown: the user asked for it to go away.
 """
 
@@ -29,7 +36,7 @@ from datetime import datetime, timezone
 
 from dash import dcc, html
 
-from layouts.progress_panel import within_window
+from layouts.progress_panel import symbol_state, within_window
 from services.run_service import STAGES
 
 # Symbols named on the pill before the rest collapse into "+n".
@@ -43,6 +50,9 @@ FINISHING_S = 30
 PILL_TTL_S = 24 * 3600
 # How long after a run ends its completion may still be announced.
 TOAST_WINDOW_S = 3600
+# Symbols the completion toast links individually before the rest fold
+# into the run page link: a 20-name run must not become 20 chips.
+MAX_TOAST_SYMBOLS = 8
 
 _STATE_CLASS = {
     "running": "run-pill run-pill-running",
@@ -149,6 +159,9 @@ def _pin(run: dict) -> dict:
         "symbols": list(run.get("symbols") or []),
         "owner_uid": run.get("owner_uid"),
         "kind": run.get("kind"),
+        # Per-symbol stage states: the completion toast reads which
+        # symbols have a report to open. Small (one dict per stage).
+        "stages": run.get("stages") or {},
     }
 
 
@@ -176,8 +189,20 @@ def _view(run: dict, state: str, parts: list, *, href=None, cancel=False,
     }
 
 
-def run_href(run_id: str) -> str:
-    return f"/runs/{run_id}?open=first"
+def run_href(run_id: str, open: str | None = None) -> str:
+    """The run page; ``open`` names what the reader shows on arrival:
+    "first" for the first report, a symbol for that symbol's report,
+    None for the page alone (the reader picks a row)."""
+    return f"/runs/{run_id}?open={open}" if open else f"/runs/{run_id}"
+
+
+def landing_href(run: dict) -> str:
+    """Where Ready / Failed links land. One symbol: straight into its
+    report. Several: the run page, every row in view, nothing opened."""
+    symbols = [s for s in (run.get("symbols") or []) if s]
+    if len(symbols) == 1:
+        return run_href(run["run_id"], symbols[0])
+    return run_href(run["run_id"])
 
 
 def _active_view(run: dict, owner_uid, run_store, now) -> dict:
@@ -198,7 +223,7 @@ def _active_view(run: dict, owner_uid, run_store, now) -> dict:
 
 def _terminal_view(run: dict) -> dict | None:
     status = run.get("status")
-    href = run_href(run["run_id"])
+    href = landing_href(run)
     if status == "done":
         return _view(run, "ready", ["Ready", symbols_label(run.get("symbols"))],
                      href=href)
@@ -275,17 +300,55 @@ def done_toast(view, notified, now=None) -> dict | None:
                          now or now_utc(), TOAST_WINDOW_S):
         return None
     failed = view["state"] == "failed"
-    text = (view.get("title") or "unknown error") if failed \
-        else symbols_label(view["pin"].get("symbols"))
+    if failed:
+        return {
+            "run_id": view["run_id"],
+            "header": "Run failed",
+            "icon": "danger",
+            "body": [
+                html.Span(view.get("title") or "unknown error",
+                          className="run-done-text"),
+                dcc.Link("View", href=view["href"], className="run-done-link"),
+            ],
+        }
+    symbols = [s for s in (pin.get("symbols") or []) if s]
     return {
         "run_id": view["run_id"],
-        "header": "Run failed" if failed else "Report ready",
-        "icon": "danger" if failed else "success",
-        "body": [
-            html.Span(text, className="run-done-text"),
-            dcc.Link("View", href=view["href"], className="run-done-link"),
-        ],
+        "header": "Reports ready" if len(symbols) > 1 else "Report ready",
+        "icon": "success",
+        "body": toast_symbol_links(view["run_id"], symbols,
+                                   pin.get("stages") or {}),
     }
+
+
+def toast_symbol_links(run_id: str, symbols: list, stages=None) -> list:
+    """The completion toast's body: one link per symbol, each opening
+    that symbol's report on the run page, then the run page itself.
+
+    A symbol whose research stage recorded a failure is still listed
+    (the run page has its row and the reason) but marked, so the reader
+    is not sent to a report that does not exist. Beyond MAX_TOAST_SYMBOLS
+    the rest fold into a count; the run page lists them all.
+    """
+    chips = []
+    for sym in symbols[:MAX_TOAST_SYMBOLS]:
+        state = symbol_state(stages, "research", sym) if stages else "pending"
+        if state == "failed":
+            chips.append(html.Span(
+                sym, className="run-done-symbol run-done-symbol-failed",
+                title=f"{sym}: no report (the research stage failed)"))
+        else:
+            chips.append(dcc.Link(
+                sym, href=run_href(run_id, sym), className="run-done-symbol",
+                title=f"Open the {sym} report"))
+    rest = len(symbols) - MAX_TOAST_SYMBOLS
+    if rest > 0:
+        chips.append(html.Span(f"+{rest} more", className="run-done-more"))
+    return [
+        html.Div(chips, className="run-done-symbols"),
+        dcc.Link("View run", href=run_href(run_id), className="run-done-link",
+                 title="The run page: every symbol, the synthesis, the timing"),
+    ]
 
 
 def pill_children(view: dict) -> list:

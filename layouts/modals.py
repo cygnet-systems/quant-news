@@ -68,7 +68,11 @@ def run_field_defaults() -> dict:
         "report_model": "gpt-5.6-luna",
         "depth": "thesis",
         "recs": "auto",
-        "recs_model": "claude-sonnet-5",
+        # Luna, like the report and the scheduler (config.RECOMMENDATIONS_
+        # MODEL): the dialog used to default the synthesis to Sonnet 5
+        # alone, so a manual run and the daily job synthesised on
+        # different models and their calls were not comparable.
+        "recs_model": MODEL.RECOMMENDATIONS_MODEL,
         "evidence": list(MODEL.DEFAULT_EVIDENCE),
         "tools": [WEB_RESEARCH_TOOL],
         "models": [mid for mid, _, _ in RUN_MODELS],
@@ -78,6 +82,29 @@ def run_field_defaults() -> dict:
         "ensemble_method": MODEL.ENSEMBLE_DEFAULT_METHOD,
         "ensemble_min_agree": MODEL.ENSEMBLE_MIN_AGREE,
     }
+
+
+_RECS_MODEL_OPTIONS = [
+    {"label": "GPT-5.6 Luna", "value": "gpt-5.6-luna"},
+    {"label": "Claude Sonnet 5", "value": "claude-sonnet-5"},
+    {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
+]
+
+
+def _recs_model_options(default: str) -> list:
+    """The synthesis model choices, the default labelled and listed first.
+
+    RECOMMENDATIONS_MODEL is an env override; a deployment that names a
+    model this list does not carry would otherwise render an empty
+    select and record None on the run.
+    """
+    options = [dict(o) for o in _RECS_MODEL_OPTIONS]
+    if not any(o["value"] == default for o in options):
+        options.insert(0, {"label": default, "value": default})
+    for o in options:
+        if o["value"] == default:
+            o["label"] += " (default)"
+    return sorted(options, key=lambda o: o["value"] != default)
 
 
 def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
@@ -164,11 +191,7 @@ def _report_param_selects(prefix: str, values: dict | None = None) -> dict:
         ),
         "recs-model": dbc.Select(
             id=f"{prefix}-recs-model",
-            options=[
-                {"label": "Claude Sonnet 5 (default)", "value": "claude-sonnet-5"},
-                {"label": "GPT-5.6 Luna (reasoning)", "value": "gpt-5.6-luna"},
-                {"label": "Claude Sonnet 4.6", "value": "claude-sonnet-4-6"},
-            ],
+            options=_recs_model_options(d["recs_model"]),
             value=v.get("recs_model") or d["recs_model"],
             size="sm",
         ),

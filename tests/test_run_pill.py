@@ -160,16 +160,23 @@ class TestTextPatterns:
         view = _view([], latest=_run(status="done"))
         assert view["label"] == "Ready · NVDA, AMD · View"
         assert view["text"] == "Ready · NVDA, AMD"
-        assert view["href"] == "/runs/r1?open=first"
+        # Two symbols: the run page, nothing auto-opened (the reader picks).
+        assert view["href"] == "/runs/r1"
         assert view["state"] == "ready"
         assert view["cancel"] is False
+
+    def test_single_symbol_ready_opens_that_report(self):
+        view = _view([], latest=_run(status="done", symbols=("GEV",)))
+        assert view["href"] == "/runs/r1?open=GEV"
+        assert rp.landing_href({"run_id": "x", "symbols": []}) == "/runs/x"
+        assert rp.run_href("x", "first") == "/runs/x?open=first"
 
     def test_failed_shows_the_first_error_line(self):
         run = _run(status="failed", error="worker pid 4242 died\nTraceback ...")
         view = _view([], latest=run)
         assert view["label"] == "Failed · worker pid 4242 died · View"
         assert view["title"] == "worker pid 4242 died"
-        assert view["href"] == "/runs/r1?open=first"
+        assert view["href"] == "/runs/r1"
         assert view["className"] == "run-pill run-pill-failed"
         assert _view([], latest=_run(status="failed", error=None))["text"] \
             == "Failed · unknown error"
@@ -298,7 +305,7 @@ class TestChildren:
     def test_ready_has_a_view_link_and_no_cancel(self):
         children = rp.pill_children(_view([], latest=_run(status="done")))
         assert self._ids(children) == [None, "run-pill-text", "run-pill-link"]
-        assert children[2].href == "/runs/r1?open=first"
+        assert children[2].href == "/runs/r1"
         assert children[2].children == "View"
 
 
@@ -372,7 +379,7 @@ class TestRenderRunPill:
         assert out[HIDDEN] is False
         assert out[CLASS] == "run-pill run-pill-ready"
         link = next(c for c in out[CHILDREN] if getattr(c, "id", None) == "run-pill-link")
-        assert link.href == "/runs/d1?open=first"
+        assert link.href == "/runs/d1"
         assert runs.list_calls == [{"limit": 1, "kind": "manual", "owner_uid": "u1"}]
         # Nothing in flight: back to the idle rate.
         assert out[INTERVAL] == app_module._PROGRESS_POLL_IDLE_MS
@@ -429,15 +436,18 @@ class TestDoneToast:
     sees it, then never again for that run: the notified store is the
     guard, not the fingerprint."""
 
-    def test_ready_opens_report_ready_with_a_view_link_once(self, runs):
+    def test_ready_opens_reports_ready_with_a_link_per_symbol_once(self, runs):
         runs.latest = _run("d1", status="done", symbols=("NVDA", "AMD"))
         out = _tick()
         assert out[TOAST_OPEN] is True
-        assert out[TOAST_HEADER] == "Report ready"
+        assert out[TOAST_HEADER] == "Reports ready"
         assert out[TOAST_ICON] == "success"
-        text, link = out[TOAST_BODY]
-        assert text.children == "NVDA, AMD"
-        assert link.children == "View" and link.href == "/runs/d1?open=first"
+        chips, link = out[TOAST_BODY]
+        # Each symbol opens ITS report: a user who ran AAPL and GEV used to
+        # get one View that always opened AAPL.
+        assert [(c.children, c.href) for c in chips.children] == \
+            [("NVDA", "/runs/d1?open=NVDA"), ("AMD", "/runs/d1?open=AMD")]
+        assert link.children == "View run" and link.href == "/runs/d1"
         assert out[NOTIFIED] == {"run_id": "d1"}
         # Next tick: same pill (no_update) and, with the run recorded as
         # announced, no toast either.
@@ -465,7 +475,7 @@ class TestDoneToast:
         assert out[TOAST_ICON] == "danger"
         text, link = out[TOAST_BODY]
         assert text.children == "provider timeout"
-        assert link.href == "/runs/f1?open=first"
+        assert link.href == "/runs/f1"
         assert out[NOTIFIED] == {"run_id": "f1"}
 
     def test_a_new_run_is_announced_after_an_old_one(self, runs):
@@ -776,7 +786,8 @@ class TestWiring:
     def test_done_toast_is_the_pill_callbacks_and_persists(self):
         from dash._callback import GLOBAL_CALLBACK_MAP
         from layouts.main_layout import create_layout
-        writers = [k for k in GLOBAL_CALLBACK_MAP if "run-done-toast.is_open" in k]
+        writers = [k for k in GLOBAL_CALLBACK_MAP
+                   if "run-done-toast.is_open" in k and "@" not in k]
         assert len(writers) == 1 and "run-pill.hidden" in writers[0]
         cb = GLOBAL_CALLBACK_MAP[writers[0]]
         assert any(st["id"] == "run-notified-store" for st in cb["state"])
@@ -830,3 +841,56 @@ class TestWiring:
         assert "getClientRects().length" in script
         assert "row = feed.lastElementChild" in script
         assert "row.scrollIntoView" in script
+
+
+class TestToastSymbolLinks:
+    def _chips(self, body):
+        return body[0].children
+
+    def test_one_symbol_is_report_ready_and_one_link(self):
+        view = rp.finished_view(_run("d1", status="done", symbols=("GEV",)),
+                                "u1", now=NOW)
+        toast = rp.done_toast(view, None, now=NOW)
+        assert toast["header"] == "Report ready"
+        chips = self._chips(toast["body"])
+        assert [(c.children, c.href) for c in chips] == [("GEV", "/runs/d1?open=GEV")]
+
+    def test_failed_research_symbol_is_marked_not_linked(self):
+        stages = {"research": {"state": "done", "symbols": {
+            "NVDA": "done", "AMD": "failed"}, "errors": {"AMD": "no news"}}}
+        body = rp.toast_symbol_links("d1", ["NVDA", "AMD"], stages)
+        nvda, amd = self._chips(body)
+        assert nvda.href == "/runs/d1?open=NVDA"
+        assert not hasattr(amd, "href")
+        assert "run-done-symbol-failed" in amd.className
+        assert "no report" in amd.title
+        # A research stage that recorded nothing for a symbol still links
+        # it: the run page decides, not the toast.
+        body = rp.toast_symbol_links("d1", ["NVDA"], {"research": {"state": "skipped"}})
+        assert self._chips(body)[0].href == "/runs/d1?open=NVDA"
+        assert self._chips(rp.toast_symbol_links("d1", ["NVDA"], {}))[0].href \
+            == "/runs/d1?open=NVDA"
+
+    def test_long_runs_fold_past_the_cap(self):
+        symbols = [f"S{i}" for i in range(rp.MAX_TOAST_SYMBOLS + 3)]
+        body = rp.toast_symbol_links("d1", symbols, {})
+        chips = self._chips(body)
+        assert len(chips) == rp.MAX_TOAST_SYMBOLS + 1
+        assert chips[-1].children == "+3 more"
+        assert body[1].href == "/runs/d1"
+
+    def test_pin_carries_the_stages_for_the_toast(self):
+        run = _run("d1", status="done", stages={"research": {"state": "done"}})
+        assert rp.finished_view(run, "u1", now=NOW)["pin"]["stages"] == \
+            {"research": {"state": "done"}}
+
+    def test_toast_closes_once_its_run_page_is_open(self):
+        """The clientside closer: seen store naming the announced run."""
+        from dash._callback import GLOBAL_CALLBACK_LIST
+        closers = [c for c in GLOBAL_CALLBACK_LIST
+                   if "run-done-toast.is_open" in str(c["output"])
+                   and c.get("clientside_function") is not None]
+        assert len(closers) == 1
+        assert sorted(i["id"] for i in closers[0]["inputs"]) == \
+            ["run-notified-store", "run-seen-store"]
+        assert closers[0]["prevent_initial_call"] is True
