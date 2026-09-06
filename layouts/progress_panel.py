@@ -287,6 +287,9 @@ def body(run, events) -> list:
     lines = feed_lines(events)
     if run is None:
         return [lines]
+    # No `open` here: the fold is the reader's, and a native toggle never
+    # reaches Dash. assets/feed_details_state.js re-applies their choice
+    # after each rewrite recreates this node.
     return [
         stepper(run),
         html.Details(

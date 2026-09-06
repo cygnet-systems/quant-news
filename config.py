@@ -278,14 +278,16 @@ class ModelConfig:
     # fetches only days it has not seen. The same articles are not paid for
     # again every morning.
     NEWS_RETENTION_DAYS: int = int(os.getenv("NEWS_RETENTION_DAYS", "90"))
-    # How many of the window's articles a PROMPT actually reads. Sampled
-    # spread across the window (services.news_window.select_spread), never
-    # "the newest N", that is what quietly turned a 30-day window into a
-    # 3-day one. 0 = every kept article (watch the token bill).
-    #   research: per symbol, the trading_agents research report
-    #   synthesis: in total across all symbols, the portfolio-level report
-    NEWS_PROMPT_ARTICLES: int = int(os.getenv("NEWS_PROMPT_ARTICLES", "25"))
-    NEWS_SYNTHESIS_ARTICLES: int = int(os.getenv("NEWS_SYNTHESIS_ARTICLES", "40"))
+    # The per-symbol research prompt reads EVERY article the run kept: the
+    # window, the relevance floor and NEWS_MAX_ARTICLES above are the only
+    # knobs, and they are the frontend's. There used to be a second,
+    # backend-only budget (NEWS_PROMPT_ARTICLES, 25) that sampled the kept
+    # list again, so a run the dialog showed as "50 articles" reached the
+    # model as 25 and nothing in the UI said so.
+    # There is no second reader. The portfolio view is rolled up from the
+    # per-symbol research epilogues (services.portfolio_rollup), so the
+    # 40-article portfolio sample (NEWS_SYNTHESIS_ARTICLES) is gone with the
+    # model call that read it.
 
     # Decision thresholds (shared across Kronos and XGBoost)
     BUY_THRESHOLD: float = 0.55
@@ -342,8 +344,10 @@ class ModelConfig:
     # Anthropic's web_search server tool (opus-5 measured at ~$1.1/symbol,
     # too dear for a 20-name daily run).
     # Web access is a run TOOL, not an env switch: the Run dialog's Tools
-    # section (and the scheduled job's web_research param) turn it on; the
-    # backend default is off, so nothing searches unless a run asked.
+    # section (on in the Standard and Deep presets since 2026-09-06) and
+    # the scheduled job's web_research param turn it on; the backend
+    # default is off, so nothing searches unless a run asked, and the
+    # anomaly gate below decides which symbols actually buy a search.
     INVESTIGATION_MODEL: str = os.getenv("INVESTIGATION_MODEL", "gpt-5.6-luna")
     # Reasoning effort for gpt-* investigators (OpenAI Responses API).
     INVESTIGATION_OPENAI_EFFORT: str = os.getenv("INVESTIGATION_OPENAI_EFFORT", "medium")
@@ -498,11 +502,15 @@ class ModelConfig:
     # is; the A/B showed the quality gap is taste, not correctness.
     RECOMMENDATIONS_MODEL: str = os.getenv("RECOMMENDATIONS_MODEL", "gpt-5.6-luna")
     RECOMMENDATIONS_PROVIDER: str = os.getenv("RECOMMENDATIONS_PROVIDER", "openai")
-    # Re-asked once on this model when the primary fails after the report
-    # and predictions have already been paid for. The row records the model
+    # Opt-in: re-asked once on this model when the primary fails after the
+    # report and predictions have already been paid for. Empty (the default)
+    # means no fallback. It used to default to a Sonnet model, and over the
+    # 30 days to 2026-09-06 the fallback answered 48 of 77 synthesis calls
+    # at ~$0.21 each against ~$0.016 on Luna: 34% of the whole LLM bill,
+    # bought silently during an OpenAI outage. The row records the model
     # that actually answered (model_used), so a fallback run is visible.
     RECOMMENDATIONS_FALLBACK_MODEL: str = os.getenv(
-        "RECOMMENDATIONS_FALLBACK_MODEL", "claude-sonnet-4-6")
+        "RECOMMENDATIONS_FALLBACK_MODEL", "").strip()
     # 5000: key_level/change_trigger/watch_items grew the JSON; a truncated
     # payload fails the parser and blanks the whole Luna panel. The synthesis
     # is one call for the WHOLE run, so the ceiling has to cover the widest

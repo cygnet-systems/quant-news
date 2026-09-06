@@ -250,6 +250,8 @@ class TestConfirmDispatch:
         # The confirm branch reads the same raw values run_preflight does:
         # a run-recs that never rendered (None) is not a divergence, so
         # the row is "standard", the way the dialog's hint called it.
+        # The fixture's 2026-09-03 is a past session, so the date rule has
+        # already stripped Standard's web tool: [] is the untouched dialog.
         out = confirm(["NVDA"], scope="full", preset="standard",
                       model_checks=[True] * 5, recs=None, run_tools=[])
         row = rs.get_run(out[RUN_STORE]["run_id"])
@@ -820,8 +822,9 @@ class TestAnalyzeNow:
         assert config["preset"] == "standard" and config["customized"] == []
         assert config["scope"] == "full" and config["recs"] == "auto"
         assert config["models"] == [m for m, _, _ in RUN_MODELS]
-        # Standard buys the report and the synthesis, never the open web.
-        assert config["tools"] == []
+        # Standard buys the report, the synthesis, and (since 2026-09-06)
+        # the open web for whatever the anomaly scan flags on a live run.
+        assert config["tools"] == ["web_research"]
         assert config["target_date"] and config["prediction_date"]
         assert config["prediction_date"] < config["target_date"]
 
@@ -918,6 +921,8 @@ class TestAnalyzeNow:
                       relevance=d["relevance"],
                       report_model=d["report_model"], depth=d["depth"],
                       recs=d["recs"], recs_model=d["recs_model"],
+                      # 2026-09-03 is a past session: the date rule strips
+                      # the open web from Standard here, as the shortcut does.
                       run_evidence=list(d["evidence"]), run_tools=[],
                       model_checks=[True] * 5, run_ensemble=d["ensemble"],
                       ens_method=d["ensemble_method"],

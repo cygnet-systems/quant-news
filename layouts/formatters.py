@@ -59,9 +59,17 @@ def json_report_to_markdown(data: dict) -> str:
     if overall:
         lines.append("# Portfolio Summary\n")
         rec = overall.get("recommendation", "n/a")
-        conf = overall.get("confidence", 0)
+        conf = overall.get("confidence")
         lines.append(f"**Recommendation:** {rec}  ")
-        lines.append(f"**Confidence:** {int(conf * 100) if isinstance(conf, float) and conf <= 1 else conf}%  ")
+        # The roll-up states None when no report gave a conviction; a
+        # missing number is "not stated", never 0%.
+        if isinstance(conf, (int, float)):
+            lines.append(f"**Confidence:** {int(conf * 100) if conf <= 1 else int(conf)}%  ")
+        else:
+            lines.append("**Confidence:** not stated  ")
+        if overall.get("rollup"):
+            lines.append("*Rolled up from the per-symbol research reports; "
+                         "no separate portfolio model call.*  ")
         lines.append(f"**Sentiment:** {overall.get('market_sentiment', ', ')}\n")
         if overall.get("sentiment_explanation"):
             lines.append(f"{overall['sentiment_explanation']}\n")

@@ -52,6 +52,10 @@ BLOCK_SEVERITY: dict[str, str] = {
     # too. An empty window with a responding source is fine.
     "news_source": REQUIRED,
     "business": EXPECTED,
+    # The last quarter's company-originated headlines out of the news store.
+    # The store fills from the daily windows, so a symbol new to the
+    # watchlist has days of it, not months; that is a thin block, not a gap.
+    "developments": OPTIONAL,
     "sector": EXPECTED,
     "fundamentals": EXPECTED,
     "events": EXPECTED,
@@ -77,6 +81,7 @@ BLOCK_LABELS: dict[str, str] = {
     "spy": "SPY market context",
     "news_source": "news source",
     "business": "business profile",
+    "developments": "recent developments (news store)",
     "sector": "sector ETF context",
     "fundamentals": "fundamentals",
     "events": "event calendar",

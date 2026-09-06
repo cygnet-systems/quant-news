@@ -69,9 +69,9 @@ def test_research_prompt_maps_outcomes_and_positioning():
     # With nothing anomalous the section list is the fixed frame it has
     # always been, numbered the same way.
     sections = render_output_sections("BHF", "2026-09-02", "XLF", [])
-    assert "5. Positioning & Flows" in sections
-    assert "10. Scenarios" in sections
-    assert "12. Trade Plan" in sections
+    assert "7. Positioning & Flows" in sections
+    assert "5. Scenarios & Risk" in sections
+    assert "3. Technicals & Trade Plan" in sections
     assert "Step 3b: Map the outcomes" in SINGLE_AGENT_SYSTEM_PROMPT
     assert '"scenarios"' in EPILOGUE_INSTRUCTIONS
 

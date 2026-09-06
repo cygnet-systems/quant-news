@@ -3073,38 +3073,9 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
     # separate either way (the research reports are single-symbol and
     # cannot replace it).
 
-    # The overall shallow call is Luna's understudy: when research runs
-    # per symbol AND Luna will synthesize the portfolio view, it adds a
-    # third opinion nobody consumes. Run it only when one of those is off.
-    run_overall = overall_articles and not (
-        include_research and recs_mode != "off")
-    if run_overall:
-        # The per-symbol metric blocks are already computed above from OHLCV
-        # truncated to the cutoff. The overall call used to get none of them,
-        # and since this flow also withholds live quotes, its financial block
-        # was empty: the model reported a broken data feed instead of an
-        # analysis. Hand it the same validated numbers the symbol calls get.
-        overall_metrics = "\n\n".join(
-            b["metrics"] for b in extra_blocks_by_symbol.values() if b.get("metrics")
-        )
-
-        def _run_overall(*args, **kw):
-            from services import usage_service as _usage
-            with _usage.track("ai_report", trade_date=as_of_str,
-                              section="ai_report:overall"):
-                return llm.summarize_news_structured(*args, **kw)
-
-        aio_tasks.append(_run_task(
-            "overall", None, _run_overall, overall_articles, symbols or [],
-            stock_data=enriched_stock_data,
-            as_of_date=as_of_str,
-            extra_blocks={"metrics": overall_metrics} if overall_metrics else None,
-            include_thesis=include_thesis_flag,
-            model=report_model,
-            provider=report_provider,
-        ))
-        emit("ai", f"Overall: synthesizing {len(overall_articles)} articles "
-                        f"across {len(symbols or [])} symbols…")
+    # No portfolio model call here either: when this scope ran the
+    # research per symbol, the portfolio view is rolled up from those
+    # reports below; the full pipeline rolls it up in the synthesis step.
 
     await asyncio.gather(*aio_tasks)
 
@@ -3156,7 +3127,10 @@ async def generate_ai_analysis(run_store, stock_data, dispatched):
         # regardless, so the Luna callback needs to know recs were opted out.
         result["recs_off"] = True
 
-    if not result["by_symbol"] and not result["overall"]:
+    if include_research and result["by_symbol"]:
+        from services.portfolio_rollup import build_overall_rollup
+        result["overall"] = build_overall_rollup(result["by_symbol"])
+    if include_research and not result["by_symbol"]:
         result["failed"] = True
         emit("error", "AI Report produced no analysis")
         progress("report", state="failed", done=0, total=n_symbols)
@@ -3303,6 +3277,25 @@ def update_symbol_tabs(symbols, news_data, stored_tab):
     Input("report-history-store", "data"),
     Input("recommendations-store", "data"),
 )
+def _overall_for_view(ai_analysis, model_signals, symbols) -> dict:
+    """The portfolio view for the Overall tab. A report-only run carries it
+    on the store; a full run's research arrives with the model signals, so
+    the roll-up is built here from the merged entries. Never a model call."""
+    overall = (ai_analysis or {}).get("overall")
+    if overall:
+        return overall
+    try:
+        from services.analysis_runner import merge_research_into_analysis
+        from services.portfolio_rollup import build_overall_rollup
+        merged, _ = merge_research_into_analysis(
+            ai_analysis, model_signals, list(symbols or []))
+        return build_overall_rollup(merged.get("by_symbol") or {},
+                                    model_signals) or {}
+    except Exception as e:
+        logger.debug(f"overall roll-up for view failed: {e}")
+        return {}
+
+
 def render_active_tab(
     active_tab, news_data, ai_analysis, symbols, model_signals,
     strategy_metrics, strategy_evaluations, report_history, recommendations,
@@ -3324,7 +3317,7 @@ def render_active_tab(
         return build_overall_tab_content(
             articles_by_symbol=articles_by_symbol,
             analysis_by_symbol=analysis_by_symbol,
-            overall_analysis=(ai_analysis or {}).get("overall", {}),
+            overall_analysis=_overall_for_view(ai_analysis, model_signals, symbols),
             symbols=symbols,
             ai_failed=ai_failed,
             recommendations=recommendations,
@@ -6467,7 +6460,7 @@ def toggle_run_modal(open_clicks, reports_clicks, ctx_clicks, cancel_clicks,
             "recs": recs,
             "evidence": run_evidence,
             "tools": run_tools,
-        })
+        }, target_date=target_d)
         row_preset = preset_name if not customized else "custom"
         estimate_s = _run_estimate_s(row_preset, len(symbols),
                                      static_estimate_s)
@@ -7095,11 +7088,12 @@ def apply_run_scope(scope):
     Input("run-tools", "value"),
     State("run-customize-collapse", "is_open"),
     State("run-customize-auto", "data"),
+    State("run-date-picker", "date"),
     prevent_initial_call=True,
 )
 def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
                   report_model, recs_basis, recs_model, run_evidence,
-                  run_tools, customize_open=False, auto=None):
+                  run_tools, customize_open=False, auto=None, run_date=None):
     """Name what this run needs and cannot reach, before it is started,
     and say where the controls have left the preset.
 
@@ -7144,7 +7138,7 @@ def run_preflight(is_open, preset, scope, run_symbols, _model_checks,
         "recs": recs_basis,
         "evidence": run_evidence,
         "tools": run_tools,
-    })
+    }, target_date=run_date)
     labels = {"scope": "what to run", "models": "models",
               "recs": "recommendations", "evidence": "evidence blocks",
               "tools": "tools"}

@@ -71,7 +71,10 @@ class TestTheUserHalfCarriesWhatChanges:
         p = user_prompt()
         assert "== SITUATION ==\nsit-line" in p
         assert p.index("== SECTIONS (write these, in this order) ==") < p.index("1. Situation & Key Figures")
-        assert p.rstrip().endswith("as of 2026-09-04\"); invalidation (which close, level\n   or event kills the thesis); what to watch next session") or "12. Trade Plan" in p
+        # The frame ends on Peer Comparison now that the plan rides with the
+        # technicals and the evidence sections sit at the bottom.
+        assert p.rstrip().endswith("(omit this section only if no peer block was provided)")
+        assert "3. Technicals & Trade Plan" in p and "8. Peer Comparison" in p
 
     def test_no_rule_text_leaked_into_the_per_symbol_half(self):
         p = user_prompt()

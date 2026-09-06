@@ -121,8 +121,10 @@ class TestPresetFields:
         assert quick == {"scope": "models", "models": QUICK_MODELS,
                          "recs": "off"}
         standard = modals.preset_fields("standard")
+        # Standard turns the open web on too (2026-09-06): the anomaly gate,
+        # not the switch, is what bounds the spend.
         assert standard == {"scope": "full", "models": ALL_MODELS,
-                            "recs": "auto", "tools": []}
+                            "recs": "auto", "tools": ["web_research"]}
         deep = modals.preset_fields("deep")
         assert deep["scope"] == "full" and deep["recs"] == "auto"
         assert deep["evidence"] == [o["value"] for o in modals.EVIDENCE_OPTIONS]
@@ -235,7 +237,7 @@ class TestPresetFields:
         assert tools == ["web_research"]
 
         *_, tools = app_module.apply_run_preset("standard", "2099-01-05", CHECK_IDS)
-        assert tools == []
+        assert tools == ["web_research"]
 
     def test_backtest_date_never_turns_the_web_on(self, monkeypatch):
         _trigger(monkeypatch, "run-preset")
@@ -254,7 +256,18 @@ class TestDivergence:
     def test_matching_controls_do_not_diverge(self):
         assert modals.preset_divergence("standard", {
             "scope": "full", "models": list(reversed(ALL_MODELS)),
-            "recs": "auto", "tools": [], "evidence": ["options"]}) == []
+            "recs": "auto", "tools": ["web_research"],
+            "evidence": ["options"]}) == []
+
+    def test_the_date_rule_is_not_a_divergence(self):
+        # An untouched Standard dialog on a past date has its web tool
+        # stripped by the platform; that is the preset, not a customization.
+        assert modals.preset_divergence("standard", {
+            "scope": "full", "models": ALL_MODELS, "recs": "auto",
+            "tools": []}, target_date="2020-01-01") == []
+        assert modals.preset_divergence("standard", {
+            "scope": "full", "models": ALL_MODELS, "recs": "auto",
+            "tools": []}, target_date="2099-01-01") == ["tools"]
 
     def test_each_named_field_is_reported(self):
         got = modals.preset_divergence("deep", {
@@ -294,7 +307,7 @@ class TestDivergence:
     def test_customize_unfolds_only_on_divergence(self, monkeypatch):
         preflight, hint, collapse, auto = self._preflight(
             monkeypatch, "standard", "full", [True] * 5, "auto",
-            ["options"], [])
+            ["options"], ["web_research"])
         assert collapse is dash.no_update
         assert auto == {"diverged": []}
         assert hint == [modals.RUN_PRESETS["standard"]["hint"]]
@@ -302,7 +315,7 @@ class TestDivergence:
 
         preflight, hint, collapse, auto = self._preflight(
             monkeypatch, "standard", "report", [True] * 5, "off",
-            None, [])
+            None, ["web_research"])
         assert collapse is True
         assert auto == {"diverged": ["scope", "recs"]}
         assert "what to run, recommendations" in hint[1].children
@@ -310,36 +323,36 @@ class TestDivergence:
     def test_customize_unfolds_once_per_divergence_set(self, monkeypatch):
         # A report shortcut: the scope diverges from the moment it opens.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto", None, [])
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, ["web_research"])
         assert collapse is True and auto == {"diverged": ["scope"]}
         # The user folds Customize and keeps editing: the same divergence
         # is not a reason to unfold it again, and nothing is re-recorded.
         *_, collapse, again = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, ["web_research"],
             opened=False, customize_open=False, auto=auto)
         assert collapse is dash.no_update and again is dash.no_update
         # A new difference is: it unfolds once more and remembers the set.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "off", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "off", None, ["web_research"],
             opened=False, customize_open=False, auto=auto)
         assert collapse is True and auto == {"diverged": ["scope", "recs"]}
         # Folded again, the difference removed: the set moved but nothing
         # new is on screen to show, so it stays folded; the set is kept
         # current so the same field diverging again is news.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, ["web_research"],
             opened=False, customize_open=False, auto=auto)
         assert collapse is dash.no_update and auto == {"diverged": ["scope"]}
         # While it is open a new difference needs no unfold, only the record.
         *_, collapse, auto = self._preflight(
             monkeypatch, "standard", "report", [True] * 4 + [False], "auto",
-            None, [], opened=False, customize_open=True, auto=auto)
+            None, ["web_research"], opened=False, customize_open=True, auto=auto)
         assert collapse is dash.no_update
         assert auto == {"diverged": ["scope", "models"]}
         # Reopening the dialog starts over: the shortcut's divergence is
         # shown again even though it is the set recorded last time.
         *_, collapse, auto = self._preflight(
-            monkeypatch, "standard", "report", [True] * 5, "auto", None, [],
+            monkeypatch, "standard", "report", [True] * 5, "auto", None, ["web_research"],
             opened=True, customize_open=False, auto={"diverged": ["scope"]})
         assert collapse is True and auto == {"diverged": ["scope"]}
 
@@ -348,13 +361,13 @@ class TestDivergence:
         # raw value reaches preset_divergence, which skips it, so an
         # untouched Standard dialog is not "customized: recommendations".
         _, hint, collapse, auto = self._preflight(
-            monkeypatch, "standard", "full", [True] * 5, None, None, [])
+            monkeypatch, "standard", "full", [True] * 5, None, None, ["web_research"])
         assert collapse is dash.no_update and auto == {"diverged": []}
         assert hint == [modals.RUN_PRESETS["standard"]["hint"]]
 
     def test_closed_dialog_changes_nothing(self, monkeypatch):
         out = self._preflight(monkeypatch, "standard", "full", [True] * 5,
-                              "auto", None, [], is_open=False)
+                              "auto", None, ["web_research"], is_open=False)
         assert out == (dash.no_update,) * 4
 
     def test_customize_button_toggles(self):

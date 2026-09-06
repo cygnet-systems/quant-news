@@ -259,8 +259,8 @@ class TestTwoThingsStandOut:
         # renumbers around them rather than being replaced.
         assert '"options_skew"' in sections and '"insider_cluster"' in sections
         assert sections.index('"options_skew"') < sections.index('"insider_cluster"')
-        assert "7. Positioning & Flows" in sections
-        assert "14. Trade Plan" in sections
+        assert "9. Positioning & Flows" in sections
+        assert "5. Technicals & Trade Plan" in sections
 
     def test_the_researched_finding_and_its_citation_reach_the_block(
             self, monkeypatch):
@@ -576,8 +576,8 @@ class TestNothingStandsOut:
         assert "congressional filings" in flat
         # The fixed frame is intact and numbered as it always was.
         assert "1. Situation & Key Figures" in sections
-        assert "5. Positioning & Flows" in sections
-        assert "12. Trade Plan" in sections
+        assert "7. Positioning & Flows" in sections
+        assert "3. Technicals & Trade Plan" in sections
 
     def test_a_run_that_screened_nothing_does_not_claim_a_quiet_symbol(
             self, monkeypatch):

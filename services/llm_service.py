@@ -137,7 +137,7 @@ def _calibrated(model_name: str, raw_confidence) -> Optional[float]:
 _DEFAULT_MODELS = {
     "lm_studio": "local-model",
     "anthropic": "claude-haiku-4-5-20251001",
-    "openai": "gpt-3.5-turbo",
+    "openai": "gpt-5.6-luna",
 }
 
 
@@ -972,271 +972,6 @@ Respond using this EXACT markdown format:
 
         return self.generate(prompt, system_prompt, max_tokens=450)
 
-    def summarize_news_structured(
-        self,
-        articles: list[dict],
-        symbols: list[str],
-        stock_data: Optional[dict] = None,
-        as_of_date: Optional[str] = None,
-        extra_blocks: Optional[dict] = None,
-        include_thesis: bool = False,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> Optional[dict]:
-        """Generate a structured analysis grounded in financial data and news.
-
-        Args:
-            articles: List of article dicts with title, summary, sentiment,
-                      sentiment_score, ticker_relevance_score, etc.
-            symbols: List of stock symbols for context.
-            stock_data: Optional dict keyed by symbol with 'metrics', 'signals',
-                        and 'info' sub-dicts from the stock-data-store.
-            as_of_date: Analysis cut-off date (ISO). When set, the model is told
-                        to reason as of that date only.
-            extra_blocks: Optional dict of pre-formatted validated prompt blocks:
-                          {'metrics': str, 'events': str, 'peers': str, 'profile': str}.
-            include_thesis: When True, request the company_thesis section
-                            (background, perception, catalysts, regime risks).
-
-        Returns:
-            Dictionary with structured analysis data or None if unavailable.
-        """
-        if not articles:
-            return None
-
-        # Spread across symbols AND across the window. This used to be
-        # ``articles[:15]`` off a newest-first list. With a 20-symbol run
-        # that was fifteen headlines, mostly one symbol's, from the last day
-        # or two, whatever window the user had picked.
-        from config import MODEL as _M
-        from services.news_window import article_span, select_spread
-        budget = _M.NEWS_SYNTHESIS_ARTICLES
-        by_symbol: dict[str, list] = {}
-        for a in articles:
-            by_symbol.setdefault(a.get("symbol") or "?", []).append(a)
-        per_symbol = (max(1, budget // len(by_symbol)) if budget else 0)
-        shown: list = []
-        for sym in sorted(by_symbol):
-            shown.extend(select_spread(by_symbol[sym], per_symbol))
-        oldest, newest = article_span(shown)
-        article_text = (
-            f"({len(shown)} of {len(articles)} articles shown, sampled across "
-            f"each symbol's window {oldest} → {newest}; newest first per symbol)\n"
-        ) + "\n".join([
-            f"- {a.get('symbol') or '?'} "
-            f"{str(a.get('published_at') or '?')[:10]} "
-            f"[{(a.get('sentiment') or 'unknown').upper()}] "
-            f"(relevance:{a.get('ticker_relevance_score', 'N/A')}, "
-            f"score:{a.get('sentiment_score', 'N/A')}) "
-            f"{a.get('title', '')}: {(a.get('summary') or '')[:200]}"
-            for a in shown
-        ])
-
-        sentiment_counts = {"bullish": 0, "neutral": 0, "bearish": 0}
-        scores = []
-        for a in articles:
-            s = a.get("sentiment", "neutral").lower()
-            if "bullish" in s:
-                sentiment_counts["bullish"] += 1
-            elif "bearish" in s:
-                sentiment_counts["bearish"] += 1
-            else:
-                sentiment_counts["neutral"] += 1
-            if a.get("sentiment_score") is not None:
-                scores.append(a["sentiment_score"])
-
-        avg_score = sum(scores) / len(scores) if scores else None
-
-        symbols_str = ", ".join(symbols) if symbols else "the stocks"
-
-        financial_context = ""
-        if stock_data:
-            for sym in symbols:
-                sym_data = stock_data.get(sym, {})
-                metrics = sym_data.get("metrics", {})
-                signals = sym_data.get("signals", {})
-                info = sym_data.get("info", {})
-
-                if not metrics and not info:
-                    continue
-
-                lines = [f"\n--- {sym} Financial Data ---"]
-
-                if info:
-                    # Every line below is emitted ONLY when its data is really
-                    # present. The as-of-safe flows (Full Analysis, any
-                    # backtest) deliberately strip live quote fields so the
-                    # model cannot see the session being predicted; printing
-                    # them unconditionally rendered the absence as
-                    # "Current Price: $0.00 | Volume: 0 | P/E: N/A" for every
-                    # symbol, and the analyst model, correctly, refused to
-                    # analyze and reported a broken data feed instead.
-                    lines.append(f"Company: {info.get('name', sym)} | Sector: {info.get('sector', 'N/A')} | Industry: {info.get('industry', 'N/A')}")
-                    if info.get("market_cap") or info.get("pe_ratio") or info.get("dividend_yield"):
-                        mcap = (f"${info['market_cap']:,.0f}" if info.get("market_cap")
-                                else "N/A")
-                        lines.append(f"Market Cap: {mcap} | P/E Ratio: {info.get('pe_ratio', 'N/A')} | Dividend Yield: {info.get('dividend_yield', 'N/A')}")
-                    if info.get("current_price"):
-                        lines.append(f"Current Price: ${info['current_price']:.2f} | Previous Close: ${info.get('previous_close', 0):.2f} | Day Change: {info.get('day_change_percent', 0):.2f}%")
-                    # yfinance's 52w figures are raw exchange prices; every
-                    # indicator here runs on dividend-adjusted history, so
-                    # label the basis or the LLM flags a phantom discrepancy.
-                    if info.get("fifty_two_week_high"):
-                        lines.append(f"52-Week High: ${info['fifty_two_week_high']:.2f} | 52-Week Low: ${info.get('fifty_two_week_low', 0):.2f} (exchange figures, unadjusted)")
-                    if info.get("volume") or info.get("avg_volume"):
-                        lines.append(f"Volume: {info.get('volume', 0):,} | Avg Volume: {info.get('avg_volume', 0):,}")
-
-                if metrics:
-                    lines.append(f"Period Return: {metrics.get('total_return', 'N/A')}% | Volatility: {metrics.get('volatility', 'N/A')}%")
-                    lines.append(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 'N/A')} | Max Drawdown: {metrics.get('max_drawdown', 'N/A')}%")
-                    lines.append(f"Win Rate: {metrics.get('win_rate', 'N/A')}% | Best Day: {metrics.get('best_day', 'N/A')}% | Worst Day: {metrics.get('worst_day', 'N/A')}%")
-                    lines.append(f"Price Range: ${metrics.get('start_price', 'N/A')} → ${metrics.get('end_price', 'N/A')} ({metrics.get('start_date', '')} to {metrics.get('end_date', '')})")
-
-                if signals:
-                    signal_parts = []
-                    for key, val in signals.items():
-                        if isinstance(val, dict):
-                            signal_parts.append(f"{key}: {val.get('signal', str(val))}" +
-                                                (f" ({val.get('value', ''):.1f})" if 'value' in val else ""))
-                    if signal_parts:
-                        lines.append(f"Technical Signals: {' | '.join(signal_parts)}")
-
-                financial_context += "\n".join(lines)
-
-        sentiment_summary = (
-            f"Sentiment counts: {sentiment_counts['bullish']} bullish, "
-            f"{sentiment_counts['neutral']} neutral, {sentiment_counts['bearish']} bearish"
-        )
-        if avg_score is not None:
-            sentiment_summary += f" | Average sentiment score: {avg_score:.3f} (scale: -1 bearish to +1 bullish)"
-
-        system_prompt = """You are a senior equity research analyst. Produce a grounded analysis using ALL provided data. Financial metrics, technical signals, AND news. Respond with ONLY valid JSON.
-
-CRITICAL RULES:
-- Your response must be parseable JSON with no additional text, no markdown code blocks.
-- Ground your recommendation in the FINANCIAL DATA: price action, valuation (P/E), technicals (RSI, MACD, trend), and risk metrics (volatility, drawdown).
-- Every number you cite must come from the provided data. Never estimate or invent a figure.
-- News sentiment should CONFIRM or CHALLENGE the technical/fundamental picture, not replace it.
-- Confidence is your estimated probability (0.0-1.0) that the recommendation direction is correct; high only when technicals, fundamentals, AND sentiment agree.
-- If signals conflict (e.g., bullish news but overbought RSI), lower confidence and note the divergence.
-- DRAWDOWN CAUSALITY: if the stock is down >20% from its period high, state a causal hypothesis with evidence from the news/fundamentals, or write "cause unknown, elevated risk".
-- If a VALIDATED METRICS block is present, use its ATR/support/resistance/R:R arithmetic for any risk-reward statement instead of qualitative claims.
-- Treat any VALIDATED block as the source of truth. If two data sources conflict, FLAG the discrepancy rather than inventing a reconciled number. Do not claim historical support/resistance bounces or exact percentage moves unless a data block states them with concrete dates and prices."""
-
-        as_of_line = f"\nANALYSIS AS-OF DATE: {as_of_date}. Reason only with information available on or before this date.\n" if as_of_date else ""
-
-        eb = extra_blocks or {}
-        validated_context = ""
-        for key, label in (("profile", "COMPANY PROFILE"), ("metrics", "VALIDATED METRICS"),
-                           ("events", "EVENT CALENDAR"), ("peers", "PEER RELATIVE STRENGTH"),
-                           ("options", "OPTIONS POSITIONING"),
-                           ("quality", "QUALITY SCREEN (BAD APPLES)")):
-            if eb.get(key):
-                validated_context += f"\n{label}:\n{eb[key]}\n"
-
-        thesis_schema = ""
-        if include_thesis:
-            thesis_schema = (
-                ', "company_thesis": {'
-                '"perception": "2-3 sentences: how the market currently perceives this company based on the news coverage, vs. what the company claims to be/do (from the profile)", '
-                '"goal_alignment": "1-2 sentences: do its recent activities in the news align with its stated business goals?", '
-                '"positive_catalysts": ["2-4 concrete actions/events that would move the stock UP"], '
-                '"negative_catalysts": ["2-4 concrete actions/events that would move the stock DOWN"], '
-                '"regime_risks": "1-2 sentences on systematic/regime risks at play (rates, sector rotation, AI displacement, regulation)"'
-                '}'
-            )
-
-        prompt = f"""Analyze {symbols_str} using the following data:{as_of_line}
-{financial_context if financial_context else "(No financial data available. Analysis limited to news only)"}
-{validated_context}
-NEWS ARTICLES:
-{article_text}
-
-{sentiment_summary}
-
-BREVITY IS A HARD CONSTRAINT: the sentence counts below are maximums, not
-targets. When analyzing multiple symbols, summarize across them, do not
-narrate each symbol separately. Total response under 450 words.
-
-Respond with this exact JSON structure (no markdown, no extra text):
-
-{{"recommendation": "BULLISH|CAUTIOUS_BULLISH|NEUTRAL|CAUTIOUS_BEARISH|BEARISH", "confidence": 0.0-1.0, "key_developments": "3-4 sentences covering price action, key technicals, and most important news. Reference specific numbers.", "developments_read": "1-2 sentences: what those developments MEAN for a position holder. Interpretation, not a restatement of the numbers.", "market_sentiment": "BULLISH|NEUTRAL|BEARISH", "sentiment_explanation": "One sentence on how news sentiment aligns or conflicts with the technical/fundamental picture.", "risk_factors": "1-2 key risks from the data (valuation, volatility, technical weakness, negative news).", "risks_read": "One sentence: which single risk is most live right now and what would trigger it.", "watch_items": ["2-3 short, concrete things to monitor next (a level, a date, a metric), each checkable"]{thesis_schema}}}"""
-
-        # Compilation provenance: computed from what was actually assembled
-        # (never model-asserted) and stamped on every outcome including the
-        # sentiment fallback, so readers always see how the analysis was built.
-        src_meta = {
-            "articles": len(articles),
-            "validated_blocks": sorted(k for k in (extra_blocks or {}) if (extra_blocks or {}).get(k)),
-            "financial_data": bool(financial_context),
-            "as_of": as_of_date,
-            "analysis_tier": "news_summary",
-        }
-
-        # Reasoning models (Luna) bill reasoning as output tokens; passing
-        # reasoning_effort routes generate() through its max_completion_tokens
-        # headroom logic so the JSON actually closes.
-        gen_kwargs: dict = {}
-        if (model or "").startswith("gpt-"):
-            gen_kwargs["reasoning_effort"] = "medium"
-            provider = provider or "openai"
-
-        # Measured three times: without an explicit brevity constraint the
-        # model expands to fill any cap (truncated at 1000, 1600, AND 2400
-        # on a 5-symbol overall call), and a truncated JSON silently degrades
-        # to the sentiment fallback. The prompt now hard-caps ~450 words
-        # (~700 tokens); 3600/3200 is genuine headroom, not a target.
-        response = self.generate(
-            prompt, system_prompt,
-            max_tokens=3600 if include_thesis else 3200,
-            temperature=0.3,
-            model=model,
-            provider=provider,
-            **gen_kwargs,
-        )
-
-        if response:
-            try:
-                # String-aware balanced-brace scan (the greedy regex this
-                # replaced matched first-{ to LAST-} and "parsed" truncated
-                # responses into a json.loads failure).
-                clean = _extract_json_object(response) or response.strip()
-                result = json.loads(clean)
-
-                # Validate and normalize the result
-                valid_recommendations = ["BULLISH", "CAUTIOUS_BULLISH", "NEUTRAL", "CAUTIOUS_BEARISH", "BEARISH"]
-                rec = result.get("recommendation", "NEUTRAL").upper().replace(" ", "_")
-                if rec not in valid_recommendations:
-                    rec = "NEUTRAL"
-                result["recommendation"] = rec
-
-                # Ensure confidence is a float between 0 and 1
-                conf = result.get("confidence", 0.5)
-                if isinstance(conf, str):
-                    try:
-                        conf = float(conf)
-                    except ValueError:
-                        conf = 0.5
-                result["confidence"] = max(0.0, min(1.0, conf))
-
-                result["model_used"] = model or self._get_model()
-                result["provider_used"] = provider or self.provider
-                result["sources"] = src_meta
-                return result
-
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f"Error parsing LLM response: {e}")
-                # Return a fallback based on sentiment counts
-                fb = self._fallback_analysis(sentiment_counts, articles)
-                if fb:
-                    fb["sources"] = {**src_meta, "analysis_tier": "sentiment_fallback"}
-                return fb
-
-        fb = self._fallback_analysis(sentiment_counts, articles)
-        if fb:
-            fb["sources"] = {**src_meta, "analysis_tier": "sentiment_fallback"}
-        return fb
-
     def _fallback_analysis(
         self,
         sentiment_counts: dict,
@@ -1355,8 +1090,16 @@ Respond with this exact JSON structure (no markdown, no extra text):
         symbols: list[str],
         basis: str = "news+signals",
         model_override: Optional[str] = None,
+        fixed_actions: Optional[dict] = None,
     ) -> Optional[dict]:
         """Synthesize the chosen evidence into actionable recommendations.
+
+        ``fixed_actions`` (services.portfolio_rollup.fixed_actions) carries
+        the action and p_correct per symbol, decided by the platform from the
+        research verdict. When given, the model is told the action is not
+        its to choose, and the parsed output is overwritten with those
+        values whatever it wrote: measured on prod the model's own re-vote
+        agreed with the report 68% of the time and carried no edge over it.
 
         Uses the configured recommendations model (default: GPT 5.6 Luna).
         `basis` controls what evidence goes into the prompt and is stamped
@@ -1372,6 +1115,18 @@ Respond with this exact JSON structure (no markdown, no extra text):
         model_desc_block = "\n".join(
             f"  - {desc}" for desc in self._MODEL_DESCRIPTIONS.values()
         )
+        fixed_role = ""
+        if fixed_actions:
+            fixed_role = (
+                "\n- THE ACTION IS NOT YOURS TO CHOOSE. Each symbol block carries "
+                "ACTION and p_correct set by the platform from the research "
+                "verdict (with one HOLD rule, named where it applied). Copy "
+                "them into \"action\" and \"p_correct\" exactly. Your work is "
+                "the reasoning FOR that action, the conflicts, the key level, "
+                "the change trigger, the model notes, and the portfolio "
+                "overall. Where you would have chosen differently, say so in "
+                "conflicts and leave the action alone")
+
 
         system_prompt = f"""You are a senior portfolio strategist. You receive two independent analyses:
 
@@ -1394,7 +1149,7 @@ WHAT THIS PLATFORM HAS ACTUALLY MEASURED (use these findings, do not contradict 
 - Directional hit rates across models sit close to 50% over large samples. Treat any thesis that implies a large, reliable edge as suspect.
 
 YOUR ROLE:
-- Synthesize both inputs into specific, actionable recommendations per symbol
+- Synthesize both inputs into specific, actionable recommendations per symbol{fixed_role}
 - When the AI report and model predictions DISAGREE, this is the most valuable signal. Explain WHY they disagree and which to trust in this context
 - Where OPTIONS POSITIONING or QUALITY SCREEN lines are present, factor them in: a put-tilted chain or a high quality-screen fail count argues for lower conviction and tighter risk on bullish calls (and vice versa). They are context that shades conviction, never a standalone reason to flip a direction
 - Where a "Situation" line is present, the call is about how that situation resolves (a pending deal's completion odds and spread to the offer, a regulator's decision, an earnings print), not about trend. Models that only read price are less relevant there; say so in model_notes, and let key_level/change_trigger reference the offer price or the dated event rather than a moving average
@@ -1431,7 +1186,6 @@ Respond with ONLY valid JSON matching this schema:
         # Build per-symbol data block
         symbol_blocks = []
         analysis_by_sym = ai_analysis.get("by_symbol", {})
-        overall = ai_analysis.get("overall", {})
 
         # Research digest budget per symbol. The synthesis used to see only
         # the ~600-char verdict block. The analysis sections the research
@@ -1442,6 +1196,23 @@ Respond with ONLY valid JSON matching this schema:
 
         for symbol in symbols:
             lines = [f"=== {symbol} ==="]
+            fixed = (fixed_actions or {}).get(symbol)
+            if fixed:
+                why = {
+                    "research_verdict": "the research verdict",
+                    "models_disagree_and_missing_evidence":
+                        "HOLD rule: the independent models mostly disagree "
+                        "with the research verdict AND the report was written "
+                        "without expected evidence",
+                    "no_research_verdict": "no research verdict for this symbol",
+                }.get(fixed.get("rule"), fixed.get("rule") or "")
+                lines.append(
+                    f"ACTION (set by the platform, {why}): {fixed['action']}, "
+                    f"p_correct {float(fixed.get('p_correct') or 0.5):.2f}"
+                    + (f"; research verdict {fixed['verdict']}, models "
+                       f"{fixed.get('models_agreeing', 0)} agreeing / "
+                       f"{fixed.get('models_opposed', 0)} opposed"
+                       if fixed.get("verdict") else ""))
 
             # AI Report data (suppressed entirely on a signals-only basis)
             sym_report = {} if signals_only else analysis_by_sym.get(symbol, {})
@@ -1594,18 +1365,11 @@ Respond with ONLY valid JSON matching this schema:
 
             symbol_blocks.append("\n".join(lines))
 
-        # Overall AI report
-        overall_line = ""
-        if overall:
-            overall_line = (
-                f"\nOVERALL AI REPORT: {overall.get('recommendation', 'N/A')} "
-                f"(confidence: {overall.get('confidence', 'N/A')})\n"
-                f"  Sentiment: {overall.get('market_sentiment', 'N/A')}\n"
-            )
-
+        # No portfolio-level line: the old "OVERALL AI REPORT" was a second
+        # model's read of a news sample; the portfolio view is now rolled up
+        # from the same per-symbol reports this prompt already carries.
         user_prompt = (
             f"Analyze the following {len(symbols)} symbols and provide recommendations:\n\n"
-            + overall_line + "\n"
             + "\n\n".join(symbol_blocks)
         )
 
@@ -1635,15 +1399,13 @@ Respond with ONLY valid JSON matching this schema:
         synthesis_provider = primary_provider
         parsed = _parse_recommendations_json(raw) if raw else None
 
-        if parsed is None and API.ANTHROPIC_API_KEY:
+        fallback = MODEL.RECOMMENDATIONS_FALLBACK_MODEL
+        if (parsed is None and fallback and fallback != primary_model
+                and API.ANTHROPIC_API_KEY):
             # Primary synthesis failed, empty response OR unusable JSON (a
             # truncated payload used to drop the whole day's synthesis on the
-            # floor here). A completed AI report + prediction run shouldn't
-            # be wasted, so re-ask once on the fallback model.
-            fallback = MODEL.RECOMMENDATIONS_FALLBACK_MODEL
-            if fallback == primary_model:
-                fallback = ("claude-sonnet-4-6" if primary_model == "claude-sonnet-5"
-                            else "claude-sonnet-5")
+            # floor here). Opt-in only: with no fallback configured the run
+            # records the failure instead of buying a 13x dearer answer.
             logger.warning(
                 f"{primary_model} produced no usable synthesis "
                 f"({'empty' if not raw else 'unparseable'}): "
@@ -1665,6 +1427,24 @@ Respond with ONLY valid JSON matching this schema:
             logger.warning("Recommendations synthesis produced no usable JSON "
                            "from any model")
             return None
+
+        if fixed_actions:
+            # The platform's decision stands whatever the model wrote; the
+            # row records where the action came from.
+            by_sym = parsed.get("by_symbol")
+            if not isinstance(by_sym, dict):
+                by_sym = parsed["by_symbol"] = {}
+            for sym, fixed in fixed_actions.items():
+                rec = by_sym.get(sym)
+                if not isinstance(rec, dict):
+                    rec = by_sym[sym] = {"reasoning": "the synthesis model "
+                                         "returned nothing for this symbol"}
+                model_action = str(rec.get("action") or "").upper()
+                rec["action"] = fixed["action"]
+                rec["p_correct"] = fixed.get("p_correct", 0.5)
+                rec["action_source"] = fixed.get("rule")
+                if model_action and model_action != fixed["action"]:
+                    rec["model_would_have"] = model_action
 
         parsed["model_used"] = synthesis_model
         parsed["provider_used"] = synthesis_provider

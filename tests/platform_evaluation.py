@@ -176,7 +176,9 @@ def test_llm_analysis():
 
         # 2a. Structured analysis
         t0 = time.time()
-        structured = llm.summarize_news_structured(article_dicts, [symbol])
+        # Removed 2026-09-06: the structured portfolio pass was replaced by
+        # services.portfolio_rollup (no model call). Nothing to evaluate.
+        structured = None
         llm_time = time.time() - t0
 
         if structured:

@@ -220,10 +220,10 @@ def bench_llm():
         {"title": "Apple supply chain diversifies", "summary": "India production ramps up.", "sentiment": "neutral"},
     ]
 
-    mn, avg, mx, _ = _run_timed(
-        lambda: svc.summarize_news_structured(fake_articles, ["AAPL"])
-    )
-    record("LLM structured analysis (Anthropic)", mn, avg, mx, pass_s=5, warn_s=10)
+    # The structured portfolio pass (summarize_news_structured) was removed
+    # 2026-09-06: the portfolio view is rolled up from the research
+    # epilogues without a model call, so there is nothing to time here.
+    _ = fake_articles
 
 
 # ---- 5. Model predictions ---------------------------------------------------

@@ -1024,89 +1024,18 @@ def build_ai_report(
                         "relevance": float(relevance)},
     }
 
-    enriched: dict = {}
-    for symbol in symbols:
-        entry = {"metrics": {}, "signals": {}, "info": {}}
-        try:
-            info = get_stock_info(symbol)
-            entry["info"] = {
-                "name": info.name, "sector": info.sector, "industry": info.industry,
-            }
-        except Exception as e:
-            logger.warning(f"Could not fetch stock info for {symbol}: {e}")
-        enriched[symbol] = entry
-
-    all_articles: list = []
-    for articles in news_by_symbol.values():
-        all_articles.extend(articles or [])
-
-    metrics_block = portfolio_metrics_block(symbols, stock_data or {}, as_of)
-
-    # Same cache key the AI Report callback uses, so a scheduled run and a UI
-    # run over identical scope share one entry instead of each paying.
-    cache_key = report_cache_key(news_by_symbol, symbols, as_of, report_model,
-                                 lookback_days, include_thesis,
-                                 evidence=evidence, max_articles=max_articles,
-                                 overnight=overnight, relevance=relevance)
-    try:
-        from services import persistence_service as ps
-        cache_hash = ps.compute_data_hash(cache_key)
-        cache_payload = {
-            "event": "cache",
-            "kind": "ai_report",
-            "input_data_hash": cache_hash,
-            "summary": _report_key_summary(news_by_symbol, symbols, cache_key),
-        }
-        cached = ps.get_cached_report(None, as_of, "ai_report", cache_hash)
-        if cached:
-            prog.emit("ai", "AI report cache hit, regeneration skipped",
-                      payload={**cache_payload, "outcome": "hit"},
-                      run_id=run_id)
-            restored = json.loads(cached)
-            restored["from_cache"] = True
-            restored["recs_request"] = "news+signals"
-            restored["recs_model"] = recs_model
-            prog.emit_progress("report", state="done", done=len(symbols),
-                               total=len(symbols), run_id=run_id)
-            return restored
-        # A miss on inputs that look unchanged is a diagnosable event now:
-        # the payload records the hash and what fed it, so a cross-restart
-        # miss can be compared against the hit that should have happened.
-        prog.emit("ai", "AI report cache miss, generating fresh",
-                  payload={**cache_payload, "outcome": "miss"}, run_id=run_id)
-    except Exception as e:
-        logger.debug(f"AI report cache check failed: {e}")
-
-    if all_articles:
-        prog.emit("ai", f"Overall: synthesizing {len(all_articles)} articles "
-                        f"across {len(symbols)} symbols ({report_model})…",
-                  run_id=run_id)
-        provider = "openai" if report_model.startswith("gpt-") else "anthropic"
-        try:
-            with usage.track("ai_report", trade_date=as_of,
-                             section="ai_report:overall"):
-                result["overall"] = get_llm().summarize_news_structured(
-                    all_articles, symbols,
-                    stock_data=enriched,
-                    as_of_date=as_of,
-                    extra_blocks={"metrics": metrics_block} if metrics_block else None,
-                    # Depth used to key the cache here and never reach the
-                    # call, "Deep" was a cache miss with a Standard report.
-                    include_thesis=include_thesis,
-                    model=report_model,
-                    provider=provider,
-                )
-        except Exception as e:
-            logger.warning(f"Overall AI analysis failed: {e}")
-            prog.emit("error", f"Overall AI analysis failed: {str(e)[:80]}",
-                      run_id=run_id)
-
+    # No portfolio model call. The old summarize_news_structured pass re-read
+    # a 40-article sample across every symbol and wrote a portfolio JSON that
+    # the per-symbol research made redundant; the portfolio view is now
+    # rolled up from the research epilogues once the model stage has
+    # produced them (run_recommendations and the archive both do it).
+    prog.emit("ai", f"AI report frame ready for {len(symbols)} symbols: the "
+                    f"per-symbol research arrives with the model stage and "
+                    f"the portfolio view is rolled up from it",
+              run_id=run_id)
     result["recs_request"] = "news+signals"
     result["recs_model"] = recs_model
-    if not result["overall"]:
-        result["failed"] = True
-    prog.emit_progress("report", state="failed" if result.get("failed") else "done",
-                       done=0 if result.get("failed") else len(symbols),
+    prog.emit_progress("report", state="done", done=len(symbols),
                        total=len(symbols), run_id=run_id)
     return result
 
@@ -1222,6 +1151,23 @@ def run_recommendations(
         if backfilled and basis == "news+signals":
             basis = "research+signals"
 
+    # The portfolio view and the per-symbol actions are the platform's,
+    # decided from the research verdicts (merged in just above: before the
+    # merge the entries carry no verdict and every action would be HOLD)
+    # before the memo model is asked.
+    from services.portfolio_rollup import build_overall_rollup, fixed_actions
+    by_symbol = ai_analysis.get("by_symbol") or {}
+    ai_analysis["overall"] = build_overall_rollup(by_symbol, valid_signals)
+    actions_fixed = fixed_actions(by_symbol, valid_signals, symbols)
+    held = [s for s, d in actions_fixed.items()
+            if d["rule"] == "models_disagree_and_missing_evidence"]
+    if held:
+        prog.emit("luna", f"HOLD rule applied to {', '.join(held)}: models "
+                          f"disagree with the research verdict and the "
+                          f"report lacked expected evidence", run_id=run_id)
+    prog.emit("luna", "Actions fixed from the research verdicts: " + ", ".join(
+        f"{s}={d['action']}" for s, d in actions_fixed.items()), run_id=run_id)
+
     rec_data_hash = None
     try:
         # Hash the EVIDENCE, not the envelope. `generated_at` (and the
@@ -1280,6 +1226,7 @@ def run_recommendations(
             ai_analysis, valid_signals, symbols,
             basis=basis,
             model_override=ai_analysis.get("recs_model"),
+            fixed_actions=actions_fixed,
         )
     synthesis_ms = int((time.time() - synthesis_started) * 1000)
     if not result:
@@ -1336,6 +1283,8 @@ def run_recommendations(
                     "details": {
                         "synthesis_model": result.get("model_used"),
                         "basis": result.get("basis"),
+                        "action_source": rec.get("action_source"),
+                        "model_would_have": rec.get("model_would_have"),
                         "p_correct": rec.get("p_correct"),
                         "conviction": rec.get("conviction"),
                         "key_level": rec.get("key_level"),
@@ -1727,6 +1676,10 @@ def _run_stages(
     try:
         from services import persistence_service as ps
         merged, _ = merge_research_into_analysis(ai_analysis, signals, priced)
+        if not merged.get("overall"):
+            from services.portfolio_rollup import build_overall_rollup
+            merged["overall"] = build_overall_rollup(
+                merged.get("by_symbol") or {}, signals)
         ps.store_report(
             symbol=None, trade_date=as_of, report_type="ai_report",
             input_data_hash=ps.compute_data_hash(report_cache_key(

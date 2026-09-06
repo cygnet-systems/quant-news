@@ -28,7 +28,7 @@ the cap allows.
 
 import logging
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from services.options_service import MIN_LIQUID_VOLUME
 
@@ -164,6 +164,13 @@ INSIDER_LEAN_MARGIN = 2
 # whole window with none — so a single filing is already the exception and the
 # floor is one. What lifts it is a second member, or a purchase into a decline.
 MIN_CONGRESS_TRADES = 1
+# A disclosure is an event on the day it becomes public, and a transaction
+# is one on the day it happens; either inside this many days of the as-of
+# makes the trade current. Rows outside it are the six-month backdrop the
+# political block already prints, not something that stood out today: on a
+# 14-day ORCL run the detector fired on three members whose latest trade was
+# four months old, and the report carried a full section saying so.
+CONGRESS_RECENT_DAYS = 30
 CONGRESS_BASE = 0.3
 CONGRESS_SECOND_MEMBER = 0.2
 CONGRESS_AGAINST_TREND = 0.25
@@ -842,8 +849,37 @@ def _detect_insider_cluster(symbol, insiders, window_days, as_of) -> dict | None
         "insiders")
 
 
-def _detect_congress_activity(symbol, congress, dossier, trend) -> dict | None:
-    rows = [t for t in (congress or []) if isinstance(t, dict)]
+def _congress_is_recent(t: dict, as_of_d) -> bool:
+    """Public or transacted within CONGRESS_RECENT_DAYS of the as-of. A row
+    with neither date cannot be placed in time and does not count."""
+    if as_of_d is None:
+        return True
+    floor = as_of_d - timedelta(days=CONGRESS_RECENT_DAYS)
+    for key in ("filed_date", "visible_from", "transaction_date"):
+        d = _date_of(t.get(key))
+        if d is not None and floor <= d <= as_of_d:
+            return True
+    return False
+
+
+def _date_of(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _detect_congress_activity(symbol, congress, dossier, trend,
+                              as_of=None) -> dict | None:
+    as_of_d = _date_of(as_of)
+    rows = [t for t in (congress or [])
+            if isinstance(t, dict) and _congress_is_recent(t, as_of_d)]
     if len(rows) < MIN_CONGRESS_TRADES:
         return None
 
@@ -871,11 +907,15 @@ def _detect_congress_activity(symbol, congress, dossier, trend) -> dict | None:
     severity = round(min(1.0, severity), 3)
 
     latest = max((t.get("transaction_date") or "" for t in rows), default="")
+    public = max((str(t.get("filed_date") or t.get("visible_from") or "")
+                  for t in rows), default="")
     facts = [
-        f"{len(rows)} disclosed congressional trade(s) in {symbol} by "
+        f"{len(rows)} disclosed congressional trade(s) in {symbol} public or "
+        f"transacted within the last {CONGRESS_RECENT_DAYS} days, by "
         f"{len(members)} member(s): {', '.join(names[:4])}",
         f"{len(buys)} purchase(s) and {len(sells)} sale(s)"
-        + (f", most recent transaction {latest}" if latest else ""),
+        + (f", most recent transaction {latest}" if latest else "")
+        + (f", most recent disclosure public {public[:10]}" if public else ""),
     ]
     sizes = [(_num(t.get("amount_min")), _num(t.get("amount_max"))) for t in rows]
     lo = sum(s[0] for s in sizes if s[0])
@@ -1057,7 +1097,7 @@ def detect(symbol, as_of, *, options=None, by_expiry=None, insiders=None,
         _detect_options_flow(symbol, options),
         _detect_options_term_divergence(symbol, by_expiry, as_of),
         _detect_insider_cluster(symbol, insiders, window_days, as_of),
-        _detect_congress_activity(symbol, congress, dossier, trend),
+        _detect_congress_activity(symbol, congress, dossier, trend, as_of),
         _detect_quality_failures(symbol, quality),
         _detect_news_spike(symbol, news),
         _detect_positioning_vs_price(symbol, trend, options, insiders),
@@ -1168,8 +1208,22 @@ def format_anomaly_block(symbol: str, anomaly: dict,
         else:
             why = UNRESEARCHED_REASONS.get(anomaly.get("unresearched"),
                                            UNRESEARCHED_DEFAULT)
-        lines.append(f"NOT RESEARCHED: {why}, so nothing beyond the figures "
-                     f"above is known about why this is happening. Write the "
-                     f"section from those figures, state that the cause was "
-                     f"not researched, and do not supply one of your own.")
+        if key == "news_spike":
+            # The spike's own articles are in the NEWS block with outlet and
+            # date. Naming what they were about is reporting, not inferring
+            # a cause; the earlier wording forbade it and the section came
+            # out as "attention is elevated, but the cause was not
+            # researched" over three headlines that said what the day was.
+            lines.append(f"NOT RESEARCHED: {why}. State that in one sentence, "
+                         f"then say what the articles from that day in the "
+                         f"NEWS block were about, each with its src and date, "
+                         f"and nothing beyond what they say: whether they are "
+                         f"one story syndicated or several, and what the "
+                         f"stories were. Do not infer a cause the articles do "
+                         f"not state.")
+        else:
+            lines.append(f"NOT RESEARCHED: {why}, so nothing beyond the figures "
+                         f"above is known about why this is happening. Write "
+                         f"from those figures, state that the cause was not "
+                         f"researched, and do not supply one of your own.")
     return "\n".join(lines)

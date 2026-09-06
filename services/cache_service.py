@@ -19,6 +19,7 @@ from sqlalchemy import delete, func, select, text, update
 
 from config import APP
 from db.session import get_session, get_engine
+from services.price_basis import price_moved
 
 logger = logging.getLogger(__name__)
 
@@ -459,11 +460,13 @@ class CacheService:
                     return fallback_df, metadata
             raise
 
-    def _cache_prices(self, symbol: str, df: pd.DataFrame, period: str) -> None:
-        from db.models import StockPrice, CacheMetadata
-        if df.empty:
-            return
-
+    def _normalize_bars(self, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+        """A fetched frame as the stock_prices columns, bars without a real
+        close dropped. Empty when nothing survives."""
+        if df is None or df.empty:
+            return pd.DataFrame(columns=[
+                "date", "open", "high", "low", "close", "volume",
+                "dividends", "stock_splits"])
         cache_df = df.reset_index()
         column_mapping = {}
         for col in cache_df.columns:
@@ -505,8 +508,63 @@ class CacheService:
                 f"Dropping {int(bad.sum())} bar(s) with unusable close for "
                 f"{symbol}: {[str(d)[:10] for d in cache_df.loc[bad, 'date'].tolist()]}")
             cache_df = cache_df[~bad]
-            if cache_df.empty:
-                return
+        return cache_df
+
+    def _on_stored_basis(self, symbol: str, cache_df: pd.DataFrame):
+        """The frame to write, and whether it replaces the whole stored
+        history.
+
+        Adjusted bars are rebased backwards at every dividend and split, so
+        a fetch made after one is on a different basis from the bars it
+        would be written beside. When the stored rows older than this
+        fetch are on an older basis (services/price_basis.py decides), the
+        whole stored span is refetched so the series stays on one basis.
+        A failed refetch keeps the short frame: a seam until the next
+        fetch beats no bars at all.
+        """
+        from db.models import StockPrice
+        from services.price_basis import stale_history
+
+        with get_session() as session:
+            stored = pd.read_sql(
+                select(StockPrice.date, StockPrice.close, StockPrice.dividends,
+                       StockPrice.stock_splits, StockPrice.fetched_at)
+                .where(StockPrice.symbol == symbol),
+                session.connection(),
+            )
+        if stored.empty:
+            return cache_df, False
+        reason = stale_history(cache_df, stored)
+        if not reason:
+            return cache_df, False
+        oldest = pd.to_datetime(stored["date"]).min()
+        logger.info(
+            f"{symbol}: stored bars before "
+            f"{pd.to_datetime(cache_df['date']).min().date()} are on an older "
+            f"adjustment basis ({reason}); refetching from {oldest.date()}")
+        from services.stock_data import fetch_stock_data
+        try:
+            full = self._normalize_bars(
+                symbol, fetch_stock_data(symbol, start=oldest))
+        except Exception as e:
+            logger.warning(
+                f"{symbol}: basis refetch failed ({e}); the stored history "
+                f"keeps its seam until the next fetch")
+            return cache_df, False
+        if full.empty or pd.to_datetime(full["date"]).min() > \
+                oldest + pd.Timedelta(days=7):
+            logger.warning(
+                f"{symbol}: basis refetch did not reach {oldest.date()}; "
+                f"writing the short frame")
+            return cache_df, False
+        return full, True
+
+    def _cache_prices(self, symbol: str, df: pd.DataFrame, period: str) -> None:
+        from db.models import StockPrice, CacheMetadata
+        cache_df = self._normalize_bars(symbol, df)
+        if cache_df.empty:
+            return
+        cache_df, replace_all = self._on_stored_basis(symbol, cache_df)
 
         now = datetime.now(timezone.utc)
 
@@ -515,11 +573,17 @@ class CacheService:
             # whole symbol first meant any short fetch, the evaluator's 3mo
             # backfill, or a truncated yfinance response, destroyed the full
             # stored history and silently replaced it with the shorter frame.
+            # The one exception is a basis refetch, which spans the whole
+            # stored history by construction.
             new_dates = [d for d in cache_df["date"].tolist() if d is not None]
-            session.execute(delete(StockPrice).where(
-                StockPrice.symbol == symbol,
-                StockPrice.date.in_(new_dates),
-            ))
+            if replace_all:
+                session.execute(delete(StockPrice).where(
+                    StockPrice.symbol == symbol))
+            else:
+                session.execute(delete(StockPrice).where(
+                    StockPrice.symbol == symbol,
+                    StockPrice.date.in_(new_dates),
+                ))
 
             for _, row in cache_df.iterrows():
                 session.add(StockPrice(
@@ -766,14 +830,7 @@ class CacheService:
             # storing that as previous_close makes the row unscorable (and
             # once crashed the evaluator wholesale). Scan a few and take the
             # first real one; NULL when none is, the evaluator skips NULLs.
-            recent_closes = session.execute(
-                select(StockPrice.close)
-                .where(StockPrice.symbol == symbol, StockPrice.date <= str(pred_date))
-                .order_by(StockPrice.date.desc())
-                .limit(5)
-            ).scalars().all()
-            prev_close_row = next(
-                (c for c in recent_closes if _usable_price(c)), None)
+            prev_close_row = self._latest_usable_close(session, symbol, pred_date)
 
             # Re-storing an existing id keeps its owner and visibility. The
             # merge used to take them from the CURRENT writer, so a private
@@ -879,7 +936,6 @@ class CacheService:
         import pytz
 
         from db.models import ModelPrediction, StockPrice
-        from models.base import compute_pnl
         from utils.trading_calendar import get_previous_trading_day, is_market_open_today
 
         # Exchange-local date, not the host's: on the UTC container the host
@@ -928,13 +984,9 @@ class CacheService:
             skipped_no_price: list[str] = []
             skipped_no_prev = 0
             hold_bands: dict = {}
+            bars_by_symbol: dict = {}
             for pred in pending:
-                actual_row = session.execute(
-                    select(StockPrice.close).where(
-                        StockPrice.symbol == pred.symbol,
-                        StockPrice.date == str(pred.target_date),
-                    )
-                ).scalar_one_or_none()
+                actual_row = self._close_on(session, pred.symbol, pred.target_date)
 
                 if not _usable_price(actual_row):
                     skipped_no_price.append(
@@ -944,36 +996,17 @@ class CacheService:
                     skipped_no_prev += 1
                     continue
 
-                actual_close = actual_row
-                price_went_up = actual_close > pred.previous_close
+                # Entry and exit on the same adjustment basis. previous_close
+                # was copied when the row was stored; if a dividend went ex
+                # between then and now the cache has since rebased that
+                # bar, and scoring the old copy against the new exit would
+                # count the dividend as a price drop.
+                found = self._entry_now(session, pred, bars_by_symbol)
+                if found is not None and found[2] != 1.0 \
+                        and price_moved(pred.previous_close, found[1]):
+                    self._rebase_entry(pred, found[1])
 
-                if pred.decision == "BUY":
-                    was_correct = price_went_up
-                elif pred.decision == "SELL":
-                    was_correct = not price_went_up
-                else:
-                    # A HOLD is right when standing aside was right: the move
-                    # stayed inside the symbol's own no-trade band. Leaving
-                    # this as None made HOLD unfalsifiable, so a model that
-                    # holds most of the time never showed a wrong call.
-                    move = abs(actual_close - pred.previous_close) / pred.previous_close
-                    band = self._hold_band(
-                        session, pred.symbol, hold_bands, pred.target_date)
-                    was_correct = move <= band
-                    # The band drifts as history accrues; without recording
-                    # what this row was judged against, the verdict can never
-                    # be audited or reproduced.
-                    pred.details_json = _sanitize_json({
-                        **(pred.details_json or {}),
-                        "hold_eval": {"band": band, "move": move},
-                    })
-
-                pnl = compute_pnl(pred.decision, pred.previous_close, actual_close)
-
-                pred.actual_close = actual_close
-                pred.was_correct = was_correct
-                pred.pnl_dollars = pnl
-                pred.evaluated_at = datetime.now(timezone.utc)
+                self._score(session, pred, actual_row, hold_bands)
                 evaluated += 1
 
             if evaluated > 0:
@@ -991,6 +1024,194 @@ class CacheService:
                     f"no usable previous_close, these can never score")
 
         return evaluated
+
+    @staticmethod
+    def _latest_usable_close(session, symbol: str, on_or_before):
+        """Most recent USABLE close on or before a date, not merely the most
+        recent row: a partial pre-market bar can sit at the top with a NaN
+        close, and storing that as previous_close makes the row unscorable
+        (and once crashed the evaluator wholesale). Scan a few and take the
+        first real one; None when none is, the evaluator skips NULLs."""
+        from db.models import StockPrice
+
+        recent = session.execute(
+            select(StockPrice.close)
+            .where(StockPrice.symbol == symbol,
+                   StockPrice.date <= str(on_or_before)[:10])
+            .order_by(StockPrice.date.desc())
+            .limit(5)
+        ).scalars().all()
+        return next((c for c in recent if _usable_price(c)), None)
+
+    @staticmethod
+    def _close_on(session, symbol: str, day):
+        from db.models import StockPrice
+
+        return session.execute(
+            select(StockPrice.close).where(
+                StockPrice.symbol == symbol,
+                StockPrice.date == str(day)[:10],
+            )
+        ).scalar_one_or_none()
+
+    @staticmethod
+    def _stored_bars(session, symbol: str, cache: dict) -> pd.DataFrame:
+        """A symbol's whole stored history (date, close, dividends, splits),
+        read once per call site."""
+        from db.models import StockPrice
+
+        if symbol not in cache:
+            cache[symbol] = pd.read_sql(
+                select(StockPrice.date, StockPrice.close, StockPrice.dividends,
+                       StockPrice.stock_splits)
+                .where(StockPrice.symbol == symbol)
+                .order_by(StockPrice.date),
+                session.connection(),
+            )
+        return cache[symbol]
+
+    def _entry_now(self, session, pred, cache: dict):
+        """The bar a prediction's recorded entry came from and its close on
+        the cache's current basis, or None when no bar explains the
+        recorded value. The scheduled 7am run stores rows before the
+        session's bar exists, so the entry is usually the prior close;
+        matching by adjustment-explained equality rather than by date
+        keeps that row measuring what it measured."""
+        from services.price_basis import explained_close
+
+        return explained_close(
+            self._stored_bars(session, pred.symbol, cache),
+            pred.previous_close, pred.prediction_date)
+
+    def _exit_now(self, session, pred, cache: dict):
+        from services.price_basis import explained_close
+
+        return explained_close(
+            self._stored_bars(session, pred.symbol, cache),
+            pred.actual_close, pred.target_date, exact=True)
+
+    @staticmethod
+    def _rebase_entry(pred, entry: float) -> None:
+        """Move a prediction's entry price onto the cache's current
+        adjustment basis. predicted_close is scaled by the same factor so
+        the implied move the model made is unchanged; the original entry
+        is kept in details_json, since it is what the model saw."""
+        old = float(pred.previous_close)
+        factor = entry / old
+        pred.previous_close = entry
+        if _usable_price(pred.predicted_close):
+            pred.predicted_close = float(pred.predicted_close) * factor
+        pred.details_json = _sanitize_json({
+            **(pred.details_json or {}),
+            "entry_rebased": {
+                "from": old, "to": entry,
+                "at": datetime.now(timezone.utc).isoformat(),
+            },
+        })
+
+    def _score(self, session, pred, actual_close: float, hold_bands: dict) -> None:
+        """Verdict and P&L for one prediction against its target close."""
+        from models.base import compute_pnl
+
+        price_went_up = actual_close > pred.previous_close
+
+        if pred.decision == "BUY":
+            was_correct = price_went_up
+        elif pred.decision == "SELL":
+            was_correct = not price_went_up
+        else:
+            # A HOLD is right when standing aside was right: the move
+            # stayed inside the symbol's own no-trade band. Leaving
+            # this as None made HOLD unfalsifiable, so a model that
+            # holds most of the time never showed a wrong call.
+            move = abs(actual_close - pred.previous_close) / pred.previous_close
+            band = self._hold_band(
+                session, pred.symbol, hold_bands, pred.target_date)
+            was_correct = move <= band
+            # The band drifts as history accrues; without recording
+            # what this row was judged against, the verdict can never
+            # be audited or reproduced.
+            pred.details_json = _sanitize_json({
+                **(pred.details_json or {}),
+                "hold_eval": {"band": band, "move": move},
+            })
+
+        pred.actual_close = actual_close
+        pred.was_correct = was_correct
+        pred.pnl_dollars = compute_pnl(pred.decision, pred.previous_close, actual_close)
+        pred.evaluated_at = datetime.now(timezone.utc)
+
+    def rebase_scored_predictions(self, since_days: Optional[int] = 45,
+                                  dry_run: bool = False) -> list[dict]:
+        """Re-score predictions whose entry or exit close the cache has since
+        rebased, so every scored row is judged on the basis the cache holds
+        today.
+
+        A dividend that goes ex after a row was scored rebases both of its
+        bars by the same factor and changes nothing; the rows this catches
+        are the ones scored across the ex-date, with the entry copied on
+        the old basis (72 of 4,126 on 2026-09-06, a mean -0.36% drag). A
+        recorded price that no stored bar explains, allowing for the
+        adjustments since, is left alone: the scheduled 7am run records
+        the prior session's close as the entry, and re-picking the
+        prediction date's close would change what the row measures. Only
+        rows with a target date in the last ``since_days`` are checked on
+        the daily pass, since an adjustment shows up within days; None
+        checks everything. Returns one dict per row moved (or that would
+        move, with ``dry_run``); strategy evaluations built from those rows
+        are the caller's to rebuild.
+        """
+        from db.models import ModelPrediction
+
+        moved: list[dict] = []
+        hold_bands: dict = {}
+        bars_by_symbol: dict = {}
+        with get_session() as session:
+            stmt = select(ModelPrediction).where(
+                ModelPrediction.actual_close.isnot(None))
+            if since_days is not None:
+                floor = (datetime.now(timezone.utc)
+                         - timedelta(days=since_days)).date()
+                stmt = stmt.where(ModelPrediction.target_date >= floor)
+            for pred in session.execute(stmt).scalars().all():
+                if not (_usable_price(pred.previous_close)
+                        and _usable_price(pred.actual_close)):
+                    continue
+                found_entry = self._entry_now(session, pred, bars_by_symbol)
+                found_exit = self._exit_now(session, pred, bars_by_symbol)
+                if found_entry is None or found_exit is None:
+                    # A recorded price no stored bar explains: not ours to
+                    # re-pick.
+                    continue
+                entry, exit_ = found_entry[1], found_exit[1]
+                # Only an event between the two bars changes their ratio:
+                # one after both scales them alike, and a bar Yahoo has
+                # merely re-rounded is not an adjustment.
+                if found_entry[2] == found_exit[2] or not price_moved(
+                        pred.actual_close / pred.previous_close, exit_ / entry):
+                    continue
+                before = {"previous_close": pred.previous_close,
+                          "actual_close": pred.actual_close,
+                          "was_correct": pred.was_correct,
+                          "pnl": pred.pnl_dollars}
+                if not dry_run:
+                    if price_moved(pred.previous_close, entry):
+                        self._rebase_entry(pred, entry)
+                    self._score(session, pred, exit_, hold_bands)
+                moved.append({
+                    "id": pred.id, "symbol": pred.symbol,
+                    "model": pred.model_name, "decision": pred.decision,
+                    "target_date": str(pred.target_date)[:10],
+                    **before,
+                    "entry": entry, "exit": exit_,
+                    "was_correct_after": (pred.was_correct if not dry_run
+                                          else None),
+                    "pnl_after": pred.pnl_dollars if not dry_run else None,
+                })
+        if moved and not dry_run:
+            logger.info(f"Rebased {len(moved)} scored prediction(s) onto the "
+                        f"cache's current adjustment basis")
+        return moved
 
     def evaluation_backlog(self) -> dict:
         """Mature predictions still unevaluated, the number that should be
@@ -1627,6 +1848,18 @@ class CacheService:
                 }
                 for r in rows
             ]
+
+    def delete_strategy_evaluations_for(self, prediction_ids: list[str]) -> int:
+        """Drop every strategy's evaluation of the given predictions, so
+        the next run_evaluation rebuilds them from the rows as they now
+        stand."""
+        from db.models import StrategyEvaluation
+        if not prediction_ids:
+            return 0
+        with get_session() as session:
+            result = session.execute(delete(StrategyEvaluation).where(
+                StrategyEvaluation.prediction_id.in_(list(prediction_ids))))
+            return result.rowcount or 0
 
     def delete_strategy_evaluations(self, strategy_name: Optional[str] = None) -> int:
         from db.models import StrategyEvaluation

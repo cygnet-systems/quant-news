@@ -48,6 +48,15 @@ class EvaluationService:
         if n_evaluated > 0:
             logger.info(f"Filled actual_close for {n_evaluated} predictions")
 
+        # Step 1b: rows already scored whose closes the cache has since
+        # rebased (a dividend went ex across them) get re-scored, and the
+        # strategy evaluations built on the old prices are dropped so step
+        # 2 rebuilds them from the corrected row.
+        moved = cache.rebase_scored_predictions()
+        if moved:
+            cache.delete_strategy_evaluations_for(
+                [m["id"] for m in moved])
+
         # Step 2: Run each strategy
         results: dict[str, int] = {}
         for name, strategy in self._registry:

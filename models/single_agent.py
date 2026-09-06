@@ -26,7 +26,7 @@ and removing the old intraday-leak ambiguity.
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import pandas as pd
@@ -34,6 +34,7 @@ import pandas as pd
 from config import MODEL
 from services.evidence_contract import EvidenceLedger
 from services.news_window import (
+    sort_newest_first,
     RunParameterMissing,
     article_span,
     select_spread,
@@ -284,7 +285,7 @@ trading session. Analyze ALL of the following data carefully before deciding.
 == HOW OFTEN CALLS LIKE THIS RESOLVE CORRECTLY ==
 {track_record_block}
 
-== {ticker} BUSINESS PROFILE ==
+== {ticker} BUSINESS PROFILE & RECENT DEVELOPMENTS ==
 {business_block}
 
 == {ticker} PRICE ACTION ==
@@ -318,80 +319,84 @@ trading session. Analyze ALL of the following data carefully before deciding.
 # same twelve headings whatever the evidence holds is the thing this design
 # is trying to stop.
 FIXED_SECTIONS = (
-    """Situation & Key Figures: what kind of situation {ticker} is in and the one
-   question that decides the next 1-5 sessions. From the SITUATION &
-   INVESTIGATION block: the deal or proceeding and its terms (offer price,
-   spread, consideration, approvals and their status), the dated milestones,
-   and the decisive actors with what the sourced record says about them,
-   every fact with its src and date. If the block says a finding is an
-   inference, say so. If no situation block was gathered, say exactly that in
-   one sentence and classify the situation yourself from the news block. For
-   MOMENTUM_ONLY, one short paragraph saying nothing situational is in play.""",
-    """Technicals ({ticker}): cover price vs ALL THREE SMAs (20/50/200, the
-   200SMA anchors the long-term trend and must not be skipped), RSI, MACD,
-   volume, and volatility. In a PENDING_ACQUISITION, state every level relative
-   to the offer price as well.""",
-    """News & Catalysts: company-specific first, then sector, then macro. Every
-   claim carries its outlet and date inline; is anything actually new?""",
-    """Fundamentals: valuation and quality, only as they bear on the 1-5 day window
-   (in a PENDING_ACQUISITION, only as they bear on completion or break value)""",
-    """Positioning & Flows: who is positioned which way, covering each of these
-   for which a block was provided:
-   - Options: put/call, by expiry when given.
-   - Insiders (Form 4): NAME the executives and their titles, and for each one
-     quote the share count and, where the block states one, the dollar value,
-     exactly as the block prints them (the block states dollars only over the
-     rows carrying a real share price, and says how many that is). Give the
-     transaction dates and the visible-from dates, and state the filing lag.
-     Say plainly which pattern the window holds: a cluster of distinct sellers,
-     one filer acting alone, or nothing. Rows priced at 0.00 are grants or
-     exercises and must be described as such, never as purchases and never with
-     a dollar figure attached.
-   - Congress: the window's trade count and, where a block states one, the
-     party split; the amount bands quoted as the block writes
-     them (the blocks print a range with a dash, your prose writes it "X to Y"),
-     and the filing lag. From the dossier, NAME the members with their
-     party, chamber and seat, say whether they were sitting on {date}, give what
-     each traded in {ticker} with the dates those disclosures became public, and
-     say what else they have been trading. Where the dossier says a member was
-     named in the news with no title next to the name, the identification rests
-     on their own filing: report it that way and claim nothing more.
-     That last list only covers the
-     symbols this system syncs, so read it as a floor on their activity: where
-     the block reports nothing else, write that nothing else was in coverage,
-     never that the member traded nothing else.
-   - Institutional 13F adds and cuts, and short interest.
-   Then say what each group would need to see to change position, and which
-   scenario below each one is exposed to. Where a block is thin or holds
-   nothing, say that in one sentence and weight it accordingly rather than
-   constructing a read it cannot carry. If a block was not gathered at all, say
-   so in one line rather than skipping it.""",
-    """Peer Comparison: {ticker} vs the peer set in the data; company-specific move
-   or sector-wide repricing? (omit this section only if no peer block was provided)""",
-    """Business Context: what the company actually does, and which of tomorrow's
-   drivers (sector beta, own catalysts, liquidity) dominate for a name this size""",
-    """Market & Sector Backdrop: SPY regime and {sector_etf} versus SPY, in AT MOST
-   three sentences. This context is identical for every symbol analysed today, so
-   it earns no more space than that; spend the words on what it changes for
-   {ticker} specifically""",
+    """Situation & Key Figures: what kind of situation {ticker} is in, the one
+   question that decides the next 1-5 sessions, and where the company is
+   heading. Three parts, visibly separated. (a) The situation: from the
+   SITUATION & INVESTIGATION block when one was gathered (the deal or
+   proceeding and its terms: offer price, spread, consideration, approvals
+   and their status; the dated milestones; the decisive actors with what the
+   sourced record says about them; every fact with its src and date, and
+   where the block calls a finding an inference, say so). If no situation
+   block was gathered, say exactly that in one sentence and classify the
+   situation yourself from the news block. For MOMENTUM_ONLY, one sentence
+   saying nothing situational is in play. (b) Trajectory: from the RECENT
+   DEVELOPMENTS list in the business block, two to four sentences on what the
+   company has announced or been through over the last quarter and which
+   direction that sets (expanding, cutting, under review, awaiting an event),
+   each dated item with its src. Where the list is empty or reaches back only
+   days, say how far back it reaches and stop; never fill the gap from the
+   profile paragraph, which is a product list and says nothing about
+   direction. (c) The key figures: the two or three numbers from the blocks
+   the call turns on, and nothing else.{flags}""",
+    """News & Catalysts: company-specific first, then sector, then macro, then
+   the dated catalysts ahead. The NEWS block holds every article the run
+   kept, and most of them repeat one another or carry no fact: cite the few
+   that do, say in one line what the rest were (the same story syndicated,
+   screens, generic coverage), and never list them. Every claim carries its
+   outlet and date inline; is anything actually new?""",
+    """Technicals & Trade Plan ({ticker}): price vs ALL THREE SMAs (20/50/200,
+   the 200SMA anchors the long-term trend and must not be skipped), RSI, MACD,
+   volume, volatility, and in ONE sentence the SPY regime and {sector_etf}
+   versus SPY as they bear on {ticker} (that context is the same for every
+   symbol today and earns no more than that). In a PENDING_ACQUISITION, state
+   every level relative to the offer price as well. Then the plan: stance; the
+   key levels (support, resistance, SMAs) rounded as described above and
+   stamped "as of {date}"; invalidation (which close, level or event kills the
+   thesis); what to watch next session.""",
     """Bull vs Bear: the debate, not a summary. First "**Bull:**" with the 2-3
    strongest arguments FOR upside, each anchored to a specific number or article
    in the blocks; then "**Bear:**" with the 2-3 strongest arguments for downside,
    same standard. Argue each side at full strength. Do not soften the side you
    disagree with. The Read line states which side wins over 1-5 sessions and on
    what evidence the loser's case would take over.""",
-    """Scenarios: what is more and less likely over the next 1-5 sessions. One
-   short paragraph per scenario, in descending probability, each opening with
-   "**<name> (p≈X%):**" and covering what happens, the early confirmation in the
-   data, and the price implication against the levels in the blocks. Say once
-   that the probabilities are this report's judgement. The Read line names the
+    """Scenarios & Risk: what is more and less likely over the next 1-5
+   sessions. One short paragraph per scenario, in descending probability, each
+   opening with "**<name> (p≈X%):**" and covering what happens, the early
+   confirmation in the data, and the price implication against the levels in
+   the blocks. Say once that the probabilities are this report's judgement.
+   Then the risk, in one paragraph: the single biggest risk to THIS call and
+   the falsification conditions that would flip it, and any evidence this run
+   could not gather and what it would have changed. The Read line names the
    most likely path and what would make the least likely one take over.""",
-    """Risk: systematic / sector / idiosyncratic; name the single biggest risk to
-   THIS call and the falsification conditions that would flip it. Name any
-   evidence this run could not gather and what it would have changed.""",
-    """Trade Plan: stance; the key levels (support, resistance, SMAs) rounded as
-   described above and stamped "as of {date}"; invalidation (which close, level
-   or event kills the thesis); what to watch next session""",
+    """Fundamentals: valuation and quality, only as they bear on the 1-5 day
+   window (in a PENDING_ACQUISITION, only as they bear on completion or break
+   value). Three or four sentences.""",
+    """Positioning & Flows: who is positioned which way, in at most one short
+   paragraph per group for which a block was provided (options, put/call and
+   by expiry when given; insiders (Form 4); Congress; institutional 13F adds
+   and cuts and short interest). Lead each with the pattern, not the roster:
+   for insiders, whether the window holds a cluster of distinct sellers, one
+   filer acting alone, or nothing; for Congress, the trade count and skew.
+   NAME the executives and their titles, and NAME the members with their
+   party, chamber and seat, ONLY for the one or two filers who define the
+   pattern, with share counts, dollar values and
+   amount bands quoted as the block writes them (the blocks print a range
+   with a dash, your prose writes it "X to Y"); the rest are counts. Give visible-from dates for the named
+   rows and state the filing lag once. Rows priced at 0.00 are grants or
+   exercises and must be described as such, never as purchases and never with
+   a dollar figure attached. Where the dossier says a member was named in the
+   news with no title next to the name, the identification rests on their own
+   filing: report it that way and claim nothing more; where the dossier
+   reports nothing else in coverage, write that nothing else was in coverage,
+   never that the member traded nothing else. The row-level detail stays in
+   the evidence blocks; do not transcribe it. Then say what each group would
+   need to see to change position and which scenario above each one is
+   exposed to. Where a block is thin or holds nothing, say that in one
+   sentence and weight it accordingly rather than constructing a read it
+   cannot carry. If a block was not gathered at all, say so in one line
+   rather than skipping it.""",
+    """Peer Comparison: {ticker} vs the peer set in the data; company-specific move
+   or sector-wide repricing? (omit this section only if no peer block was provided)""",
 )
 
 # The anomaly sections go straight after Situation & Key Figures: they are
@@ -402,18 +407,45 @@ ANOMALY_INSERT_AFTER = 1
 ANOMALY_GROUP_INTRO = """Sections {first} to {last} below are the reason this
 report exists. Each covers something that measurably stands out for {ticker}
 today and has its own ANOMALY block in the precomputed section carrying its
-figures and, where this run researched it, a sourced finding. Write them at
-full strength and do not merge them into one another."""
+figures and the sourced finding the run reached on it. Write them at full
+strength and do not merge them into one another."""
 
 ANOMALY_SECTION = """{title}: write this section from the ANOMALY block headed
-   "{key}" and from nothing else. Three parts, visibly separated. (a) What the
-   evidence shows: quote that block's figures exactly, and only those. (b) What
-   the research found: the finding with the outlet and date of the source it
-   came from; where the block says the question was NOT researched, say that in
-   one sentence and stop, never supply a cause of your own. (c) What it implies
-   for the next 1-5 sessions and what would show the implication is wrong.
-   (a) and (b) are what is observed and sourced, (c) is your reading of it, and
-   the reader must be able to tell which is which without guessing."""
+   "{key}". Three parts, visibly separated. (a) What the evidence shows: quote
+   that block's figures exactly, and only those. (b) What the research found:
+   the finding with the outlet and date of the source it came from. Where the
+   block says the question was NOT researched, say that in one sentence; for
+   a news-volume spike then say what the articles from that day in the NEWS
+   block were about, each with its src and date, as what the spike consisted
+   of, and nothing beyond what those articles say. Never supply a cause of
+   your own. (c) What it implies for the next 1-5 sessions and what would
+   show the implication is wrong. (a) and (b) are what is observed and
+   sourced, (c) is your reading of it, and the reader must be able to tell
+   which is which without guessing."""
+
+# An anomaly with no researched finding is a figure the reader can already
+# see in its block: a full three-part section over it says "the cause was
+# not researched" at length, three times over on a run with web research
+# off. Those become one bullet each inside Situation & Key Figures. The
+# exception is a news-volume spike, whose same-day articles are in the NEWS
+# block with outlet and date, so the section has something sourced to say.
+FLAGS_NOTE = """ (d) Also flagged for {ticker} today, not researched:
+   {titles}. Each has an ANOMALY block in the precomputed section. Give each
+   ONE bullet quoting that block's headline figure and what it argues for
+   (size, skepticism, event exposure), no cause of your own and no separate
+   section."""
+
+
+def earns_section(anomaly: dict) -> bool:
+    """Whether an anomaly gets its own numbered section or a flag bullet."""
+    return bool(anomaly.get("researched")) or anomaly.get("key") == "news_spike"
+
+
+def split_anomalies(anomalies: Optional[list]) -> tuple[list, list]:
+    """(sectioned, flagged), each in the scan's severity order."""
+    found = list(anomalies or [])
+    return ([a for a in found if earns_section(a)],
+            [a for a in found if not earns_section(a)])
 
 # Worded over what the run ACTUALLY screened. The earlier version listed
 # every category the scanner knows about, so a run with the options block
@@ -483,21 +515,31 @@ def render_output_sections(ticker: str, date: str, sector_etf: str,
     with nothing to screen, and it gets its own wording so a crash is never
     reported to the model as an absence of findings.
     """
-    fmt = {"ticker": ticker, "date": date, "sector_etf": sector_etf}
+    sectioned, flagged = split_anomalies(anomalies)
+    flags = ""
+    if flagged:
+        flags = FLAGS_NOTE.format(
+            ticker=ticker,
+            titles="; ".join(f'"{a.get("title") or "Anomaly"}" (block '
+                             f'"{a.get("key") or "anomaly"}")' for a in flagged))
+    fmt = {"ticker": ticker, "date": date, "sector_etf": sector_etf,
+           "flags": flags}
     fixed = [s.format(**fmt) for s in FIXED_SECTIONS]
     items = fixed[:ANOMALY_INSERT_AFTER]
     intro = ""
-    found = list(anomalies or [])
-    if found:
+    if sectioned:
         first = ANOMALY_INSERT_AFTER + 1
         intro = ANOMALY_GROUP_INTRO.format(
-            ticker=ticker, first=first, last=first + len(found) - 1) + "\n\n"
+            ticker=ticker, first=first, last=first + len(sectioned) - 1) + "\n\n"
         items += [ANOMALY_SECTION.format(title=a.get("title") or "Anomaly",
                                          key=a.get("key") or "anomaly")
-                  for a in found]
+                  for a in sectioned]
     items += fixed[ANOMALY_INSERT_AFTER:]
 
     out = [f"{i}. {body}" for i, body in enumerate(items, 1)]
+    # The quiet-symbol wording is about what the scan FOUND, so a symbol
+    # whose anomalies were all flagged rather than sectioned is not quiet.
+    found = bool(sectioned or flagged)
     head = "" if found else _quiet_note(ticker, screened, scan_failed) + "\n\n"
     return head + intro + "\n".join(out)
 
@@ -759,6 +801,128 @@ def _price_action_block(df: pd.DataFrame, n: int = 15) -> str:
     return "\n".join(lines)
 
 
+# Sources that publish what the company itself put out. Together with a
+# source carrying the company's own name ("Oracle", "Oracle - Investor
+# Relations", "Oracle Blogs") these are the announcements; everything else in
+# the store is coverage of them.
+DEVELOPMENT_WIRES = ("business wire", "pr newswire", "prnewswire",
+                     "globenewswire", "globe newswire", "accesswire",
+                     "investor relations", "newsroom")
+DEVELOPMENTS_DAYS = 90
+DEVELOPMENTS_LIMIT = 12
+DEVELOPMENTS_RELEVANCE = 0.9
+
+
+def _developments_block(symbol: str, as_of: str, profile: str = "",
+                        days: int = DEVELOPMENTS_DAYS,
+                        limit: int = DEVELOPMENTS_LIMIT) -> tuple[str, dict]:
+    """The last quarter's company-originated headlines, point-in-time.
+
+    Read from the news store only (``cache.get_historical_news``), never the
+    vendor: the store fills from the daily windows and keeps 90 days, so
+    this costs nothing and reaches back exactly as far as the store does.
+    Company-originated items (the company's own name or a wire in the
+    source) come first, spread across the span; the highest-relevance
+    coverage fills the rest. The header states the span the store actually
+    covers so a thin list on a new symbol is read as thin, not as quiet.
+
+    Works on the raw store rows (dicts) and converts nothing: a busy name
+    holds a few thousand rows over 90 days, and building a NewsArticle for
+    each (with its impact regex) just to drop it was most of the cost.
+    """
+    empty = {"count": 0, "span": (None, None), "coverage": (None, None),
+             "reason": "news store holds nothing for this symbol"}
+    try:
+        from services.cache_service import get_cache
+        end = datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()
+        start = end - timedelta(days=days)
+        rows = get_cache().get_historical_news(
+            symbol, start_date=start.isoformat(), end_date=end.isoformat())
+    except Exception as e:
+        logger.warning(f"{symbol}: developments lookup failed: {e}")
+        return ("RECENT DEVELOPMENTS: the news store could not be read for "
+                "this run, so the last quarter's announcements are not "
+                "listed here.", {**empty, "reason": f"news store read failed: {str(e)[:80]}"})
+    rows = [r for r in rows if isinstance(r, dict)]
+    if not rows:
+        return (f"RECENT DEVELOPMENTS: none on record; the news store holds "
+                f"nothing for {symbol} in the {days} days to {as_of}.", empty)
+
+    def when(r) -> str:
+        return str(r.get("published_at") or r.get("published_date") or "")[:10]
+
+    dates = sorted(d for d in (when(r) for r in rows) if d)
+    coverage = (dates[0], dates[-1]) if dates else (None, None)
+    name = (profile or "").split(":")[0].strip().split()
+    company = name[0].lower() if name and len(name[0]) >= 3 else ""
+
+    def relevance(r) -> float:
+        v = r.get("ticker_relevance_score")
+        return float(v) if isinstance(v, (int, float)) else 0.0
+
+    def source_of(r) -> str:
+        return (r.get("source") or "").lower()
+
+    def originated(r) -> bool:
+        src = source_of(r)
+        return bool(src) and ((bool(company) and company in src)
+                              or any(w in src for w in DEVELOPMENT_WIRES))
+
+    def tier(r) -> int:
+        # Investor-relations items (results, guidance, event dates) outrank
+        # the company's own blogs and newsroom, which outrank wire items
+        # (a wire carries the customer-win and partner-badge releases too).
+        src = source_of(r)
+        if "investor relations" in src:
+            return 0
+        if company and company in src:
+            return 1
+        return 2
+
+    pool = [r for r in rows if relevance(r) >= DEVELOPMENTS_RELEVANCE]
+    if len(pool) < 3:
+        pool = [r for r in rows if relevance(r) >= 0.7] or rows
+    # One release reaches the store several times over (the wire, the
+    # newsroom, a regional repost); the newest copy stands for all of them.
+    seen: set = set()
+    deduped = []
+    for r in sorted(pool, key=when, reverse=True):
+        key = re.sub(r"[^a-z0-9]+", " ", (r.get("title") or "").lower()).strip()[:80]
+        if key and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    own = [r for r in deduped if originated(r)]
+    chosen: list = []
+    for t in (0, 1, 2):
+        room = limit - len(chosen)
+        if room <= 0:
+            break
+        tier_rows = [r for r in own if tier(r) == t]
+        chosen.extend(select_spread(tier_rows, room)
+                      if len(tier_rows) > room else tier_rows)
+    if len(chosen) < limit:
+        taken = {id(r) for r in chosen}
+        rest = sorted((r for r in deduped if id(r) not in taken),
+                      key=relevance, reverse=True)
+        chosen.extend(rest[: limit - len(chosen)])
+    chosen.sort(key=when, reverse=True)
+    span = ((when(chosen[-1]) or None, when(chosen[0]) or None)
+            if chosen else (None, None))
+    lines = [f"RECENT DEVELOPMENTS (point-in-time, from the news store, which "
+             f"covers {coverage[0]} → {coverage[1]} of the {days} days to "
+             f"{as_of}; {len(own)} company-originated item(s), "
+             f"{len(chosen)} listed, newest first):"]
+    for r in chosen:
+        src = str(r.get("source") or "unattributed").strip()
+        kind = "announced" if originated(r) else "coverage"
+        summary = (r.get("summary") or "")[:140]
+        lines.append(f"- {when(r) or '?'} [{kind}] (src: {src}) {r.get('title') or ''}"
+                     + (f": {summary}" if summary else ""))
+    return "\n".join(lines), {"count": len(chosen), "span": span,
+                               "coverage": coverage, "reason": ""}
+
+
 def _news_block(articles: list, n: Optional[int] = None) -> tuple[str, int, tuple]:
     """Point-in-time headlines, each carrying the outlet and date to cite.
 
@@ -766,18 +930,22 @@ def _news_block(articles: list, n: Optional[int] = None) -> tuple[str, int, tupl
     outlet has to be in the block the model reads, without ``src:`` here the
     only honest option left to the model is to drop the claim.
 
-    Shows up to ``n`` (config NEWS_PROMPT_ARTICLES) articles SPREAD across
-    the window, not the newest ``n``: newest-first truncation is how a
-    30-day window used to reach the model as its last three days.
+    Shows EVERY article the run kept: the window, the relevance floor and the
+    per-symbol cap are the frontend's knobs and the only ones. ``n`` (a
+    positive count) is for callers that want a sample SPREAD across the
+    window, never the newest ``n``: newest-first truncation is how a 30-day
+    window used to reach the model as its last three days.
     """
     if not articles:
         return "No news in the point-in-time window.", 0, (None, None)
-    if n is None:
-        n = MODEL.NEWS_PROMPT_ARTICLES
-    shown = select_spread(articles, n)
+    shown = select_spread(articles, n) if n and n > 0 else sort_newest_first(articles)
     oldest, newest = article_span(shown)
-    lines = [f"({len(shown)} of {len(articles)} articles in the window, "
-             f"sampled across {oldest} → {newest}, newest first)"]
+    sampled = f"{len(shown)} of {len(articles)} articles, sampled across" \
+        if len(shown) < len(articles) else f"all {len(articles)} articles in the window,"
+    lines = [f"({sampled} {oldest} → {newest}, newest first. Many will be "
+             f"the same story syndicated or generic coverage; weigh the "
+             f"few that carry a fact and treat repetition as one fact, "
+             f"not many)"]
     for a in shown:
         if hasattr(a, "title"):
             title = a.title or ""
@@ -1391,6 +1559,18 @@ class SingleAgentResearch:
             # get_company_profile answers "" only when the profile lookup
             # failed; a listed company always has one. The feed is down.
             ledger.unavailable("business", "company profile lookup failed")
+        # The profile is a product list and reads the same every day. What
+        # the report needs for trajectory is what the company announced and
+        # went through over the last quarter, which the news store holds
+        # (point-in-time, store only: no vendor call, so a symbol new to the
+        # watchlist gets days of it and the block says so).
+        developments, dev_stats = _developments_block(symbol, as_of, business)
+        if dev_stats["count"]:
+            ledger.have("developments")
+        else:
+            ledger.missing("developments", dev_stats["reason"])
+        business = (_smart_truncate(business, 700) + "\n\n" + developments
+                    if business else developments)
 
         # --- prior stance (cross-day continuity) ---
         # Gathered here, used ONLY after generation: the research prompt never
@@ -1443,19 +1623,19 @@ class SingleAgentResearch:
                               f"run: classify the situation yourself from the news "
                               f"and filings blocks before Step 1, and say that you did.")
         # Rendered once, measured once: the footer reports THIS count and
-        # span. The char budget scales with the article budget so the tail
-        # truncation (which would eat the oldest strata. The whole point of
-        # spreading) cannot fire on a normal block; ~320 chars per line.
+        # span. The char budget scales with the number of articles the run
+        # kept so the tail truncation (which would eat the oldest ones)
+        # cannot fire on a normal block; ~320 chars per line.
         news_block_text, news_shown, news_shown_span = _news_block(news_articles)
         news_block_text = _smart_truncate(
-            news_block_text, max(6000, 320 * (MODEL.NEWS_PROMPT_ARTICLES or 50) + 400))
+            news_block_text, max(6000, 320 * len(news_articles) + 600))
         prompt = SINGLE_AGENT_PROMPT.format(
             ticker=symbol,
             date=as_of,
             sector_etf=sector_etf,
             situation_line=situation_line,
             track_record_block=track_record or NO_TRACK_RECORD_LINE,
-            business_block=_smart_truncate(business, 1200),
+            business_block=_smart_truncate(business, 4000),
             spy_block=_smart_truncate(spy_block, 2000),
             sector_block=_smart_truncate(sector_block, 2000),
             price_block=_smart_truncate(_price_action_block(ohlcv_df), 3000),
@@ -1596,6 +1776,11 @@ class SingleAgentResearch:
             "anomalies": [a.get("key") for a in (anomalies or [])],
             "anomalies_researched": sum(1 for a in (anomalies or [])
                                         if a.get("researched")),
+            "anomalies_sectioned": [a.get("key") for a in
+                                    split_anomalies(anomalies)[0]],
+            "anomalies_flagged": [a.get("key") for a in
+                                  split_anomalies(anomalies)[1]],
+            "developments": dev_stats,
             # What the scan could rule out. Without it a reader cannot tell
             # a quiet symbol from a run that fetched nothing to screen, and
             # without the flag neither of those from a scan that raised.
@@ -1604,8 +1789,8 @@ class SingleAgentResearch:
             "evidence": ledger.to_dict(),
         }
         news_desc = (
-            f"{news_shown} of {len(news_articles)} news articles read "
-            f"({news_lookback_days}d point-in-time window; read span "
+            f"all {len(news_articles)} news articles in the run's window read "
+            f"({news_lookback_days}d point-in-time window; span "
             f"{news_shown_span[0]} → {news_shown_span[1]})"
             if use_news and news_articles else
             "no news in the window" if use_news else
@@ -1627,7 +1812,8 @@ class SingleAgentResearch:
             + (f"; prior stance from the {prior_report['trade_date']} report"
                if prior_report else "; no prior report on record")
             + (f"; situation {situation}" if situation else "")
-            + (f"; {len(anomalies)} anomaly section(s), "
+            + (f"; {len(provenance['anomalies_sectioned'])} anomaly "
+               f"section(s), {len(provenance['anomalies_flagged'])} flagged, "
                f"{provenance['anomalies_researched']} web-researched"
                if anomalies else
                "; the anomaly scan failed on this run" if scan_failed else

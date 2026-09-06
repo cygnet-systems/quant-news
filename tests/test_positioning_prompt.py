@@ -177,8 +177,8 @@ class TestPromptRules:
 
     def test_section_five_demands_the_names_the_sizes_and_the_lag(self):
         sections = render_output_sections("NVDA", AS_OF, "XLK", [])
-        section = sections.split("5. Positioning & Flows")[1] \
-            .split("6. Peer Comparison")[0]
+        section = sections.split("7. Positioning & Flows")[1] \
+            .split("8. Peer Comparison")[0]
         assert "NAME the executives and their titles" in section
         assert "NAME the members with their" in section
         assert "visible-from dates" in section
@@ -221,7 +221,7 @@ class TestBlocksInThePrompt:
         assert "== PRECOMPUTED METRICS & EVENTS" not in prompt
         # The output contract survives the absence: section 5 is still there
         # and still says to state what was not gathered.
-        assert "5. Positioning & Flows" in prompt
+        assert "7. Positioning & Flows" in prompt
         assert "If a block was not gathered at all, say" in prompt
 
     def test_an_empty_window_is_stated_rather_than_dropped(self, db,

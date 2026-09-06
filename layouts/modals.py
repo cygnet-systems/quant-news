@@ -221,13 +221,14 @@ TOOL_OPTIONS = [
 # reads them, and it drops TradingAgents: in the models-only path that
 # research runs one symbol at a time inside the prediction subprocess, so
 # with it Quick would be slower than Standard and still pay one LLM call per
-# symbol. Deep is the only preset that turns the open web on, and the date
-# rule (no web research for a backtest) still wins over it.
+# symbol. Standard and Deep both turn the open web on (the anomaly gate
+# decides which symbols actually buy a search), and the date rule (no web
+# research for a backtest) still wins over both.
 # Standard is the default, so it has to produce both primary outputs, the
 # research report and the recommendation synthesis: it shipped with recs
 # "off", which silently disabled synthesis for every default run and for
-# every schedule saved through the dialog. What Standard buys over Deep is
-# only the open web and the extra evidence blocks.
+# every schedule saved through the dialog. What Deep buys over Standard is
+# the extra evidence blocks.
 RUN_PRESET_ORDER = ["quick", "standard", "deep"]
 DEFAULT_RUN_PRESET = "standard"
 PRESET_FIELDS = ("scope", "models", "recs", "evidence", "tools")
@@ -246,18 +247,25 @@ RUN_PRESETS = {
     "standard": {
         "label": "Standard",
         "hint": "Research report, every model, and the recommendation "
-                "synthesis. No open-web research.",
+                "synthesis. Open-web research runs only for the symbols "
+                "the anomaly scan flags (next-day runs; never a backtest).",
         "fields": {
             "scope": "full",
             "models": [mid for mid, _, _ in RUN_MODELS],
             "recs": "auto",
-            "tools": [],
+            # On by default since 2026-09-06: with it off, a run whose scan
+            # flagged something wrote "the cause was not researched" over
+            # every flag. The anomaly gate (INVESTIGATE_ONLY_ANOMALIES) is
+            # what bounds the spend, not this switch; the date rule still
+            # strips it from any backtest.
+            "tools": [o["value"] for o in TOOL_OPTIONS],
         },
     },
     "deep": {
         "label": "Deep",
-        "hint": "Standard plus every evidence block and open-web research "
-                "in the situation investigation. Slowest, most spend.",
+        "hint": "Standard plus every evidence block, so the scan has more "
+                "to flag and the investigation more to read. Slowest, "
+                "most spend.",
         "fields": {
             "scope": "full",
             "models": [mid for mid, _, _ in RUN_MODELS],
@@ -288,15 +296,23 @@ def preset_fields(name: str | None) -> dict:
             for k, v in RUN_PRESETS[key]["fields"].items()}
 
 
-def preset_divergence(name: str | None, values: dict) -> list[str]:
+def preset_divergence(name: str | None, values: dict,
+                      target_date=None) -> list[str]:
     """Names of the preset's fields whose dialog value differs from it.
 
     ``values`` is what the controls hold now, keyed like the preset. List
     fields compare as sets: the order the checklists report in is not the
     user's choice. A None dialog value is read as "unmounted", not as a
     divergence, so a State that never rendered cannot open Customize.
+
+    ``target_date`` applies the date rule to the preset's tools before the
+    comparison: Standard asks for the open web, a backtest never gets it,
+    and an untouched Standard dialog on a past date must not read as
+    "customized: tools" for a difference the platform imposed.
     """
     fields = preset_fields(name)
+    if target_date is not None and "tools" in fields:
+        fields["tools"] = preset_run_tools(name, target_date)
     diverged = []
     for field in PRESET_FIELDS:
         if field not in fields:

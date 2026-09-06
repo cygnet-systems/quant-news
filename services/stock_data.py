@@ -88,13 +88,21 @@ class StockInfo:
 def fetch_stock_data(
     symbol: str,
     period: str = APP.DEFAULT_PERIOD,
+    start=None,
 ) -> pd.DataFrame:
     """Fetch historical stock data from yfinance.
+
+    Bars are split- and dividend-adjusted (yfinance's ``auto_adjust``
+    default), so every close, indicator and return downstream is on one
+    basis. The price cache relies on that: see services/price_basis.py.
 
     Args:
         symbol: Stock ticker symbol (e.g., "MSFT")
         period: Time period for historical data. Valid values:
             1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
+        start: First date to fetch, through today; overrides ``period``.
+            The cache uses it to refetch a whole stored span on a new
+            adjustment basis.
 
     Returns:
         DataFrame with OHLCV data indexed by date. Columns:
@@ -105,7 +113,10 @@ def fetch_stock_data(
     """
     try:
         ticker = get_ticker(symbol)
-        df = ticker.history(period=period)
+        if start is not None:
+            df = ticker.history(start=pd.Timestamp(start).strftime("%Y-%m-%d"))
+        else:
+            df = ticker.history(period=period)
 
         if df.empty:
             raise ValueError(f"No data available for symbol: {symbol}")
